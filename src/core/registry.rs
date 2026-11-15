@@ -9,16 +9,16 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::{LifecycleMode, TunnelConfig};
-use crate::core::health::{HealthStatus, TunnelHealthTracker};
 use crate::core::CoreError;
+use crate::core::health::{HealthStatus, TunnelHealthTracker};
 use crate::netstack::{BridgeIpRecv, BridgeIpSend, VirtualNetworkStack};
 use crate::proxy::{DynStream, ProxyTunnelTarget, ProxyUdpSocket};
 
@@ -46,10 +46,10 @@ pub enum TunnelState {
 impl std::fmt::Display for TunnelState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TunnelState::Dormant => write!(f, "dormant"),
-            TunnelState::Activating => write!(f, "activating"),
-            TunnelState::Active => write!(f, "active"),
-            TunnelState::Suspended => write!(f, "suspended"),
+            Self::Dormant => write!(f, "dormant"),
+            Self::Activating => write!(f, "activating"),
+            Self::Active => write!(f, "active"),
+            Self::Suspended => write!(f, "suspended"),
         }
     }
 }
@@ -140,6 +140,16 @@ pub struct ActiveTunnel {
     pub stats: Arc<TunnelStats>,
 }
 
+impl std::fmt::Debug for ActiveTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveTunnel")
+            .field("id", &self.id)
+            .field("netstack", &self.netstack)
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ActiveTunnel {
     /// Create a new active tunnel handle.
     pub fn new(
@@ -175,11 +185,11 @@ impl ProxyTunnelTarget for ActiveTunnel {
         let stats = Arc::clone(&self.stats);
         Box::pin(async move {
             let stream = netstack.tcp_connect(dst).await?;
-            let metered = MeteredStream {
-                inner: Box::new(stream) as DynStream,
+            let metered: DynStream = Box::new(MeteredStream {
+                inner: Box::new(stream),
                 stats,
-            };
-            Ok(Box::new(metered) as DynStream)
+            });
+            Ok(metered)
         })
     }
 
@@ -191,11 +201,9 @@ impl ProxyTunnelTarget for ActiveTunnel {
         let stats = Arc::clone(&self.stats);
         Box::pin(async move {
             let sock = netstack.udp_bind(local_port).await?;
-            let metered = MeteredUdpSocket {
-                inner: sock,
-                stats,
-            };
-            Ok(Box::new(metered) as Box<dyn ProxyUdpSocket>)
+            let metered: Box<dyn ProxyUdpSocket> =
+                Box::new(MeteredUdpSocket { inner: sock, stats });
+            Ok(metered)
         })
     }
 
@@ -211,6 +219,14 @@ impl ProxyTunnelTarget for ActiveTunnel {
 pub struct MeteredStream {
     pub inner: DynStream,
     pub stats: Arc<TunnelStats>,
+}
+
+impl std::fmt::Debug for MeteredStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeteredStream")
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MeteredStream {
@@ -246,9 +262,10 @@ impl AsyncWrite for MeteredStream {
     ) -> std::task::Poll<io::Result<usize>> {
         let res = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let std::task::Poll::Ready(Ok(n)) = res
-            && n > 0 {
-                self.stats.add_tx(n as u64);
-            }
+            && n > 0
+        {
+            self.stats.add_tx(n as u64);
+        }
         res
     }
 
@@ -271,6 +288,14 @@ impl AsyncWrite for MeteredStream {
 pub struct MeteredUdpSocket {
     inner: Box<dyn ProxyUdpSocket>,
     stats: Arc<TunnelStats>,
+}
+
+impl std::fmt::Debug for MeteredUdpSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeteredUdpSocket")
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProxyUdpSocket for MeteredUdpSocket {
@@ -305,6 +330,7 @@ impl ProxyUdpSocket for MeteredUdpSocket {
 }
 
 /// An entry in the [`TunnelRegistry`], holding both dormant config and dynamic state.
+#[derive(Debug)]
 pub struct TunnelEntry {
     /// Unique tunnel ID (e.g., "wgcf-001").
     pub id: String,
@@ -446,12 +472,14 @@ pub struct TunnelSummary {
     pub disabled: bool,
 }
 
+#[derive(Debug)]
 struct RegistryInner {
     entries: HashMap<String, Arc<TunnelEntry>>,
     keys: Vec<String>,
 }
 
 /// Thread-safe registry holding thousands of tunnel configurations.
+#[derive(Debug)]
 pub struct TunnelRegistry {
     inner: RwLock<RegistryInner>,
 }
@@ -475,15 +503,16 @@ impl TunnelRegistry {
 
     /// Register a new tunnel entry. Fails if a tunnel with the same ID already exists.
     pub fn register(&self, entry: TunnelEntry) -> Result<Arc<TunnelEntry>, CoreError> {
-        let mut inner = self.inner.write();
-        if inner.entries.contains_key(&entry.id) {
-            return Err(CoreError::DuplicateTunnel(entry.id));
-        }
-
         let id = entry.id.clone();
         let arc_entry = Arc::new(entry);
-        inner.keys.push(id.clone());
-        inner.entries.insert(id, Arc::clone(&arc_entry));
+        {
+            let mut inner = self.inner.write();
+            if inner.entries.contains_key(&id) {
+                return Err(CoreError::DuplicateTunnel(id));
+            }
+            inner.keys.push(id.clone());
+            inner.entries.insert(id, Arc::clone(&arc_entry));
+        }
         Ok(arc_entry)
     }
 
@@ -508,7 +537,11 @@ impl TunnelRegistry {
     /// Look up a tunnel entry by its registered sequential index.
     pub fn get_by_index(&self, index: usize) -> Option<Arc<TunnelEntry>> {
         let inner = self.inner.read();
-        inner.keys.get(index).and_then(|id| inner.entries.get(id)).cloned()
+        inner
+            .keys
+            .get(index)
+            .and_then(|id| inner.entries.get(id))
+            .cloned()
     }
 
     /// Look up a tunnel ID by its registered sequential index without cloning all IDs.
@@ -519,14 +552,16 @@ impl TunnelRegistry {
 
     /// Find the tunnel ID with the least active connections in a single scan.
     pub fn least_conn_id(&self) -> Option<String> {
-        let inner = self.inner.read();
         let mut min_conns = usize::MAX;
         let mut chosen = None;
-        for (id, entry) in &inner.entries {
-            let conns = entry.stats.active_conns.load(Ordering::Relaxed);
-            if conns < min_conns {
-                min_conns = conns;
-                chosen = Some(id.clone());
+        {
+            let inner = self.inner.read();
+            for (id, entry) in &inner.entries {
+                let conns = entry.stats.active_conns.load(Ordering::Relaxed);
+                if conns < min_conns {
+                    min_conns = conns;
+                    chosen = Some(id.clone());
+                }
             }
         }
         chosen
@@ -545,11 +580,10 @@ impl TunnelRegistry {
             .keys
             .iter()
             .filter(|k| {
-                if let Some(entry) = inner.entries.get(*k) {
-                    entry.health.is_routable()
-                } else {
-                    false
-                }
+                inner
+                    .entries
+                    .get(*k)
+                    .is_some_and(|entry| entry.health.is_routable())
             })
             .cloned()
             .collect()
@@ -558,7 +592,11 @@ impl TunnelRegistry {
     /// Return all registered tunnel entries.
     pub fn all_entries(&self) -> Vec<Arc<TunnelEntry>> {
         let inner = self.inner.read();
-        inner.keys.iter().filter_map(|k| inner.entries.get(k).cloned()).collect()
+        inner
+            .keys
+            .iter()
+            .filter_map(|k| inner.entries.get(k).cloned())
+            .collect()
     }
 
     /// Total count of tunnels registered in memory.
@@ -580,12 +618,11 @@ impl TunnelRegistry {
     /// Remove a tunnel from the registry by its ID.
     pub fn remove(&self, id: &str) -> Option<Arc<TunnelEntry>> {
         let mut inner = self.inner.write();
-        if let Some(entry) = inner.entries.remove(id) {
+        let entry = inner.entries.remove(id);
+        if entry.is_some() {
             inner.keys.retain(|k| k != id);
-            Some(entry)
-        } else {
-            None
         }
+        entry
     }
 
     /// Generate summary statistics snapshots for all tunnels.

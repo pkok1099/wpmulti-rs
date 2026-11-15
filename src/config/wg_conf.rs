@@ -4,10 +4,10 @@
 //! supporting dual-stack IPv4/IPv6 addresses, multiple peers, wg-quick directives tolerance,
 //! inline and full-line comments (`#` and `;`), and case-insensitive headers and directives.
 
-use std::net::IpAddr;
-use std::path::Path;
 use base64::prelude::*;
 use ipnetwork::IpNetwork;
+use std::net::IpAddr;
+use std::path::Path;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Complete parsed WireGuard configuration.
@@ -109,7 +109,10 @@ impl std::fmt::Debug for WgPeerConfig {
             .field("public_key", &self.public_key)
             .field("endpoint", &self.endpoint)
             .field("allowed_ips", &self.allowed_ips)
-            .field("preshared_key", &self.preshared_key.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "preshared_key",
+                &self.preshared_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("persistent_keepalive", &self.persistent_keepalive)
             .finish()
     }
@@ -147,7 +150,9 @@ pub enum WgConfError {
         source: base64::DecodeError,
     },
 
-    #[error("line {line_number}: invalid key length for '{field}': expected {expected} bytes, got {actual}")]
+    #[error(
+        "line {line_number}: invalid key length for '{field}': expected {expected} bytes, got {actual}"
+    )]
     InvalidKeyLength {
         line_number: usize,
         field: &'static str,
@@ -164,10 +169,7 @@ pub enum WgConfError {
     },
 
     #[error("line {line_number}: invalid DNS address '{value}'")]
-    InvalidDnsAddress {
-        line_number: usize,
-        value: String,
-    },
+    InvalidDnsAddress { line_number: usize, value: String },
 
     #[error("line {line_number}: invalid port number '{value}' in '{field}'")]
     InvalidPort {
@@ -177,16 +179,10 @@ pub enum WgConfError {
     },
 
     #[error("line {line_number}: invalid MTU value '{value}'")]
-    InvalidMtu {
-        line_number: usize,
-        value: String,
-    },
+    InvalidMtu { line_number: usize, value: String },
 
     #[error("line {line_number}: invalid PersistentKeepalive '{value}'")]
-    InvalidKeepalive {
-        line_number: usize,
-        value: String,
-    },
+    InvalidKeepalive { line_number: usize, value: String },
 
     #[error("line {line_number}: invalid endpoint '{value}': {reason}")]
     InvalidEndpoint {
@@ -247,23 +243,34 @@ pub fn strip_comment(line: &str) -> &str {
         }
         prev_is_ws = c.is_whitespace();
     }
-    match cut_idx {
-        Some(idx) => line[..idx].trim(),
-        None => line.trim(),
-    }
+    cut_idx
+        .and_then(|idx| line.get(..idx))
+        .map_or_else(|| line.trim(), str::trim)
 }
 
 /// Decode a 32-byte Curve25519 key from Base64 (padded or unpadded).
-fn decode_32byte_key(val: &str, line_number: usize, field: &'static str) -> Result<[u8; 32], WgConfError> {
+fn decode_32byte_key(
+    val: &str,
+    line_number: usize,
+    field: &'static str,
+) -> Result<[u8; 32], WgConfError> {
     let trimmed = val.trim();
     let bytes = match BASE64_STANDARD.decode(trimmed) {
         Ok(b) => b,
-        Err(_) if trimmed.len() == 43 => {
-            base64::engine::general_purpose::STANDARD_NO_PAD
-                .decode(trimmed)
-                .map_err(|e| WgConfError::InvalidBase64Key { line_number, field, source: e })?
+        Err(_) if trimmed.len() == 43 => base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(trimmed)
+            .map_err(|e| WgConfError::InvalidBase64Key {
+                line_number,
+                field,
+                source: e,
+            })?,
+        Err(e) => {
+            return Err(WgConfError::InvalidBase64Key {
+                line_number,
+                field,
+                source: e,
+            });
         }
-        Err(e) => return Err(WgConfError::InvalidBase64Key { line_number, field, source: e }),
     };
 
     if bytes.len() != 32 {
@@ -293,19 +300,22 @@ fn parse_cidr(s: &str, line_number: usize, field: &'static str) -> Result<IpNetw
     }
 
     if s.contains('/') {
-        s.parse::<IpNetwork>().map_err(|e| WgConfError::InvalidCidr {
-            line_number,
-            field,
-            value: s.to_string(),
-            reason: e.to_string(),
-        })
+        s.parse::<IpNetwork>()
+            .map_err(|e| WgConfError::InvalidCidr {
+                line_number,
+                field,
+                value: s.to_string(),
+                reason: e.to_string(),
+            })
     } else {
-        let ip: IpAddr = s.parse().map_err(|e: std::net::AddrParseError| WgConfError::InvalidCidr {
-            line_number,
-            field,
-            value: s.to_string(),
-            reason: e.to_string(),
-        })?;
+        let ip: IpAddr =
+            s.parse()
+                .map_err(|e: std::net::AddrParseError| WgConfError::InvalidCidr {
+                    line_number,
+                    field,
+                    value: s.to_string(),
+                    reason: e.to_string(),
+                })?;
         match ip {
             IpAddr::V4(v4) => ipnetwork::Ipv4Network::new(v4, 32)
                 .map(IpNetwork::V4)
@@ -330,11 +340,13 @@ fn parse_cidr(s: &str, line_number: usize, field: &'static str) -> Result<IpNetw
 /// Validate endpoint format: `<host>:<port>`.
 fn validate_endpoint(endpoint: &str, line_number: usize) -> Result<(), WgConfError> {
     let (_host, port_str) = if endpoint.starts_with('[') {
-        let closing = endpoint.find(']').ok_or(WgConfError::InvalidEndpoint {
-            line_number,
-            value: endpoint.to_string(),
-            reason: "unclosed bracket in IPv6 endpoint",
-        })?;
+        let closing = endpoint
+            .find(']')
+            .ok_or_else(|| WgConfError::InvalidEndpoint {
+                line_number,
+                value: endpoint.to_string(),
+                reason: "unclosed bracket in IPv6 endpoint",
+            })?;
         let host = &endpoint[1..closing];
         let rest = &endpoint[closing + 1..];
         if !rest.starts_with(':') {
@@ -355,12 +367,12 @@ fn validate_endpoint(endpoint: &str, line_number: usize) -> Result<(), WgConfErr
         (host, port_str)
     } else {
         let mut parts = endpoint.rsplitn(2, ':');
-        let port_str = parts.next().ok_or(WgConfError::InvalidEndpoint {
+        let port_str = parts.next().ok_or_else(|| WgConfError::InvalidEndpoint {
             line_number,
             value: endpoint.to_string(),
             reason: "missing port in endpoint",
         })?;
-        let host = parts.next().ok_or(WgConfError::InvalidEndpoint {
+        let host = parts.next().ok_or_else(|| WgConfError::InvalidEndpoint {
             line_number,
             value: endpoint.to_string(),
             reason: "missing host in endpoint",
@@ -373,13 +385,16 @@ fn validate_endpoint(endpoint: &str, line_number: usize) -> Result<(), WgConfErr
             });
         }
         if host.parse::<std::net::Ipv4Addr>().is_err()
-            && !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
-                return Err(WgConfError::InvalidEndpoint {
-                    line_number,
-                    value: endpoint.to_string(),
-                    reason: "hostname contains invalid characters",
-                });
-            }
+            && !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return Err(WgConfError::InvalidEndpoint {
+                line_number,
+                value: endpoint.to_string(),
+                reason: "hostname contains invalid characters",
+            });
+        }
         (host, port_str)
     };
 
@@ -398,6 +413,107 @@ fn validate_endpoint(endpoint: &str, line_number: usize) -> Result<(), WgConfErr
     Ok(())
 }
 
+fn apply_interface_kv(
+    iface: &mut InterfaceBuilder,
+    key: &str,
+    val: &str,
+    line_number: usize,
+) -> Result<(), WgConfError> {
+    match key.to_ascii_lowercase().as_str() {
+        "privatekey" => {
+            let key_bytes = decode_32byte_key(val, line_number, "PrivateKey")?;
+            iface.private_key = Some(StaticSecret::from(key_bytes));
+        }
+        "address" => {
+            for token in val.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                iface
+                    .addresses
+                    .push(parse_cidr(token, line_number, "Address")?);
+            }
+        }
+        "dns" => {
+            for token in val.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                if let Ok(ip) = token.parse::<IpAddr>() {
+                    iface.dns.push(ip);
+                } else {
+                    tracing::debug!(line_number, "Ignoring non-IP DNS search domain: {token}");
+                }
+            }
+        }
+        "listenport" if !val.is_empty() => {
+            let port: u16 = val.parse().map_err(|_| WgConfError::InvalidPort {
+                line_number,
+                field: "ListenPort",
+                value: val.to_string(),
+            })?;
+            iface.listen_port = if port == 0 { None } else { Some(port) };
+        }
+        "mtu" => {
+            let mtu: u16 = val.parse().map_err(|_| WgConfError::InvalidMtu {
+                line_number,
+                value: val.to_string(),
+            })?;
+            if mtu == 0 {
+                return Err(WgConfError::InvalidMtu {
+                    line_number,
+                    value: val.to_string(),
+                });
+            }
+            iface.mtu = Some(mtu);
+        }
+        "listenport" | "table" | "postup" | "preup" | "postdown" | "predown" | "saveconfig"
+        | "fwmark" => {
+            tracing::trace!(line_number, "Ignored wg-quick directive {key} = {val}");
+        }
+        unknown => {
+            tracing::debug!(
+                line_number,
+                "Ignored unrecognized interface key '{unknown}'"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn apply_peer_kv(
+    peer: &mut PeerBuilder,
+    key: &str,
+    val: &str,
+    line_number: usize,
+) -> Result<(), WgConfError> {
+    match key.to_ascii_lowercase().as_str() {
+        "publickey" => {
+            let key_bytes = decode_32byte_key(val, line_number, "PublicKey")?;
+            peer.public_key = Some(PublicKey::from(key_bytes));
+        }
+        "endpoint" => {
+            validate_endpoint(val, line_number)?;
+            peer.endpoint = Some(val.to_string());
+        }
+        "allowedips" => {
+            for token in val.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                peer.allowed_ips
+                    .push(parse_cidr(token, line_number, "AllowedIPs")?);
+            }
+        }
+        "presharedkey" => {
+            let key_bytes = decode_32byte_key(val, line_number, "PresharedKey")?;
+            peer.preshared_key = Some(key_bytes);
+        }
+        "persistentkeepalive" => {
+            let keepalive: u16 = val.parse().map_err(|_| WgConfError::InvalidKeepalive {
+                line_number,
+                value: val.to_string(),
+            })?;
+            peer.persistent_keepalive = Some(keepalive);
+        }
+        unknown => {
+            tracing::debug!(line_number, "Ignored unrecognized peer key '{unknown}'");
+        }
+    }
+    Ok(())
+}
+
 /// Parse a WireGuard configuration file from a string slice.
 /// Returns the parsed `WgInterfaceConfig` and list of `WgPeerConfig`.
 pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConfig>), WgConfError> {
@@ -412,7 +528,6 @@ pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConf
             continue;
         }
 
-        // Section headers: [Interface] or [Peer]
         if line.starts_with('[') && line.ends_with(']') {
             let header = line[1..line.len() - 1].trim();
             if header.eq_ignore_ascii_case("interface") {
@@ -422,11 +537,10 @@ pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConf
                 iface_builder = Some(InterfaceBuilder::default());
                 current_section = CurrentSection::Interface;
             } else if header.eq_ignore_ascii_case("peer") {
-                let pb = PeerBuilder {
+                peer_builders.push(PeerBuilder {
                     line_number,
                     ..Default::default()
-                };
-                peer_builders.push(pb);
+                });
                 current_section = CurrentSection::Peer(peer_builders.len() - 1);
             } else {
                 return Err(WgConfError::UnknownSection {
@@ -437,16 +551,13 @@ pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConf
             continue;
         }
 
-        // Key-Value parsing
-        let (key, val) = match line.split_once('=') {
-            Some((k, v)) => (k.trim(), v.trim()),
-            None => {
-                return Err(WgConfError::MalformedLine {
-                    line_number,
-                    line: line.to_string(),
-                });
-            }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(WgConfError::MalformedLine {
+                line_number,
+                line: line.to_string(),
+            });
         };
+        let (key, val) = (k.trim(), v.trim());
 
         match current_section {
             CurrentSection::None => {
@@ -456,103 +567,20 @@ pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConf
                 });
             }
             CurrentSection::Interface => {
-                let iface = iface_builder.as_mut().expect("iface_builder initialized");
-                match key.to_ascii_lowercase().as_str() {
-                    "privatekey" => {
-                        let key_bytes = decode_32byte_key(val, line_number, "PrivateKey")?;
-                        iface.private_key = Some(StaticSecret::from(key_bytes));
-                    }
-                    "address" => {
-                        for token in val.split(',') {
-                            let t = token.trim();
-                            if !t.is_empty() {
-                                iface.addresses.push(parse_cidr(t, line_number, "Address")?);
-                            }
-                        }
-                    }
-                    "dns" => {
-                        for token in val.split(',') {
-                            let t = token.trim();
-                            if !t.is_empty() {
-                                if let Ok(ip) = t.parse::<IpAddr>() {
-                                    iface.dns.push(ip);
-                                } else {
-                                    tracing::debug!(line_number, "Ignoring non-IP DNS search domain: {t}");
-                                }
-                            }
-                        }
-                    }
-                    "listenport" => {
-                        if !val.is_empty() {
-                            let port: u16 = val.parse().map_err(|_| WgConfError::InvalidPort {
-                                line_number,
-                                field: "ListenPort",
-                                value: val.to_string(),
-                            })?;
-                            iface.listen_port = if port == 0 { None } else { Some(port) };
-                        }
-                    }
-                    "mtu" => {
-                        let mtu: u16 = val.parse().map_err(|_| WgConfError::InvalidMtu {
-                            line_number,
-                            value: val.to_string(),
-                        })?;
-                        if mtu == 0 {
-                            return Err(WgConfError::InvalidMtu {
-                                line_number,
-                                value: val.to_string(),
-                            });
-                        }
-                        iface.mtu = Some(mtu);
-                    }
-                    // Safely ignore standard wg-quick directives
-                    "table" | "postup" | "preup" | "postdown" | "predown" | "saveconfig" | "fwmark" => {
-                        tracing::trace!(line_number, "Ignored wg-quick directive {key} = {val}");
-                    }
-                    unknown => {
-                        tracing::debug!(line_number, "Ignored unrecognized interface key '{unknown}'");
-                    }
-                }
+                let Some(iface) = iface_builder.as_mut() else {
+                    return Err(WgConfError::MissingInterface);
+                };
+                apply_interface_kv(iface, key, val, line_number)?;
             }
             CurrentSection::Peer(idx) => {
-                let peer = &mut peer_builders[idx];
-                match key.to_ascii_lowercase().as_str() {
-                    "publickey" => {
-                        let key_bytes = decode_32byte_key(val, line_number, "PublicKey")?;
-                        peer.public_key = Some(PublicKey::from(key_bytes));
-                    }
-                    "endpoint" => {
-                        validate_endpoint(val, line_number)?;
-                        peer.endpoint = Some(val.to_string());
-                    }
-                    "allowedips" => {
-                        for token in val.split(',') {
-                            let t = token.trim();
-                            if !t.is_empty() {
-                                peer.allowed_ips.push(parse_cidr(t, line_number, "AllowedIPs")?);
-                            }
-                        }
-                    }
-                    "presharedkey" => {
-                        let key_bytes = decode_32byte_key(val, line_number, "PresharedKey")?;
-                        peer.preshared_key = Some(key_bytes);
-                    }
-                    "persistentkeepalive" => {
-                        let keepalive: u16 = val.parse().map_err(|_| WgConfError::InvalidKeepalive {
-                            line_number,
-                            value: val.to_string(),
-                        })?;
-                        peer.persistent_keepalive = Some(keepalive);
-                    }
-                    unknown => {
-                        tracing::debug!(line_number, "Ignored unrecognized peer key '{unknown}'");
-                    }
-                }
+                let Some(peer) = peer_builders.get_mut(idx) else {
+                    return Err(WgConfError::MissingInterface);
+                };
+                apply_peer_kv(peer, key, val, line_number)?;
             }
         }
     }
 
-    // Assemble Interface
     let iface = iface_builder.ok_or(WgConfError::MissingInterface)?;
     let private_key = iface.private_key.ok_or(WgConfError::MissingPrivateKey)?;
     let interface_config = WgInterfaceConfig {
@@ -563,7 +591,6 @@ pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConf
         mtu: iface.mtu.unwrap_or(1420),
     };
 
-    // Assemble Peers
     if peer_builders.is_empty() {
         return Err(WgConfError::NoPeers);
     }
@@ -588,7 +615,9 @@ pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConf
 }
 
 /// Parse a WireGuard configuration file from a filesystem path.
-pub fn parse_wg_conf_file<P: AsRef<Path>>(path: P) -> Result<(WgInterfaceConfig, Vec<WgPeerConfig>), WgConfError> {
+pub fn parse_wg_conf_file<P: AsRef<Path>>(
+    path: P,
+) -> Result<(WgInterfaceConfig, Vec<WgPeerConfig>), WgConfError> {
     let content = std::fs::read_to_string(path.as_ref())?;
     parse_wg_conf(&content)
 }

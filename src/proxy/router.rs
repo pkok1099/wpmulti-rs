@@ -8,8 +8,8 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -29,8 +29,8 @@ pub enum TargetAddr {
 impl std::fmt::Display for TargetAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TargetAddr::Ip(addr) => write!(f, "{}", addr),
-            TargetAddr::Domain(domain, port) => write!(f, "{}:{}", domain, port),
+            Self::Ip(addr) => write!(f, "{addr}"),
+            Self::Domain(domain, port) => write!(f, "{domain}:{port}"),
         }
     }
 }
@@ -64,10 +64,7 @@ pub trait ProxyUdpSocket: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>>;
 
     /// Receive a UDP datagram into the provided buffer.
-    fn recv_from<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> RecvFromFut<'a>;
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> RecvFromFut<'a>;
 
     /// Returns the bound local port of this UDP socket.
     fn local_port(&self) -> u16;
@@ -100,18 +97,18 @@ impl ProxyUdpSocket for tokio::net::UdpSocket {
         buf: &'a [u8],
         target: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
-        Box::pin(async move { tokio::net::UdpSocket::send_to(self, buf, target).await })
+        Box::pin(async move { Self::send_to(self, buf, target).await })
     }
 
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
     ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
-        Box::pin(async move { tokio::net::UdpSocket::recv_from(self, buf).await })
+        Box::pin(async move { Self::recv_from(self, buf).await })
     }
 
     fn local_port(&self) -> u16 {
-        self.local_addr().map(|a| a.port()).unwrap_or(0)
+        self.local_addr().map_or(0, |a| a.port())
     }
 }
 
@@ -125,10 +122,7 @@ pub trait ProxyTunnelTarget: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>>;
 
     /// Bind a UDP socket in the tunnel.
-    fn udp_bind<'a>(
-        &'a self,
-        local_port: u16,
-    ) -> UdpBindFut<'a>;
+    fn udp_bind(&self, local_port: u16) -> UdpBindFut<'_>;
 
     /// Resolve a domain name inside the tunnel.
     fn resolve_in_tunnel<'a>(
@@ -143,8 +137,8 @@ impl ProxyTunnelTarget for VirtualNetworkStack {
         dst: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
         Box::pin(async move {
-            let stream = self.tcp_connect(dst).await?;
-            Ok(Box::new(stream) as DynStream)
+            let stream: DynStream = Box::new(self.tcp_connect(dst).await?);
+            Ok(stream)
         })
     }
 
@@ -153,8 +147,8 @@ impl ProxyTunnelTarget for VirtualNetworkStack {
         local_port: u16,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
         Box::pin(async move {
-            let sock = self.udp_bind(local_port).await?;
-            Ok(Box::new(sock) as Box<dyn ProxyUdpSocket>)
+            let sock: Box<dyn ProxyUdpSocket> = Box::new(self.udp_bind(local_port).await?);
+            Ok(sock)
         })
     }
 
@@ -190,6 +184,7 @@ impl<T: ProxyTunnelTarget + ?Sized> ProxyTunnelTarget for Arc<T> {
 }
 
 /// Direct host connector bypassing WireGuard tunnels (useful for loopback testing).
+#[derive(Debug)]
 pub struct DirectTunnelTarget;
 
 impl ProxyTunnelTarget for DirectTunnelTarget {
@@ -198,8 +193,8 @@ impl ProxyTunnelTarget for DirectTunnelTarget {
         dst: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
         Box::pin(async move {
-            let stream = tokio::net::TcpStream::connect(dst).await?;
-            Ok(Box::new(stream) as DynStream)
+            let stream: DynStream = Box::new(tokio::net::TcpStream::connect(dst).await?);
+            Ok(stream)
         })
     }
 
@@ -209,8 +204,9 @@ impl ProxyTunnelTarget for DirectTunnelTarget {
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
         Box::pin(async move {
             let bind_addr = SocketAddr::from(([0, 0, 0, 0], local_port));
-            let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
-            Ok(Box::new(socket) as Box<dyn ProxyUdpSocket>)
+            let socket: Box<dyn ProxyUdpSocket> =
+                Box::new(tokio::net::UdpSocket::bind(bind_addr).await?);
+            Ok(socket)
         })
     }
 
@@ -222,7 +218,7 @@ impl ProxyTunnelTarget for DirectTunnelTarget {
             if let Ok(ip) = domain.parse::<IpAddr>() {
                 return Ok(ip);
             }
-            let host_port = format!("{}:0", domain);
+            let host_port = format!("{domain}:0");
             let mut addrs = tokio::net::lookup_host(&host_port).await?;
             addrs
                 .next()
@@ -259,24 +255,24 @@ impl TunnelSelector {
     pub fn parse(username: &str) -> Self {
         let u = username.trim();
         if u.is_empty() || u.eq_ignore_ascii_case("default") {
-            return TunnelSelector::DefaultPool;
+            return Self::DefaultPool;
         }
         if u.eq_ignore_ascii_case("auto") {
-            return TunnelSelector::ByKeyword(PoolKeyword::Auto);
+            return Self::ByKeyword(PoolKeyword::Auto);
         }
         if u.eq_ignore_ascii_case("random") {
-            return TunnelSelector::ByKeyword(PoolKeyword::Random);
+            return Self::ByKeyword(PoolKeyword::Random);
         }
         if u.eq_ignore_ascii_case("round-robin") || u.eq_ignore_ascii_case("roundrobin") {
-            return TunnelSelector::ByKeyword(PoolKeyword::RoundRobin);
+            return Self::ByKeyword(PoolKeyword::RoundRobin);
         }
         if u.eq_ignore_ascii_case("least-conn") || u.eq_ignore_ascii_case("leastconn") {
-            return TunnelSelector::ByKeyword(PoolKeyword::LeastConn);
+            return Self::ByKeyword(PoolKeyword::LeastConn);
         }
         if let Some(tag) = u.strip_prefix("tag:") {
-            return TunnelSelector::ByTag(tag.to_string());
+            return Self::ByTag(tag.to_string());
         }
-        TunnelSelector::ById(u.to_string())
+        Self::ById(u.to_string())
     }
 }
 
@@ -303,10 +299,7 @@ pub trait TunnelRouter: Send + Sync {
     ) -> Result<TunnelSelector, ProxyAuthError>;
 
     /// Resolve a [`TunnelSelector`] to an active [`ProxyTunnelTarget`].
-    fn select_tunnel<'a>(
-        &'a self,
-        selector: &'a TunnelSelector,
-    ) -> SelectTunnelFut<'a>;
+    fn select_tunnel<'a>(&'a self, selector: &'a TunnelSelector) -> SelectTunnelFut<'a>;
 }
 
 impl<T: TunnelRouter + ?Sized> TunnelRouter for Arc<T> {
@@ -325,11 +318,20 @@ impl<T: TunnelRouter + ?Sized> TunnelRouter for Arc<T> {
     }
 }
 
-/// Router for dedicated per-tunnel ports routing all connections to a single tunnel target.
+/// Router for dedicated per-tunnel ports forwarding all connections to a single tunnel target.
 pub struct SingleTunnelRouter {
     target: Arc<dyn ProxyTunnelTarget>,
     tunnel_id: String,
     auth: Option<(String, String)>,
+}
+
+impl std::fmt::Debug for SingleTunnelRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleTunnelRouter")
+            .field("tunnel_id", &self.tunnel_id)
+            .field("has_auth", &self.auth.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SingleTunnelRouter {
@@ -407,6 +409,16 @@ pub struct PoolRouter {
     rr_counter: AtomicUsize,
 }
 
+impl std::fmt::Debug for PoolRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolRouter")
+            .field("strategy", &self.strategy)
+            .field("auth_mode", &self.auth_mode)
+            .field("allow_anonymous", &self.allow_anonymous)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PoolRouter {
     /// Create a new pool router with the given strategy and anonymous access flag.
     pub fn new(strategy: PoolStrategy, allow_anonymous: bool) -> Self {
@@ -466,14 +478,15 @@ impl PoolRouter {
         let selected_id = match self.strategy {
             PoolStrategy::RoundRobin | PoolStrategy::LeastConn => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % inner.keys.len();
-                &inner.keys[idx]
+                inner.keys.get(idx)
             }
-            PoolStrategy::Fallback => &inner.keys[0],
+            PoolStrategy::Fallback => inner.keys.first(),
             PoolStrategy::Random => {
                 let idx = (rand::random::<u32>() as usize) % inner.keys.len();
-                &inner.keys[idx]
+                inner.keys.get(idx)
             }
-        };
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "selected tunnel not found"))?;
 
         inner
             .tunnels
@@ -549,14 +562,12 @@ impl TunnelRouter for PoolRouter {
             match selector {
                 TunnelSelector::ById(id) => {
                     let inner = self.inner.read();
-                    inner
-                        .tunnels
-                        .get(id)
-                        .cloned()
-                        .ok_or_else(|| io::Error::new(
+                    inner.tunnels.get(id).cloned().ok_or_else(|| {
+                        io::Error::new(
                             io::ErrorKind::NotFound,
-                            format!("tunnel '{}' not found in pool", id),
-                        ))
+                            format!("tunnel '{id}' not found in pool"),
+                        )
+                    })
                 }
                 TunnelSelector::ByKeyword(keyword) => {
                     let inner = self.inner.read();
@@ -572,25 +583,31 @@ impl TunnelRouter for PoolRouter {
                             self.rr_counter.fetch_add(1, Ordering::Relaxed) % inner.keys.len()
                         }
                     };
-                    let id = &inner.keys[idx];
-                    inner
-                        .tunnels
-                        .get(id)
-                        .cloned()
+                    let target = inner
+                        .keys
+                        .get(idx)
+                        .and_then(|id| inner.tunnels.get(id))
+                        .cloned();
+                    drop(inner);
+                    target
                         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tunnel not found"))
                 }
                 TunnelSelector::ByTag(tag) => {
                     // Match prefix or substring in registered tunnel IDs
-                    let inner = self.inner.read();
-                    for (id, target) in inner.tunnels.iter() {
-                        if id.contains(tag) {
-                            return Ok(Arc::clone(target));
-                        }
-                    }
-                    Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("no tunnel found matching tag '{}'", tag),
-                    ))
+                    let matched = {
+                        let inner = self.inner.read();
+                        inner
+                            .tunnels
+                            .iter()
+                            .find(|(id, _)| id.contains(tag))
+                            .map(|(_, target)| Arc::clone(target))
+                    };
+                    matched.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("no tunnel found matching tag '{tag}'"),
+                        )
+                    })
                 }
                 TunnelSelector::DefaultPool => self.pick_pool_tunnel(),
             }

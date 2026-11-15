@@ -146,7 +146,7 @@ pub struct SharedListenerFixture {
     pub name: String,
     pub proto_type: String, // "socks5" | "http"
     pub bind: SocketAddr,
-    pub auth_mode: String,  // "none" | "global" | "per_tunnel"
+    pub auth_mode: String, // "none" | "global" | "per_tunnel"
     pub global_password: Option<String>,
     pub default_strategy: String, // "round-robin" | "random" | "least-conn"
     pub allow_anonymous: bool,
@@ -250,12 +250,18 @@ impl WpMultiTomlBuilder {
         out.push_str(&format!("log_level = \"{}\"\n", self.log_level));
         out.push_str(&format!("dns_fallback = \"{}\"\n", self.dns_fallback));
         out.push_str(&format!("dns_strategy = \"{}\"\n", self.dns_strategy));
-        out.push_str(&format!("max_active_tunnels = {}\n\n", self.max_active_tunnels));
+        out.push_str(&format!(
+            "max_active_tunnels = {}\n\n",
+            self.max_active_tunnels
+        ));
 
         out.push_str("[lifecycle]\n");
         out.push_str(&format!("mode = \"{}\"\n", self.lifecycle_mode));
         out.push_str(&format!("idle_timeout = \"{}\"\n", self.idle_timeout));
-        out.push_str(&format!("handshake_timeout = \"{}\"\n", self.handshake_timeout));
+        out.push_str(&format!(
+            "handshake_timeout = \"{}\"\n",
+            self.handshake_timeout
+        ));
         if !self.eager_tunnels.is_empty() {
             let eager_list = self
                 .eager_tunnels
@@ -296,7 +302,10 @@ impl WpMultiTomlBuilder {
             if let Some(pass) = &listener.global_password {
                 out.push_str(&format!("global_password = \"{}\"\n", pass));
             }
-            out.push_str(&format!("default_strategy = \"{}\"\n", listener.default_strategy));
+            out.push_str(&format!(
+                "default_strategy = \"{}\"\n",
+                listener.default_strategy
+            ));
             out.push_str(&format!("allow_anonymous = {}\n", listener.allow_anonymous));
             out.push_str(&format!("pool = \"{}\"\n\n", listener.pool));
         }
@@ -391,8 +400,12 @@ pub fn generate_245_cloned_wgcf_configs(
 
 /// Allocates a single guaranteed available ephemeral TCP/UDP port
 pub fn allocate_ephemeral_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
-    let port = listener.local_addr().expect("failed to get local addr").port();
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
+    let port = listener
+        .local_addr()
+        .expect("failed to get local addr")
+        .port();
     drop(listener);
     port
 }

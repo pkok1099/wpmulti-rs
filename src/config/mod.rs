@@ -3,20 +3,20 @@
 //! Provides WireGuard `.conf` parsing, TOML orchestration schema parsing,
 //! unique tunnel ID addressing, and batch loading from directories.
 
-pub mod wg_conf;
-pub mod toml_config;
 #[cfg(test)]
 mod tests;
+pub mod toml_config;
+pub mod wg_conf;
 
-pub use wg_conf::{
-    parse_wg_conf, parse_wg_conf_file, strip_comment, WgConfig, WgConfError,
-    WgInterfaceConfig, WgPeerConfig,
-};
 pub use toml_config::{
-    parse_duration_str, AdminSettings, AuthMode, ConfigError, DnsPreference, DnsStrategy,
-    GlobalSettings, HealthCheckSettings, IpMode, LifecycleMode, LifecycleSettings, ListenerType, LogLevel,
-    MainConfig, PerTunnelSettings, PoolStrategy, SharedListenerSettings,
-    TuiSettings, TuiSortField, TunnelPoolSelection, TunnelPortOverride,
+    AdminSettings, AuthMode, ConfigError, DnsPreference, DnsStrategy, GlobalSettings,
+    HealthCheckSettings, IpMode, LifecycleMode, LifecycleSettings, ListenerType, LogLevel,
+    MainConfig, PerTunnelSettings, PoolStrategy, SharedListenerSettings, TuiSettings, TuiSortField,
+    TunnelPoolSelection, TunnelPortOverride, parse_duration_str,
+};
+pub use wg_conf::{
+    WgConfError, WgConfig, WgInterfaceConfig, WgPeerConfig, parse_wg_conf, parse_wg_conf_file,
+    strip_comment,
 };
 
 use std::collections::HashMap;
@@ -44,14 +44,17 @@ impl Eq for TunnelConfig {}
 /// Load a single tunnel configuration from a `.conf` file.
 ///
 /// Derives the unique tunnel ID from the file stem (e.g. `wgcf-001.conf` -> `wgcf-001`).
-pub fn load_tunnel_config_from_file<P: AsRef<Path>>(
-    path: P,
-) -> Result<TunnelConfig, ConfigError> {
+pub fn load_tunnel_config_from_file<P: AsRef<Path>>(path: P) -> Result<TunnelConfig, ConfigError> {
     let path = path.as_ref();
     let id = path
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| ConfigError::InvalidTunnelId(format!("Path '{}' has no valid filename stem", path.display())))?
+        .ok_or_else(|| {
+            ConfigError::InvalidTunnelId(format!(
+                "Path '{}' has no valid filename stem",
+                path.display()
+            ))
+        })?
         .to_string();
 
     let content = std::fs::read_to_string(path)?;
@@ -65,10 +68,12 @@ pub fn load_tunnel_config_from_str(
 ) -> Result<TunnelConfig, ConfigError> {
     let id = id.into();
     if id.trim().is_empty() {
-        return Err(ConfigError::InvalidTunnelId("Tunnel ID cannot be empty".into()));
+        return Err(ConfigError::InvalidTunnelId(
+            "Tunnel ID cannot be empty".into(),
+        ));
     }
-    let (interface, peers) = wg_conf::parse_wg_conf(content)
-        .map_err(|e| ConfigError::WgConf(e.to_string()))?;
+    let (interface, peers) =
+        parse_wg_conf(content).map_err(|e| ConfigError::WgConf(e.to_string()))?;
 
     Ok(TunnelConfig {
         id,
@@ -93,9 +98,10 @@ pub fn load_tunnel_configs_from_dir<P: AsRef<Path>>(
         let path = entry.path();
         if path.is_file()
             && let Some(ext) = path.extension().and_then(|s| s.to_str())
-                && ext.eq_ignore_ascii_case("conf") {
-                    entries.push(path);
-                }
+            && ext.eq_ignore_ascii_case("conf")
+        {
+            entries.push(path);
+        }
     }
 
     // Sort paths alphabetically to ensure deterministic ordering
@@ -108,7 +114,12 @@ pub fn load_tunnel_configs_from_dir<P: AsRef<Path>>(
         let id = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| ConfigError::InvalidTunnelId(format!("Path '{}' has no valid filename stem", path.display())))?
+            .ok_or_else(|| {
+                ConfigError::InvalidTunnelId(format!(
+                    "Path '{}' has no valid filename stem",
+                    path.display()
+                ))
+            })?
             .to_string();
 
         if let Some(first_path) = seen_ids.get(&id) {
@@ -121,7 +132,7 @@ pub fn load_tunnel_configs_from_dir<P: AsRef<Path>>(
         seen_ids.insert(id.clone(), path.clone());
 
         let content = std::fs::read_to_string(&path)?;
-        let (interface, peers) = wg_conf::parse_wg_conf(&content)
+        let (interface, peers) = parse_wg_conf(&content)
             .map_err(|e| ConfigError::WgConf(format!("Failed parsing {}: {e}", path.display())))?;
 
         configs.push(TunnelConfig {

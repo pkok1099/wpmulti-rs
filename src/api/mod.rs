@@ -10,5 +10,5 @@ pub mod server;
 pub mod tests;
 
 pub use metrics::generate_prometheus_metrics;
-pub use routes::{handle_admin_request, parse_http_request, HttpRequest, HttpResponse};
+pub use routes::{HttpRequest, HttpResponse, handle_admin_request, parse_http_request};
 pub use server::AdminServer;

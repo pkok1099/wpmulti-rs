@@ -6,6 +6,24 @@
 //! 3. MultiTenantRouter tunnel selection with zero-copy Arc<[String]> and O(1) indexed lookup
 //! 4. In-tunnel DNS resolution encoding and DnsLruCache concurrent throughput
 
+#![allow(
+    unreachable_pub,
+    unused_qualifications,
+    trivial_casts,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::type_complexity,
+    clippy::wildcard_enum_match_arm,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -18,14 +36,12 @@ use tokio::io::AsyncReadExt;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zerocopy::IntoBytes;
 
-use wpmulti::config::{
-    LifecycleMode, PoolStrategy, TunnelConfig, WgInterfaceConfig, WgPeerConfig,
-};
+use wpmulti::config::{LifecycleMode, PoolStrategy, TunnelConfig, WgInterfaceConfig, WgPeerConfig};
 use wpmulti::core::lifecycle::LifecycleController;
 use wpmulti::core::registry::{TunnelEntry, TunnelRegistry};
 use wpmulti::core::router::MultiTenantRouter;
-use wpmulti::netstack::bridge::{VirtualTunBridge, DEFAULT_MTU};
-use wpmulti::netstack::dns::{build_query, DnsLruCache, QueryType};
+use wpmulti::netstack::bridge::{DEFAULT_MTU, VirtualTunBridge};
+use wpmulti::netstack::dns::{DnsLruCache, QueryType, build_query};
 use wpmulti::proxy::http::read_http_request_headers_buffered;
 use wpmulti::proxy::{PoolKeyword, TunnelRouter, TunnelSelector};
 
@@ -105,11 +121,12 @@ async fn main() {
     // Build sample 28-byte IPv4 UDP packet
     let builder = PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).udp(1234, 5678);
     let mut raw_packet = Vec::new();
-    builder.write(&mut raw_packet, b"BENCHMARK_PAYLOAD_DATA").unwrap();
+    builder
+        .write(&mut raw_packet, b"BENCHMARK_PAYLOAD_DATA")
+        .unwrap();
     let packet_size = raw_packet.len();
 
-    let (mut bridge, mut bridge_tx, mut bridge_rx) =
-        VirtualTunBridge::new(DEFAULT_MTU, 1024);
+    let (mut bridge, mut bridge_tx, mut bridge_rx) = VirtualTunBridge::new(DEFAULT_MTU, 1024);
     let mut pool = gotatun::packet::PacketBufPool::<4096>::new(64);
 
     // smoltcp TX pipeline: transmit -> bridge_rx
@@ -127,7 +144,8 @@ async fn main() {
     }
     let elapsed_bridge_tx = start_tx.elapsed();
     let bridge_tx_rate = packet_count as f64 / elapsed_bridge_tx.as_secs_f64();
-    let bridge_tx_mb = (packet_count * packet_size) as f64 / (1024.0 * 1024.0) / elapsed_bridge_tx.as_secs_f64();
+    let bridge_tx_mb =
+        (packet_count * packet_size) as f64 / (1024.0 * 1024.0) / elapsed_bridge_tx.as_secs_f64();
 
     // smoltcp RX pipeline: bridge_tx -> receive
     let start_rx = Instant::now();
@@ -146,10 +164,17 @@ async fn main() {
     }
     let elapsed_bridge_rx = start_rx.elapsed();
     let bridge_rx_rate = packet_count as f64 / elapsed_bridge_rx.as_secs_f64();
-    let bridge_rx_mb = (packet_count * packet_size) as f64 / (1024.0 * 1024.0) / elapsed_bridge_rx.as_secs_f64();
+    let bridge_rx_mb =
+        (packet_count * packet_size) as f64 / (1024.0 * 1024.0) / elapsed_bridge_rx.as_secs_f64();
 
-    println!("  * smoltcp TX -> Bridge RX:   {:.2} packets/s ({:.2} MB/s) [Elapsed: {:.2?}]", bridge_tx_rate, bridge_tx_mb, elapsed_bridge_tx);
-    println!("  * Bridge TX -> smoltcp RX:   {:.2} packets/s ({:.2} MB/s) [Elapsed: {:.2?}]", bridge_rx_rate, bridge_rx_mb, elapsed_bridge_rx);
+    println!(
+        "  * smoltcp TX -> Bridge RX:   {:.2} packets/s ({:.2} MB/s) [Elapsed: {:.2?}]",
+        bridge_tx_rate, bridge_tx_mb, elapsed_bridge_tx
+    );
+    println!(
+        "  * Bridge TX -> smoltcp RX:   {:.2} packets/s ({:.2} MB/s) [Elapsed: {:.2?}]",
+        bridge_rx_rate, bridge_rx_mb, elapsed_bridge_rx
+    );
 
     // -------------------------------------------------------------------------
     // Benchmark 2: HTTP Header Parsing (Chunked Buffered vs 1-Byte Read)
@@ -180,7 +205,9 @@ async fn main() {
     let start_opt = Instant::now();
     for _ in 0..iterations {
         let mut cursor = Cursor::new(http_req);
-        let (method, uri, _, headers, _) = read_http_request_headers_buffered(&mut cursor).await.unwrap();
+        let (method, uri, _, headers, _) = read_http_request_headers_buffered(&mut cursor)
+            .await
+            .unwrap();
         assert_eq!(method, "GET");
         assert_eq!(uri, "http://example.com/api/v1/resource");
         assert_eq!(headers.get("host").map(|s| s.as_str()), Some("example.com"));
@@ -189,8 +216,14 @@ async fn main() {
     let opt_rate = iterations as f64 / elapsed_opt.as_secs_f64();
     let speedup = elapsed_base.as_secs_f64() / elapsed_opt.as_secs_f64();
 
-    println!("  * Baseline (1-byte read):    {:.2} req/s [Elapsed: {:.2?}]", base_rate, elapsed_base);
-    println!("  * Optimized (chunked read):  {:.2} req/s [Elapsed: {:.2?}]", opt_rate, elapsed_opt);
+    println!(
+        "  * Baseline (1-byte read):    {:.2} req/s [Elapsed: {:.2?}]",
+        base_rate, elapsed_base
+    );
+    println!(
+        "  * Optimized (chunked read):  {:.2} req/s [Elapsed: {:.2?}]",
+        opt_rate, elapsed_opt
+    );
     println!("  * Speedup Factor:            {:.2}x faster", speedup);
 
     // -------------------------------------------------------------------------
@@ -229,8 +262,14 @@ async fn main() {
     let router_rate = router_selections as f64 / elapsed_router.as_secs_f64();
     let router_lat_ns = (elapsed_router.as_nanos() as f64) / (router_selections as f64);
 
-    println!("  * Router Throughput:         {:.2} selections/s", router_rate);
-    println!("  * Average Selection Latency: {:.2} ns/selection", router_lat_ns);
+    println!(
+        "  * Router Throughput:         {:.2} selections/s",
+        router_rate
+    );
+    println!(
+        "  * Average Selection Latency: {:.2} ns/selection",
+        router_lat_ns
+    );
 
     // -------------------------------------------------------------------------
     // Benchmark 4: DNS Resolution Encoding & Concurrent LRU Cache
@@ -275,7 +314,10 @@ async fn main() {
     let elapsed_enc = start_enc.elapsed();
     let enc_rate = dns_ops as f64 / elapsed_enc.as_secs_f64();
 
-    println!("  * DNS LRU Cache (4 threads): {:.2} lookups/s ({:.2} ns/lookup)", dns_rate, dns_lat_ns);
+    println!(
+        "  * DNS LRU Cache (4 threads): {:.2} lookups/s ({:.2} ns/lookup)",
+        dns_rate, dns_lat_ns
+    );
     println!("  * DNS Query Encoding:        {:.2} queries/s", enc_rate);
 
     // -------------------------------------------------------------------------
@@ -284,14 +326,39 @@ async fn main() {
     println!("\n===============================================================================");
     println!("                          BENCHMARK SUMMARY RESULTS                            ");
     println!("===============================================================================");
-    println!("| Subsystem                      | Operations   | Elapsed     | Rate / Speedup       |");
-    println!("|--------------------------------|--------------|-------------|----------------------|");
-    println!("| 1. smoltcp TX -> Bridge RX     | {:>12} | {:>11.2?} | {:>14.2} pkts/s |", packet_count, elapsed_bridge_tx, bridge_tx_rate);
-    println!("| 1. Bridge TX -> smoltcp RX     | {:>12} | {:>11.2?} | {:>14.2} pkts/s |", packet_count, elapsed_bridge_rx, bridge_rx_rate);
-    println!("| 2. HTTP Header Baseline (1B)   | {:>12} | {:>11.2?} | {:>14.2} reqs/s |", iterations, elapsed_base, base_rate);
-    println!("| 2. HTTP Header Chunked (1KB)   | {:>12} | {:>11.2?} | {:>10.2} req/s ({:.1}x) |", iterations, elapsed_opt, opt_rate, speedup);
-    println!("| 3. MultiTenantRouter (245 tun) | {:>12} | {:>11.2?} | {:>14.2} ops/s  |", router_selections, elapsed_router, router_rate);
-    println!("| 4. DNS LRU Cache Concurrent    | {:>12} | {:>11.2?} | {:>14.2} hits/s |", dns_ops, elapsed_dns, dns_rate);
-    println!("| 4. DNS Wire Query Encoding     | {:>12} | {:>11.2?} | {:>14.2} pkts/s |", dns_ops, elapsed_enc, enc_rate);
+    println!(
+        "| Subsystem                      | Operations   | Elapsed     | Rate / Speedup       |"
+    );
+    println!(
+        "|--------------------------------|--------------|-------------|----------------------|"
+    );
+    println!(
+        "| 1. smoltcp TX -> Bridge RX     | {:>12} | {:>11.2?} | {:>14.2} pkts/s |",
+        packet_count, elapsed_bridge_tx, bridge_tx_rate
+    );
+    println!(
+        "| 1. Bridge TX -> smoltcp RX     | {:>12} | {:>11.2?} | {:>14.2} pkts/s |",
+        packet_count, elapsed_bridge_rx, bridge_rx_rate
+    );
+    println!(
+        "| 2. HTTP Header Baseline (1B)   | {:>12} | {:>11.2?} | {:>14.2} reqs/s |",
+        iterations, elapsed_base, base_rate
+    );
+    println!(
+        "| 2. HTTP Header Chunked (1KB)   | {:>12} | {:>11.2?} | {:>10.2} req/s ({:.1}x) |",
+        iterations, elapsed_opt, opt_rate, speedup
+    );
+    println!(
+        "| 3. MultiTenantRouter (245 tun) | {:>12} | {:>11.2?} | {:>14.2} ops/s  |",
+        router_selections, elapsed_router, router_rate
+    );
+    println!(
+        "| 4. DNS LRU Cache Concurrent    | {:>12} | {:>11.2?} | {:>14.2} hits/s |",
+        dns_ops, elapsed_dns, dns_rate
+    );
+    println!(
+        "| 4. DNS Wire Query Encoding     | {:>12} | {:>11.2?} | {:>14.2} pkts/s |",
+        dns_ops, elapsed_enc, enc_rate
+    );
     println!("===============================================================================\n");
 }

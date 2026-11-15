@@ -1,14 +1,31 @@
+#![allow(
+    unreachable_pub,
+    unused_qualifications,
+    trivial_casts,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::type_complexity,
+    clippy::wildcard_enum_match_arm,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
+
 mod common;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{
-    allocate_ephemeral_port, AdminTestClient, HttpProxyTestClient,
-    SharedListenerFixture, Socks5Target, Socks5TestClient, TestEnvironment, WgConfBuilder,
-    WgPeerFixture, WpMultiTomlBuilder,
+    AdminTestClient, HttpProxyTestClient, SharedListenerFixture, Socks5Target, Socks5TestClient,
+    TestEnvironment, WgConfBuilder, WgPeerFixture, WpMultiTomlBuilder, allocate_ephemeral_port,
 };
 use etherparse::PacketBuilder;
 use gotatun::tun::{IpRecv, IpSend};
@@ -16,22 +33,20 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use wpmulti::config::{
-    load_tunnel_config_from_file, load_tunnel_config_from_str, parse_wg_conf,
     AuthMode, DnsStrategy, LifecycleMode, LogLevel, MainConfig, PoolStrategy, TuiSortField,
+    load_tunnel_config_from_file, load_tunnel_config_from_str, parse_wg_conf,
 };
 use wpmulti::core::{
     DedicatedTunnelRouter, LifecycleController, ListenerSupervisor, MultiTenantRouter,
     TunnelConnGuard, TunnelEntry, TunnelManager, TunnelRegistry, TunnelState,
 };
-use wpmulti::netstack::{
-    build_query, parse_response, DnsLruCache, QueryType, VirtualTunBridge,
-};
+use wpmulti::netstack::{DnsLruCache, QueryType, VirtualTunBridge, build_query, parse_response};
 use wpmulti::proxy::{
-    build_socks5_udp_packet, extract_basic_auth, handle_http, handle_socks5_with_addrs,
-    parse_authority, parse_socks5_udp_packet, DirectTunnelTarget, PoolKeyword, SingleTunnelRouter,
-    TargetAddr, TunnelRouter, TunnelSelector, METHOD_NO_AUTH, METHOD_USER_PASS,
+    DirectTunnelTarget, METHOD_NO_AUTH, METHOD_USER_PASS, PoolKeyword, SingleTunnelRouter,
+    TargetAddr, TunnelRouter, TunnelSelector, build_socks5_udp_packet, extract_basic_auth,
+    handle_http, handle_socks5_with_addrs, parse_authority, parse_socks5_udp_packet,
 };
-use wpmulti::tui::{format_bytes, render_dashboard, TuiApp, TuiDataSource};
+use wpmulti::tui::{TuiApp, TuiDataSource, format_bytes, render_dashboard};
 
 fn make_valid_wg_conf() -> String {
     WgConfBuilder::new()
@@ -60,12 +75,10 @@ PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
 Endpoint = 198.51.100.1:51820
 AllowedIPs = 0.0.0.0/0
 ";
-    let (iface, peers) = parse_wg_conf(conf_content).expect("Failed to parse standard IPv4 WG conf");
+    let (iface, peers) =
+        parse_wg_conf(conf_content).expect("Failed to parse standard IPv4 WG conf");
     assert_eq!(iface.addresses.len(), 1);
-    assert_eq!(
-        iface.addresses[0],
-        "10.0.0.2/32".parse().unwrap()
-    );
+    assert_eq!(iface.addresses[0], "10.0.0.2/32".parse().unwrap());
     assert_eq!(iface.dns.len(), 1);
     assert_eq!(iface.dns[0], "1.1.1.1".parse::<IpAddr>().unwrap());
     assert_eq!(iface.mtu, 1420);
@@ -78,7 +91,10 @@ AllowedIPs = 0.0.0.0/0
 fn test_f1_wg_conf_dual_stack() {
     let conf = WgConfBuilder::new()
         .private_key("0OaUaQd4uJq5m8eN8uJq5m8eN8uJq5m8eN8uJq5m8eM=")
-        .addresses(&["172.16.0.2/32", "2606:4700:110:8524:5b27:35a3:e0e7:4816/128"])
+        .addresses(&[
+            "172.16.0.2/32",
+            "2606:4700:110:8524:5b27:35a3:e0e7:4816/128",
+        ])
         .dns(&["1.1.1.1", "2606:4700:4700::1111"])
         .add_peer(
             WgPeerFixture::new(
@@ -178,7 +194,10 @@ fn test_f2_toml_config_minimal_defaults() {
 config_dir = "/etc/wpmulti/conf.d"
 "#;
     let cfg: MainConfig = toml::from_str(toml_str).expect("Failed to parse minimal TOML");
-    assert_eq!(cfg.global.bind_address, "127.0.0.1".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        cfg.global.bind_address,
+        "127.0.0.1".parse::<IpAddr>().unwrap()
+    );
     assert_eq!(cfg.global.log_level, LogLevel::Info);
     assert_eq!(cfg.global.dns_strategy, DnsStrategy::TunnelOnly);
     assert_eq!(cfg.lifecycle.mode, LifecycleMode::Lazy);
@@ -204,11 +223,18 @@ fn test_f2_toml_config_full_schema() {
             allow_anonymous: true,
             pool: "all".to_string(),
         })
-        .admin(true, Some("127.0.0.1:9090".parse().unwrap()), Some("adm_token"))
+        .admin(
+            true,
+            Some("127.0.0.1:9090".parse().unwrap()),
+            Some("adm_token"),
+        )
         .build_toml();
 
     let cfg: MainConfig = toml::from_str(&toml_str).expect("Failed to parse full TOML");
-    assert_eq!(cfg.global.bind_address, "0.0.0.0".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        cfg.global.bind_address,
+        "0.0.0.0".parse::<IpAddr>().unwrap()
+    );
     assert_eq!(cfg.global.log_level, LogLevel::Debug);
     assert_eq!(cfg.per_tunnel.base_socks5_port, Some(10080));
     assert_eq!(cfg.per_tunnel.base_http_port, Some(18080));
@@ -265,9 +291,15 @@ fn test_f2_toml_config_multiple_shared_listeners() {
     let cfg: MainConfig = toml::from_str(&toml_str).expect("Failed to parse shared listeners");
     assert_eq!(cfg.shared_listeners.len(), 2);
     assert_eq!(cfg.shared_listeners[0].auth_mode, AuthMode::PerTunnel);
-    assert_eq!(cfg.shared_listeners[0].default_strategy, PoolStrategy::RoundRobin);
+    assert_eq!(
+        cfg.shared_listeners[0].default_strategy,
+        PoolStrategy::RoundRobin
+    );
     assert_eq!(cfg.shared_listeners[1].auth_mode, AuthMode::Global);
-    assert_eq!(cfg.shared_listeners[1].default_strategy, PoolStrategy::Random);
+    assert_eq!(
+        cfg.shared_listeners[1].default_strategy,
+        PoolStrategy::Random
+    );
 }
 
 #[test]
@@ -332,7 +364,10 @@ fn test_f3_unique_id_lookup_by_exact_id() {
         "node-a",
         &WgConfBuilder::new()
             .mtu(1280)
-            .add_peer(WgPeerFixture::new("bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "127.0.0.1:51820"))
+            .add_peer(WgPeerFixture::new(
+                "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                "127.0.0.1:51820",
+            ))
             .build_ini(),
     )
     .unwrap();
@@ -340,13 +375,20 @@ fn test_f3_unique_id_lookup_by_exact_id() {
         "node-b",
         &WgConfBuilder::new()
             .mtu(1420)
-            .add_peer(WgPeerFixture::new("bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "127.0.0.1:51820"))
+            .add_peer(WgPeerFixture::new(
+                "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                "127.0.0.1:51820",
+            ))
             .build_ini(),
     )
     .unwrap();
 
-    registry.register(TunnelEntry::new("node-a", conf_a, LifecycleMode::Lazy)).unwrap();
-    registry.register(TunnelEntry::new("node-b", conf_b, LifecycleMode::Eager)).unwrap();
+    registry
+        .register(TunnelEntry::new("node-a", conf_a, LifecycleMode::Lazy))
+        .unwrap();
+    registry
+        .register(TunnelEntry::new("node-b", conf_b, LifecycleMode::Eager))
+        .unwrap();
 
     let entry_a = registry.get("node-a").unwrap();
     let entry_b = registry.get("node-b").unwrap();
@@ -368,7 +410,10 @@ fn test_f3_unique_id_directory_batch_load() {
     assert_eq!(tunnels.len(), 5);
     let mut ids: Vec<_> = tunnels.iter().map(|t| t.id.as_str()).collect();
     ids.sort();
-    assert_eq!(ids, vec!["client_1", "client_2", "client_3", "client_4", "client_5"]);
+    assert_eq!(
+        ids,
+        vec!["client_1", "client_2", "client_3", "client_4", "client_5"]
+    );
 }
 
 #[test]
@@ -410,7 +455,9 @@ async fn test_f4_bridge_rx_pipeline_delivers_packet() {
     b.write(&mut ipv4_buf, raw_payload).unwrap();
 
     // gotatun IpSend sends packet into bridge
-    let pkt = gotatun::packet::Packet::copy_from(ipv4_buf.as_slice()).try_into_ip().unwrap();
+    let pkt = gotatun::packet::Packet::copy_from(ipv4_buf.as_slice())
+        .try_into_ip()
+        .unwrap();
     ip_send.send(pkt).await.unwrap();
 
     // Bridge rx_token receives packet into smoltcp
@@ -437,7 +484,9 @@ async fn test_f4_bridge_tx_pipeline_transmits_packet() {
 
     // smoltcp transmit into bridge
     use smoltcp::phy::{Device, TxToken};
-    let tx_token = bridge.transmit(smoltcp::time::Instant::from_millis(0)).unwrap();
+    let tx_token = bridge
+        .transmit(smoltcp::time::Instant::from_millis(0))
+        .unwrap();
     tx_token.consume(ipv4_buf.len(), |buf| {
         buf.copy_from_slice(&ipv4_buf);
     });
@@ -466,11 +515,15 @@ async fn test_f4_bridge_dual_stack_ipv4_and_ipv6() {
     v6_buf.reserve(b6.size(v6_payload.len()));
     b6.write(&mut v6_buf, v6_payload).unwrap();
 
-    let pkt = gotatun::packet::Packet::copy_from(v6_buf.as_slice()).try_into_ip().unwrap();
+    let pkt = gotatun::packet::Packet::copy_from(v6_buf.as_slice())
+        .try_into_ip()
+        .unwrap();
     ip_send.send(pkt).await.unwrap();
 
     use smoltcp::phy::{Device, RxToken};
-    let (rx_token, _) = bridge.receive(smoltcp::time::Instant::from_millis(0)).unwrap();
+    let (rx_token, _) = bridge
+        .receive(smoltcp::time::Instant::from_millis(0))
+        .unwrap();
     rx_token.consume(|buffer| {
         let sliced = etherparse::SlicedPacket::from_ip(buffer).unwrap();
         assert_eq!(sliced.payload, v6_payload);
@@ -486,7 +539,9 @@ async fn test_f4_bridge_notify_wakes_event_loop() {
     buf.reserve(b.size(payload.len()));
     b.write(&mut buf, payload).unwrap();
 
-    let pkt = gotatun::packet::Packet::copy_from(buf.as_slice()).try_into_ip().unwrap();
+    let pkt = gotatun::packet::Packet::copy_from(buf.as_slice())
+        .try_into_ip()
+        .unwrap();
     let send_res = ip_send.send(pkt).await;
     assert!(send_res.is_ok());
 }
@@ -511,7 +566,10 @@ fn test_f5_dns_query_encoding_aaaa_record() {
     let query_bytes = build_query("ipv6.example.org", QueryType::AAAA, 0xABCD).unwrap();
     assert_eq!(&query_bytes[0..2], &0xABCDu16.to_be_bytes());
     // Verify QTYPE AAAA (28) in tail
-    assert_eq!(&query_bytes[query_bytes.len() - 4..query_bytes.len() - 2], &28u16.to_be_bytes());
+    assert_eq!(
+        &query_bytes[query_bytes.len() - 4..query_bytes.len() - 2],
+        &28u16.to_be_bytes()
+    );
 }
 
 #[test]
@@ -551,19 +609,19 @@ fn test_f5_dns_response_decoding_success() {
     let mut resp = Vec::new();
     resp.extend_from_slice(&0x4321u16.to_be_bytes()); // TxID
     resp.extend_from_slice(&0x8180u16.to_be_bytes()); // Flags: Response, NoError
-    resp.extend_from_slice(&1u16.to_be_bytes());      // QDCOUNT = 1
-    resp.extend_from_slice(&1u16.to_be_bytes());      // ANCOUNT = 1
-    resp.extend_from_slice(&0u16.to_be_bytes());      // NSCOUNT = 0
-    resp.extend_from_slice(&0u16.to_be_bytes());      // ARCOUNT = 0
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+    resp.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT = 1
+    resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+    resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
     resp.extend_from_slice(b"\x03foo\x03com\x00");
-    resp.extend_from_slice(&1u16.to_be_bytes());   // QTYPE = A
-    resp.extend_from_slice(&1u16.to_be_bytes());   // QCLASS = IN
-    resp.extend_from_slice(&[0xC0, 0x0C]);         // Pointer to QNAME
-    resp.extend_from_slice(&1u16.to_be_bytes());   // TYPE = A
-    resp.extend_from_slice(&1u16.to_be_bytes());   // CLASS = IN
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+    resp.extend_from_slice(&[0xC0, 0x0C]); // Pointer to QNAME
+    resp.extend_from_slice(&1u16.to_be_bytes()); // TYPE = A
+    resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
     resp.extend_from_slice(&300u32.to_be_bytes()); // TTL = 300
-    resp.extend_from_slice(&4u16.to_be_bytes());   // RDLENGTH = 4
-    resp.extend_from_slice(&[93, 184, 216, 34]);   // 93.184.216.34
+    resp.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH = 4
+    resp.extend_from_slice(&[93, 184, 216, 34]); // 93.184.216.34
 
     let (ips, ttl) = parse_response(&resp, 0x4321).expect("Failed to parse DNS response");
     assert_eq!(ips, vec!["93.184.216.34".parse::<IpAddr>().unwrap()]);
@@ -574,9 +632,7 @@ fn test_f5_dns_response_decoding_success() {
 // Feature 6: SOCKS5 TCP CONNECT (F6)
 // =============================================================================
 
-async fn spawn_real_socks5_server(
-    expected_pass: Option<&str>,
-) -> SocketAddr {
+async fn spawn_real_socks5_server(expected_pass: Option<&str>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
@@ -593,9 +649,7 @@ async fn spawn_real_socks5_server(
     addr
 }
 
-async fn spawn_real_http_server(
-    expected_pass: Option<&str>,
-) -> SocketAddr {
+async fn spawn_real_http_server(expected_pass: Option<&str>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
@@ -625,7 +679,10 @@ async fn test_f6_socks5_greeting_user_pass_negotiation() {
     let addr = spawn_real_socks5_server(Some("pass123")).await;
 
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
-    let method = client.greeting(&[METHOD_NO_AUTH, METHOD_USER_PASS]).await.unwrap();
+    let method = client
+        .greeting(&[METHOD_NO_AUTH, METHOD_USER_PASS])
+        .await
+        .unwrap();
     assert_eq!(method, METHOD_USER_PASS);
 }
 
@@ -636,7 +693,10 @@ async fn test_f6_socks5_rfc1929_authentication_success() {
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
     let method = client.greeting(&[METHOD_USER_PASS]).await.unwrap();
     assert_eq!(method, METHOD_USER_PASS);
-    client.authenticate("admin", "pass123").await.expect("Auth should succeed");
+    client
+        .authenticate("admin", "pass123")
+        .await
+        .expect("Auth should succeed");
 }
 
 #[tokio::test]
@@ -865,7 +925,9 @@ fn test_f9_port_auto_bind_sequential_socks5() {
 
     let registry = Arc::new(TunnelRegistry::new());
     for t in tunnels {
-        registry.register(TunnelEntry::new(t.id.clone(), t, LifecycleMode::Lazy)).unwrap();
+        registry
+            .register(TunnelEntry::new(t.id.clone(), t, LifecycleMode::Lazy))
+            .unwrap();
     }
 
     let entries = registry.all_entries();
@@ -874,9 +936,18 @@ fn test_f9_port_auto_bind_sequential_socks5() {
         entry.set_assigned_port(port);
     }
 
-    assert_eq!(*registry.get("tun-0").unwrap().assigned_port.read(), Some(10000));
-    assert_eq!(*registry.get("tun-1").unwrap().assigned_port.read(), Some(10001));
-    assert_eq!(*registry.get("tun-2").unwrap().assigned_port.read(), Some(10002));
+    assert_eq!(
+        *registry.get("tun-0").unwrap().assigned_port.read(),
+        Some(10000)
+    );
+    assert_eq!(
+        *registry.get("tun-1").unwrap().assigned_port.read(),
+        Some(10001)
+    );
+    assert_eq!(
+        *registry.get("tun-2").unwrap().assigned_port.read(),
+        Some(10002)
+    );
 }
 
 #[test]
@@ -893,7 +964,9 @@ fn test_f9_port_auto_bind_sequential_http() {
 
     let registry = Arc::new(TunnelRegistry::new());
     for t in tunnels {
-        registry.register(TunnelEntry::new(t.id.clone(), t, LifecycleMode::Lazy)).unwrap();
+        registry
+            .register(TunnelEntry::new(t.id.clone(), t, LifecycleMode::Lazy))
+            .unwrap();
     }
 
     for (i, entry) in registry.all_entries().iter().enumerate() {
@@ -901,8 +974,14 @@ fn test_f9_port_auto_bind_sequential_http() {
         entry.set_assigned_port(port);
     }
 
-    assert_eq!(*registry.get("http-0").unwrap().assigned_port.read(), Some(20000));
-    assert_eq!(*registry.get("http-1").unwrap().assigned_port.read(), Some(20001));
+    assert_eq!(
+        *registry.get("http-0").unwrap().assigned_port.read(),
+        Some(20000)
+    );
+    assert_eq!(
+        *registry.get("http-1").unwrap().assigned_port.read(),
+        Some(20001)
+    );
 }
 
 #[test]
@@ -947,9 +1026,15 @@ async fn test_f9_listener_supervisor_starts_dedicated_listeners() {
 
     let tunnel = load_tunnel_config_from_str("ded-01", &make_valid_wg_conf()).unwrap();
     let registry = Arc::new(TunnelRegistry::new());
-    registry.register(TunnelEntry::new("ded-01", tunnel, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("ded-01", tunnel, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     let supervisor = ListenerSupervisor::new();
 
     let started = supervisor
@@ -968,9 +1053,15 @@ async fn test_f9_listener_supervisor_starts_dedicated_listeners() {
 async fn test_f9_dedicated_router_targets_assigned_tunnel() {
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("fixed_tun", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("fixed_tun", t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("fixed_tun", t, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     let router = DedicatedTunnelRouter::new("fixed_tun".to_string(), lifecycle, None);
 
     let _selected = router
@@ -989,9 +1080,15 @@ async fn test_f10_shared_port_route_by_tunnel_id() {
     let registry = Arc::new(TunnelRegistry::new());
     for id in ["wgcf-001", "wgcf-002", "wgcf-003"] {
         let t = load_tunnel_config_from_str(id, &make_valid_wg_conf()).unwrap();
-        registry.register(TunnelEntry::new(id, t, LifecycleMode::Lazy)).unwrap();
+        registry
+            .register(TunnelEntry::new(id, t, LifecycleMode::Lazy))
+            .unwrap();
     }
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
 
     let router = MultiTenantRouter::new(
         lifecycle,
@@ -1012,9 +1109,15 @@ async fn test_f10_shared_port_route_by_round_robin_keyword() {
     let registry = Arc::new(TunnelRegistry::new());
     for id in ["tun-a", "tun-b"] {
         let t = load_tunnel_config_from_str(id, &make_valid_wg_conf()).unwrap();
-        registry.register(TunnelEntry::new(id, t, LifecycleMode::Lazy)).unwrap();
+        registry
+            .register(TunnelEntry::new(id, t, LifecycleMode::Lazy))
+            .unwrap();
     }
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
 
     let router = MultiTenantRouter::new(
         lifecycle,
@@ -1023,8 +1126,14 @@ async fn test_f10_shared_port_route_by_round_robin_keyword() {
         true,
     );
 
-    let _sel1 = router.select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::RoundRobin)).await.unwrap();
-    let _sel2 = router.select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::RoundRobin)).await.unwrap();
+    let _sel1 = router
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::RoundRobin))
+        .await
+        .unwrap();
+    let _sel2 = router
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::RoundRobin))
+        .await
+        .unwrap();
     assert_eq!(registry.active_count(), 2);
 }
 
@@ -1033,18 +1142,23 @@ async fn test_f10_shared_port_route_by_random_keyword() {
     let registry = Arc::new(TunnelRegistry::new());
     for id in ["rand-1", "rand-2", "rand-3"] {
         let t = load_tunnel_config_from_str(id, &make_valid_wg_conf()).unwrap();
-        registry.register(TunnelEntry::new(id, t, LifecycleMode::Lazy)).unwrap();
+        registry
+            .register(TunnelEntry::new(id, t, LifecycleMode::Lazy))
+            .unwrap();
     }
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
-
-    let router = MultiTenantRouter::new(
-        lifecycle,
+    let lifecycle = LifecycleController::new(
         Arc::clone(&registry),
-        PoolStrategy::Random,
-        true,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
     );
 
-    let _sel = router.select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::Random)).await.unwrap();
+    let router =
+        MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::Random, true);
+
+    let _sel = router
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::Random))
+        .await
+        .unwrap();
     assert!(registry.active_count() >= 1);
 }
 
@@ -1052,8 +1166,14 @@ async fn test_f10_shared_port_route_by_random_keyword() {
 async fn test_f10_shared_port_anonymous_default_pool() {
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("anon-tun", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("anon-tun", t, LifecycleMode::Lazy)).unwrap();
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    registry
+        .register(TunnelEntry::new("anon-tun", t, LifecycleMode::Lazy))
+        .unwrap();
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
 
     let router = MultiTenantRouter::new(
         lifecycle,
@@ -1062,7 +1182,10 @@ async fn test_f10_shared_port_anonymous_default_pool() {
         true,
     );
 
-    let _sel = router.select_tunnel(&TunnelSelector::DefaultPool).await.unwrap();
+    let _sel = router
+        .select_tunnel(&TunnelSelector::DefaultPool)
+        .await
+        .unwrap();
     assert!(registry.get("anon-tun").unwrap().is_active());
 }
 
@@ -1070,17 +1193,26 @@ async fn test_f10_shared_port_anonymous_default_pool() {
 async fn test_f10_shared_port_global_password_validation() {
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("tun-glob", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("tun-glob", t, LifecycleMode::Lazy)).unwrap();
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    registry
+        .register(TunnelEntry::new("tun-glob", t, LifecycleMode::Lazy))
+        .unwrap();
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
 
     let router = MultiTenantRouter::new(
         lifecycle,
         Arc::clone(&registry),
         PoolStrategy::RoundRobin,
         false,
-    ).with_auth(AuthMode::Global, Some("supersecret".to_string()));
+    )
+    .with_auth(AuthMode::Global, Some("supersecret".to_string()));
 
-    let authed = router.authenticate(Some(("tun-glob", "supersecret"))).unwrap();
+    let authed = router
+        .authenticate(Some(("tun-glob", "supersecret")))
+        .unwrap();
     assert_eq!(authed, TunnelSelector::ById("tun-glob".to_string()));
 
     let failed = router.authenticate(Some(("tun-glob", "wrongpass")));
@@ -1104,15 +1236,24 @@ fn test_f11_lazy_initial_state_is_dormant() {
 async fn test_f11_lazy_wake_on_demand_activates() {
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("lazy-wake", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("lazy-wake", t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("lazy-wake", t, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(10), Duration::from_millis(50));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+    );
     assert_eq!(registry.active_count(), 0);
 
     let (active, _guard) = lifecycle.get_or_activate("lazy-wake").await.unwrap();
     assert_eq!(active.id, "lazy-wake");
     assert_eq!(registry.active_count(), 1);
-    assert_eq!(*registry.get("lazy-wake").unwrap().state.read(), TunnelState::Active);
+    assert_eq!(
+        *registry.get("lazy-wake").unwrap().state.read(),
+        TunnelState::Active
+    );
 }
 
 #[test]
@@ -1140,16 +1281,25 @@ fn test_f11_lazy_connection_guard_tracking() {
 async fn test_f11_lazy_manual_suspend_transition() {
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("lazy-susp", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("lazy-susp", t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("lazy-susp", t, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(10), Duration::from_millis(50));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+    );
     let (_active, guard) = lifecycle.get_or_activate("lazy-susp").await.unwrap();
     assert_eq!(registry.active_count(), 1);
 
     drop(guard);
     lifecycle.suspend_tunnel("lazy-susp").await.unwrap();
     assert_eq!(registry.active_count(), 0);
-    assert_eq!(*registry.get("lazy-susp").unwrap().state.read(), TunnelState::Suspended);
+    assert_eq!(
+        *registry.get("lazy-susp").unwrap().state.read(),
+        TunnelState::Suspended
+    );
 }
 
 #[tokio::test]

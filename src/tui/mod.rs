@@ -4,9 +4,9 @@
 
 pub mod app;
 pub mod logs;
-pub mod ui;
 #[cfg(test)]
 pub mod tests;
+pub mod ui;
 
 pub use app::{TuiApp, TuiDataSource, TuiProbeResult, TuiTab};
 pub use logs::TuiLogBuffer;

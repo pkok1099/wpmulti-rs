@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -11,15 +11,15 @@ use std::{
 use etherparse::{PacketBuilder, SlicedPacket, TransportSlice};
 use gotatun::{
     noise::{
-        handshake::parse_handshake_anon, index_table::IndexTable, rate_limiter::RateLimiter,
-        Tunn, TunnResult,
+        Tunn, TunnResult, handshake::parse_handshake_anon, index_table::IndexTable,
+        rate_limiter::RateLimiter,
     },
     packet::{Packet, WgKind},
     x25519,
 };
 use tokio::{
     net::UdpSocket,
-    sync::{watch, Mutex, RwLock},
+    sync::{Mutex, RwLock, watch},
     task::JoinHandle,
 };
 use zerocopy::IntoBytes;
@@ -360,7 +360,11 @@ impl MockIpEngine {
         }
     }
 
-    pub fn process_packet(&mut self, ip_bytes: &[u8], controls: &MockPeerControls) -> Option<Vec<u8>> {
+    pub fn process_packet(
+        &mut self,
+        ip_bytes: &[u8],
+        controls: &MockPeerControls,
+    ) -> Option<Vec<u8>> {
         if ip_bytes.is_empty() {
             return None;
         }
@@ -379,11 +383,17 @@ impl MockIpEngine {
         let (src_ip, dst_ip) = match sliced.ip? {
             etherparse::InternetSlice::Ipv4(v4, _) => {
                 self.stats.ipv4_packets.fetch_add(1, Ordering::Relaxed);
-                (IpAddr::V4(v4.source_addr()), IpAddr::V4(v4.destination_addr()))
+                (
+                    IpAddr::V4(v4.source_addr()),
+                    IpAddr::V4(v4.destination_addr()),
+                )
             }
             etherparse::InternetSlice::Ipv6(v6, _) => {
                 self.stats.ipv6_packets.fetch_add(1, Ordering::Relaxed);
-                (IpAddr::V6(v6.source_addr()), IpAddr::V6(v6.destination_addr()))
+                (
+                    IpAddr::V6(v6.source_addr()),
+                    IpAddr::V6(v6.destination_addr()),
+                )
             }
         };
 
@@ -407,8 +417,17 @@ impl MockIpEngine {
 
                     // Synthesize SYN | ACK
                     self.build_tcp(
-                        dst_ip, src_ip, dst_port, src_port, server_isn, client_seq, true, true,
-                        false, false, &[],
+                        dst_ip,
+                        src_ip,
+                        dst_port,
+                        src_port,
+                        server_isn,
+                        client_seq,
+                        true,
+                        true,
+                        false,
+                        false,
+                        &[],
                     )
                 } else if tcp.fin() {
                     self.stats.tcp_closed.fetch_add(1, Ordering::Relaxed);
@@ -419,15 +438,26 @@ impl MockIpEngine {
                     };
                     // Synthesize FIN | ACK
                     self.build_tcp(
-                        dst_ip, src_ip, dst_port, src_port, server_seq, client_seq, false, true,
-                        true, false, &[],
+                        dst_ip,
+                        src_ip,
+                        dst_port,
+                        src_port,
+                        server_seq,
+                        client_seq,
+                        false,
+                        true,
+                        true,
+                        false,
+                        &[],
                     )
                 } else if tcp.rst() {
                     self.tcp_conns.remove(&key);
                     None
                 } else if !sliced.payload.is_empty() {
                     let payload = sliced.payload;
-                    self.stats.tcp_bytes_echoed.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    self.stats
+                        .tcp_bytes_echoed
+                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
 
                     let (server_seq, client_seq) = if let Some(st) = self.tcp_conns.get_mut(&key) {
                         let s = st.server_seq;
@@ -435,7 +465,10 @@ impl MockIpEngine {
                         st.server_seq = s.wrapping_add(payload.len() as u32);
                         (s, st.client_seq)
                     } else {
-                        (1000, tcp.sequence_number().wrapping_add(payload.len() as u32))
+                        (
+                            1000,
+                            tcp.sequence_number().wrapping_add(payload.len() as u32),
+                        )
                     };
 
                     // TCP Echo: PSH | ACK
@@ -457,7 +490,9 @@ impl MockIpEngine {
                     if controls.drop_dns.load(Ordering::Relaxed) {
                         return None;
                     }
-                    self.stats.dns_queries_answered.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .dns_queries_answered
+                        .fetch_add(1, Ordering::Relaxed);
                     let resp = self.handle_dns_query(sliced.payload)?;
                     self.build_udp(dst_ip, src_ip, dst_port, src_port, &resp)
                 } else {
@@ -533,8 +568,8 @@ impl MockIpEngine {
         let mut buf = Vec::new();
         match (src_ip, dst_ip) {
             (IpAddr::V4(s), IpAddr::V4(d)) => {
-                let mut b =
-                    PacketBuilder::ipv4(s.octets(), d.octets(), 64).tcp(src_port, dst_port, seq, 65535);
+                let mut b = PacketBuilder::ipv4(s.octets(), d.octets(), 64)
+                    .tcp(src_port, dst_port, seq, 65535);
                 if syn {
                     b = b.syn();
                 }
@@ -551,8 +586,8 @@ impl MockIpEngine {
                 b.write(&mut buf, payload).ok()?;
             }
             (IpAddr::V6(s), IpAddr::V6(d)) => {
-                let mut b =
-                    PacketBuilder::ipv6(s.octets(), d.octets(), 64).tcp(src_port, dst_port, seq, 65535);
+                let mut b = PacketBuilder::ipv6(s.octets(), d.octets(), 64)
+                    .tcp(src_port, dst_port, seq, 65535);
                 if syn {
                     b = b.syn();
                 }

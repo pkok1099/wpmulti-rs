@@ -1,18 +1,36 @@
+#![allow(
+    unreachable_pub,
+    unused_qualifications,
+    trivial_casts,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::type_complexity,
+    clippy::wildcard_enum_match_arm,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
+
 mod common;
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{
-    allocate_ephemeral_port, allocate_ephemeral_port_range, generate_245_cloned_wgcf_configs,
     AdminTestClient, HttpProxyTestClient, MockWireGuardPeer, SharedListenerFixture, Socks5Target,
     Socks5TestClient, TestEnvironment, WgConfBuilder, WgPeerFixture, WpMultiTomlBuilder,
+    allocate_ephemeral_port, allocate_ephemeral_port_range, generate_245_cloned_wgcf_configs,
 };
 use etherparse::PacketBuilder;
 use gotatun::{
-    noise::{index_table::IndexTable, rate_limiter::RateLimiter, Tunn, TunnResult},
+    noise::{Tunn, TunnResult, index_table::IndexTable, rate_limiter::RateLimiter},
     packet::{Packet, WgKind},
     x25519,
 };
@@ -171,7 +189,10 @@ async fn test_mock_peer_handshake_and_l3_echo() {
             assert_eq!(&sliced.payload[0..2], &0x1234u16.to_be_bytes()); // TxID matches
             let flags = u16::from_be_bytes([sliced.payload[2], sliced.payload[3]]);
             assert_eq!(flags, 0x8180); // Response, NoError
-            assert_eq!(u16::from_be_bytes([sliced.payload[6], sliced.payload[7]]), 1); // ANCOUNT: 1
+            assert_eq!(
+                u16::from_be_bytes([sliced.payload[6], sliced.payload[7]]),
+                1
+            ); // ANCOUNT: 1
         }
         other => panic!("Expected WriteToTunnel from DNS, got {:?}", other),
     }
@@ -296,7 +317,10 @@ async fn test_mock_peer_handshake_and_l3_echo() {
                 .expect("Failed to slice decrypted IPv6 packet");
             assert_eq!(sliced.payload, echo_v6_payload);
         }
-        other => panic!("Expected WriteToTunnel from echoed IPv6 UDP, got {:?}", other),
+        other => panic!(
+            "Expected WriteToTunnel from echoed IPv6 UDP, got {:?}",
+            other
+        ),
     }
     assert_eq!(mock.stats().ipv6_packets.load(Ordering::SeqCst), 1);
 
@@ -307,10 +331,15 @@ async fn test_mock_peer_handshake_and_l3_echo() {
         .await
         .expect("Failed to send encap data");
 
-    let timeout_res =
-        tokio::time::timeout(Duration::from_millis(80), client_socket.recv_from(&mut resp_buf))
-            .await;
-    assert!(timeout_res.is_err(), "Expected packet to be dropped by controls");
+    let timeout_res = tokio::time::timeout(
+        Duration::from_millis(80),
+        client_socket.recv_from(&mut resp_buf),
+    )
+    .await;
+    assert!(
+        timeout_res.is_err(),
+        "Expected packet to be dropped by controls"
+    );
     mock.controls().drop_data.store(false, Ordering::SeqCst);
 
     mock.stop().await;
@@ -687,10 +716,7 @@ async fn test_admin_client_driver() {
     assert_eq!(reload["reloaded"], 245);
 
     let rx_val = client
-        .get_metric_value(
-            "wpmulti_tunnel_rx_bytes",
-            &[("tunnel_id", "wgcf-001")],
-        )
+        .get_metric_value("wpmulti_tunnel_rx_bytes", &[("tunnel_id", "wgcf-001")])
         .await
         .expect("Metric parse failed");
     assert_eq!(rx_val, 1048576.0);
@@ -763,12 +789,14 @@ async fn test_fixtures_builders_and_245_cloned_wgcf() {
     assert!(base_range >= 30000);
 
     // 4. Verify 245 Cloned wgcf Configs Generation in dedicated directory
-    let cloned_env = TestEnvironment::new("wgcf_245").expect("Failed to create cloned TestEnvironment");
+    let cloned_env =
+        TestEnvironment::new("wgcf_245").expect("Failed to create cloned TestEnvironment");
     let mock_endpoint = "127.0.0.1:51820".parse().unwrap();
     let mock_pubkey = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=";
 
-    let wgcf_set = generate_245_cloned_wgcf_configs(cloned_env.conf_dir(), mock_endpoint, mock_pubkey)
-        .expect("Failed to generate 245 cloned wgcf configs");
+    let wgcf_set =
+        generate_245_cloned_wgcf_configs(cloned_env.conf_dir(), mock_endpoint, mock_pubkey)
+            .expect("Failed to generate 245 cloned wgcf configs");
 
     assert_eq!(wgcf_set.tunnel_ids.len(), 245);
     assert_eq!(wgcf_set.file_paths.len(), 245);
@@ -807,7 +835,10 @@ async fn test_full_e2e_pipeline_socks5_and_http_via_mock_wg_peer() {
         .addresses(&["10.7.0.2/32"])
         .dns(&["1.1.1.1"])
         .mtu(1280)
-        .add_peer(WgPeerFixture::new(&peer_pubkey_b64, &mock.endpoint().to_string()))
+        .add_peer(WgPeerFixture::new(
+            &peer_pubkey_b64,
+            &mock.endpoint().to_string(),
+        ))
         .build_ini();
     let tunnel_cfg =
         wpmulti::load_tunnel_config_from_str("wg-e2e-full", &conf_ini).expect("parse wg conf");
@@ -821,8 +852,8 @@ async fn test_full_e2e_pipeline_socks5_and_http_via_mock_wg_peer() {
     main_cfg.per_tunnel.base_socks5_port = Some(s5_port);
     main_cfg.per_tunnel.base_http_port = Some(http_port);
 
-    let manager = wpmulti::TunnelManager::new(main_cfg, vec![tunnel_cfg])
-        .expect("TunnelManager::new failed");
+    let manager =
+        wpmulti::TunnelManager::new(main_cfg, vec![tunnel_cfg]).expect("TunnelManager::new failed");
     manager.start().await.expect("TunnelManager::start failed");
 
     // 4. SOCKS5 CONNECT with in-tunnel domain DNS resolution -> MockWireGuardPeer TCP echo
@@ -841,27 +872,52 @@ async fn test_full_e2e_pipeline_socks5_and_http_via_mock_wg_peer() {
     let s5_payload = b"hello_full_e2e_socks5_wg";
     s5_stream.write_all(s5_payload).await.expect("SOCKS5 write");
     let mut s5_echo = vec![0u8; s5_payload.len()];
-    s5_stream.read_exact(&mut s5_echo).await.expect("SOCKS5 read");
+    s5_stream
+        .read_exact(&mut s5_echo)
+        .await
+        .expect("SOCKS5 read");
     assert_eq!(&s5_echo, s5_payload);
     drop(s5_stream);
 
     // 5. HTTP CONNECT -> MockWireGuardPeer TCP echo
     let http_addr: SocketAddr = format!("127.0.0.1:{}", http_port).parse().unwrap();
-    let mut http_stream = HttpProxyTestClient::connect_tunnel(http_addr, "93.184.216.34:8080", None)
-        .await
-        .expect("HTTP CONNECT through WireGuard tunnel");
+    let mut http_stream =
+        HttpProxyTestClient::connect_tunnel(http_addr, "93.184.216.34:8080", None)
+            .await
+            .expect("HTTP CONNECT through WireGuard tunnel");
 
     let http_payload = b"hello_full_e2e_http_wg";
-    http_stream.write_all(http_payload).await.expect("HTTP write");
+    http_stream
+        .write_all(http_payload)
+        .await
+        .expect("HTTP write");
     let mut http_echo = vec![0u8; http_payload.len()];
-    http_stream.read_exact(&mut http_echo).await.expect("HTTP read");
+    http_stream
+        .read_exact(&mut http_echo)
+        .await
+        .expect("HTTP read");
     assert_eq!(&http_echo, http_payload);
     drop(http_stream);
 
     // Verify MockWireGuardPeer actually processed handshake + encrypted transport packets
-    assert!(mock.stats().handshakes_completed.load(std::sync::atomic::Ordering::Relaxed) >= 1);
-    assert!(mock.stats().data_packets_received.load(std::sync::atomic::Ordering::Relaxed) >= 2);
-    assert!(mock.stats().tcp_syn_received.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+    assert!(
+        mock.stats()
+            .handshakes_completed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1
+    );
+    assert!(
+        mock.stats()
+            .data_packets_received
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 2
+    );
+    assert!(
+        mock.stats()
+            .tcp_syn_received
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 2
+    );
 
     manager.stop().await.expect("TunnelManager::stop");
     drop(mock);

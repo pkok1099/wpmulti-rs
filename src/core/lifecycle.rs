@@ -7,8 +7,8 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -17,10 +17,10 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::LifecycleMode;
+use crate::core::CoreError;
 use crate::core::health::TunnelHealthTracker;
 use crate::core::registry::{ActiveTunnel, TunnelEntry, TunnelRegistry, TunnelState, TunnelStats};
-use crate::core::CoreError;
-use crate::netstack::{VirtualNetworkStack, VirtualTunBridge, DEFAULT_CHANNEL_CAPACITY};
+use crate::netstack::{DEFAULT_CHANNEL_CAPACITY, VirtualNetworkStack, VirtualTunBridge};
 use crate::proxy::{DynStream, ProxyTunnelTarget, ProxyUdpSocket};
 
 /// RAII Guard tracking an active connection routed through a specific tunnel.
@@ -57,6 +57,7 @@ impl Drop for TunnelConnGuard {
 }
 
 /// A [`ProxyTunnelTarget`] wrapper that holds an RAII [`TunnelConnGuard`].
+#[derive(Debug)]
 pub struct GuardedTunnelTarget {
     tunnel: Arc<ActiveTunnel>,
     guard: Arc<TunnelConnGuard>,
@@ -108,7 +109,7 @@ impl GuardedTunnelTarget {
     }
 
     /// Access the underlying active tunnel handle.
-    pub fn tunnel(&self) -> &Arc<ActiveTunnel> {
+    pub const fn tunnel(&self) -> &Arc<ActiveTunnel> {
         &self.tunnel
     }
 }
@@ -137,11 +138,11 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
                     if let Some(h) = &health {
                         h.record_success();
                     }
-                    let guarded = GuardedStream {
+                    let guarded: DynStream = Box::new(GuardedStream {
                         inner: stream,
                         _guard: guard,
-                    };
-                    Ok(Box::new(guarded) as DynStream)
+                    });
+                    Ok(guarded)
                 }
                 Err(e) => {
                     if let Some(h) = &health {
@@ -161,11 +162,11 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         let guard = Arc::clone(&self.guard);
         Box::pin(async move {
             let socket = tunnel.udp_bind(local_port).await?;
-            let guarded = GuardedUdpSocket {
+            let guarded: Box<dyn ProxyUdpSocket> = Box::new(GuardedUdpSocket {
                 inner: socket,
                 _guard: guard,
-            };
-            Ok(Box::new(guarded) as Box<dyn ProxyUdpSocket>)
+            });
+            Ok(guarded)
         })
     }
 
@@ -203,6 +204,12 @@ pub struct GuardedUdpSocket {
     _guard: Arc<TunnelConnGuard>,
 }
 
+impl std::fmt::Debug for GuardedUdpSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardedUdpSocket").finish_non_exhaustive()
+    }
+}
+
 impl ProxyUdpSocket for GuardedUdpSocket {
     fn send_to<'a>(
         &'a self,
@@ -228,6 +235,12 @@ impl ProxyUdpSocket for GuardedUdpSocket {
 pub struct GuardedStream {
     inner: DynStream,
     _guard: Arc<TunnelConnGuard>,
+}
+
+impl std::fmt::Debug for GuardedStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardedStream").finish_non_exhaustive()
+    }
 }
 
 impl AsyncRead for GuardedStream {
@@ -293,6 +306,7 @@ impl Drop for ActivatingGuard<'_> {
 }
 
 /// Controller orchestrating lazy on-demand activation, native suspend/resume, and idle teardown.
+#[derive(Debug)]
 pub struct LifecycleController {
     registry: Arc<TunnelRegistry>,
     idle_timeout: Duration,
@@ -322,7 +336,10 @@ impl LifecycleController {
             check_interval,
             handshake_timeout_ms: std::sync::atomic::AtomicU64::new(10_000),
             max_active_tunnels: std::sync::atomic::AtomicUsize::new(usize::MAX),
-            dns_fallback: Mutex::new("1.1.1.1:53".parse().unwrap()),
+            dns_fallback: Mutex::new(SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+                53,
+            )),
             dns_strategy: std::sync::atomic::AtomicU8::new(0),
             shutdown_tx,
             teardown_handle: Mutex::new(None),
@@ -363,8 +380,9 @@ impl LifecycleController {
 
     /// Configure the handshake / endpoint resolution timeout for tunnel activation.
     pub fn set_handshake_timeout(&self, timeout: Duration) {
-        let ms = timeout.as_millis().min(u64::MAX as u128) as u64;
-        self.handshake_timeout_ms.store(ms.max(1), Ordering::Relaxed);
+        let ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.handshake_timeout_ms
+            .store(ms.max(1), Ordering::Relaxed);
     }
 
     /// Return the configured handshake / endpoint resolution timeout.
@@ -388,7 +406,7 @@ impl LifecycleController {
     }
 
     /// Access the underlying [`TunnelRegistry`].
-    pub fn registry(&self) -> &Arc<TunnelRegistry> {
+    pub const fn registry(&self) -> &Arc<TunnelRegistry> {
         &self.registry
     }
 
@@ -458,7 +476,7 @@ impl LifecycleController {
         let maybe_active = entry.active.write().take();
         if let Some(active) = maybe_active {
             tracing::debug!("Closing and shutting down netstack for tunnel '{}'", id);
-            let _ = active.device.suspend().await;
+            let () = active.device.suspend().await;
             active.netstack.close().await;
         }
         *entry.state.write() = TunnelState::Dormant;
@@ -498,7 +516,7 @@ impl LifecycleController {
         if self.registry.active_count() >= max_active {
             return Err(CoreError::ActivationFailed(
                 target_id.to_string(),
-                format!("max_active_tunnels ({}) limit reached", max_active),
+                format!("max_active_tunnels ({max_active}) limit reached"),
             ));
         }
         Ok(())
@@ -556,26 +574,25 @@ impl LifecycleController {
 
         match current_state {
             TunnelState::Active => {
-                let active = entry
-                    .active
-                    .read()
-                    .clone()
-                    .ok_or_else(|| CoreError::ActivationFailed(id.to_string(), "active handle missing".into()))?;
+                let active = entry.active.read().clone().ok_or_else(|| {
+                    CoreError::ActivationFailed(id.to_string(), "active handle missing".into())
+                })?;
                 let guard = TunnelConnGuard::new(id, Arc::clone(&entry.stats));
                 Ok((active, guard))
             }
             TunnelState::Suspended => {
                 // Resume existing device
-                let active = entry
-                    .active
-                    .read()
-                    .clone()
-                    .ok_or_else(|| CoreError::ActivationFailed(id.to_string(), "suspended handle missing".into()))?;
+                let active = entry.active.read().clone().ok_or_else(|| {
+                    CoreError::ActivationFailed(id.to_string(), "suspended handle missing".into())
+                })?;
 
                 tracing::debug!("Resuming suspended tunnel '{}'", id);
                 if let Err(e) = active.device.resume().await {
                     entry.health.record_failure(3, Duration::from_secs(30));
-                    return Err(CoreError::ActivationFailed(id.to_string(), format!("device resume error: {:?}", e)));
+                    return Err(CoreError::ActivationFailed(
+                        id.to_string(),
+                        format!("device resume error: {e:?}"),
+                    ));
                 }
 
                 *entry.state.write() = TunnelState::Active;
@@ -641,25 +658,22 @@ impl LifecycleController {
                     .unwrap_or_default()
                     .as_secs();
                 entry.stats.last_active_at.store(now, Ordering::Relaxed);
-                entry
-                    .active
-                    .read()
-                    .clone()
-                    .ok_or_else(|| CoreError::ActivationFailed(id.to_string(), "active handle missing".into()))
+                entry.active.read().clone().ok_or_else(|| {
+                    CoreError::ActivationFailed(id.to_string(), "active handle missing".into())
+                })
             }
             TunnelState::Suspended => {
-                let active = entry
-                    .active
-                    .read()
-                    .clone()
-                    .ok_or_else(|| CoreError::ActivationFailed(id.to_string(), "suspended handle missing".into()))?;
+                let active = entry.active.read().clone().ok_or_else(|| {
+                    CoreError::ActivationFailed(id.to_string(), "suspended handle missing".into())
+                })?;
 
                 tracing::debug!("Resuming suspended tunnel '{}'", id);
-                active
-                    .device
-                    .resume()
-                    .await
-                    .map_err(|e| CoreError::ActivationFailed(id.to_string(), format!("device resume error: {:?}", e)))?;
+                active.device.resume().await.map_err(|e| {
+                    CoreError::ActivationFailed(
+                        id.to_string(),
+                        format!("device resume error: {e:?}"),
+                    )
+                })?;
 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -715,7 +729,10 @@ impl LifecycleController {
         let _lock = entry.activation_lock.lock().await;
 
         if entry.stats.active_conns.load(Ordering::SeqCst) > 0 {
-            tracing::debug!("Aborting suspension for tunnel '{}': active connections exist", id);
+            tracing::debug!(
+                "Aborting suspension for tunnel '{}': active connections exist",
+                id
+            );
             return Ok(());
         }
 
@@ -748,8 +765,7 @@ impl LifecycleController {
             (cfg.interface.clone(), cfg.peers.clone())
         };
         let mtu = config_interface.mtu;
-        let (bridge, bridge_tx, bridge_rx) =
-            VirtualTunBridge::new(mtu, DEFAULT_CHANNEL_CAPACITY);
+        let (bridge, bridge_tx, bridge_rx) = VirtualTunBridge::new(mtu, DEFAULT_CHANNEL_CAPACITY);
 
         // Prepare peers
         let mut peers = Vec::with_capacity(config_peers.len());
@@ -758,12 +774,21 @@ impl LifecycleController {
             if let Ok(addr) = p_cfg.endpoint.parse::<SocketAddr>() {
                 peer.endpoint = Some(addr);
             } else {
-                match tokio::time::timeout(handshake_timeout, tokio::net::lookup_host(&p_cfg.endpoint)).await {
+                match tokio::time::timeout(
+                    handshake_timeout,
+                    tokio::net::lookup_host(&p_cfg.endpoint),
+                )
+                .await
+                {
                     Ok(Ok(mut addrs)) => {
                         peer.endpoint = addrs.next();
                     }
                     Ok(Err(e)) => {
-                        tracing::debug!("Failed to resolve peer endpoint '{}': {}", p_cfg.endpoint, e);
+                        tracing::debug!(
+                            "Failed to resolve peer endpoint '{}': {}",
+                            p_cfg.endpoint,
+                            e
+                        );
                     }
                     Err(_) => {
                         return Err(CoreError::ActivationFailed(
@@ -792,7 +817,10 @@ impl LifecycleController {
         }
 
         let device = builder.build().await.map_err(|e| {
-            CoreError::ActivationFailed(entry.id.clone(), format!("failed to build gotatun device: {:?}", e))
+            CoreError::ActivationFailed(
+                entry.id.clone(),
+                format!("failed to build gotatun device: {e:?}"),
+            )
         })?;
 
         // Build smoltcp VirtualNetworkStack
@@ -801,16 +829,18 @@ impl LifecycleController {
             bridge,
             ip_mode,
             prefer_ipv6,
-            dns_fallback,
-            dns_strategy,
+            (dns_fallback, dns_strategy),
             handshake_timeout,
         )
         .await
         {
             Ok(ns) => ns,
             Err(e) => {
-                let _ = device.suspend().await;
-                return Err(CoreError::ActivationFailed(entry.id.clone(), format!("failed to build netstack: {:?}", e)));
+                let () = device.suspend().await;
+                return Err(CoreError::ActivationFailed(
+                    entry.id.clone(),
+                    format!("failed to build netstack: {e:?}"),
+                ));
             }
         };
 

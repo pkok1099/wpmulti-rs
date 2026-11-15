@@ -4,12 +4,12 @@ pub mod commands;
 #[cfg(test)]
 pub mod tests;
 
-use std::path::PathBuf;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 pub use commands::{
-    cmd_probe, cmd_run, cmd_status, cmd_toggle_tunnels, cmd_top, cmd_validate, run_probe_single,
-    ProbeResult,
+    ProbeResult, cmd_probe, cmd_run, cmd_status, cmd_toggle_tunnels, cmd_top, cmd_validate,
+    run_probe_single,
 };
 
 /// Command line interface for `wpmulti`.
@@ -156,38 +156,48 @@ pub enum Commands {
 /// Parse arguments and execute the selected subcommand.
 pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Commands::Run { config, dir, tui } = cli.command {
+        return cmd_run(config, dir, tui).await;
+    }
+
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
     match cli.command {
-        Commands::Run { config, dir, tui } => cmd_run(config, dir, tui).await,
-        other => {
-            let _ = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::INFO)
-                .try_init();
-            match other {
-                Commands::Top { admin_url, auth_token } => cmd_top(admin_url, auth_token).await,
-                Commands::Validate { config, dir } => {
-                    cmd_validate(config, dir)?;
-                    Ok(())
-                }
-                Commands::Status { admin_url, auth_token } => {
-                    cmd_status(admin_url, auth_token).await?;
-                    Ok(())
-                }
-                Commands::Probe { config, dir, json, timeout } => {
-                    cmd_probe(config, dir, json, timeout).await?;
-                    Ok(())
-                }
-                Commands::Disable {
-                    target,
-                    admin_url,
-                    auth_token,
-                } => cmd_toggle_tunnels(target, true, admin_url, auth_token).await,
-                Commands::Enable {
-                    target,
-                    admin_url,
-                    auth_token,
-                } => cmd_toggle_tunnels(target, false, admin_url, auth_token).await,
-                Commands::Run { .. } => unreachable!(),
-            }
+        Commands::Run { .. } => unreachable!(),
+        Commands::Top {
+            admin_url,
+            auth_token,
+        } => cmd_top(admin_url, auth_token).await,
+        Commands::Validate { config, dir } => {
+            cmd_validate(config, dir)?;
+            Ok(())
         }
+        Commands::Status {
+            admin_url,
+            auth_token,
+        } => {
+            cmd_status(admin_url, auth_token).await?;
+            Ok(())
+        }
+        Commands::Probe {
+            config,
+            dir,
+            json,
+            timeout,
+        } => {
+            cmd_probe(config, dir, json, timeout).await?;
+            Ok(())
+        }
+        Commands::Disable {
+            target,
+            admin_url,
+            auth_token,
+        } => cmd_toggle_tunnels(target, true, admin_url, auth_token).await,
+        Commands::Enable {
+            target,
+            admin_url,
+            auth_token,
+        } => cmd_toggle_tunnels(target, false, admin_url, auth_token).await,
     }
 }

@@ -1,14 +1,31 @@
+#![allow(
+    unreachable_pub,
+    unused_qualifications,
+    trivial_casts,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::type_complexity,
+    clippy::wildcard_enum_match_arm,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
+
 mod common;
 
 use std::net::Ipv4Addr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{
-    allocate_ephemeral_port, AdminTestClient, HttpProxyTestClient,
-    SharedListenerFixture, Socks5TestClient, TestEnvironment, WgConfBuilder,
-    WgPeerFixture, WpMultiTomlBuilder,
+    AdminTestClient, HttpProxyTestClient, SharedListenerFixture, Socks5TestClient, TestEnvironment,
+    WgConfBuilder, WgPeerFixture, WpMultiTomlBuilder, allocate_ephemeral_port,
 };
 use etherparse::PacketBuilder;
 use gotatun::tun::{IpRecv, IpSend};
@@ -16,21 +33,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use wpmulti::config::{
-    load_tunnel_config_from_str, parse_duration_str, parse_wg_conf,
-    AuthMode, LifecycleMode, MainConfig, PoolStrategy, TuiSortField,
+    AuthMode, LifecycleMode, MainConfig, PoolStrategy, TuiSortField, load_tunnel_config_from_str,
+    parse_duration_str, parse_wg_conf,
 };
 use wpmulti::core::{
-    CoreError, LifecycleController, ListenerSupervisor, MultiTenantRouter,
-    TunnelEntry, TunnelManager, TunnelRegistry, TunnelState,
+    CoreError, LifecycleController, ListenerSupervisor, MultiTenantRouter, TunnelEntry,
+    TunnelManager, TunnelRegistry, TunnelState,
 };
-use wpmulti::netstack::{parse_response, DnsError, DnsLruCache, VirtualTunBridge};
+use wpmulti::netstack::{DnsError, DnsLruCache, VirtualTunBridge, parse_response};
 use wpmulti::proxy::{
-    handle_http, handle_socks5_with_addrs, parse_authority, parse_socks5_udp_packet,
-    DirectTunnelTarget, DynStream, PoolKeyword, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket,
-    SingleTunnelRouter, TunnelRouter, TunnelSelector, CMD_BIND, METHOD_GSSAPI,
-    METHOD_NO_ACCEPTABLE, METHOD_NO_AUTH, METHOD_USER_PASS, REP_CMD_NOT_SUPPORTED,
+    CMD_BIND, DirectTunnelTarget, DynStream, METHOD_GSSAPI, METHOD_NO_ACCEPTABLE, METHOD_NO_AUTH,
+    METHOD_USER_PASS, PoolKeyword, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket,
+    REP_CMD_NOT_SUPPORTED, SingleTunnelRouter, TunnelRouter, TunnelSelector, handle_http,
+    handle_socks5_with_addrs, parse_authority, parse_socks5_udp_packet,
 };
-use wpmulti::tui::{format_bytes, render_dashboard, TuiApp, TuiDataSource};
+use wpmulti::tui::{TuiApp, TuiDataSource, format_bytes, render_dashboard};
 
 fn make_valid_wg_conf() -> String {
     WgConfBuilder::new()
@@ -230,7 +247,11 @@ fn test_f2_bnd_extreme_toml_many_shared_listeners() {
     for i in 0..25 {
         builder = builder.add_shared_listener(SharedListenerFixture {
             name: format!("listener_{}", i),
-            proto_type: if i % 2 == 0 { "socks5".to_string() } else { "http".to_string() },
+            proto_type: if i % 2 == 0 {
+                "socks5".to_string()
+            } else {
+                "http".to_string()
+            },
             bind: format!("127.0.0.1:{}", 10000 + i).parse().unwrap(),
             auth_mode: "none".to_string(),
             global_password: None,
@@ -254,7 +275,9 @@ fn test_f3_bnd_duplicate_tunnel_id_registration() {
     let t1 = load_tunnel_config_from_str("dup-01", &make_valid_wg_conf()).unwrap();
     let t2 = load_tunnel_config_from_str("dup-01", &make_valid_wg_conf()).unwrap();
 
-    registry.register(TunnelEntry::new("dup-01", t1, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("dup-01", t1, LifecycleMode::Lazy))
+        .unwrap();
     let res = registry.register(TunnelEntry::new("dup-01", t2, LifecycleMode::Lazy));
     assert!(matches!(res, Err(CoreError::DuplicateTunnel(_))));
 }
@@ -271,7 +294,9 @@ fn test_f3_bnd_special_characters_in_tunnel_id() {
     let registry = TunnelRegistry::new();
     let id = "tun.01-prod_v6@site";
     let t = load_tunnel_config_from_str(id, &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new(id, t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new(id, t, LifecycleMode::Lazy))
+        .unwrap();
 
     let fetched = registry.get(id);
     assert!(fetched.is_some());
@@ -290,7 +315,9 @@ fn test_f3_bnd_concurrent_registry_access() {
     for i in 0..50 {
         let id = format!("conc-{}", i);
         let t = load_tunnel_config_from_str(&id, &make_valid_wg_conf()).unwrap();
-        registry.register(TunnelEntry::new(&id, t, LifecycleMode::Lazy)).unwrap();
+        registry
+            .register(TunnelEntry::new(&id, t, LifecycleMode::Lazy))
+            .unwrap();
     }
 
     let mut handles = Vec::new();
@@ -329,8 +356,12 @@ async fn test_f4_bnd_bridge_channel_capacity_saturation() {
     buf.reserve(b.size(4));
     b.write(&mut buf, b"data").unwrap();
 
-    let pkt1 = gotatun::packet::Packet::copy_from(buf.as_slice()).try_into_ip().unwrap();
-    let pkt2 = gotatun::packet::Packet::copy_from(buf.as_slice()).try_into_ip().unwrap();
+    let pkt1 = gotatun::packet::Packet::copy_from(buf.as_slice())
+        .try_into_ip()
+        .unwrap();
+    let pkt2 = gotatun::packet::Packet::copy_from(buf.as_slice())
+        .try_into_ip()
+        .unwrap();
 
     assert!(ip_send.send(pkt1).await.is_ok());
     assert!(ip_send.send(pkt2).await.is_ok());
@@ -349,7 +380,9 @@ async fn test_f4_bnd_invalid_ip_version_nibble() {
     let mut raw = vec![0x30, 0x00, 0x00, 0x14];
     raw.resize(20, 0);
 
-    let pkt = gotatun::packet::Packet::copy_from(raw.as_slice()).try_into_ip().unwrap();
+    let pkt = gotatun::packet::Packet::copy_from(raw.as_slice())
+        .try_into_ip()
+        .unwrap();
     ip_send.send(pkt).await.unwrap();
 
     use smoltcp::phy::Device;
@@ -365,7 +398,9 @@ async fn test_f4_bnd_zero_length_payload() {
     buf.reserve(b.size(0));
     b.write(&mut buf, &[]).unwrap();
 
-    let pkt = gotatun::packet::Packet::copy_from(buf.as_slice()).try_into_ip().unwrap();
+    let pkt = gotatun::packet::Packet::copy_from(buf.as_slice())
+        .try_into_ip()
+        .unwrap();
     assert!(ip_send.send(pkt).await.is_ok());
 
     let mut pool = gotatun::packet::PacketBufPool::new(1420);
@@ -381,10 +416,10 @@ fn test_f5_bnd_dns_response_nxdomain() {
     let mut resp = Vec::new();
     resp.extend_from_slice(&0x1111u16.to_be_bytes()); // TxID
     resp.extend_from_slice(&0x8183u16.to_be_bytes()); // Flags: Response, NXDOMAIN (RCODE=3)
-    resp.extend_from_slice(&1u16.to_be_bytes());      // QDCOUNT
-    resp.extend_from_slice(&0u16.to_be_bytes());      // ANCOUNT
-    resp.extend_from_slice(&0u16.to_be_bytes());      // NSCOUNT
-    resp.extend_from_slice(&0u16.to_be_bytes());      // ARCOUNT
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    resp.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
     resp.extend_from_slice(b"\x06ghosty\x03com\x00");
     resp.extend_from_slice(&1u16.to_be_bytes());
     resp.extend_from_slice(&1u16.to_be_bytes());
@@ -482,8 +517,9 @@ impl ProxyTunnelTarget for FailingTunnelTarget {
     fn resolve_in_tunnel<'a>(
         &'a self,
         _domain: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<std::net::IpAddr>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<std::net::IpAddr>> + Send + 'a>,
+    > {
         Box::pin(async {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -572,7 +608,8 @@ async fn test_f6_bnd_socks5_invalid_version_header() {
 #[tokio::test]
 async fn test_f6_bnd_socks5_auth_bad_credentials() {
     let addr =
-        spawn_real_socks5_server_with_target(Arc::new(DirectTunnelTarget), Some("correct_pass")).await;
+        spawn_real_socks5_server_with_target(Arc::new(DirectTunnelTarget), Some("correct_pass"))
+            .await;
 
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
     let method = client.greeting(&[METHOD_USER_PASS]).await.unwrap();
@@ -587,7 +624,9 @@ async fn test_f6_bnd_socks5_connect_unroutable_target() {
 
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
     client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
-    let res = client.cmd_connect_ipv4(Ipv4Addr::new(192, 0, 2, 1), 80).await;
+    let res = client
+        .cmd_connect_ipv4(Ipv4Addr::new(192, 0, 2, 1), 80)
+        .await;
     assert!(res.is_err());
 }
 
@@ -660,7 +699,9 @@ async fn test_f7_bnd_socks5_udp_control_stream_drop_cleans_up() {
 async fn test_f8_bnd_http_malformed_request_line() {
     let addr = spawn_real_http_server_with_target(Arc::new(DirectTunnelTarget), None).await;
 
-    let (resp, _) = HttpProxyTestClient::send_raw(addr, "MALFORMED_LINE\r\n\r\n").await.unwrap();
+    let (resp, _) = HttpProxyTestClient::send_raw(addr, "MALFORMED_LINE\r\n\r\n")
+        .await
+        .unwrap();
     assert_eq!(resp.status_code, 400);
 }
 
@@ -675,7 +716,9 @@ async fn test_f8_bnd_http_auth_missing_or_bad_credentials() {
     let addr =
         spawn_real_http_server_with_target(Arc::new(DirectTunnelTarget), Some("secret")).await;
 
-    let (resp, _) = HttpProxyTestClient::send_raw(addr, "CONNECT target:443 HTTP/1.1\r\n\r\n").await.unwrap();
+    let (resp, _) = HttpProxyTestClient::send_raw(addr, "CONNECT target:443 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
     assert_eq!(resp.status_code, 407);
     assert!(resp.is_proxy_auth_required());
 }
@@ -684,8 +727,13 @@ async fn test_f8_bnd_http_auth_missing_or_bad_credentials() {
 async fn test_f8_bnd_http_header_too_large() {
     let addr = spawn_real_http_server_with_target(Arc::new(DirectTunnelTarget), None).await;
 
-    let big_header = format!("CONNECT target:443 HTTP/1.1\r\nX-Padding: {}\r\n\r\n", "A".repeat(17000));
-    let (resp, _) = HttpProxyTestClient::send_raw(addr, &big_header).await.unwrap();
+    let big_header = format!(
+        "CONNECT target:443 HTTP/1.1\r\nX-Padding: {}\r\n\r\n",
+        "A".repeat(17000)
+    );
+    let (resp, _) = HttpProxyTestClient::send_raw(addr, &big_header)
+        .await
+        .unwrap();
     assert!(resp.status_code == 431 || resp.status_code == 400);
 }
 
@@ -693,7 +741,9 @@ async fn test_f8_bnd_http_header_too_large() {
 async fn test_f8_bnd_http_connect_unreachable_target() {
     let addr = spawn_real_http_server_with_target(Arc::new(FailingTunnelTarget), None).await;
 
-    let (resp, _) = HttpProxyTestClient::send_raw(addr, "CONNECT 192.0.2.1:80 HTTP/1.1\r\n\r\n").await.unwrap();
+    let (resp, _) = HttpProxyTestClient::send_raw(addr, "CONNECT 192.0.2.1:80 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
     assert_eq!(resp.status_code, 502);
 }
 
@@ -723,9 +773,15 @@ async fn test_f9_bnd_port_already_in_use_error() {
 
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("coll_tun", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("coll_tun", t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("coll_tun", t, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     let supervisor = ListenerSupervisor::new();
 
     let res = supervisor.start_all(&config, &registry, &lifecycle).await;
@@ -741,12 +797,21 @@ async fn test_f9_bnd_per_tunnel_disabled_spawns_zero_listeners() {
 
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("tun_off", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("tun_off", t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("tun_off", t, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     let supervisor = ListenerSupervisor::new();
 
-    let started = supervisor.start_all(&config, &registry, &lifecycle).await.unwrap();
+    let started = supervisor
+        .start_all(&config, &registry, &lifecycle)
+        .await
+        .unwrap();
     assert_eq!(started.len(), 0);
 }
 
@@ -775,10 +840,17 @@ async fn test_f9_bnd_empty_tunnel_list_starts_zero_dedicated() {
     config.shared_listeners.clear();
 
     let registry = Arc::new(TunnelRegistry::new());
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     let supervisor = ListenerSupervisor::new();
 
-    let started = supervisor.start_all(&config, &registry, &lifecycle).await.unwrap();
+    let started = supervisor
+        .start_all(&config, &registry, &lifecycle)
+        .await
+        .unwrap();
     assert_eq!(started.len(), 0);
 }
 
@@ -789,26 +861,58 @@ async fn test_f9_bnd_empty_tunnel_list_starts_zero_dedicated() {
 #[tokio::test]
 async fn test_f10_bnd_shared_port_non_existent_tunnel_id() {
     let registry = Arc::new(TunnelRegistry::new());
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
-    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::RoundRobin, false);
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        false,
+    );
 
-    let res = router.select_tunnel(&TunnelSelector::ById("non_existent".to_string())).await;
+    let res = router
+        .select_tunnel(&TunnelSelector::ById("non_existent".to_string()))
+        .await;
     assert!(res.is_err());
 }
 
 #[test]
 fn test_f10_bnd_shared_port_invalid_pool_keyword() {
-    assert_eq!(TunnelSelector::parse("fastest"), TunnelSelector::ById("fastest".to_string()));
-    assert_eq!(TunnelSelector::parse("random"), TunnelSelector::ByKeyword(PoolKeyword::Random));
-    assert_eq!(TunnelSelector::parse("round-robin"), TunnelSelector::ByKeyword(PoolKeyword::RoundRobin));
-    assert_eq!(TunnelSelector::parse("least-conn"), TunnelSelector::ByKeyword(PoolKeyword::LeastConn));
+    assert_eq!(
+        TunnelSelector::parse("fastest"),
+        TunnelSelector::ById("fastest".to_string())
+    );
+    assert_eq!(
+        TunnelSelector::parse("random"),
+        TunnelSelector::ByKeyword(PoolKeyword::Random)
+    );
+    assert_eq!(
+        TunnelSelector::parse("round-robin"),
+        TunnelSelector::ByKeyword(PoolKeyword::RoundRobin)
+    );
+    assert_eq!(
+        TunnelSelector::parse("least-conn"),
+        TunnelSelector::ByKeyword(PoolKeyword::LeastConn)
+    );
 }
 
 #[test]
 fn test_f10_bnd_shared_port_anonymous_rejected_when_disallowed() {
     let registry = Arc::new(TunnelRegistry::new());
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
-    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::RoundRobin, false);
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        false,
+    );
 
     let res = router.authenticate(None);
     assert!(matches!(res, Err(ProxyAuthError::AuthRequired)));
@@ -817,9 +921,18 @@ fn test_f10_bnd_shared_port_anonymous_rejected_when_disallowed() {
 #[test]
 fn test_f10_bnd_shared_port_wrong_global_password() {
     let registry = Arc::new(TunnelRegistry::new());
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
-    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::RoundRobin, false)
-        .with_auth(AuthMode::Global, Some("correct_password".to_string()));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        false,
+    )
+    .with_auth(AuthMode::Global, Some("correct_password".to_string()));
 
     let res = router.authenticate(Some(("user", "wrong_password")));
     assert!(matches!(res, Err(ProxyAuthError::InvalidCredentials)));
@@ -830,14 +943,29 @@ async fn test_f10_bnd_shared_port_pool_isolation_rejected() {
     let registry = Arc::new(TunnelRegistry::new());
     let t1 = load_tunnel_config_from_str("pool_a_tun", &make_valid_wg_conf()).unwrap();
     let t2 = load_tunnel_config_from_str("pool_b_tun", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("pool_a_tun", t1, LifecycleMode::Lazy)).unwrap();
-    registry.register(TunnelEntry::new("pool_b_tun", t2, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("pool_a_tun", t1, LifecycleMode::Lazy))
+        .unwrap();
+    registry
+        .register(TunnelEntry::new("pool_b_tun", t2, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
-    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::RoundRobin, true);
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
     router.set_allowed_tunnels(Some(vec!["pool_a_tun".to_string()]));
 
-    let res = router.select_tunnel(&TunnelSelector::ById("pool_b_tun".to_string())).await;
+    let res = router
+        .select_tunnel(&TunnelSelector::ById("pool_b_tun".to_string()))
+        .await;
     assert!(res.is_err());
 }
 
@@ -849,9 +977,15 @@ async fn test_f10_bnd_shared_port_pool_isolation_rejected() {
 async fn test_f11_bnd_idle_timeout_reset_on_activity() {
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("active_idle", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("active_idle", t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("active_idle", t, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_millis(50), Duration::from_millis(10));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_millis(50),
+        Duration::from_millis(10),
+    );
     let (_active, guard) = lifecycle.get_or_activate("active_idle").await.unwrap();
 
     let entry = registry.get("active_idle").unwrap();
@@ -866,9 +1000,15 @@ async fn test_f11_bnd_idle_timeout_reset_on_activity() {
 async fn test_f11_bnd_concurrent_activation_deduplication() {
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("dedup_wake", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("dedup_wake", t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("dedup_wake", t, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = Arc::new(LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1)));
+    let lifecycle = Arc::new(LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    ));
 
     let lc1 = Arc::clone(&lifecycle);
     let lc2 = Arc::clone(&lifecycle);
@@ -887,34 +1027,58 @@ async fn test_f11_bnd_concurrent_activation_deduplication() {
 async fn test_f11_bnd_suspend_already_dormant_is_noop() {
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("dormant_noop", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("dormant_noop", t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("dormant_noop", t, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     let res = lifecycle.suspend_tunnel("dormant_noop").await;
     assert!(res.is_ok());
-    assert_eq!(*registry.get("dormant_noop").unwrap().state.read(), TunnelState::Dormant);
+    assert_eq!(
+        *registry.get("dormant_noop").unwrap().state.read(),
+        TunnelState::Dormant
+    );
 }
 
 #[tokio::test]
 async fn test_f11_bnd_manual_activation_state_tracking() {
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("man_act", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("man_act", t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("man_act", t, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     lifecycle.activate_tunnel("man_act").await.unwrap();
 
     assert_eq!(registry.active_count(), 1);
-    assert_eq!(*registry.get("man_act").unwrap().state.read(), TunnelState::Active);
+    assert_eq!(
+        *registry.get("man_act").unwrap().state.read(),
+        TunnelState::Active
+    );
 }
 
 #[tokio::test]
 async fn test_f11_bnd_rapid_activate_suspend_cycles() {
     let registry = Arc::new(TunnelRegistry::new());
     let t = load_tunnel_config_from_str("cycle_tun", &make_valid_wg_conf()).unwrap();
-    registry.register(TunnelEntry::new("cycle_tun", t, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("cycle_tun", t, LifecycleMode::Lazy))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     for _ in 0..5 {
         let (_act, guard) = lifecycle.get_or_activate("cycle_tun").await.unwrap();
         drop(guard);
@@ -936,7 +1100,11 @@ async fn test_f12_bnd_admin_missing_bearer_token_returns_401() {
     config.admin.auth_token = Some("secure_secret_token".to_string());
 
     let manager = Arc::new(TunnelManager::new(config.clone(), Vec::new()).unwrap());
-    let server = wpmulti::api::AdminServer::new(config.admin.bind, Arc::clone(&manager), config.admin.auth_token);
+    let server = wpmulti::api::AdminServer::new(
+        config.admin.bind,
+        Arc::clone(&manager),
+        config.admin.auth_token,
+    );
     let bound = server.start().await.unwrap();
 
     let client = AdminTestClient::new(bound, None);
@@ -955,7 +1123,11 @@ async fn test_f12_bnd_admin_invalid_bearer_token_returns_401() {
     config.admin.auth_token = Some("secure_secret_token".to_string());
 
     let manager = Arc::new(TunnelManager::new(config.clone(), Vec::new()).unwrap());
-    let server = wpmulti::api::AdminServer::new(config.admin.bind, Arc::clone(&manager), config.admin.auth_token);
+    let server = wpmulti::api::AdminServer::new(
+        config.admin.bind,
+        Arc::clone(&manager),
+        config.admin.auth_token,
+    );
     let bound = server.start().await.unwrap();
 
     let client = AdminTestClient::new(bound, Some("wrong_token".to_string()));
@@ -977,7 +1149,12 @@ async fn test_f12_bnd_admin_non_existent_route_returns_404() {
     let bound = server.start().await.unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
-    stream.write_all(b"GET /non_existent_path HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").await.unwrap();
+    stream
+        .write_all(
+            b"GET /non_existent_path HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp).await.unwrap();
     let resp_str = String::from_utf8_lossy(&resp);

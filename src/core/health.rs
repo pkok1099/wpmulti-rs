@@ -4,8 +4,8 @@
 //! tunnel health, tripping passive circuit breakers for dormant/lazy tunnels with 0% idle CPU,
 //! and actively probing eager tunnels.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
@@ -32,9 +32,9 @@ pub enum HealthStatus {
 impl std::fmt::Display for HealthStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HealthStatus::Healthy => write!(f, "healthy"),
-            HealthStatus::Unhealthy => write!(f, "unhealthy"),
-            HealthStatus::HalfOpen => write!(f, "half_open"),
+            Self::Healthy => write!(f, "healthy"),
+            Self::Unhealthy => write!(f, "unhealthy"),
+            Self::HalfOpen => write!(f, "half_open"),
         }
     }
 }
@@ -59,7 +59,7 @@ impl Default for TunnelHealthTracker {
 
 impl TunnelHealthTracker {
     /// Construct a new tracker initialized to Healthy.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             status: RwLock::new(HealthStatus::Healthy),
             consecutive_failures: AtomicUsize::new(0),
@@ -75,8 +75,7 @@ impl TunnelHealthTracker {
     pub fn is_routable(&self) -> bool {
         let mut status = self.status.write();
         match *status {
-            HealthStatus::Healthy => true,
-            HealthStatus::HalfOpen => true,
+            HealthStatus::Healthy | HealthStatus::HalfOpen => true,
             HealthStatus::Unhealthy => {
                 let cooldown = self.cooldown_until.read();
                 if let Some(until) = *cooldown {
@@ -146,16 +145,15 @@ impl TunnelHealthTracker {
 
     /// Return the remaining cooldown in seconds, or 0 if not currently cooling down.
     pub fn cooldown_remaining_secs(&self) -> u64 {
-        if let Some(until) = *self.cooldown_until.read() {
+        let until = *self.cooldown_until.read();
+        until.map_or(0, |u| {
             let now = Instant::now();
-            if until > now {
-                until.duration_since(now).as_secs()
+            if u > now {
+                u.duration_since(now).as_secs()
             } else {
                 0
             }
-        } else {
-            0
-        }
+        })
     }
 
     /// Reset tracker back to initial Healthy state.
@@ -169,6 +167,7 @@ impl TunnelHealthTracker {
 /// Background supervisor periodically checking eager tunnels via `force_handshake`.
 ///
 /// Strictly ignores lazy tunnels to ensure zero background overhead while dormant.
+#[derive(Debug)]
 pub struct ActiveProber {
     shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
     task_handle: Mutex<Option<JoinHandle<()>>>,
@@ -182,7 +181,7 @@ impl Default for ActiveProber {
 
 impl ActiveProber {
     /// Create a new dormant active prober.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             shutdown_tx: Mutex::new(None),
             task_handle: Mutex::new(None),
@@ -190,18 +189,15 @@ impl ActiveProber {
     }
 
     /// Start the active prober background task.
-    pub fn start(
-        &self,
-        registry: Arc<TunnelRegistry>,
-        settings: HealthCheckSettings,
-    ) {
-        let mut tx_guard = self.shutdown_tx.lock();
-        if tx_guard.is_some() {
-            return;
-        }
-
+    pub fn start(&self, registry: Arc<TunnelRegistry>, settings: HealthCheckSettings) {
         let (tx, mut rx) = watch::channel(false);
-        *tx_guard = Some(tx);
+        {
+            let mut tx_guard = self.shutdown_tx.lock();
+            if tx_guard.is_some() {
+                return;
+            }
+            *tx_guard = Some(tx);
+        }
 
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(settings.probe_interval);
@@ -259,11 +255,11 @@ impl ActiveProber {
                 let sem_clone = Arc::clone(&sem);
 
                 set.spawn(async move {
+                    const MAX_PROBE_ATTEMPTS: usize = 3;
                     let Ok(_permit) = sem_clone.acquire_owned().await else {
                         return;
                     };
                     let mut succeeded = false;
-                    const MAX_PROBE_ATTEMPTS: usize = 3;
                     for attempt in 0..MAX_PROBE_ATTEMPTS {
                         let probe_res = tokio::time::timeout(
                             timeout,
@@ -273,8 +269,8 @@ impl ActiveProber {
                         match probe_res {
                             Ok(Ok(())) => {
                                 health.record_success();
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs();
                                 stats.record_handshake(now);
@@ -314,7 +310,8 @@ impl ActiveProber {
 
     /// Stop the prober background task and wait for its clean shutdown.
     pub async fn stop(&self) {
-        if let Some(tx) = self.shutdown_tx.lock().take() {
+        let tx = self.shutdown_tx.lock().take();
+        if let Some(tx) = tx {
             let _ = tx.send(true);
         }
         let handle = self.task_handle.lock().take();
@@ -328,53 +325,46 @@ impl ActiveProber {
 mod tests {
     use super::*;
 
+    fn assert_tracker_state(
+        tracker: &TunnelHealthTracker,
+        status: HealthStatus,
+        failures: usize,
+        routable: bool,
+    ) {
+        assert_eq!(tracker.current_status(), status);
+        assert_eq!(tracker.consecutive_failures(), failures);
+        assert_eq!(tracker.is_routable(), routable);
+    }
+
     #[test]
     fn test_health_tracker_state_transitions() {
         let tracker = TunnelHealthTracker::new();
-        assert_eq!(tracker.current_status(), HealthStatus::Healthy);
-        assert!(tracker.is_routable());
-        assert_eq!(tracker.consecutive_failures(), 0);
+        assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
         assert_eq!(tracker.cooldown_remaining_secs(), 0);
 
         let threshold = 3;
         let cooldown = Duration::from_millis(50);
 
-        // First failure: below threshold
         tracker.record_failure(threshold, cooldown);
-        assert_eq!(tracker.consecutive_failures(), 1);
-        assert_eq!(tracker.current_status(), HealthStatus::Healthy);
-        assert!(tracker.is_routable());
+        assert_tracker_state(&tracker, HealthStatus::Healthy, 1, true);
 
-        // Success resets failures
         tracker.record_success();
-        assert_eq!(tracker.consecutive_failures(), 0);
-        assert_eq!(tracker.current_status(), HealthStatus::Healthy);
+        assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
 
-        // Trigger failures up to threshold
         tracker.record_failure(threshold, cooldown);
         tracker.record_failure(threshold, cooldown);
-        assert_eq!(tracker.consecutive_failures(), 2);
-        assert_eq!(tracker.current_status(), HealthStatus::Healthy);
-        assert!(tracker.is_routable());
+        assert_tracker_state(&tracker, HealthStatus::Healthy, 2, true);
 
-        // Tripping failure
         tracker.record_failure(threshold, cooldown);
-        assert_eq!(tracker.consecutive_failures(), 3);
-        assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
-        assert!(!tracker.is_routable());
+        assert_tracker_state(&tracker, HealthStatus::Unhealthy, 3, false);
 
-        // Wait for cooldown expiration
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(tracker.cooldown_remaining_secs(), 0);
-
-        // When cooldown expires, is_routable() transitions to HalfOpen and allows trial
         assert!(tracker.is_routable());
         assert_eq!(tracker.current_status(), HealthStatus::HalfOpen);
 
-        // Successful trial restores Healthy
         tracker.record_success();
-        assert_eq!(tracker.current_status(), HealthStatus::Healthy);
-        assert_eq!(tracker.consecutive_failures(), 0);
+        assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
     }
 
     #[test]

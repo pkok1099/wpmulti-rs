@@ -60,36 +60,55 @@ pub fn encode_target_addr(target: &TargetAddr, buf: &mut Vec<u8>) {
         TargetAddr::Domain(domain, port) => {
             buf.push(ATYP_DOMAIN);
             let bytes = domain.as_bytes();
-            let len = bytes.len().min(255) as u8;
-            buf.push(len);
-            buf.extend_from_slice(&bytes[..len as usize]);
+            let len = bytes.len().min(255);
+            buf.push(len as u8);
+            if let Some(slice) = bytes.get(..len) {
+                buf.extend_from_slice(slice);
+            }
             buf.extend_from_slice(&port.to_be_bytes());
         }
     }
+}
+
+fn copy_into_at(dst: &mut [u8], offset: usize, src: &[u8]) -> bool {
+    dst.get_mut(offset..offset + src.len()).is_some_and(|slot| {
+        slot.copy_from_slice(src);
+        true
+    })
 }
 
 /// Encodes a [`TargetAddr`] into a pre-allocated slice in SOCKS5 format, returning the number of bytes written.
 pub fn encode_target_addr_slice(target: &TargetAddr, buf: &mut [u8]) -> usize {
     match target {
         TargetAddr::Ip(SocketAddr::V4(v4)) => {
-            buf[0] = ATYP_IPV4;
-            buf[1..5].copy_from_slice(&v4.ip().octets());
-            buf[5..7].copy_from_slice(&v4.port().to_be_bytes());
+            if let Some(slot) = buf.get_mut(0) {
+                *slot = ATYP_IPV4;
+            }
+            copy_into_at(buf, 1, &v4.ip().octets());
+            copy_into_at(buf, 5, &v4.port().to_be_bytes());
             7
         }
         TargetAddr::Ip(SocketAddr::V6(v6)) => {
-            buf[0] = ATYP_IPV6;
-            buf[1..17].copy_from_slice(&v6.ip().octets());
-            buf[17..19].copy_from_slice(&v6.port().to_be_bytes());
+            if let Some(slot) = buf.get_mut(0) {
+                *slot = ATYP_IPV6;
+            }
+            copy_into_at(buf, 1, &v6.ip().octets());
+            copy_into_at(buf, 17, &v6.port().to_be_bytes());
             19
         }
         TargetAddr::Domain(domain, port) => {
-            buf[0] = ATYP_DOMAIN;
             let bytes = domain.as_bytes();
             let len = bytes.len().min(255);
-            buf[1] = len as u8;
-            buf[2..2 + len].copy_from_slice(&bytes[..len]);
-            buf[2 + len..4 + len].copy_from_slice(&port.to_be_bytes());
+            if let Some(slot) = buf.get_mut(0) {
+                *slot = ATYP_DOMAIN;
+            }
+            if let Some(slot) = buf.get_mut(1) {
+                *slot = len as u8;
+            }
+            if let Some(src) = bytes.get(..len) {
+                copy_into_at(buf, 2, src);
+            }
+            copy_into_at(buf, 2 + len, &port.to_be_bytes());
             4 + len
         }
     }
@@ -97,10 +116,10 @@ pub fn encode_target_addr_slice(target: &TargetAddr, buf: &mut [u8]) -> usize {
 
 /// Writes RFC 1928 SOCKS5 UDP header `[RSV 2B, FRAG 1B, ATYP, ADDR, PORT]` into a pre-allocated slice.
 pub fn write_socks5_udp_header(target: &TargetAddr, out: &mut [u8]) -> usize {
-    out[0] = 0x00;
-    out[1] = 0x00;
-    out[2] = 0x00;
-    let addr_len = encode_target_addr_slice(target, &mut out[3..]);
+    copy_into_at(out, 0, &[0x00, 0x00, 0x00]);
+    let addr_len = out
+        .get_mut(3..)
+        .map_or(0, |rest| encode_target_addr_slice(target, rest));
     3 + addr_len
 }
 
@@ -111,68 +130,68 @@ pub async fn send_socks5_reply<W: AsyncWrite + Unpin>(
     bnd_addr: SocketAddr,
 ) -> io::Result<()> {
     let mut reply = [0u8; 32];
-    reply[0] = SOCKS5_VERSION;
-    reply[1] = rep;
-    reply[2] = 0x00;
-    let len = encode_target_addr_slice(&TargetAddr::Ip(bnd_addr), &mut reply[3..]);
-    writer.write_all(&reply[..3 + len]).await?;
+    let len = {
+        let [ver, code, rsv, rest @ ..] = &mut reply;
+        *ver = SOCKS5_VERSION;
+        *code = rep;
+        *rsv = 0x00;
+        encode_target_addr_slice(&TargetAddr::Ip(bnd_addr), rest)
+    };
+    if let Some(frame) = reply.get(..3 + len) {
+        writer.write_all(frame).await?;
+    }
     writer.flush().await
 }
 
 /// Parses an RFC 1928 UDP datagram: `[RSV 2B, FRAG 1B, ATYP 1B, DST.ADDR, DST.PORT, Payload]`.
 pub fn parse_socks5_udp_packet(buf: &[u8]) -> Option<(TargetAddr, &[u8])> {
-    if buf.len() < 4 {
+    let &[_, _, frag, atyp, ref rest @ ..] = buf else {
         return None;
-    }
-    // buf[0..2] is RSV (0x00, 0x00)
-    // buf[2] is FRAG (fragment index); we drop non-zero fragments as standalone is standard
-    if buf[2] != 0 {
+    };
+    // frag is FRAG (fragment index); we drop non-zero fragments as standalone is standard
+    if frag != 0 {
         return None;
     }
 
-    let atyp = buf[3];
-    let mut offset = 4;
-    let target = match atyp {
+    let (target, payload) = match atyp {
         ATYP_IPV4 => {
-            if buf.len() < offset + 4 + 2 {
-                return None;
-            }
-            let ip = Ipv4Addr::new(buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]);
-            let port = u16::from_be_bytes([buf[offset + 4], buf[offset + 5]]);
-            offset += 6;
-            TargetAddr::Ip(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+            let (addr_bytes, payload) = rest.split_at_checked(4)?;
+            let ip_octets: [u8; 4] = addr_bytes.try_into().ok()?;
+            let (port_bytes, payload) = payload.split_at_checked(2)?;
+            let port_octets: [u8; 2] = port_bytes.try_into().ok()?;
+            let addr =
+                SocketAddrV4::new(Ipv4Addr::from(ip_octets), u16::from_be_bytes(port_octets));
+            (TargetAddr::Ip(SocketAddr::V4(addr)), payload)
         }
         ATYP_DOMAIN => {
-            if buf.len() < offset + 1 {
-                return None;
-            }
-            let len = buf[offset] as usize;
-            offset += 1;
-            if buf.len() < offset + len + 2 {
-                return None;
-            }
-            let domain = String::from_utf8(buf[offset..offset + len].to_vec()).ok()?;
-            offset += len;
-            let port = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-            offset += 2;
-            TargetAddr::Domain(domain, port)
+            let (&len_byte, after_len) = rest.split_first()?;
+            let len = len_byte as usize;
+            let (domain_bytes, after_domain) = after_len.split_at_checked(len)?;
+            let domain = String::from_utf8(domain_bytes.to_vec()).ok()?;
+            let (port_bytes, payload) = after_domain.split_at_checked(2)?;
+            let port_octets: [u8; 2] = port_bytes.try_into().ok()?;
+            (
+                TargetAddr::Domain(domain, u16::from_be_bytes(port_octets)),
+                payload,
+            )
         }
         ATYP_IPV6 => {
-            if buf.len() < offset + 16 + 2 {
-                return None;
-            }
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&buf[offset..offset + 16]);
-            let ip = Ipv6Addr::from(octets);
-            offset += 16;
-            let port = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-            offset += 2;
-            TargetAddr::Ip(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)))
+            let (addr_bytes, after_addr) = rest.split_at_checked(16)?;
+            let ip_octets: [u8; 16] = addr_bytes.try_into().ok()?;
+            let (port_bytes, payload) = after_addr.split_at_checked(2)?;
+            let port_octets: [u8; 2] = port_bytes.try_into().ok()?;
+            let addr = SocketAddrV6::new(
+                Ipv6Addr::from(ip_octets),
+                u16::from_be_bytes(port_octets),
+                0,
+                0,
+            );
+            (TargetAddr::Ip(SocketAddr::V6(addr)), payload)
         }
         _ => return None,
     };
 
-    Some((target, &buf[offset..]))
+    Some((target, payload))
 }
 
 /// Encapsulates a payload into an RFC 1928 UDP relay datagram.
@@ -197,22 +216,10 @@ where
     handle_socks5_with_addrs(stream, router, None, None).await
 }
 
-/// Core SOCKS5 connection handler with explicit local and peer IP addresses from the TCP control socket.
-///
-/// When `local_ip` and `peer_ip` are provided, `UDP ASSOCIATE` binds the relay socket to `local_ip`
-/// (returning a non-unspecified `BND.ADDR`) and restricts the first UDP datagram to `peer_ip`.
-pub async fn handle_socks5_with_addrs<S>(
-    mut stream: S,
-    router: Arc<dyn TunnelRouter>,
-    local_ip: Option<IpAddr>,
-    peer_ip: Option<IpAddr>,
-) -> io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    // -------------------------------------------------------------------------
-    // Phase 1: Greeting & Method Selection (RFC 1928 Section 3)
-    // -------------------------------------------------------------------------
+async fn negotiate_socks5_auth<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    router: &Arc<dyn TunnelRouter>,
+) -> io::Result<TunnelSelector> {
     let mut header = [0u8; 2];
     stream.read_exact(&mut header).await?;
     if header[0] != SOCKS5_VERSION {
@@ -234,21 +241,12 @@ where
     stream.read_exact(&mut methods).await?;
 
     let allow_anonymous = router.authenticate(None).is_ok();
-
-    let chosen_method = if allow_anonymous {
-        if methods.contains(&METHOD_NO_AUTH) {
-            METHOD_NO_AUTH
-        } else if methods.contains(&METHOD_USER_PASS) {
-            METHOD_USER_PASS
-        } else {
-            METHOD_NO_ACCEPTABLE
-        }
+    let chosen_method = if allow_anonymous && methods.contains(&METHOD_NO_AUTH) {
+        METHOD_NO_AUTH
+    } else if methods.contains(&METHOD_USER_PASS) {
+        METHOD_USER_PASS
     } else {
-        if methods.contains(&METHOD_USER_PASS) {
-            METHOD_USER_PASS
-        } else {
-            METHOD_NO_ACCEPTABLE
-        }
+        METHOD_NO_ACCEPTABLE
     };
 
     stream.write_all(&[SOCKS5_VERSION, chosen_method]).await?;
@@ -261,60 +259,56 @@ where
         ));
     }
 
-    // -------------------------------------------------------------------------
-    // Phase 2: RFC 1929 Subnegotiation (if User/Pass chosen)
-    // -------------------------------------------------------------------------
-    let selector = if chosen_method == METHOD_USER_PASS {
-        let mut auth_ver = [0u8; 2];
-        stream.read_exact(&mut auth_ver).await?;
-        if auth_ver[0] != RFC1929_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported RFC 1929 auth version: 0x{:02X}", auth_ver[0]),
-            ));
-        }
-
-        let ulen = auth_ver[1] as usize;
-        let mut uname_buf = vec![0u8; ulen];
-        stream.read_exact(&mut uname_buf).await?;
-
-        let mut plen_buf = [0u8; 1];
-        stream.read_exact(&mut plen_buf).await?;
-        let plen = plen_buf[0] as usize;
-        let mut pass_buf = vec![0u8; plen];
-        stream.read_exact(&mut pass_buf).await?;
-
-        let username = String::from_utf8_lossy(&uname_buf);
-        let password = String::from_utf8_lossy(&pass_buf);
-
-        match router.authenticate(Some((&username, &password))) {
-            Ok(sel) => {
-                stream.write_all(&[RFC1929_VERSION, 0x00]).await?;
-                stream.flush().await?;
-                sel
-            }
-            Err(err) => {
-                tracing::debug!("SOCKS5 RFC 1929 authentication rejected: {:?}", err);
-                stream.write_all(&[RFC1929_VERSION, 0x01]).await?;
-                stream.flush().await?;
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "authentication rejected",
-                ));
-            }
-        }
-    } else {
-        router.authenticate(None).map_err(|e| {
+    if chosen_method != METHOD_USER_PASS {
+        return router.authenticate(None).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("anonymous access not permitted: {:?}", e),
+                format!("anonymous access not permitted: {e:?}"),
             )
-        })?
-    };
+        });
+    }
 
-    // -------------------------------------------------------------------------
-    // Phase 3: Command Request (RFC 1928 Section 4)
-    // -------------------------------------------------------------------------
+    let mut auth_ver = [0u8; 2];
+    stream.read_exact(&mut auth_ver).await?;
+    if auth_ver[0] != RFC1929_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported RFC 1929 auth version: 0x{:02X}", auth_ver[0]),
+        ));
+    }
+
+    let mut uname_buf = vec![0u8; auth_ver[1] as usize];
+    stream.read_exact(&mut uname_buf).await?;
+
+    let mut plen_buf = [0u8; 1];
+    stream.read_exact(&mut plen_buf).await?;
+    let mut pass_buf = vec![0u8; plen_buf[0] as usize];
+    stream.read_exact(&mut pass_buf).await?;
+
+    let username = String::from_utf8_lossy(&uname_buf);
+    let password = String::from_utf8_lossy(&pass_buf);
+
+    match router.authenticate(Some((&username, &password))) {
+        Ok(sel) => {
+            stream.write_all(&[RFC1929_VERSION, 0x00]).await?;
+            stream.flush().await?;
+            Ok(sel)
+        }
+        Err(err) => {
+            tracing::debug!("SOCKS5 RFC 1929 authentication rejected: {:?}", err);
+            stream.write_all(&[RFC1929_VERSION, 0x01]).await?;
+            stream.flush().await?;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authentication rejected",
+            ))
+        }
+    }
+}
+
+async fn read_socks5_command<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> io::Result<(u8, TargetAddr)> {
     let mut cmd_hdr = [0u8; 4];
     stream.read_exact(&mut cmd_hdr).await?;
     if cmd_hdr[0] != SOCKS5_VERSION {
@@ -325,9 +319,7 @@ where
     }
 
     let cmd = cmd_hdr[1];
-    let atyp = cmd_hdr[3];
-
-    let target = match atyp {
+    let target = match cmd_hdr[3] {
         ATYP_IPV4 => {
             let mut buf = [0u8; 6];
             stream.read_exact(&mut buf).await?;
@@ -338,16 +330,13 @@ where
         ATYP_DOMAIN => {
             let mut len_buf = [0u8; 1];
             stream.read_exact(&mut len_buf).await?;
-            let len = len_buf[0] as usize;
-            let mut dom_buf = vec![0u8; len];
+            let mut dom_buf = vec![0u8; len_buf[0] as usize];
             stream.read_exact(&mut dom_buf).await?;
-            let domain = String::from_utf8(dom_buf).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid domain string")
-            })?;
+            let domain = String::from_utf8(dom_buf)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid domain string"))?;
             let mut port_buf = [0u8; 2];
             stream.read_exact(&mut port_buf).await?;
-            let port = u16::from_be_bytes(port_buf);
-            TargetAddr::Domain(domain, port)
+            TargetAddr::Domain(domain, u16::from_be_bytes(port_buf))
         }
         ATYP_IPV6 => {
             let mut buf = [0u8; 18];
@@ -360,21 +349,35 @@ where
         }
         other => {
             let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
-            let _ = send_socks5_reply(&mut stream, REP_ADDR_NOT_SUPPORTED, dummy_addr).await;
+            let _ = send_socks5_reply(stream, REP_ADDR_NOT_SUPPORTED, dummy_addr).await;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported address type 0x{:02X}", other),
+                format!("unsupported address type 0x{other:02X}"),
             ));
         }
     };
 
-    // -------------------------------------------------------------------------
-    // Phase 4: Command Execution (CONNECT or UDP ASSOCIATE)
-    // -------------------------------------------------------------------------
+    Ok((cmd, target))
+}
+
+/// Core SOCKS5 connection handler with explicit local and peer IP addresses from the TCP control socket.
+///
+/// When `local_ip` and `peer_ip` are provided, `UDP ASSOCIATE` binds the relay socket to `local_ip`
+/// (returning a non-unspecified `BND.ADDR`) and restricts the first UDP datagram to `peer_ip`.
+pub async fn handle_socks5_with_addrs<S>(
+    mut stream: S,
+    router: Arc<dyn TunnelRouter>,
+    local_ip: Option<IpAddr>,
+    peer_ip: Option<IpAddr>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let selector = negotiate_socks5_auth(&mut stream, &router).await?;
+    let (cmd, target) = read_socks5_command(&mut stream).await?;
+
     match cmd {
-        CMD_CONNECT => {
-            handle_connect(stream, router, &selector, target).await
-        }
+        CMD_CONNECT => handle_connect(stream, router, &selector, target).await,
         CMD_UDP_ASSOCIATE => {
             handle_udp_associate(stream, router, &selector, local_ip, peer_ip).await
         }
@@ -383,7 +386,7 @@ where
             let _ = send_socks5_reply(&mut stream, REP_CMD_NOT_SUPPORTED, dummy_addr).await;
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("unsupported SOCKS5 command 0x{:02X}", other),
+                format!("unsupported SOCKS5 command 0x{other:02X}"),
             ))
         }
     }
@@ -427,6 +430,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let mut tunnel_stream: DynStream = match target_tunnel.tcp_connect(dst_addr).await {
         Ok(s) => s,
         Err(e) => {
+            #[allow(clippy::wildcard_enum_match_arm)]
             let rep = match e.kind() {
                 io::ErrorKind::ConnectionRefused => REP_CONN_REFUSED,
                 io::ErrorKind::TimedOut => REP_TTL_EXPIRED,
@@ -476,7 +480,11 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     let relay_socket = match tokio::net::UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("Failed to bind Tokio UDP relay socket on {}: {:?}", bind_addr, e);
+            tracing::error!(
+                "Failed to bind Tokio UDP relay socket on {}: {:?}",
+                bind_addr,
+                e
+            );
             let _ = send_socks5_reply(&mut stream, REP_GENERAL_FAILURE, dummy_addr).await;
             return Err(e);
         }
@@ -505,17 +513,73 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     send_socks5_reply(&mut stream, REP_SUCCESS, relay_addr).await?;
 
     // Run UDP relay session driven by the TCP control connection lifecycle
-    run_udp_relay_loop(&mut stream, relay_socket, virtual_udp, target_tunnel, peer_ip).await
+    run_udp_relay_loop(
+        &mut stream,
+        relay_socket,
+        virtual_udp,
+        target_tunnel,
+        peer_ip,
+    )
+    .await
 }
 
 /// Normalizes IPv4-mapped IPv6 addresses to IPv4 for consistent peer IP comparison.
-fn normalize_ip(ip: IpAddr) -> IpAddr {
+const fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),
             None => IpAddr::V6(v6),
         },
-        v4 => v4,
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    }
+}
+
+async fn forward_client_udp_datagram(
+    packet: &[u8],
+    from_addr: SocketAddr,
+    client_udp_addr: &mut Option<SocketAddr>,
+    normalized_expected_ip: Option<IpAddr>,
+    virtual_udp: &dyn ProxyUdpSocket,
+    target_tunnel: &Arc<dyn ProxyTunnelTarget>,
+) {
+    if let Some(expected_addr) = *client_udp_addr {
+        if expected_addr != from_addr {
+            tracing::warn!(
+                "Ignoring UDP packet from unexpected source {}; expected locked source {}",
+                from_addr,
+                expected_addr
+            );
+            return;
+        }
+    } else {
+        if let Some(expected_ip) = normalized_expected_ip
+            && normalize_ip(from_addr.ip()) != expected_ip
+        {
+            tracing::warn!(
+                "Rejecting UDP associate packet from {} (does not match control TCP peer IP {})",
+                from_addr,
+                expected_ip
+            );
+            return;
+        }
+        *client_udp_addr = Some(from_addr);
+    }
+
+    let Some((target_addr, payload)) = parse_socks5_udp_packet(packet) else {
+        return;
+    };
+    let resolved = match target_addr {
+        TargetAddr::Ip(addr) => Some(addr),
+        TargetAddr::Domain(ref dom, port) => match target_tunnel.resolve_in_tunnel(dom).await {
+            Ok(ip) => Some(SocketAddr::new(ip, port)),
+            Err(e) => {
+                tracing::warn!("Failed to resolve UDP target domain '{}': {:?}", dom, e);
+                None
+            }
+        },
+    };
+    if let Some(target_sock) = resolved {
+        let _ = virtual_udp.send_to(payload, target_sock).await;
     }
 }
 
@@ -538,61 +602,25 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
 
     loop {
         tokio::select! {
-            // 1. Monitor TCP control connection for EOF / termination
             tcp_res = control_stream.read(&mut tcp_byte) => {
-                match tcp_res {
-                    Ok(0) | Err(_) => {
-                        tracing::debug!("SOCKS5 UDP ASSOCIATE control connection closed by client");
-                        break;
-                    }
-                    Ok(_) => {
-                        // Unexpected data on control stream; continue
-                    }
+                if !matches!(tcp_res, Ok(1..)) {
+                    tracing::debug!("SOCKS5 UDP ASSOCIATE control connection closed by client");
+                    break;
                 }
             }
 
-            // 2. Incoming datagram from client on Tokio UDP relay socket
             relay_res = relay_socket.recv_from(&mut relay_buf) => {
                 match relay_res {
                     Ok((n, from_addr)) => {
-                        if let Some(expected_addr) = client_udp_addr {
-                            if expected_addr != from_addr {
-                                tracing::warn!(
-                                    "Ignoring UDP packet from unexpected source {}; expected locked source {}",
-                                    from_addr,
-                                    expected_addr
-                                );
-                                continue;
-                            }
-                        } else {
-                            if let Some(expected_ip) = normalized_expected_ip
-                                && normalize_ip(from_addr.ip()) != expected_ip
-                            {
-                                tracing::warn!(
-                                    "Rejecting UDP associate packet from {} (does not match control TCP peer IP {})",
-                                    from_addr,
-                                    expected_ip
-                                );
-                                continue;
-                            }
-                            client_udp_addr = Some(from_addr);
-                        }
-                        if let Some((target_addr, payload)) = parse_socks5_udp_packet(&relay_buf[..n]) {
-                            let resolved = match target_addr {
-                                TargetAddr::Ip(addr) => Some(addr),
-                                TargetAddr::Domain(ref dom, port) => {
-                                    match target_tunnel.resolve_in_tunnel(dom).await {
-                                        Ok(ip) => Some(SocketAddr::new(ip, port)),
-                                        Err(e) => {
-                                            tracing::warn!("Failed to resolve UDP target domain '{}': {:?}", dom, e);
-                                            None
-                                        }
-                                    }
-                                }
-                            };
-                            if let Some(target_sock) = resolved {
-                                let _ = virtual_udp.send_to(payload, target_sock).await;
-                            }
+                        if let Some(pkt) = relay_buf.get(..n) {
+                            forward_client_udp_datagram(
+                                pkt,
+                                from_addr,
+                                &mut client_udp_addr,
+                                normalized_expected_ip,
+                                virtual_udp.as_ref(),
+                                &target_tunnel,
+                            ).await;
                         }
                     }
                     Err(e) => {
@@ -602,14 +630,19 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
                 }
             }
 
-            // 3. Incoming datagram from tunnel on Virtual UDP socket
             virtual_res = virtual_udp.recv_from(&mut virtual_buf) => {
                 match virtual_res {
                     Ok((n, peer_addr)) => {
-                        if let Some(c_addr) = client_udp_addr {
+                        if let Some(c_addr) = client_udp_addr
+                            && let Some(payload) = virtual_buf.get(..n)
+                        {
                             let hdr_len = write_socks5_udp_header(&TargetAddr::Ip(peer_addr), &mut out_pkt_buf);
-                            out_pkt_buf[hdr_len..hdr_len + n].copy_from_slice(&virtual_buf[..n]);
-                            let _ = relay_socket.send_to(&out_pkt_buf[..hdr_len + n], c_addr).await;
+                            if let Some(dst) = out_pkt_buf.get_mut(hdr_len..hdr_len + n) {
+                                dst.copy_from_slice(payload);
+                                if let Some(frame) = out_pkt_buf.get(..hdr_len + n) {
+                                    let _ = relay_socket.send_to(frame, c_addr).await;
+                                }
+                            }
                         }
                     }
                     Err(e) => {

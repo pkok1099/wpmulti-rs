@@ -12,16 +12,14 @@ pub mod router;
 #[cfg(test)]
 pub mod tests;
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{
-    load_tunnel_configs_from_dir, LifecycleMode, MainConfig, TunnelConfig,
-};
+use crate::config::{LifecycleMode, MainConfig, TunnelConfig, load_tunnel_configs_from_dir};
 pub use health::{ActiveProber, HealthStatus, TunnelHealthTracker};
 pub use lifecycle::{GuardedStream, GuardedTunnelTarget, LifecycleController, TunnelConnGuard};
 pub use listener::{ActiveListenerInfo, ListenerSupervisor};
@@ -66,6 +64,7 @@ pub struct ReloadReport {
 }
 
 /// Central multi-tunnel coordinator managing lifecycle, routing, and listeners.
+#[derive(Debug)]
 pub struct TunnelManager {
     config: RwLock<MainConfig>,
     config_path: RwLock<Option<std::path::PathBuf>>,
@@ -97,11 +96,8 @@ impl TunnelManager {
 
         let idle_timeout = config.lifecycle.idle_timeout;
         let check_interval = Duration::from_secs(1);
-        let lifecycle = LifecycleController::new(
-            Arc::clone(&registry),
-            idle_timeout,
-            check_interval,
-        );
+        let lifecycle =
+            LifecycleController::new(Arc::clone(&registry), idle_timeout, check_interval);
         lifecycle.set_prefer_ipv6(
             config.global.dns_preference == crate::config::toml_config::DnsPreference::Ipv6First,
         );
@@ -126,27 +122,27 @@ impl TunnelManager {
     }
 
     /// Access the underlying [`TunnelRegistry`].
-    pub fn registry(&self) -> &Arc<TunnelRegistry> {
+    pub const fn registry(&self) -> &Arc<TunnelRegistry> {
         &self.registry
     }
 
     /// Access the underlying [`LifecycleController`].
-    pub fn lifecycle(&self) -> &Arc<LifecycleController> {
+    pub const fn lifecycle(&self) -> &Arc<LifecycleController> {
         &self.lifecycle
     }
 
     /// Access the underlying [`ListenerSupervisor`].
-    pub fn listeners(&self) -> &Arc<ListenerSupervisor> {
+    pub const fn listeners(&self) -> &Arc<ListenerSupervisor> {
         &self.listeners
     }
 
     /// Access the underlying [`ActiveProber`].
-    pub fn prober(&self) -> &Arc<ActiveProber> {
+    pub const fn prober(&self) -> &Arc<ActiveProber> {
         &self.prober
     }
 
     /// Access the daemon's bounded [`crate::tui::TuiLogBuffer`].
-    pub fn log_buffer(&self) -> &crate::tui::TuiLogBuffer {
+    pub const fn log_buffer(&self) -> &crate::tui::TuiLogBuffer {
         &self.log_buffer
     }
 
@@ -176,7 +172,8 @@ impl TunnelManager {
                 continue;
             }
             if let Some((a_str, b_str)) = tok.split_once('-')
-                && let (Ok(a), Ok(b)) = (a_str.trim().parse::<usize>(), b_str.trim().parse::<usize>())
+                && let (Ok(a), Ok(b)) =
+                    (a_str.trim().parse::<usize>(), b_str.trim().parse::<usize>())
             {
                 if a == 0 || b == 0 || a > b {
                     return Err(CoreError::ActivationFailed(
@@ -186,8 +183,8 @@ impl TunnelManager {
                 }
                 let start = a - 1;
                 let end = b.min(sorted_ids.len());
-                if start < end {
-                    for id in &sorted_ids[start..end] {
+                if let Some(slice) = sorted_ids.get(start..end) {
+                    for id in slice {
                         if !selected.contains(id) {
                             selected.push(id.clone());
                         }
@@ -196,14 +193,13 @@ impl TunnelManager {
                 continue;
             }
             if let Ok(idx) = tok.parse::<usize>() {
-                if idx == 0 || idx > sorted_ids.len() {
+                let Some(id) = idx.checked_sub(1).and_then(|i| sorted_ids.get(i)) else {
                     return Err(CoreError::TunnelNotFound(format!(
                         "tunnel index {} out of range (1..={})",
                         idx,
                         sorted_ids.len()
                     )));
-                }
-                let id = &sorted_ids[idx - 1];
+                };
                 if !selected.contains(id) {
                     selected.push(id.clone());
                 }
@@ -313,9 +309,10 @@ impl TunnelManager {
                 let lifecycle = Arc::clone(&self.lifecycle);
                 let sem = Arc::clone(&sem);
                 set.spawn(async move {
-                    let _permit = sem.acquire_owned().await.map_err(|_| {
-                        CoreError::Other("Boot semaphore closed".to_string())
-                    })?;
+                    let _permit = sem
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| CoreError::Other("Boot semaphore closed".to_string()))?;
                     tracing::info!("Eagerly booting Eager tunnel '{}'", id);
                     lifecycle.activate_tunnel(&id).await?;
                     Ok::<(), CoreError>(())
@@ -328,8 +325,7 @@ impl TunnelManager {
                     Ok(Err(e)) => return Err(e),
                     Err(e) => {
                         return Err(CoreError::Other(format!(
-                            "Parallel tunnel boot task failed: {}",
-                            e
+                            "Parallel tunnel boot task failed: {e}"
                         )));
                     }
                 }
@@ -338,7 +334,8 @@ impl TunnelManager {
 
         // 3. Start active prober for eager tunnels
         let cfg = self.config.read().clone();
-        self.prober.start(Arc::clone(&self.registry), cfg.health_check.clone());
+        self.prober
+            .start(Arc::clone(&self.registry), cfg.health_check.clone());
 
         // 4. Start listeners
         self.listeners
@@ -443,7 +440,8 @@ impl TunnelManager {
                         let saved_port = *existing.assigned_port.read();
                         *existing.config.write() = t_cfg.clone();
 
-                        let new_entry = TunnelEntry::new(t_cfg.id.clone(), t_cfg, existing.lifecycle_mode);
+                        let new_entry =
+                            TunnelEntry::new(t_cfg.id.clone(), t_cfg, existing.lifecycle_mode);
                         if let Some(p) = saved_port {
                             new_entry.set_assigned_port(p);
                         }
@@ -462,9 +460,9 @@ impl TunnelManager {
                     default_mode
                 };
                 let new_id = t_cfg.id.clone();
-                let entry = self
-                    .registry
-                    .register(TunnelEntry::new(new_id.clone(), t_cfg, mode))?;
+                let entry =
+                    self.registry
+                        .register(TunnelEntry::new(new_id.clone(), t_cfg, mode))?;
 
                 if cfg_snapshot.per_tunnel.enabled
                     && self.listeners.is_started()

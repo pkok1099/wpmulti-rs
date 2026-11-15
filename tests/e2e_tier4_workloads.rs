@@ -1,13 +1,31 @@
+#![allow(
+    unreachable_pub,
+    unused_qualifications,
+    trivial_casts,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::type_complexity,
+    clippy::wildcard_enum_match_arm,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
+
 mod common;
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{
-    generate_245_cloned_wgcf_configs, AdminTestClient, TestEnvironment, WgConfBuilder,
-    WgPeerFixture,
+    AdminTestClient, TestEnvironment, WgConfBuilder, WgPeerFixture,
+    generate_245_cloned_wgcf_configs,
 };
 use etherparse::PacketBuilder;
 use gotatun::tun::IpRecv;
@@ -16,17 +34,14 @@ use smoltcp::phy::{Device, TxToken};
 use tokio::task::JoinSet;
 use wpmulti::api::AdminServer;
 use wpmulti::config::{
-    AuthMode, LifecycleMode, MainConfig, PoolStrategy, SharedListenerSettings,
-    TunnelConfig, TunnelPoolSelection, WgInterfaceConfig, WgPeerConfig,
+    AuthMode, LifecycleMode, MainConfig, PoolStrategy, SharedListenerSettings, TunnelConfig,
+    TunnelPoolSelection, WgInterfaceConfig, WgPeerConfig,
 };
 use wpmulti::core::{
-    LifecycleController, MultiTenantRouter, TunnelEntry, TunnelManager, TunnelRegistry,
-    TunnelState,
+    LifecycleController, MultiTenantRouter, TunnelEntry, TunnelManager, TunnelRegistry, TunnelState,
 };
-use wpmulti::netstack::{build_query, DnsLruCache, QueryType, VirtualTunBridge};
-use wpmulti::proxy::{
-    parse_socks5_udp_packet, TargetAddr, TunnelRouter, TunnelSelector,
-};
+use wpmulti::netstack::{DnsLruCache, QueryType, VirtualTunBridge, build_query};
+use wpmulti::proxy::{TargetAddr, TunnelRouter, TunnelSelector, parse_socks5_udp_packet};
 
 fn make_test_conf(id: &str, endpoint: &str) -> TunnelConfig {
     TunnelConfig {
@@ -99,9 +114,7 @@ async fn test_scenario_1_245_cloned_wgcf_concurrency_and_ipv6() {
     for i in 1..=20 {
         let mgr = Arc::clone(&manager);
         let tid = format!("wgcf-{:03}", i);
-        join_set.spawn(async move {
-            mgr.activate_tunnel(&tid).await.map(|a| a.id.clone())
-        });
+        join_set.spawn(async move { mgr.activate_tunnel(&tid).await.map(|a| a.id.clone()) });
     }
 
     let mut activated_count = 0;
@@ -123,7 +136,9 @@ async fn test_scenario_1_245_cloned_wgcf_concurrency_and_ipv6() {
     let builder = PacketBuilder::ipv6(src_ipv6.octets(), dst_ipv6.octets(), 64).udp(12345, 53);
     builder.write(&mut ipv6_buf, ipv6_payload).unwrap();
 
-    let tx_token = bridge.transmit(smoltcp::time::Instant::from_millis(0)).unwrap();
+    let tx_token = bridge
+        .transmit(smoltcp::time::Instant::from_millis(0))
+        .unwrap();
     tx_token.consume(ipv6_buf.len(), |buf| {
         buf.copy_from_slice(&ipv6_buf);
     });
@@ -153,7 +168,8 @@ async fn test_scenario_2_shared_port_multi_user_socks5_and_http() {
     for i in 1..=10 {
         let id = format!("tenant-tun-{:02}", i);
         let conf = make_test_conf(&id, "127.0.0.1:51820");
-        reg.register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy)).unwrap();
+        reg.register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy))
+            .unwrap();
     }
 
     let lc = LifecycleController::new(
@@ -243,7 +259,9 @@ async fn test_scenario_3_lazy_lifecycle_full_cycle() {
     let registry = Arc::new(TunnelRegistry::new());
     let conf = make_test_conf("lazy-lifecycle-tun", "127.0.0.1:51820");
     let id = conf.id.clone();
-    registry.register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy))
+        .unwrap();
 
     let idle_timeout = Duration::from_millis(80);
     let check_interval = Duration::from_millis(20);
@@ -257,7 +275,10 @@ async fn test_scenario_3_lazy_lifecycle_full_cycle() {
     assert_eq!(entry.stats.active_conns.load(Ordering::SeqCst), 0);
 
     // 2. Incoming connection: Wake on Demand
-    let (active_tunnel, guard) = lifecycle.get_or_activate("lazy-lifecycle-tun").await.unwrap();
+    let (active_tunnel, guard) = lifecycle
+        .get_or_activate("lazy-lifecycle-tun")
+        .await
+        .unwrap();
     assert_eq!(active_tunnel.id, "lazy-lifecycle-tun");
     assert_eq!(*entry.state.read(), TunnelState::Active);
     assert_eq!(entry.stats.active_conns.load(Ordering::SeqCst), 1);
@@ -285,7 +306,10 @@ async fn test_scenario_3_lazy_lifecycle_full_cycle() {
     assert_eq!(*entry.state.read(), TunnelState::Suspended);
 
     // 6. Resume on new connection: wake from Suspended back to Active
-    let (resumed_tunnel, guard2) = lifecycle.get_or_activate("lazy-lifecycle-tun").await.unwrap();
+    let (resumed_tunnel, guard2) = lifecycle
+        .get_or_activate("lazy-lifecycle-tun")
+        .await
+        .unwrap();
     assert_eq!(resumed_tunnel.id, "lazy-lifecycle-tun");
     assert_eq!(*entry.state.read(), TunnelState::Active);
     assert_eq!(entry.stats.active_conns.load(Ordering::SeqCst), 1);
@@ -304,7 +328,9 @@ async fn test_scenario_4_dns_leak_prevention_heavy_fqdn_requests() {
     // Prepopulate 50 internal service FQDNs
     for i in 1..=50 {
         let domain = format!("svc-{:02}.internal.corp", i);
-        let ip: IpAddr = format!("10.100.{}.{}", (i / 250) + 1, (i % 250) + 1).parse().unwrap();
+        let ip: IpAddr = format!("10.100.{}.{}", (i / 250) + 1, (i % 250) + 1)
+            .parse()
+            .unwrap();
         cache.insert(&domain, vec![ip], 300);
     }
 
@@ -444,8 +470,8 @@ async fn test_scenario_6_high_concurrency_udp_associate_streaming() {
             s5_udp.extend_from_slice(payload_bytes);
 
             // Parse SOCKS5 UDP header
-            let (target, extracted_payload) = parse_socks5_udp_packet(&s5_udp)
-                .expect("parse socks5 udp packet");
+            let (target, extracted_payload) =
+                parse_socks5_udp_packet(&s5_udp).expect("parse socks5 udp packet");
             assert_eq!(extracted_payload, payload_bytes);
 
             match target {
@@ -461,7 +487,9 @@ async fn test_scenario_6_high_concurrency_udp_associate_streaming() {
                 .udp(15000 + client_id as u16, port);
             b.write(&mut ip_buf, extracted_payload).unwrap();
 
-            let tx_token = bridge.transmit(smoltcp::time::Instant::from_millis(0)).unwrap();
+            let tx_token = bridge
+                .transmit(smoltcp::time::Instant::from_millis(0))
+                .unwrap();
             tx_token.consume(ip_buf.len(), |buf| {
                 buf.copy_from_slice(&ip_buf);
             });

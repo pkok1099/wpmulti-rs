@@ -15,16 +15,17 @@ pub use http::{
 };
 pub use router::{
     AsyncReadWrite, DirectTunnelTarget, DynStream, PoolKeyword, PoolRouter, ProxyAuthError,
-    ProxyTunnelTarget, ProxyUdpSocket, SingleTunnelRouter, TargetAddr, TunnelRouter, TunnelSelector,
+    ProxyTunnelTarget, ProxyUdpSocket, SingleTunnelRouter, TargetAddr, TunnelRouter,
+    TunnelSelector,
 };
 pub use socks5::{
-    build_socks5_udp_packet, encode_target_addr, encode_target_addr_slice, handle_socks5,
-    handle_socks5_with_addrs, parse_socks5_udp_packet, send_socks5_reply,
-    write_socks5_udp_header, ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, CMD_BIND, CMD_CONNECT,
-    CMD_UDP_ASSOCIATE, METHOD_GSSAPI, METHOD_NO_ACCEPTABLE, METHOD_NO_AUTH, METHOD_USER_PASS,
-    REP_ADDR_NOT_SUPPORTED, REP_CMD_NOT_SUPPORTED, REP_CONN_NOT_ALLOWED, REP_CONN_REFUSED,
-    REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE, REP_NETWORK_UNREACHABLE, REP_SUCCESS,
-    REP_TTL_EXPIRED, RFC1929_VERSION, SOCKS5_VERSION,
+    ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, CMD_BIND, CMD_CONNECT, CMD_UDP_ASSOCIATE, METHOD_GSSAPI,
+    METHOD_NO_ACCEPTABLE, METHOD_NO_AUTH, METHOD_USER_PASS, REP_ADDR_NOT_SUPPORTED,
+    REP_CMD_NOT_SUPPORTED, REP_CONN_NOT_ALLOWED, REP_CONN_REFUSED, REP_GENERAL_FAILURE,
+    REP_HOST_UNREACHABLE, REP_NETWORK_UNREACHABLE, REP_SUCCESS, REP_TTL_EXPIRED, RFC1929_VERSION,
+    SOCKS5_VERSION, build_socks5_udp_packet, encode_target_addr, encode_target_addr_slice,
+    handle_socks5, handle_socks5_with_addrs, parse_socks5_udp_packet, send_socks5_reply,
+    write_socks5_udp_header,
 };
 
 /// Runs an asynchronous SOCKS5 server listening on the provided [`tokio::net::TcpListener`].
@@ -38,7 +39,8 @@ pub async fn run_socks5_listener(
         let peer_ip = Some(peer_addr.ip());
         let router_clone = Arc::clone(&router);
         tokio::spawn(async move {
-            if let Err(e) = handle_socks5_with_addrs(stream, router_clone, local_ip, peer_ip).await {
+            if let Err(e) = handle_socks5_with_addrs(stream, router_clone, local_ip, peer_ip).await
+            {
                 tracing::debug!("SOCKS5 client {} disconnected: {:?}", peer_addr, e);
             }
         });

@@ -10,12 +10,39 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::AdminServer;
 use crate::config::{
-    load_tunnel_config_from_file, load_tunnel_configs_from_dir, parse_duration_str, IpMode,
-    MainConfig, TunnelConfig,
+    IpMode, MainConfig, TunnelConfig, load_tunnel_config_from_file, load_tunnel_configs_from_dir,
+    parse_duration_str,
 };
 use crate::core::TunnelManager;
-use crate::netstack::{VirtualNetworkStack, VirtualTunBridge, DEFAULT_CHANNEL_CAPACITY};
-use crate::tui::{run_terminal_tui, TuiApp, TuiDataSource};
+use crate::netstack::{DEFAULT_CHANNEL_CAPACITY, VirtualNetworkStack, VirtualTunBridge};
+use crate::tui::{TuiApp, TuiDataSource, run_terminal_tui};
+
+fn init_logging(
+    log_level: crate::config::LogLevel,
+    tui_mode: bool,
+    log_buffer: &crate::tui::TuiLogBuffer,
+) {
+    let max_level = match log_level {
+        crate::config::LogLevel::Trace => tracing::Level::TRACE,
+        crate::config::LogLevel::Debug => tracing::Level::DEBUG,
+        crate::config::LogLevel::Info => tracing::Level::INFO,
+        crate::config::LogLevel::Warn => tracing::Level::WARN,
+        crate::config::LogLevel::Error => tracing::Level::ERROR,
+    };
+    if tui_mode {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .with_ansi(false)
+            .with_writer(log_buffer.clone())
+            .try_init();
+    } else {
+        use tracing_subscriber::fmt::writer::MakeWriterExt;
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .with_writer(log_buffer.clone().and(std::io::stdout))
+            .try_init();
+    }
+}
 
 /// Execute the `wpmulti run` command: starts multi-tunnel daemon and optional TUI.
 pub async fn cmd_run(
@@ -37,16 +64,9 @@ pub async fn cmd_run(
         config.global.config_dir = dir;
     }
 
-    let max_level = match config.global.log_level {
-        crate::config::LogLevel::Trace => tracing::Level::TRACE,
-        crate::config::LogLevel::Debug => tracing::Level::DEBUG,
-        crate::config::LogLevel::Info => tracing::Level::INFO,
-        crate::config::LogLevel::Warn => tracing::Level::WARN,
-        crate::config::LogLevel::Error => tracing::Level::ERROR,
-    };
     let tunnels = if config.global.config_dir.exists() {
         load_tunnel_configs_from_dir(&config.global.config_dir)
-            .map_err(|e| format!("Failed to load tunnels: {}", e))?
+            .map_err(|e| format!("Failed to load tunnels: {e}"))?
     } else {
         Vec::new()
     };
@@ -54,26 +74,14 @@ pub async fn cmd_run(
     let total_tunnels = tunnels.len();
     let manager = Arc::new(
         TunnelManager::new(config.clone(), tunnels)
-            .map_err(|e| format!("Failed to initialize TunnelManager: {}", e))?,
+            .map_err(|e| format!("Failed to initialize TunnelManager: {e}"))?,
     );
 
     let tui_log_buffer = manager.log_buffer().clone();
     if let Some(ref cfg_path) = saved_config_path {
         manager.set_config_path(cfg_path.clone());
     }
-    if tui_mode {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(max_level)
-            .with_ansi(false)
-            .with_writer(tui_log_buffer.clone())
-            .try_init();
-    } else {
-        use tracing_subscriber::fmt::writer::MakeWriterExt;
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(max_level)
-            .with_writer(tui_log_buffer.clone().and(std::io::stdout))
-            .try_init();
-    }
+    init_logging(config.global.log_level, tui_mode, &tui_log_buffer);
     let tui_log_buffer = Some(tui_log_buffer);
 
     let admin_server = if config.admin.enabled {
@@ -92,15 +100,37 @@ pub async fn cmd_run(
     manager
         .start()
         .await
-        .map_err(|e| format!("Failed to start TunnelManager: {}", e))?;
+        .map_err(|e| format!("Failed to start TunnelManager: {e}"))?;
     tracing::info!(
         "wpmulti daemon started successfully with {} tunnels",
         total_tunnels
     );
 
+    run_tui_or_wait(
+        tui_mode,
+        &manager,
+        &config,
+        tui_log_buffer,
+        saved_config_path,
+        admin_server,
+    )
+    .await?;
+
+    tracing::info!("wpmulti stopped cleanly.");
+    Ok(())
+}
+
+async fn run_tui_or_wait(
+    tui_mode: bool,
+    manager: &Arc<TunnelManager>,
+    config: &MainConfig,
+    tui_log_buffer: Option<crate::tui::TuiLogBuffer>,
+    saved_config_path: Option<PathBuf>,
+    admin_server: Option<AdminServer>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if tui_mode {
         let mut app = TuiApp::new(
-            TuiDataSource::InProcess(Arc::clone(&manager)),
+            TuiDataSource::InProcess(Arc::clone(manager)),
             config.tui.default_sort,
         );
         if let Some(buf) = tui_log_buffer {
@@ -110,23 +140,17 @@ pub async fn cmd_run(
             app = app.with_config_path(path);
         }
         let _ = run_terminal_tui(app, config.tui.refresh_rate_ms).await;
-
         tracing::info!("TUI exited. Stopping daemon...");
-        let _ = manager.stop().await;
-        if let Some(srv) = admin_server {
-            srv.stop().await;
-        }
     } else {
         tracing::info!("Daemon running. Press Ctrl+C to terminate.");
         tokio::signal::ctrl_c().await?;
         tracing::info!("Shutdown signal received. Stopping daemon...");
-        let _ = manager.stop().await;
-        if let Some(srv) = admin_server {
-            srv.stop().await;
-        }
     }
 
-    tracing::info!("wpmulti stopped cleanly.");
+    let _ = manager.stop().await;
+    if let Some(srv) = admin_server {
+        srv.stop().await;
+    }
     Ok(())
 }
 
@@ -169,17 +193,13 @@ pub async fn cmd_status(
     admin_url: String,
     auth_token: Option<String>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let body = crate::tui::app::admin_http_request(
-        &admin_url,
-        "GET",
-        "/status",
-        auth_token.as_deref(),
-    )
-    .await
-    .map_err(std::io::Error::other)?;
+    let body =
+        crate::tui::app::admin_http_request(&admin_url, "GET", "/status", auth_token.as_deref())
+            .await
+            .map_err(std::io::Error::other)?;
 
-    let val: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+    let val: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| format!("Failed to parse JSON response: {e}"))?;
 
     println!("{}", serde_json::to_string_pretty(&val)?);
     Ok(val)
@@ -220,11 +240,14 @@ pub async fn cmd_toggle_tunnels(
         Some(&body),
     )
     .await
-    .map_err(|e| format!("Failed to reach Admin API: {}", e))?;
+    .map_err(|e| format!("Failed to reach Admin API: {e}"))?;
     let val: serde_json::Value = serde_json::from_slice(&resp)?;
-    let count = val["count"].as_u64().unwrap_or(0);
+    let count = val
+        .get("count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let action = if disabled { "Disabled" } else { "Enabled" };
-    println!("{} {} tunnel(s) matching '{}'.", action, count, target);
+    println!("{action} {count} tunnel(s) matching '{target}'.");
     Ok(())
 }
 
@@ -247,36 +270,24 @@ pub struct ProbeResult {
     pub error: Option<String>,
 }
 
-/// Run probe for a single tunnel config.
-pub async fn run_probe_single(
-    config: &TunnelConfig,
+fn probe_error_result(
+    id: &str,
     config_file: String,
-    timeout: Duration,
+    endpoint: String,
+    error: String,
 ) -> ProbeResult {
-    let endpoint = config
-        .peers
-        .first()
-        .map(|p| p.endpoint.clone())
-        .unwrap_or_else(|| "none".to_string());
+    ProbeResult {
+        id: id.to_string(),
+        config_file,
+        endpoint,
+        healthy: false,
+        rtt_ms: None,
+        exit_ip: None,
+        error: Some(error),
+    }
+}
 
-    let peer_pubkey = match config.peers.first().map(|p| p.public_key) {
-        Some(pk) => pk,
-        None => {
-            return ProbeResult {
-                id: config.id.clone(),
-                config_file,
-                endpoint,
-                healthy: false,
-                rtt_ms: None,
-                exit_ip: None,
-                error: Some("no peers configured in tunnel file".to_string()),
-            };
-        }
-    };
-
-    let (bridge, bridge_tx, bridge_rx) =
-        VirtualTunBridge::new(config.interface.mtu, DEFAULT_CHANNEL_CAPACITY);
-
+async fn build_probe_peers(config: &TunnelConfig) -> Vec<gotatun::device::Peer> {
     let mut peers = Vec::with_capacity(config.peers.len());
     for p_cfg in &config.peers {
         let mut peer = gotatun::device::Peer::new(p_cfg.public_key);
@@ -290,6 +301,32 @@ pub async fn run_probe_single(
         peer.keepalive = p_cfg.persistent_keepalive;
         peers.push(peer);
     }
+    peers
+}
+
+/// Run probe for a single tunnel config.
+pub async fn run_probe_single(
+    config: &TunnelConfig,
+    config_file: String,
+    timeout: Duration,
+) -> ProbeResult {
+    let endpoint = config
+        .peers
+        .first()
+        .map_or_else(|| "none".to_string(), |p| p.endpoint.clone());
+
+    let Some(peer_pubkey) = config.peers.first().map(|p| p.public_key) else {
+        return probe_error_result(
+            &config.id,
+            config_file,
+            endpoint,
+            "no peers configured in tunnel file".to_string(),
+        );
+    };
+
+    let (bridge, bridge_tx, bridge_rx) =
+        VirtualTunBridge::new(config.interface.mtu, DEFAULT_CHANNEL_CAPACITY);
+    let peers = build_probe_peers(config).await;
 
     let mut builder = gotatun::device::DeviceBuilder::new()
         .with_default_udp()
@@ -305,15 +342,12 @@ pub async fn run_probe_single(
     let device = match builder.build().await {
         Ok(d) => d,
         Err(e) => {
-            return ProbeResult {
-                id: config.id.clone(),
+            return probe_error_result(
+                &config.id,
                 config_file,
                 endpoint,
-                healthy: false,
-                rtt_ms: None,
-                exit_ip: None,
-                error: Some(format!("failed to build WireGuard device: {e}")),
-            };
+                format!("failed to build WireGuard device: {e}"),
+            );
         }
     };
 
@@ -327,16 +361,13 @@ pub async fn run_probe_single(
     {
         Ok(ns) => ns,
         Err(e) => {
-            let _ = device.suspend().await;
-            return ProbeResult {
-                id: config.id.clone(),
+            let () = device.suspend().await;
+            return probe_error_result(
+                &config.id,
                 config_file,
                 endpoint,
-                healthy: false,
-                rtt_ms: None,
-                exit_ip: None,
-                error: Some(format!("failed to build network stack: {e}")),
-            };
+                format!("failed to build network stack: {e}"),
+            );
         }
     };
 
@@ -349,16 +380,24 @@ pub async fn run_probe_single(
             (true, Some(elapsed), None)
         }
         Ok(Err(e)) => (false, None, Some(format!("handshake failed: {e}"))),
-        Err(_) => (false, None, Some(format!("handshake timed out after {:?}", timeout))),
+        Err(_) => (
+            false,
+            None,
+            Some(format!("handshake timed out after {timeout:?}")),
+        ),
     };
 
     let exit_ip = if healthy {
-        config.interface.addresses.first().map(|net| net.ip().to_string())
+        config
+            .interface
+            .addresses
+            .first()
+            .map(|net| net.ip().to_string())
     } else {
         None
     };
 
-    let _ = device.suspend().await;
+    let () = device.suspend().await;
     netstack.close().await;
 
     ProbeResult {
@@ -379,8 +418,10 @@ pub async fn cmd_probe(
     json_output: bool,
     timeout_str: String,
 ) -> Result<Vec<ProbeResult>, Box<dyn std::error::Error>> {
+    const MAX_CONCURRENT_PROBES: usize = 32;
+
     let timeout = parse_duration_str(&timeout_str)
-        .map_err(|e| format!("Invalid probe timeout '{}': {}", timeout_str, e))?;
+        .map_err(|e| format!("Invalid probe timeout '{timeout_str}': {e}"))?;
 
     let configs_with_path: Vec<(TunnelConfig, String)> = match (config_path, dir_path) {
         (Some(file), None) => {
@@ -412,7 +453,6 @@ pub async fn cmd_probe(
         return Ok(Vec::new());
     }
 
-    const MAX_CONCURRENT_PROBES: usize = 32;
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES));
     let mut set = tokio::task::JoinSet::new();
     let total = configs_with_path.len();
@@ -445,9 +485,15 @@ pub async fn cmd_probe(
 }
 
 fn print_probe_table(results: &[ProbeResult]) {
-    println!("┌──────────┬──────────────────────┬─────────────┬────────────────┬────────────────────────┐");
-    println!("│ STATUS   │ CONFIG               │ RTT         │ EXIT IP        │ ENDPOINT               │");
-    println!("├──────────┼──────────────────────┼─────────────┼────────────────┼────────────────────────┤");
+    println!(
+        "┌──────────┬──────────────────────┬─────────────┬────────────────┬────────────────────────┐"
+    );
+    println!(
+        "│ STATUS   │ CONFIG               │ RTT         │ EXIT IP        │ ENDPOINT               │"
+    );
+    println!(
+        "├──────────┼──────────────────────┼─────────────┼────────────────┼────────────────────────┤"
+    );
 
     let mut passed = 0;
     let mut failed = 0;
@@ -461,10 +507,9 @@ fn print_probe_table(results: &[ProbeResult]) {
             "FAILED"
         };
 
-        let rtt = match r.rtt_ms {
-            Some(ms) => format!("{:.1} ms", ms),
-            None => "-".to_string(),
-        };
+        let rtt = r
+            .rtt_ms
+            .map_or_else(|| "-".to_string(), |ms| format!("{ms:.1} ms"));
 
         let exit_ip = r.exit_ip.as_deref().unwrap_or("-");
 
@@ -478,7 +523,9 @@ fn print_probe_table(results: &[ProbeResult]) {
         );
     }
 
-    println!("└──────────┴──────────────────────┴─────────────┴────────────────┴────────────────────────┘");
+    println!(
+        "└──────────┴──────────────────────┴─────────────┴────────────────┴────────────────────────┘"
+    );
     println!(
         "Probe completed: {} passed, {} failed (total {}).",
         passed,

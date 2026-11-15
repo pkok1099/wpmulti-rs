@@ -9,7 +9,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -27,8 +27,8 @@ const TX_AMBER: Color = Color::Rgb(255, 184, 108);
 const MUTED_SLATE: Color = Color::Rgb(98, 114, 164);
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-use crate::core::health::HealthStatus;
 use crate::core::TunnelState;
+use crate::core::health::HealthStatus;
 use crate::tui::app::{TuiApp, TuiTab};
 
 /// Format a byte count into a human-readable string (`B`, `KB`, `MB`, `GB`).
@@ -43,7 +43,7 @@ pub fn format_bytes(bytes: u64) -> String {
     } else if bytes >= KB {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
@@ -72,18 +72,18 @@ pub fn parse_key_sequence(bytes: &[u8]) -> Option<TuiKey> {
 
 /// Parse the next key from `bytes` and return `(Option<TuiKey>, consumed_bytes)`.
 pub fn parse_next_key(bytes: &[u8]) -> (Option<TuiKey>, usize) {
-    if bytes.is_empty() {
+    let Some(&first) = bytes.first() else {
         return (None, 0);
-    }
-    if bytes[0] == 0x1b {
-        if bytes.len() == 1 {
+    };
+    if first == 0x1b {
+        let Some(&second) = bytes.get(1) else {
             return (Some(TuiKey::Esc), 1);
-        }
-        if bytes[1] == b'[' || bytes[1] == b'O' {
-            if bytes.len() < 3 {
+        };
+        if second == b'[' || second == b'O' {
+            let Some(&third) = bytes.get(2) else {
                 return (None, 0);
-            }
-            return match bytes[2] {
+            };
+            return match third {
                 b'A' => (Some(TuiKey::Up), 3),
                 b'B' => (Some(TuiKey::Down), 3),
                 b'C' => (Some(TuiKey::Right), 3),
@@ -99,7 +99,7 @@ pub fn parse_next_key(bytes: &[u8]) -> (Option<TuiKey>, usize) {
         }
         return (Some(TuiKey::Esc), 1);
     }
-    match bytes[0] {
+    match first {
         b'\r' | b'\n' => (Some(TuiKey::Enter), 1),
         0x7f | 0x08 => (Some(TuiKey::Backspace), 1),
         b'\t' => (Some(TuiKey::Tab), 1),
@@ -118,8 +118,10 @@ pub fn parse_next_key(bytes: &[u8]) -> (Option<TuiKey>, usize) {
 pub fn parse_keys_from_bytes(bytes: &[u8]) -> Vec<TuiKey> {
     let mut keys = Vec::new();
     let mut offset = 0;
-    while offset < bytes.len() {
-        let (maybe_key, consumed) = parse_next_key(&bytes[offset..]);
+    while let Some(rest) = bytes.get(offset..)
+        && !rest.is_empty()
+    {
+        let (maybe_key, consumed) = parse_next_key(rest);
         if consumed == 0 {
             break;
         }
@@ -154,38 +156,41 @@ pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String
 }
 
 /// Draw the full 5-tab `nyx`-style dashboard onto a `ratatui::Frame`.
-pub fn draw_dashboard(f: &mut Frame, app: &mut TuiApp) {
+pub fn draw_dashboard(f: &mut Frame<'_>, app: &mut TuiApp) {
     let area = f.area();
-    let chunks = Layout::default()
+    let [header_area, body_area, footer_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Header + Tabs
             Constraint::Min(3),    // Active Tab Body
             Constraint::Length(2), // Footer / Status
         ])
-        .split(area);
+        .areas(area);
 
-    draw_header_and_tabs(f, app, chunks[0]);
+    draw_header_and_tabs(f, app, header_area);
 
     match app.active_tab {
-        TuiTab::Tunnels => draw_tunnels_tab(f, app, chunks[1]),
-        TuiTab::Logs => draw_logs_tab(f, app, chunks[1]),
-        TuiTab::Listeners => draw_listeners_tab(f, app, chunks[1]),
-        TuiTab::Config => draw_config_tab(f, app, chunks[1]),
-        TuiTab::Probe => draw_probe_tab(f, app, chunks[1]),
+        TuiTab::Tunnels => draw_tunnels_tab(f, app, body_area),
+        TuiTab::Logs => draw_logs_tab(f, app, body_area),
+        TuiTab::Listeners => draw_listeners_tab(f, app, body_area),
+        TuiTab::Config => draw_config_tab(f, app, body_area),
+        TuiTab::Probe => draw_probe_tab(f, app, body_area),
     }
 
-    draw_footer(f, app, chunks[2]);
+    draw_footer(f, app, footer_area);
 }
 
-fn draw_header_and_tabs(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn draw_header_and_tabs(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     let active_count = app
         .tunnels
         .iter()
         .filter(|t| t.state == TunnelState::Active)
         .count();
     let total_conns: usize = app.tunnels.iter().map(|t| t.active_conns).sum();
-    let spinner = SPINNER_FRAMES[(app.anim_tick as usize) % SPINNER_FRAMES.len()];
+    let spinner = SPINNER_FRAMES
+        .get((app.anim_tick as usize) % SPINNER_FRAMES.len())
+        .copied()
+        .unwrap_or('-');
     let live_dot = if (app.anim_tick / 5).is_multiple_of(2) {
         "● LIVE"
     } else {
@@ -205,10 +210,7 @@ fn draw_header_and_tabs(f: &mut Frame, app: &TuiApp, area: Rect) {
         )
     };
 
-    let tab_titles: Vec<Line> = TuiTab::ALL
-        .iter()
-        .map(|t| Line::from(t.label()))
-        .collect();
+    let tab_titles: Vec<Line<'_>> = TuiTab::ALL.iter().map(|t| Line::from(t.label())).collect();
     let selected_idx = TuiTab::ALL
         .iter()
         .position(|t| *t == app.active_tab)
@@ -239,123 +241,204 @@ fn draw_header_and_tabs(f: &mut Frame, app: &TuiApp, area: Rect) {
     f.render_widget(tabs, area);
 }
 
-fn draw_tunnels_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
+fn draw_overview_sparklines(f: &mut Frame<'_>, app: &TuiApp, spark_col: Rect) {
+    let [rx_spark_area, tx_spark_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Length(4)])
+        .areas(spark_col);
+    let rx_data: Vec<u64> = app.rx_rates.iter().copied().collect();
+    let tx_data: Vec<u64> = app.tx_rates.iter().copied().collect();
+
+    let rx_spark = Sparkline::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(MUTED_SLATE))
+                .title(Span::styled(
+                    format!(" ▼ RX {}/s ", format_bytes(app.current_rx_bps)),
+                    Style::default().fg(RX_EMERALD).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .data(&rx_data)
+        .style(Style::default().fg(RX_EMERALD));
+    let tx_spark = Sparkline::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(MUTED_SLATE))
+                .title(Span::styled(
+                    format!(" ▲ TX {}/s ", format_bytes(app.current_tx_bps)),
+                    Style::default().fg(TX_AMBER).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .data(&tx_data)
+        .style(Style::default().fg(TX_AMBER));
+    f.render_widget(rx_spark, rx_spark_area);
+    f.render_widget(tx_spark, tx_spark_area);
+}
+
+fn draw_tunnels_overview(f: &mut Frame<'_>, app: &TuiApp, t_area: Rect) {
+    let [spark_col, bar_col, gauge_col] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(42),
+            Constraint::Percentage(36),
+            Constraint::Percentage(22),
+        ])
+        .areas(t_area);
+
+    draw_overview_sparklines(f, app, spark_col);
+
+    let top = app.top_tunnels(5);
+    let bars: Vec<Bar<'_>> = top
+        .iter()
+        .map(|(id, total)| {
+            let short: String = id.chars().take(8).collect();
+            Bar::default()
+                .value(*total)
+                .label(Line::from(short))
+                .text_value(format_bytes(*total))
+                .style(Style::default().fg(ACCENT_CYAN))
+        })
+        .collect();
+    let barchart = BarChart::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(MUTED_SLATE))
+                .title(Span::styled(
+                    " Top 5 Tunnels ",
+                    Style::default()
+                        .fg(ACCENT_CYAN)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        )
+        .data(BarGroup::default().bars(&bars))
+        .bar_width(7)
+        .bar_gap(1)
+        .value_style(Style::default().fg(Color::White))
+        .label_style(Style::default().fg(Color::Gray));
+    f.render_widget(barchart, bar_col);
+
+    let total = app.tunnels.len().max(1);
+    let healthy = app
+        .tunnels
+        .iter()
+        .filter(|t| t.health == HealthStatus::Healthy)
+        .count();
+    let ratio = (healthy as f64 / total as f64).clamp(0.0, 1.0);
+    let gauge_color = if ratio >= 0.8 {
+        RX_EMERALD
+    } else if ratio >= 0.4 {
+        TX_AMBER
+    } else {
+        Color::Rgb(255, 85, 85)
+    };
+    let gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(MUTED_SLATE))
+                .title(" Pool Health "),
+        )
+        .gauge_style(Style::default().fg(gauge_color).bg(Color::Rgb(40, 42, 54)))
+        .ratio(ratio)
+        .label(format!(
+            "{}/{} ({:.0}%)",
+            healthy,
+            app.tunnels.len(),
+            ratio * 100.0
+        ));
+    f.render_widget(gauge, gauge_col);
+}
+
+#[derive(Clone, Copy)]
+struct TableColumns {
+    tx: bool,
+    port: bool,
+    endpoint: bool,
+}
+
+fn build_tunnel_table_rows(
+    app: &TuiApp,
+    visible_rows: usize,
+    cols: TableColumns,
+) -> Vec<Row<'static>> {
+    app.filtered_indices
+        .iter()
+        .enumerate()
+        .skip(app.scroll_offset)
+        .take(visible_rows.max(1))
+        .filter_map(|(vis_idx, &orig_idx)| {
+            let t = app.tunnels.get(orig_idx)?;
+            let (state_str, st_style) = if t.disabled {
+                (
+                    "Disabled".to_string(),
+                    Style::default().fg(Color::Rgb(255, 85, 85)),
+                )
+            } else {
+                (format!("{:?}", t.state), state_style(t.state))
+            };
+            let health_str = match t.health {
+                HealthStatus::Healthy => "Healthy",
+                HealthStatus::HalfOpen => "HalfOpen",
+                HealthStatus::Unhealthy => "Unhealthy",
+            };
+            let mut cells = vec![
+                Cell::from(t.id.clone()),
+                Cell::from(state_str).style(st_style),
+                Cell::from(health_str).style(health_style(t.health)),
+                Cell::from(t.active_conns.to_string()),
+                Cell::from(format_bytes(t.rx_bytes)),
+            ];
+            if cols.tx {
+                cells.push(Cell::from(format_bytes(t.tx_bytes)));
+            }
+            if cols.port {
+                let port = t
+                    .assigned_port
+                    .map_or_else(|| "-".to_string(), |p| p.to_string());
+                cells.push(Cell::from(port));
+            }
+            if cols.endpoint {
+                cells.push(Cell::from(
+                    t.endpoint.clone().unwrap_or_else(|| "-".to_string()),
+                ));
+            }
+            let row = Row::new(cells);
+            if vis_idx == app.selected_index {
+                Some(
+                    row.style(
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                )
+            } else {
+                Some(row)
+            }
+        })
+        .collect()
+}
+
+fn draw_tunnels_tab(f: &mut Frame<'_>, app: &mut TuiApp, area: Rect) {
     let show_top = area.height >= 15 && area.width >= 56;
     let (top_area, table_area) = if show_top {
-        let split = Layout::default()
+        let [top, tbl] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(8), Constraint::Min(4)])
-            .split(area);
-        (Some(split[0]), split[1])
+            .areas(area);
+        (Some(top), tbl)
     } else {
         (None, area)
     };
 
     if let Some(t_area) = top_area {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(42),
-                Constraint::Percentage(36),
-                Constraint::Percentage(22),
-            ])
-            .split(t_area);
-
-        // Left: Stacked RX & TX thick Sparklines (equal 4-row height each)
-        let spark_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(4), Constraint::Length(4)])
-            .split(cols[0]);
-        let rx_data: Vec<u64> = app.rx_rates.iter().copied().collect();
-        let tx_data: Vec<u64> = app.tx_rates.iter().copied().collect();
-
-        let rx_spark = Sparkline::default()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(MUTED_SLATE))
-                    .title(Span::styled(
-                        format!(" ▼ RX {}/s ", format_bytes(app.current_rx_bps)),
-                        Style::default().fg(RX_EMERALD).add_modifier(Modifier::BOLD),
-                    )),
-            )
-            .data(&rx_data)
-            .style(Style::default().fg(RX_EMERALD));
-        let tx_spark = Sparkline::default()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(MUTED_SLATE))
-                    .title(Span::styled(
-                        format!(" ▲ TX {}/s ", format_bytes(app.current_tx_bps)),
-                        Style::default().fg(TX_AMBER).add_modifier(Modifier::BOLD),
-                    )),
-            )
-            .data(&tx_data)
-            .style(Style::default().fg(TX_AMBER));
-        f.render_widget(rx_spark, spark_rows[0]);
-        f.render_widget(tx_spark, spark_rows[1]);
-
-        // Middle: Top 5 Busiest Tunnels BarChart
-        let top = app.top_tunnels(5);
-        let bars: Vec<Bar> = top
-            .iter()
-            .map(|(id, total)| {
-                let short: String = id.chars().take(8).collect();
-                Bar::default()
-                    .value(*total)
-                    .label(Line::from(short))
-                    .text_value(format_bytes(*total))
-                    .style(Style::default().fg(ACCENT_CYAN))
-            })
-            .collect();
-        let barchart = BarChart::default()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(MUTED_SLATE))
-                    .title(Span::styled(
-                        " Top 5 Tunnels ",
-                        Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD),
-                    )),
-            )
-            .data(BarGroup::default().bars(&bars))
-            .bar_width(7)
-            .bar_gap(1)
-            .value_style(Style::default().fg(Color::White))
-            .label_style(Style::default().fg(Color::Gray));
-        f.render_widget(barchart, cols[1]);
-
-        // Right: Pool Health Gauge
-        let total = app.tunnels.len().max(1);
-        let healthy = app
-            .tunnels
-            .iter()
-            .filter(|t| t.health == HealthStatus::Healthy)
-            .count();
-        let ratio = (healthy as f64 / total as f64).clamp(0.0, 1.0);
-        let gauge_color = if ratio >= 0.8 {
-            RX_EMERALD
-        } else if ratio >= 0.4 {
-            TX_AMBER
-        } else {
-            Color::Rgb(255, 85, 85)
-        };
-        let gauge = Gauge::default()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(MUTED_SLATE))
-                    .title(" Pool Health "),
-            )
-            .gauge_style(Style::default().fg(gauge_color).bg(Color::Rgb(40, 42, 54)))
-            .ratio(ratio)
-            .label(format!("{}/{} ({:.0}%)", healthy, app.tunnels.len(), ratio * 100.0));
-        f.render_widget(gauge, cols[2]);
+        draw_tunnels_overview(f, app, t_area);
     }
 
     let w = table_area.width;
@@ -384,58 +467,15 @@ fn draw_tunnels_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     let visible_rows = table_area.height.saturating_sub(3) as usize;
     app.update_scroll(visible_rows.max(1));
 
-    let rows: Vec<Row> = app
-        .filtered_indices
-        .iter()
-        .enumerate()
-        .skip(app.scroll_offset)
-        .take(visible_rows.max(1))
-        .map(|(vis_idx, &orig_idx)| {
-            let t = &app.tunnels[orig_idx];
-            let (state_str, st_style) = if t.disabled {
-                ("Disabled".to_string(), Style::default().fg(Color::Rgb(255, 85, 85)))
-            } else {
-                (format!("{:?}", t.state), state_style(t.state))
-            };
-            let health_str = match t.health {
-                HealthStatus::Healthy => "Healthy",
-                HealthStatus::HalfOpen => "HalfOpen",
-                HealthStatus::Unhealthy => "Unhealthy",
-            };
-            let mut cells = vec![
-                Cell::from(t.id.clone()),
-                Cell::from(state_str).style(st_style),
-                Cell::from(health_str).style(health_style(t.health)),
-                Cell::from(t.active_conns.to_string()),
-                Cell::from(format_bytes(t.rx_bytes)),
-            ];
-            if show_tx {
-                cells.push(Cell::from(format_bytes(t.tx_bytes)));
-            }
-            if show_port {
-                let port = t
-                    .assigned_port
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                cells.push(Cell::from(port));
-            }
-            if show_endpoint {
-                cells.push(Cell::from(
-                    t.endpoint.clone().unwrap_or_else(|| "-".to_string()),
-                ));
-            }
-            let row = Row::new(cells);
-            if vis_idx == app.selected_index {
-                row.style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                row
-            }
-        })
-        .collect();
+    let rows = build_tunnel_table_rows(
+        app,
+        visible_rows,
+        TableColumns {
+            tx: show_tx,
+            port: show_port,
+            endpoint: show_endpoint,
+        },
+    );
 
     let mut widths = vec![
         Constraint::Min(14),
@@ -460,15 +500,13 @@ fn draw_tunnels_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         format!(" Tunnel {} of {} ", app.selected_index + 1, total_visible)
     };
 
-    let table = Table::new(rows, widths)
-        .header(header_row)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(pos_title),
-        );
+    let table = Table::new(rows, widths).header(header_row).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(pos_title),
+    );
     f.render_widget(table, table_area);
 
     if total_visible > visible_rows.max(1) {
@@ -481,7 +519,7 @@ fn draw_tunnels_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     }
 }
 
-fn draw_logs_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn draw_logs_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     let filter_label = app.log_level_filter.as_deref().unwrap_or("ALL");
     let logs = app.filtered_logs();
     let visible = area.height.saturating_sub(2) as usize;
@@ -491,45 +529,51 @@ fn draw_logs_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
     let start = total.saturating_sub(visible + scroll);
     let end = total.saturating_sub(scroll);
 
-    let lines: Vec<Line> = if logs.is_empty() {
-        vec![Line::from(Span::styled(
-            "No logs captured yet (live logs are captured in `wpmulti run --tui`).",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        logs[start..end]
-            .iter()
-            .map(|l| {
-                let style = if l.contains("ERROR") {
-                    Style::default().fg(Color::Red)
-                } else if l.contains("WARN") {
-                    Style::default().fg(Color::Yellow)
-                } else if l.contains("INFO") {
-                    Style::default().fg(Color::Green)
-                } else if l.contains("DEBUG") {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default()
-                };
-                Line::from(Span::styled(l.as_str(), style))
-            })
-            .collect()
-    };
+    let lines: Vec<Line<'_>> = logs
+        .get(start..end)
+        .filter(|slice| !slice.is_empty())
+        .map_or_else(
+            || {
+                vec![Line::from(Span::styled(
+                    "No logs captured yet (live logs are captured in `wpmulti run --tui`).",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            },
+            |slice| {
+                slice
+                    .iter()
+                    .map(|l| {
+                        let style = if l.contains("ERROR") {
+                            Style::default().fg(Color::Red)
+                        } else if l.contains("WARN") {
+                            Style::default().fg(Color::Yellow)
+                        } else if l.contains("INFO") {
+                            Style::default().fg(Color::Green)
+                        } else if l.contains("DEBUG") {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default()
+                        };
+                        Line::from(Span::styled(l.as_str(), style))
+                    })
+                    .collect()
+            },
+        );
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Live Logs [Filter: {}] ({} lines) ", filter_label, total));
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " Live Logs [Filter: {filter_label}] ({total} lines) "
+    ));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_listeners_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn draw_listeners_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     let header = Row::new(vec!["NAME", "TYPE", "ADDRESS", "MODE", "TUNNEL"]).style(
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     );
     let visible = area.height.saturating_sub(3) as usize;
-    let rows: Vec<Row> = app
+    let rows: Vec<Row<'_>> = app
         .listeners
         .iter()
         .skip(app.listener_scroll)
@@ -564,7 +608,7 @@ fn draw_listeners_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn draw_config_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn draw_config_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     let Some(cfg) = &app.config_snapshot else {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -589,16 +633,14 @@ fn draw_config_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
         .saturating_sub(visible.saturating_sub(1))
         .min(total.saturating_sub(visible));
 
-    let rows: Vec<Row> = (start..total)
+    let rows: Vec<Row<'_>> = (start..total)
         .take(visible)
         .map(|idx| {
             let (label, val, is_cycle) = TuiApp::config_row_display(cfg, idx);
             let display_val = if idx == app.config_selected {
-                if let Some(edit_buf) = &app.config_editing {
-                    format!("{}_", edit_buf)
-                } else {
-                    val
-                }
+                app.config_editing
+                    .as_ref()
+                    .map_or(val, |edit_buf| format!("{edit_buf}_"))
             } else {
                 val
             };
@@ -620,11 +662,10 @@ fn draw_config_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
         })
         .collect();
 
-    let path_label = app
-        .config_path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "remote/in-memory".to_string());
+    let path_label = app.config_path.as_ref().map_or_else(
+        || "remote/in-memory".to_string(),
+        |p| p.display().to_string(),
+    );
 
     let table = Table::new(
         rows,
@@ -638,12 +679,12 @@ fn draw_config_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Config ({}) ", path_label)),
+            .title(format!(" Config ({path_label}) ")),
     );
     f.render_widget(table, area);
 }
 
-fn draw_probe_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn draw_probe_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     if app.probe_results.is_empty() {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -664,7 +705,7 @@ fn draw_probe_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
             .add_modifier(Modifier::BOLD),
     );
     let visible = area.height.saturating_sub(3) as usize;
-    let rows: Vec<Row> = app
+    let rows: Vec<Row<'_>> = app
         .probe_results
         .iter()
         .skip(app.probe_scroll)
@@ -677,8 +718,7 @@ fn draw_probe_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
             };
             let rtt = r
                 .rtt_ms
-                .map(|ms| format!("{}ms", ms))
-                .unwrap_or_else(|| "-".to_string());
+                .map_or_else(|| "-".to_string(), |ms| format!("{ms}ms"));
             Row::new(vec![
                 Cell::from(r.id.clone()),
                 Cell::from(r.endpoint.clone()),
@@ -708,7 +748,7 @@ fn draw_probe_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn draw_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn draw_footer(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     let help = match app.active_tab {
         TuiTab::Tunnels => {
             "1-5/Tab:Tabs  j/k:Nav  /:Search  s:Sort  a:Activate  d:Suspend  x:Toggle  X:Batch  r:Reload  q:Quit"
@@ -722,7 +762,7 @@ fn draw_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
     let mut lines = Vec::new();
     if let Some(buf) = &app.batch_prompt {
         lines.push(Line::from(Span::styled(
-            format!("Batch [+/-]target (e.g. -1-200, +1-50, A, all): {}_", buf),
+            format!("Batch [+/-]target (e.g. -1-200, +1-50, A, all): {buf}_"),
             Style::default().fg(Color::Yellow),
         )));
     } else if app.is_searching {
@@ -734,7 +774,7 @@ fn draw_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
         && at.elapsed() < Duration::from_secs(5)
     {
         lines.push(Line::from(Span::styled(
-            format!(">>> {}", msg),
+            format!(">>> {msg}"),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -812,17 +852,25 @@ pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Resu
                         handle_tui_key(&mut app, tui_key).await;
                     }
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollDown => handle_tui_key(&mut app, TuiKey::Down).await,
-                    MouseEventKind::ScrollUp => handle_tui_key(&mut app, TuiKey::Up).await,
-                    MouseEventKind::Down(MouseButton::Left) if mouse.row == 1 => {
-                        if let Some(tab) = tab_at_column(mouse.column as usize) {
-                            app.set_tab(tab);
+                Event::Mouse(mouse) =>
+                {
+                    #[allow(clippy::wildcard_enum_match_arm)]
+                    match mouse.kind {
+                        MouseEventKind::ScrollDown => handle_tui_key(&mut app, TuiKey::Down).await,
+                        MouseEventKind::ScrollUp => handle_tui_key(&mut app, TuiKey::Up).await,
+                        MouseEventKind::Down(MouseButton::Left) if mouse.row == 1 => {
+                            if let Some(tab) = tab_at_column(mouse.column as usize) {
+                                app.set_tab(tab);
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                },
-                _ => {}
+                }
+                Event::Key(_)
+                | Event::FocusGained
+                | Event::FocusLost
+                | Event::Paste(_)
+                | Event::Resize(_, _) => {}
             }
         }
 
@@ -852,7 +900,8 @@ fn tab_at_column(col: usize) -> Option<TuiTab> {
     None
 }
 
-fn map_crossterm_key(code: KeyCode) -> Option<TuiKey> {
+#[allow(clippy::wildcard_enum_match_arm)]
+const fn map_crossterm_key(code: KeyCode) -> Option<TuiKey> {
     match code {
         KeyCode::Char(c) => Some(TuiKey::Char(c)),
         KeyCode::Up => Some(TuiKey::Up),
@@ -871,13 +920,14 @@ fn map_crossterm_key(code: KeyCode) -> Option<TuiKey> {
     }
 }
 
-async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
+#[allow(clippy::wildcard_enum_match_arm)]
+async fn handle_prompt_key(app: &mut TuiApp, key: TuiKey) -> bool {
     if app.batch_prompt.is_some() {
         match key {
             TuiKey::Esc => app.batch_prompt = None,
             TuiKey::Enter => {
                 if let Err(e) = app.commit_batch_toggle().await {
-                    app.set_status(format!("Batch error: {}", e));
+                    app.set_status(format!("Batch error: {e}"));
                 }
             }
             TuiKey::Backspace => {
@@ -892,7 +942,7 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
             }
             _ => {}
         }
-        return;
+        return true;
     }
 
     if app.is_searching {
@@ -908,7 +958,7 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
             }
             _ => {}
         }
-        return;
+        return true;
     }
 
     if app.active_tab == TuiTab::Config && app.config_editing.is_some() {
@@ -916,7 +966,7 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
             TuiKey::Esc => app.config_editing = None,
             TuiKey::Enter => {
                 if let Err(e) = app.commit_config_edit().await {
-                    app.set_status(format!("Config error: {}", e));
+                    app.set_status(format!("Config error: {e}"));
                 }
             }
             TuiKey::Backspace => {
@@ -931,6 +981,53 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
             }
             _ => {}
         }
+        return true;
+    }
+
+    false
+}
+
+#[allow(clippy::wildcard_enum_match_arm)]
+async fn handle_tunnels_tab_key(app: &mut TuiApp, key: TuiKey) {
+    match key {
+        TuiKey::Up | TuiKey::Char('k') => app.select_prev(),
+        TuiKey::Down | TuiKey::Char('j') => app.select_next(),
+        TuiKey::PageUp => app.page_up(10),
+        TuiKey::PageDown => app.page_down(10),
+        TuiKey::Home => app.scroll_to_top(),
+        TuiKey::End => app.scroll_to_bottom(),
+        TuiKey::Char('/') => app.is_searching = true,
+        TuiKey::Char('s') => app.cycle_sort(),
+        TuiKey::Char('a') => {
+            if let Err(e) = app.activate_selected().await {
+                app.set_status(format!("Activate error: {e}"));
+            }
+        }
+        TuiKey::Char('d') => {
+            if let Err(e) = app.suspend_selected().await {
+                app.set_status(format!("Suspend error: {e}"));
+            }
+        }
+        TuiKey::Char('x') => {
+            if let Err(e) = app.toggle_selected_disabled().await {
+                app.set_status(format!("Toggle error: {e}"));
+            }
+        }
+        TuiKey::Char('X') => {
+            app.batch_prompt = Some(String::new());
+        }
+        TuiKey::Char('r') => {
+            if let Err(e) = app.trigger_reload().await {
+                app.set_status(format!("Reload error: {e}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::wildcard_enum_match_arm)]
+async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
+    if handle_prompt_key(app, key).await {
         return;
     }
 
@@ -944,40 +1041,7 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
         TuiKey::Tab | TuiKey::Right => app.next_tab(),
         TuiKey::Left => app.prev_tab(),
         _ => match app.active_tab {
-            TuiTab::Tunnels => match key {
-                TuiKey::Up | TuiKey::Char('k') => app.select_prev(),
-                TuiKey::Down | TuiKey::Char('j') => app.select_next(),
-                TuiKey::PageUp => app.page_up(10),
-                TuiKey::PageDown => app.page_down(10),
-                TuiKey::Home => app.scroll_to_top(),
-                TuiKey::End => app.scroll_to_bottom(),
-                TuiKey::Char('/') => app.is_searching = true,
-                TuiKey::Char('s') => app.cycle_sort(),
-                TuiKey::Char('a') => {
-                    if let Err(e) = app.activate_selected().await {
-                        app.set_status(format!("Activate error: {}", e));
-                    }
-                }
-                TuiKey::Char('d') => {
-                    if let Err(e) = app.suspend_selected().await {
-                        app.set_status(format!("Suspend error: {}", e));
-                    }
-                }
-                TuiKey::Char('x') => {
-                    if let Err(e) = app.toggle_selected_disabled().await {
-                        app.set_status(format!("Toggle error: {}", e));
-                    }
-                }
-                TuiKey::Char('X') => {
-                    app.batch_prompt = Some(String::new());
-                }
-                TuiKey::Char('r') => {
-                    if let Err(e) = app.trigger_reload().await {
-                        app.set_status(format!("Reload error: {}", e));
-                    }
-                }
-                _ => {}
-            },
+            TuiTab::Tunnels => handle_tunnels_tab_key(app, key).await,
             TuiTab::Logs => match key {
                 TuiKey::Up | TuiKey::Char('k') => app.log_scroll = app.log_scroll.saturating_add(1),
                 TuiKey::Down | TuiKey::Char('j') => {
@@ -1015,12 +1079,12 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
                 }
                 TuiKey::Enter | TuiKey::Char(' ') => {
                     if let Err(e) = app.activate_config_row().await {
-                        app.set_status(format!("Config error: {}", e));
+                        app.set_status(format!("Config error: {e}"));
                     }
                 }
                 TuiKey::Char('w') => {
                     if let Err(e) = app.save_config_and_reload().await {
-                        app.set_status(format!("Save error: {}", e));
+                        app.set_status(format!("Save error: {e}"));
                     }
                 }
                 _ => {}

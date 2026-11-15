@@ -108,7 +108,10 @@ fn test_wg_conf_wg_quick_directives_tolerance() {
     );
 
     let res = load_tunnel_config_from_str("wg-quick-test", &conf);
-    assert!(res.is_ok(), "Parser must tolerate wg-quick directives without error");
+    assert!(
+        res.is_ok(),
+        "Parser must tolerate wg-quick directives without error"
+    );
 }
 
 // =========================================================================
@@ -144,7 +147,9 @@ fn test_wg_conf_comments_and_formatting() {
 #[test]
 fn test_wg_conf_invalid_cases() {
     // Missing [Interface]
-    let no_iface = format!("[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\nAllowedIPs = 0.0.0.0/0\n");
+    let no_iface = format!(
+        "[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\nAllowedIPs = 0.0.0.0/0\n"
+    );
     assert!(load_tunnel_config_from_str("err1", &no_iface).is_err());
 
     // Missing PrivateKey
@@ -160,7 +165,8 @@ fn test_wg_conf_invalid_cases() {
     assert!(load_tunnel_config_from_str("err4", short_key).is_err());
 
     // Invalid CIDR address
-    let bad_cidr = format!("[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 999.999.999.999/24\n");
+    let bad_cidr =
+        format!("[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 999.999.999.999/24\n");
     assert!(load_tunnel_config_from_str("err5", &bad_cidr).is_err());
 
     // Missing [Peer]
@@ -168,11 +174,15 @@ fn test_wg_conf_invalid_cases() {
     assert!(load_tunnel_config_from_str("err6", &no_peer).is_err());
 
     // Malformed endpoint (no port)
-    let bad_ep = format!("[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.1/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1\nAllowedIPs = 0.0.0.0/0\n");
+    let bad_ep = format!(
+        "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.1/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1\nAllowedIPs = 0.0.0.0/0\n"
+    );
     assert!(load_tunnel_config_from_str("err7", &bad_ep).is_err());
 
     // Empty tunnel ID
-    let valid_conf = format!("[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.1/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\n");
+    let valid_conf = format!(
+        "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.1/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\n"
+    );
     assert!(load_tunnel_config_from_str("", &valid_conf).is_err());
 }
 
@@ -262,6 +272,10 @@ fn test_toml_config_full_schema() {
         })
     );
 
+    assert_full_schema_listeners_and_admin(&cfg);
+}
+
+fn assert_full_schema_listeners_and_admin(cfg: &MainConfig) {
     assert_eq!(cfg.shared_listeners.len(), 2);
     assert_eq!(cfg.shared_listeners[0].name, "shared-socks5");
     assert_eq!(cfg.shared_listeners[0].listener_type, ListenerType::Socks5);
@@ -297,7 +311,10 @@ fn test_toml_config_minimal_and_defaults() {
     let empty_toml = "";
     let cfg = MainConfig::from_toml_str(empty_toml).expect("empty toml should parse with defaults");
 
-    assert_eq!(cfg.global.bind_address, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    assert_eq!(
+        cfg.global.bind_address,
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
+    );
     assert_eq!(cfg.global.log_level, LogLevel::Info);
     assert_eq!(cfg.health_check.threshold, 3);
     assert_eq!(cfg.health_check.cooldown, Duration::from_secs(30));
@@ -488,7 +505,8 @@ fn test_ip_mode_helpers_and_parsing() {
     "#;
     let cfg: MainConfig = toml::from_str(toml_str).expect("parse ip_mode");
     assert_eq!(cfg.global.ip_mode, IpMode::Ipv6Only);
-    cfg.validate().expect("global ipv6_only without listener override is valid");
+    cfg.validate()
+        .expect("global ipv6_only without listener override is valid");
 }
 
 #[test]
@@ -505,7 +523,8 @@ fn test_ip_mode_listener_validation() {
         ip_mode = "ipv4_only"
     "#;
     let cfg: MainConfig = toml::from_str(valid_toml).unwrap();
-    cfg.validate().expect("dual_stack global allows ipv4_only listener");
+    cfg.validate()
+        .expect("dual_stack global allows ipv4_only listener");
 
     // Invalid: global ipv4_only with ipv6_only listener override
     let conflict_toml = r#"
@@ -519,7 +538,10 @@ fn test_ip_mode_listener_validation() {
         ip_mode = "ipv6_only"
     "#;
     let cfg: MainConfig = toml::from_str(conflict_toml).unwrap();
-    assert!(cfg.validate().is_err(), "conflicting ip_mode must fail validation");
+    assert!(
+        cfg.validate().is_err(),
+        "conflicting ip_mode must fail validation"
+    );
 
     // Invalid: global ipv6_only with dual_stack listener override (cannot loosen)
     let loosen_toml = r#"
@@ -533,7 +555,10 @@ fn test_ip_mode_listener_validation() {
         ip_mode = "dual_stack"
     "#;
     let cfg: MainConfig = toml::from_str(loosen_toml).unwrap();
-    assert!(cfg.validate().is_err(), "loosening global ip_mode must fail validation");
+    assert!(
+        cfg.validate().is_err(),
+        "loosening global ip_mode must fail validation"
+    );
 }
 
 #[test]

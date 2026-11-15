@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::config::{LifecycleMode, MainConfig, TuiSortField, TunnelConfig, WgInterfaceConfig, WgPeerConfig};
+use crate::config::{
+    LifecycleMode, MainConfig, TuiSortField, TunnelConfig, WgInterfaceConfig, WgPeerConfig,
+};
 use crate::core::{HealthStatus, TunnelManager, TunnelState, TunnelSummary};
 use crate::tui::app::{TuiApp, TuiDataSource};
 use crate::tui::ui::{format_bytes, render_dashboard};
@@ -29,7 +31,13 @@ fn make_test_tunnel_config(id: &str, endpoint: &str) -> TunnelConfig {
     }
 }
 
-fn make_dummy_summary(id: &str, state: TunnelState, conns: usize, rx: u64, tx: u64) -> TunnelSummary {
+fn make_dummy_summary(
+    id: &str,
+    state: TunnelState,
+    conns: usize,
+    rx: u64,
+    tx: u64,
+) -> TunnelSummary {
     TunnelSummary {
         id: id.to_string(),
         state,
@@ -192,9 +200,7 @@ fn test_tui_render_dashboard_ansi() {
 async fn test_tui_in_process_activation_and_suspension() {
     let mut config = MainConfig::default();
     config.per_tunnel.enabled = false;
-    let tunnels = vec![
-        make_test_tunnel_config("t-alpha", "127.0.0.1:51820"),
-    ];
+    let tunnels = vec![make_test_tunnel_config("t-alpha", "127.0.0.1:51820")];
     let mgr = Arc::new(TunnelManager::new(config, tunnels).unwrap());
 
     let mut app = TuiApp::new(TuiDataSource::InProcess(Arc::clone(&mgr)), TuiSortField::Id);
@@ -214,7 +220,7 @@ async fn test_tui_in_process_activation_and_suspension() {
 
 #[test]
 fn test_parse_key_sequence_arrows_and_nav() {
-    use crate::tui::ui::{parse_key_sequence, parse_keys_from_bytes, parse_next_key, TuiKey};
+    use crate::tui::ui::{TuiKey, parse_key_sequence, parse_keys_from_bytes, parse_next_key};
 
     assert_eq!(parse_key_sequence(b"\x1b[A"), Some(TuiKey::Up));
     assert_eq!(parse_key_sequence(b"\x1b[B"), Some(TuiKey::Down));
@@ -236,7 +242,12 @@ fn test_parse_key_sequence_arrows_and_nav() {
     // Coalesced reads & UTF-8 input
     assert_eq!(
         parse_keys_from_bytes(b"\x1b[A\x1b[Bjq"),
-        vec![TuiKey::Up, TuiKey::Down, TuiKey::Char('j'), TuiKey::Char('q')]
+        vec![
+            TuiKey::Up,
+            TuiKey::Down,
+            TuiKey::Char('j'),
+            TuiKey::Char('q')
+        ]
     );
     assert_eq!(
         parse_keys_from_bytes("αβ".as_bytes()),
@@ -256,7 +267,13 @@ fn test_render_dashboard_small_terminal_auto_resize() {
         TuiSortField::Id,
     );
     app.set_tunnels(vec![
-        make_dummy_summary("wgcf-very-long-tunnel-name-001", TunnelState::Active, 2, 1024, 2048),
+        make_dummy_summary(
+            "wgcf-very-long-tunnel-name-001",
+            TunnelState::Active,
+            2,
+            1024,
+            2048,
+        ),
         make_dummy_summary("wgcf-002", TunnelState::Dormant, 0, 0, 0),
     ]);
 
@@ -291,21 +308,21 @@ fn test_render_dashboard_small_terminal_auto_resize() {
 
 #[test]
 fn test_multi_tab_switching_logs_and_rendering() {
-    use crate::config::toml_config::MainConfig;
     use crate::config::ListenerType;
+    use crate::config::toml_config::MainConfig;
     use crate::core::listener::ActiveListenerInfo;
-    use crate::tui::logs::TuiLogBuffer;
-    use crate::tui::ui::{parse_key_sequence, render_dashboard, TuiKey};
     use crate::tui::TuiTab;
+    use crate::tui::logs::TuiLogBuffer;
+    use crate::tui::ui::{TuiKey, parse_key_sequence, render_dashboard};
 
     assert_eq!(parse_key_sequence(b"\x1b[C"), Some(TuiKey::Right));
     assert_eq!(parse_key_sequence(b"\x1b[D"), Some(TuiKey::Left));
 
     let log_buf = TuiLogBuffer::new(3);
-    log_buf.push_line("2026-11-15T10:00:00Z INFO wpmulti::core: tunnel-1 active".to_string());
-    log_buf.push_line("2026-11-15T10:00:01Z WARN wpmulti::health: slow probe".to_string());
-    log_buf.push_line("2026-11-15T10:00:02Z ERROR wpmulti::net: timeout".to_string());
-    log_buf.push_line("2026-11-15T10:00:03Z DEBUG wpmulti::dns: resolved".to_string());
+    log_buf.push_line("2026-11-15T10:00:00Z INFO wpmulti::core: tunnel-1 active");
+    log_buf.push_line("2026-11-15T10:00:01Z WARN wpmulti::health: slow probe");
+    log_buf.push_line("2026-11-15T10:00:02Z ERROR wpmulti::net: timeout");
+    log_buf.push_line("2026-11-15T10:00:03Z DEBUG wpmulti::dns: resolved");
     // Bounded ring buffer keeps only last 3 lines
     assert_eq!(log_buf.snapshot().len(), 3);
 

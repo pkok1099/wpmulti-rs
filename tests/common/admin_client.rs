@@ -73,9 +73,10 @@ impl AdminTestClient {
     pub async fn get_health(&self) -> std::io::Result<serde_json::Value> {
         let (status, val) = self.request_json("GET", "/health", None).await?;
         if status != 200 {
-            return Err(std::io::Error::other(
-                format!("health returned status {}", status),
-            ));
+            return Err(std::io::Error::other(format!(
+                "health returned status {}",
+                status
+            )));
         }
         Ok(val)
     }
@@ -84,9 +85,10 @@ impl AdminTestClient {
     pub async fn get_status(&self) -> std::io::Result<serde_json::Value> {
         let (status, val) = self.request_json("GET", "/status", None).await?;
         if status != 200 {
-            return Err(std::io::Error::other(
-                format!("status returned status {}", status),
-            ));
+            return Err(std::io::Error::other(format!(
+                "status returned status {}",
+                status
+            )));
         }
         Ok(val)
     }
@@ -99,9 +101,10 @@ impl AdminTestClient {
         };
         let (status, val) = self.request_json("GET", &path, None).await?;
         if status != 200 {
-            return Err(std::io::Error::other(
-                format!("list tunnels returned status {}", status),
-            ));
+            return Err(std::io::Error::other(format!(
+                "list tunnels returned status {}",
+                status
+            )));
         }
         Ok(val)
     }
@@ -124,9 +127,10 @@ impl AdminTestClient {
         let path = format!("/tunnels/{}/activate", id);
         let (status, val) = self.request_json("POST", &path, None).await?;
         if status != 200 {
-            return Err(std::io::Error::other(
-                format!("activate returned status {}", status),
-            ));
+            return Err(std::io::Error::other(format!(
+                "activate returned status {}",
+                status
+            )));
         }
         Ok(val)
     }
@@ -136,9 +140,10 @@ impl AdminTestClient {
         let path = format!("/tunnels/{}/deactivate", id);
         let (status, val) = self.request_json("POST", &path, None).await?;
         if status != 200 {
-            return Err(std::io::Error::other(
-                format!("deactivate returned status {}", status),
-            ));
+            return Err(std::io::Error::other(format!(
+                "deactivate returned status {}",
+                status
+            )));
         }
         Ok(val)
     }
@@ -147,9 +152,10 @@ impl AdminTestClient {
     pub async fn trigger_reload(&self) -> std::io::Result<serde_json::Value> {
         let (status, val) = self.request_json("POST", "/reload", None).await?;
         if status != 200 {
-            return Err(std::io::Error::other(
-                format!("reload returned status {}", status),
-            ));
+            return Err(std::io::Error::other(format!(
+                "reload returned status {}",
+                status
+            )));
         }
         Ok(val)
     }
@@ -170,15 +176,20 @@ impl AdminTestClient {
         stream.write_all(req.as_bytes()).await?;
         let (status, _reason, _headers, body) = read_http_headers(&mut stream).await?;
         if status != 200 {
-            return Err(std::io::Error::other(
-                format!("metrics returned status {}", status),
-            ));
+            return Err(std::io::Error::other(format!(
+                "metrics returned status {}",
+                status
+            )));
         }
         Ok(String::from_utf8_lossy(&body).to_string())
     }
 
     /// Scrapes metrics and extracts a metric value matching name and label criteria
-    pub async fn get_metric_value(&self, metric_name: &str, labels: &[(&str, &str)]) -> std::io::Result<f64> {
+    pub async fn get_metric_value(
+        &self,
+        metric_name: &str,
+        labels: &[(&str, &str)],
+    ) -> std::io::Result<f64> {
         let text = self.get_metrics().await?;
         Self::parse_metric_from_text(&text, metric_name, labels).ok_or_else(|| {
             std::io::Error::new(
@@ -189,27 +200,31 @@ impl AdminTestClient {
     }
 
     /// Static parser for Prometheus metric output text
-    pub fn parse_metric_from_text(text: &str, metric_name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    pub fn parse_metric_from_text(
+        text: &str,
+        metric_name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<f64> {
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             if let Some((metric_part, val_part)) = line.split_once(' ')
-                && metric_part.starts_with(metric_name) {
-                    let mut matched = true;
-                    for &(k, v) in labels {
-                        let needle = format!("{}=\"{}\"", k, v);
-                        if !metric_part.contains(&needle) {
-                            matched = false;
-                            break;
-                        }
+                && metric_part.starts_with(metric_name)
+            {
+                let mut matched = true;
+                for &(k, v) in labels {
+                    let needle = format!("{}=\"{}\"", k, v);
+                    if !metric_part.contains(&needle) {
+                        matched = false;
+                        break;
                     }
-                    if matched
-                        && let Ok(val) = val_part.trim().parse::<f64>() {
-                            return Some(val);
-                        }
                 }
+                if matched && let Ok(val) = val_part.trim().parse::<f64>() {
+                    return Some(val);
+                }
+            }
         }
         None
     }

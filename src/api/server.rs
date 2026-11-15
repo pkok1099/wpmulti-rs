@@ -10,10 +10,11 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::api::routes::{handle_admin_request, parse_http_request, HttpResponse};
+use crate::api::routes::{HttpResponse, handle_admin_request, parse_http_request};
 use crate::core::TunnelManager;
 
 /// Embedded HTTP Admin REST API server.
+#[derive(Debug)]
 pub struct AdminServer {
     bind_addr: SocketAddr,
     manager: Arc<TunnelManager>,
@@ -42,7 +43,7 @@ impl AdminServer {
     }
 
     /// Bound or configured listen address.
-    pub fn bind_addr(&self) -> SocketAddr {
+    pub const fn bind_addr(&self) -> SocketAddr {
         self.bind_addr
     }
 
@@ -141,27 +142,32 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 Ok(n) => n,
                 Err(_) => return Err(()),
             };
-            buf.extend_from_slice(&temp[..n]);
+            if let Some(chunk) = temp.get(..n) {
+                buf.extend_from_slice(chunk);
+            }
 
             if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 // Check Content-Length to read remainder of body if any
-                let header_str = String::from_utf8_lossy(&buf[..pos]);
+                let header_bytes = buf.get(..pos).unwrap_or_default();
+                let header_str = String::from_utf8_lossy(header_bytes);
                 let mut content_len = 0;
                 for line in header_str.lines() {
                     if let Some((k, v)) = line.split_once(':')
-                        && k.trim().eq_ignore_ascii_case("content-length") {
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
                         content_len = v.trim().parse::<usize>().unwrap_or(0);
                     }
                 }
 
                 if content_len > 65536 {
-                    let resp = HttpResponse::payload_too_large("Request body too large (max 64 KiB)");
+                    let resp =
+                        HttpResponse::payload_too_large("Request body too large (max 64 KiB)");
                     let _ = stream.write_all(&resp.to_bytes()).await;
                     return Err(());
                 }
 
                 let required_total = pos + 4 + content_len;
-                if required_total > 131072 {
+                if required_total > 131_072 {
                     let resp = HttpResponse::payload_too_large("Request too large");
                     let _ = stream.write_all(&resp.to_bytes()).await;
                     return Err(());
@@ -173,7 +179,9 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                         Ok(n) => n,
                         Err(_) => return Err(()),
                     };
-                    buf.extend_from_slice(&temp[..n]);
+                    if let Some(chunk) = temp.get(..n) {
+                        buf.extend_from_slice(chunk);
+                    }
                     if buf.len() > required_total {
                         break;
                     }

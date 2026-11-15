@@ -3,11 +3,11 @@
 //! Provides Serde data structures, sensible defaults, duration parsers,
 //! and validation logic for `wpmulti`.
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// Configuration errors encountered during deserialization or validation.
@@ -51,32 +51,49 @@ pub fn parse_duration_str(s: &str) -> Result<Duration, String> {
     }
 
     if let Some(rest) = s.strip_suffix("ms") {
-        let v: u64 = rest.trim().parse().map_err(|e| format!("Invalid ms duration: {e}"))?;
+        let v: u64 = rest
+            .trim()
+            .parse()
+            .map_err(|e| format!("Invalid ms duration: {e}"))?;
         return Ok(Duration::from_millis(v));
     }
     if let Some(rest) = s.strip_suffix('s') {
-        let v: u64 = rest.trim().parse().map_err(|e| format!("Invalid s duration: {e}"))?;
+        let v: u64 = rest
+            .trim()
+            .parse()
+            .map_err(|e| format!("Invalid s duration: {e}"))?;
         return Ok(Duration::from_secs(v));
     }
     if let Some(rest) = s.strip_suffix('m') {
-        let v: u64 = rest.trim().parse().map_err(|e| format!("Invalid m duration: {e}"))?;
+        let v: u64 = rest
+            .trim()
+            .parse()
+            .map_err(|e| format!("Invalid m duration: {e}"))?;
         return Ok(Duration::from_secs(v * 60));
     }
     if let Some(rest) = s.strip_suffix('h') {
-        let v: u64 = rest.trim().parse().map_err(|e| format!("Invalid h duration: {e}"))?;
+        let v: u64 = rest
+            .trim()
+            .parse()
+            .map_err(|e| format!("Invalid h duration: {e}"))?;
         return Ok(Duration::from_secs(v * 3600));
     }
     if let Some(rest) = s.strip_suffix('d') {
-        let v: u64 = rest.trim().parse().map_err(|e| format!("Invalid d duration: {e}"))?;
+        let v: u64 = rest
+            .trim()
+            .parse()
+            .map_err(|e| format!("Invalid d duration: {e}"))?;
         return Ok(Duration::from_secs(v * 86400));
     }
 
-    Err(format!("Unsupported duration format: '{s}' (supported: ms, s, m, h, d)"))
+    Err(format!(
+        "Unsupported duration format: '{s}' (supported: ms, s, m, h, d)"
+    ))
 }
 
 /// Serde module for Duration strings or integer seconds.
 pub mod duration_str_serde {
-    use super::*;
+    use super::{Deserialize, Deserializer, Duration, Serializer, parse_duration_str};
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
     where
@@ -155,22 +172,22 @@ pub enum IpMode {
 
 impl IpMode {
     /// Returns true if the given IP address is permitted under this mode.
-    pub fn allows_ip(&self, ip: IpAddr) -> bool {
+    pub const fn allows_ip(self, ip: IpAddr) -> bool {
         match self {
-            IpMode::DualStack => true,
-            IpMode::Ipv4Only => ip.is_ipv4(),
-            IpMode::Ipv6Only => ip.is_ipv6(),
+            Self::DualStack => true,
+            Self::Ipv4Only => ip.is_ipv4(),
+            Self::Ipv6Only => ip.is_ipv6(),
         }
     }
 
     /// Validate that `ip` is permitted under this mode, returning `AddrNotAvailable` otherwise.
-    pub fn check_ip(&self, ip: IpAddr, context: &str) -> std::io::Result<()> {
+    pub fn check_ip(self, ip: IpAddr, context: &str) -> std::io::Result<()> {
         if self.allows_ip(ip) {
             Ok(())
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
-                format!("{} {} blocked by ip_mode {:?}", context, ip, self),
+                format!("{context} {ip} blocked by ip_mode {self:?}"),
             ))
         }
     }
@@ -178,40 +195,47 @@ impl IpMode {
     /// Encode this mode into a compact `u8` representation for atomic storage.
     pub const fn to_u8(self) -> u8 {
         match self {
-            IpMode::DualStack => 0,
-            IpMode::Ipv4Only => 1,
-            IpMode::Ipv6Only => 2,
+            Self::DualStack => 0,
+            Self::Ipv4Only => 1,
+            Self::Ipv6Only => 2,
         }
     }
 
     /// Decode a `u8` representation back into [`IpMode`].
     pub const fn from_u8(code: u8) -> Self {
         match code {
-            1 => IpMode::Ipv4Only,
-            2 => IpMode::Ipv6Only,
-            _ => IpMode::DualStack,
+            1 => Self::Ipv4Only,
+            2 => Self::Ipv6Only,
+            _ => Self::DualStack,
         }
     }
 
     /// Combine a listener-level override with the global `IpMode`.
     /// Rejects contradictory strict modes (e.g. global `ipv4_only` + listener `ipv6_only`).
-    pub fn effective_with_global(listener_override: Option<IpMode>, global: IpMode) -> Result<IpMode, String> {
+    pub fn effective_with_global(
+        listener_override: Option<Self>,
+        global: Self,
+    ) -> Result<Self, String> {
         match (global, listener_override) {
             (g, None) => Ok(g),
-            (IpMode::DualStack, Some(l)) => Ok(l),
-            (IpMode::Ipv4Only, Some(IpMode::Ipv4Only)) => Ok(IpMode::Ipv4Only),
-            (IpMode::Ipv6Only, Some(IpMode::Ipv6Only)) => Ok(IpMode::Ipv6Only),
-            (IpMode::Ipv4Only, Some(IpMode::DualStack)) => Err(
-                "listener ip_mode 'dual_stack' cannot loosen global ip_mode 'ipv4_only'".to_string(),
+            (Self::DualStack, Some(l)) => Ok(l),
+            (Self::Ipv4Only, Some(Self::Ipv4Only)) => Ok(Self::Ipv4Only),
+            (Self::Ipv6Only, Some(Self::Ipv6Only)) => Ok(Self::Ipv6Only),
+            (Self::Ipv4Only, Some(Self::DualStack)) => Err(
+                "listener ip_mode 'dual_stack' cannot loosen global ip_mode 'ipv4_only'"
+                    .to_string(),
             ),
-            (IpMode::Ipv6Only, Some(IpMode::DualStack)) => Err(
-                "listener ip_mode 'dual_stack' cannot loosen global ip_mode 'ipv6_only'".to_string(),
+            (Self::Ipv6Only, Some(Self::DualStack)) => Err(
+                "listener ip_mode 'dual_stack' cannot loosen global ip_mode 'ipv6_only'"
+                    .to_string(),
             ),
-            (IpMode::Ipv4Only, Some(IpMode::Ipv6Only)) => Err(
-                "listener ip_mode 'ipv6_only' conflicts with global ip_mode 'ipv4_only'".to_string(),
+            (Self::Ipv4Only, Some(Self::Ipv6Only)) => Err(
+                "listener ip_mode 'ipv6_only' conflicts with global ip_mode 'ipv4_only'"
+                    .to_string(),
             ),
-            (IpMode::Ipv6Only, Some(IpMode::Ipv4Only)) => Err(
-                "listener ip_mode 'ipv4_only' conflicts with global ip_mode 'ipv6_only'".to_string(),
+            (Self::Ipv6Only, Some(Self::Ipv4Only)) => Err(
+                "listener ip_mode 'ipv4_only' conflicts with global ip_mode 'ipv6_only'"
+                    .to_string(),
             ),
         }
     }
@@ -269,14 +293,12 @@ pub enum TuiSortField {
 }
 
 /// Selection of tunnels participating in a shared listener pool.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TunnelPoolSelection {
     #[default]
     All,
     Selected(Vec<String>),
 }
-
 
 impl<'de> Deserialize<'de> for TunnelPoolSelection {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -293,12 +315,12 @@ impl<'de> Deserialize<'de> for TunnelPoolSelection {
         match PoolHelper::deserialize(deserializer)? {
             PoolHelper::Str(s) => {
                 if s.eq_ignore_ascii_case("all") {
-                    Ok(TunnelPoolSelection::All)
+                    Ok(Self::All)
                 } else {
-                    Ok(TunnelPoolSelection::Selected(vec![s]))
+                    Ok(Self::Selected(vec![s]))
                 }
             }
-            PoolHelper::List(list) => Ok(TunnelPoolSelection::Selected(list)),
+            PoolHelper::List(list) => Ok(Self::Selected(list)),
         }
     }
 }
@@ -309,8 +331,8 @@ impl Serialize for TunnelPoolSelection {
         S: Serializer,
     {
         match self {
-            TunnelPoolSelection::All => serializer.serialize_str("all"),
-            TunnelPoolSelection::Selected(list) => list.serialize(serializer),
+            Self::All => serializer.serialize_str("all"),
+            Self::Selected(list) => list.serialize(serializer),
         }
     }
 }
@@ -347,15 +369,15 @@ fn default_config_dir() -> PathBuf {
     PathBuf::from("/etc/wpmulti/conf.d")
 }
 
-fn default_bind_address() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
+const fn default_bind_address() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
-fn default_dns_fallback() -> SocketAddr {
-    "1.1.1.1:53".parse().expect("valid socket addr")
+const fn default_dns_fallback() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)
 }
 
-fn default_max_active_tunnels() -> usize {
+const fn default_max_active_tunnels() -> usize {
     1000
 }
 
@@ -390,11 +412,11 @@ pub struct LifecycleSettings {
     pub eager_tunnels: Vec<String>,
 }
 
-fn default_idle_timeout() -> Duration {
-    Duration::from_secs(300)
+const fn default_idle_timeout() -> Duration {
+    Duration::from_mins(5)
 }
 
-fn default_handshake_timeout() -> Duration {
+const fn default_handshake_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
@@ -438,15 +460,17 @@ pub struct PerTunnelSettings {
     pub overrides: HashMap<String, TunnelPortOverride>,
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
-fn default_base_socks5_port() -> Option<u16> {
+#[allow(clippy::unnecessary_wraps)]
+const fn default_base_socks5_port() -> Option<u16> {
     Some(10000)
 }
 
-fn default_base_http_port() -> Option<u16> {
+#[allow(clippy::unnecessary_wraps)]
+const fn default_base_http_port() -> Option<u16> {
     Some(20000)
 }
 
@@ -490,7 +514,7 @@ pub struct SharedListenerSettings {
     pub ip_mode: Option<IpMode>,
 }
 
-fn default_false() -> bool {
+const fn default_false() -> bool {
     false
 }
 
@@ -507,8 +531,8 @@ pub struct AdminSettings {
     pub auth_token: Option<String>,
 }
 
-fn default_admin_bind() -> SocketAddr {
-    "127.0.0.1:9090".parse().expect("valid socket addr")
+const fn default_admin_bind() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090)
 }
 
 impl Default for AdminSettings {
@@ -531,7 +555,7 @@ pub struct TuiSettings {
     pub default_sort: TuiSortField,
 }
 
-fn default_refresh_rate_ms() -> u64 {
+const fn default_refresh_rate_ms() -> u64 {
     500
 }
 
@@ -560,19 +584,19 @@ pub struct HealthCheckSettings {
     pub probe_timeout: Duration,
 }
 
-fn default_failure_threshold() -> usize {
+const fn default_failure_threshold() -> usize {
     3
 }
 
-fn default_cooldown() -> Duration {
+const fn default_cooldown() -> Duration {
     Duration::from_secs(30)
 }
 
-fn default_probe_interval() -> Duration {
+const fn default_probe_interval() -> Duration {
     Duration::from_secs(30)
 }
 
-fn default_probe_timeout() -> Duration {
+const fn default_probe_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
@@ -630,20 +654,7 @@ impl MainConfig {
         Self::from_toml_str(&content)
     }
 
-    /// Perform comprehensive validation of configuration invariants.
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.global.max_active_tunnels == 0 {
-            return Err(ConfigError::Validation(
-                "global.max_active_tunnels must be greater than 0".into(),
-            ));
-        }
-
-        if self.lifecycle.handshake_timeout.is_zero() {
-            return Err(ConfigError::Validation(
-                "lifecycle.handshake_timeout must be greater than 0".into(),
-            ));
-        }
-
+    fn validate_shared_listeners(&self) -> Result<(), ConfigError> {
         let mut listener_names = HashSet::new();
         let mut bind_ports = HashSet::new();
 
@@ -718,7 +729,10 @@ impl MainConfig {
                 }
             }
         }
+        Ok(())
+    }
 
+    fn validate_per_tunnel(&self) -> Result<(), ConfigError> {
         for (id, override_cfg) in &self.per_tunnel.overrides {
             if let Some(pwd) = &override_cfg.password
                 && pwd.is_empty()
@@ -729,47 +743,73 @@ impl MainConfig {
             }
         }
 
-        if self.per_tunnel.enabled {
-            if let Some(s5) = self.per_tunnel.base_socks5_port
-                && s5 == 0 {
-                    return Err(ConfigError::Validation(
-                        "per_tunnel.base_socks5_port cannot be 0".into(),
-                    ));
-                }
-            if let Some(http) = self.per_tunnel.base_http_port
-                && http == 0 {
-                    return Err(ConfigError::Validation(
-                        "per_tunnel.base_http_port cannot be 0".into(),
-                    ));
-                }
-            if let (Some(s5), Some(http)) = (self.per_tunnel.base_socks5_port, self.per_tunnel.base_http_port)
-                && s5 == http {
-                    return Err(ConfigError::Validation(
-                        "per_tunnel.base_socks5_port and base_http_port cannot be identical".into(),
-                    ));
-                }
-            for (id, override_port) in &self.per_tunnel.overrides {
-                if let Some(p) = override_port.socks5_port
-                    && p == 0 {
-                        return Err(ConfigError::Validation(format!(
-                            "Override socks5_port for tunnel '{id}' cannot be 0"
-                        )));
-                    }
-                if let Some(p) = override_port.http_port
-                    && p == 0 {
-                        return Err(ConfigError::Validation(format!(
-                            "Override http_port for tunnel '{id}' cannot be 0"
-                        )));
-                    }
+        if !self.per_tunnel.enabled {
+            return Ok(());
+        }
+
+        if let Some(s5) = self.per_tunnel.base_socks5_port
+            && s5 == 0
+        {
+            return Err(ConfigError::Validation(
+                "per_tunnel.base_socks5_port cannot be 0".into(),
+            ));
+        }
+        if let Some(http) = self.per_tunnel.base_http_port
+            && http == 0
+        {
+            return Err(ConfigError::Validation(
+                "per_tunnel.base_http_port cannot be 0".into(),
+            ));
+        }
+        if let (Some(s5), Some(http)) = (
+            self.per_tunnel.base_socks5_port,
+            self.per_tunnel.base_http_port,
+        ) && s5 == http
+        {
+            return Err(ConfigError::Validation(
+                "per_tunnel.base_socks5_port and base_http_port cannot be identical".into(),
+            ));
+        }
+        for (id, override_port) in &self.per_tunnel.overrides {
+            if let Some(p) = override_port.socks5_port
+                && p == 0
+            {
+                return Err(ConfigError::Validation(format!(
+                    "Override socks5_port for tunnel '{id}' cannot be 0"
+                )));
+            }
+            if let Some(p) = override_port.http_port
+                && p == 0
+            {
+                return Err(ConfigError::Validation(format!(
+                    "Override http_port for tunnel '{id}' cannot be 0"
+                )));
             }
         }
+        Ok(())
+    }
+
+    /// Perform comprehensive validation of configuration invariants.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.global.max_active_tunnels == 0 {
+            return Err(ConfigError::Validation(
+                "global.max_active_tunnels must be greater than 0".into(),
+            ));
+        }
+        if self.lifecycle.handshake_timeout.is_zero() {
+            return Err(ConfigError::Validation(
+                "lifecycle.handshake_timeout must be greater than 0".into(),
+            ));
+        }
+
+        self.validate_shared_listeners()?;
+        self.validate_per_tunnel()?;
 
         if self.tui.refresh_rate_ms < 50 {
             return Err(ConfigError::Validation(
                 "tui.refresh_rate_ms must be at least 50 ms".into(),
             ));
         }
-
         if self.health_check.threshold == 0 {
             return Err(ConfigError::Validation(
                 "health_check.threshold must be greater than 0".into(),

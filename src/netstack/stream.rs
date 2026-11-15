@@ -3,12 +3,12 @@
 //! Provides [`VirtualTcpStream`] implementing [`tokio::io::AsyncRead`] and
 //! [`tokio::io::AsyncWrite`], and [`VirtualUdpSocket`] for datagram transfer.
 
+use parking_lot::Mutex;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use smoltcp::iface::SocketHandle;
@@ -26,7 +26,7 @@ impl std::fmt::Debug for VirtualTcpStream {
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
             .field("closed", &self.closed)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -35,10 +35,10 @@ impl std::fmt::Debug for VirtualUdpSocket {
         f.debug_struct("VirtualUdpSocket")
             .field("handle", &self.handle)
             .field("local_port", &self.local_port)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
-pub fn to_smoltcp_endpoint(addr: SocketAddr) -> IpEndpoint {
+pub const fn to_smoltcp_endpoint(addr: SocketAddr) -> IpEndpoint {
     match addr {
         SocketAddr::V4(v4) => IpEndpoint::new(IpAddress::Ipv4(*v4.ip()), v4.port()),
         SocketAddr::V6(v6) => IpEndpoint::new(IpAddress::Ipv6(*v6.ip()), v6.port()),
@@ -46,7 +46,7 @@ pub fn to_smoltcp_endpoint(addr: SocketAddr) -> IpEndpoint {
 }
 
 /// Helper: convert smoltcp IpEndpoint to standard SocketAddr.
-pub fn to_std_socket_addr(ep: IpEndpoint) -> SocketAddr {
+pub const fn to_std_socket_addr(ep: IpEndpoint) -> SocketAddr {
     match ep.addr {
         IpAddress::Ipv4(v4) => SocketAddr::V4(std::net::SocketAddrV4::new(v4, ep.port)),
         IpAddress::Ipv6(v6) => SocketAddr::V6(std::net::SocketAddrV6::new(v6, ep.port, 0, 0)),
@@ -65,7 +65,7 @@ pub struct VirtualTcpStream {
 
 impl VirtualTcpStream {
     /// Create a new stream wrapper from an established socket handle.
-    pub(crate) fn new(
+    pub(crate) const fn new(
         handle: SocketHandle,
         inner: Arc<Mutex<StackInner>>,
         notify: Arc<Notify>,
@@ -83,12 +83,14 @@ impl VirtualTcpStream {
     }
 
     /// Returns the local address of this stream.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    #[allow(clippy::unnecessary_wraps)]
+    pub const fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local_addr)
     }
 
     /// Returns the remote peer address of this stream.
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+    #[allow(clippy::unnecessary_wraps)]
+    pub const fn peer_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.peer_addr)
     }
 }
@@ -105,12 +107,13 @@ impl AsyncRead for VirtualTcpStream {
 
         let mut inner = self.inner.lock();
         if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
+            drop(inner);
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "tcp socket handle not found in socket set",
             )));
         }
-        let socket = inner.sockets.get_mut::<tcp::Socket>(self.handle);
+        let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
 
         match socket.state() {
             State::Established | State::CloseWait => {
@@ -123,15 +126,11 @@ impl AsyncRead for VirtualTcpStream {
                             self.notify.notify_one();
                             Poll::Ready(Ok(()))
                         }
-                        Err(tcp::RecvError::Finished) => {
-                            Poll::Ready(Ok(()))
-                        }
-                        Err(tcp::RecvError::InvalidState) => {
-                            Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::NotConnected,
-                                "tcp socket invalid state for recv",
-                            )))
-                        }
+                        Err(tcp::RecvError::Finished) => Poll::Ready(Ok(())),
+                        Err(tcp::RecvError::InvalidState) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "tcp socket invalid state for recv",
+                        ))),
                     }
                 } else if !socket.may_recv() {
                     // FIN received and all bytes drained
@@ -141,7 +140,12 @@ impl AsyncRead for VirtualTcpStream {
                     Poll::Pending
                 }
             }
-            State::FinWait1 | State::FinWait2 | State::Closing | State::TimeWait | State::LastAck | State::Closed => {
+            State::FinWait1
+            | State::FinWait2
+            | State::Closing
+            | State::TimeWait
+            | State::LastAck
+            | State::Closed => {
                 if socket.can_recv() {
                     let unfilled = buf.initialize_unfilled();
                     if let Ok(n) = socket.recv_slice(unfilled) {
@@ -157,12 +161,10 @@ impl AsyncRead for VirtualTcpStream {
                 socket.register_recv_waker(cx.waker());
                 Poll::Pending
             }
-            State::Listen => {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "listening socket cannot be read",
-                )))
-            }
+            State::Listen => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "listening socket cannot be read",
+            ))),
         }
     }
 }
@@ -186,12 +188,13 @@ impl AsyncWrite for VirtualTcpStream {
 
         let mut inner = self.inner.lock();
         if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
+            drop(inner);
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "tcp socket handle not found in socket set",
             )));
         }
-        let socket = inner.sockets.get_mut::<tcp::Socket>(self.handle);
+        let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
 
         match socket.state() {
             State::Established | State::CloseWait => {
@@ -209,12 +212,10 @@ impl AsyncWrite for VirtualTcpStream {
                             self.notify.notify_one();
                             Poll::Ready(Ok(n))
                         }
-                        Err(tcp::SendError::InvalidState) => {
-                            Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::NotConnected,
-                                "tcp socket invalid state for send",
-                            )))
-                        }
+                        Err(tcp::SendError::InvalidState) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "tcp socket invalid state for send",
+                        ))),
                     }
                 } else {
                     socket.register_send_waker(cx.waker());
@@ -225,39 +226,38 @@ impl AsyncWrite for VirtualTcpStream {
                 socket.register_send_waker(cx.waker());
                 Poll::Pending
             }
-            State::FinWait1 | State::FinWait2 | State::Closing | State::TimeWait | State::LastAck | State::Closed => {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "connection reset by peer or closed",
-                )))
-            }
-            State::Listen => {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "listening socket cannot be written",
-                )))
-            }
+            State::FinWait1
+            | State::FinWait2
+            | State::Closing
+            | State::TimeWait
+            | State::LastAck
+            | State::Closed => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection reset by peer or closed",
+            ))),
+            State::Listen => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "listening socket cannot be written",
+            ))),
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.closed {
             return Poll::Ready(Ok(()));
         }
 
         let mut inner = self.inner.lock();
         if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
+            drop(inner);
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "tcp socket handle not found in socket set",
             )));
         }
-        let socket = inner.sockets.get_mut::<tcp::Socket>(self.handle);
+        let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
 
-        match socket.state() {
+        let poll = match socket.state() {
             State::Established | State::CloseWait => {
                 if socket.send_queue() == 0 {
                     Poll::Ready(Ok(()))
@@ -270,26 +270,32 @@ impl AsyncWrite for VirtualTcpStream {
                 socket.register_send_waker(cx.waker());
                 Poll::Pending
             }
-            _ => Poll::Ready(Ok(())),
-        }
+            State::Closed
+            | State::Listen
+            | State::FinWait1
+            | State::FinWait2
+            | State::Closing
+            | State::LastAck
+            | State::TimeWait => Poll::Ready(Ok(())),
+        };
+        drop(inner);
+        poll
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.closed {
             return Poll::Ready(Ok(()));
         }
 
         let mut inner = self.inner.lock();
         if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
+            drop(inner);
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "tcp socket handle not found in socket set",
             )));
         }
-        let socket = inner.sockets.get_mut::<tcp::Socket>(self.handle);
+        let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
 
         match socket.state() {
             State::Established | State::CloseWait => {
@@ -303,12 +309,11 @@ impl AsyncWrite for VirtualTcpStream {
                 socket.register_send_waker(cx.waker());
                 Poll::Pending
             }
-            State::TimeWait | State::Closed => {
-                drop(inner);
-                self.get_mut().closed = true;
-                Poll::Ready(Ok(()))
-            }
-            _ => {
+            State::Closed
+            | State::Listen
+            | State::SynSent
+            | State::SynReceived
+            | State::TimeWait => {
                 drop(inner);
                 self.get_mut().closed = true;
                 Poll::Ready(Ok(()))
@@ -322,7 +327,7 @@ impl Drop for VirtualTcpStream {
         let mut inner = self.inner.lock();
         let exists = inner.sockets.iter().any(|(h, _)| h == self.handle);
         if exists {
-            let socket = inner.sockets.get_mut::<tcp::Socket>(self.handle);
+            let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
             if socket.is_active() {
                 socket.abort();
             }
@@ -344,7 +349,7 @@ pub struct VirtualUdpSocket {
 
 impl VirtualUdpSocket {
     /// Create a new virtual UDP socket wrapper.
-    pub(crate) fn new(
+    pub(crate) const fn new(
         handle: SocketHandle,
         inner: Arc<Mutex<StackInner>>,
         notify: Arc<Notify>,
@@ -372,7 +377,7 @@ impl VirtualUdpSocket {
                     "udp socket handle not found in socket set",
                 )));
             }
-            let socket = inner.sockets.get_mut::<udp::Socket>(self.handle);
+            let socket = inner.sockets.get_mut::<udp::Socket<'_>>(self.handle);
 
             if socket.can_send() {
                 match socket.send_slice(buf, endpoint) {
@@ -385,12 +390,10 @@ impl VirtualUdpSocket {
                         socket.register_send_waker(cx.waker());
                         Poll::Pending
                     }
-                    Err(udp::SendError::Unaddressable) => {
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::AddrNotAvailable,
-                            "unaddressable destination endpoint",
-                        )))
-                    }
+                    Err(udp::SendError::Unaddressable) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "unaddressable destination endpoint",
+                    ))),
                 }
             } else {
                 socket.register_send_waker(cx.waker());
@@ -410,7 +413,7 @@ impl VirtualUdpSocket {
                     "udp socket handle not found in socket set",
                 )));
             }
-            let socket = inner.sockets.get_mut::<udp::Socket>(self.handle);
+            let socket = inner.sockets.get_mut::<udp::Socket<'_>>(self.handle);
 
             if socket.can_recv() {
                 match socket.recv_slice(buf) {
@@ -420,12 +423,10 @@ impl VirtualUdpSocket {
                         self.notify.notify_one();
                         Poll::Ready(Ok((len, peer_addr)))
                     }
-                    Err(udp::RecvError::Truncated) => {
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "received datagram truncated, buffer too small",
-                        )))
-                    }
+                    Err(udp::RecvError::Truncated) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "received datagram truncated, buffer too small",
+                    ))),
                     Err(udp::RecvError::Exhausted) => {
                         socket.register_recv_waker(cx.waker());
                         Poll::Pending
@@ -440,7 +441,7 @@ impl VirtualUdpSocket {
     }
 
     /// Returns the local port bound by this UDP socket.
-    pub fn local_port(&self) -> u16 {
+    pub const fn local_port(&self) -> u16 {
         self.local_port
     }
 }

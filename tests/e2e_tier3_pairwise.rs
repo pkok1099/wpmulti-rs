@@ -1,8 +1,26 @@
+#![allow(
+    unreachable_pub,
+    unused_qualifications,
+    trivial_casts,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::type_complexity,
+    clippy::wildcard_enum_match_arm,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
+
 mod common;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{
@@ -15,8 +33,8 @@ use gotatun::x25519::{PublicKey, StaticSecret};
 use smoltcp::phy::{Device, TxToken};
 use wpmulti::api::AdminServer;
 use wpmulti::config::{
-    AuthMode, LifecycleMode, MainConfig, PoolStrategy, SharedListenerSettings,
-    TuiSortField, TunnelConfig, TunnelPoolSelection, WgInterfaceConfig, WgPeerConfig,
+    AuthMode, LifecycleMode, MainConfig, PoolStrategy, SharedListenerSettings, TuiSortField,
+    TunnelConfig, TunnelPoolSelection, WgInterfaceConfig, WgPeerConfig,
 };
 use wpmulti::core::{
     DedicatedTunnelRouter, LifecycleController, MultiTenantRouter, TunnelEntry, TunnelManager,
@@ -24,10 +42,10 @@ use wpmulti::core::{
 };
 use wpmulti::netstack::{DnsLruCache, VirtualTunBridge};
 use wpmulti::proxy::{
-    parse_authority, parse_socks5_udp_packet, PoolKeyword, ProxyAuthError, TargetAddr,
-    TunnelRouter, TunnelSelector,
+    PoolKeyword, ProxyAuthError, TargetAddr, TunnelRouter, TunnelSelector, parse_authority,
+    parse_socks5_udp_packet,
 };
-use wpmulti::tui::{render_dashboard, TuiApp, TuiDataSource};
+use wpmulti::tui::{TuiApp, TuiDataSource, render_dashboard};
 
 fn make_test_conf(id: &str, endpoint: &str) -> TunnelConfig {
     TunnelConfig {
@@ -60,9 +78,11 @@ async fn test_pairwise_f1_wg_conf_and_f9_per_tunnel_dedicated_port() {
     let base_s5 = 31100u16;
     let base_http = 32100u16;
 
-    let confs = [make_test_conf("tunnel-a", "198.51.100.1:51820"),
+    let confs = [
+        make_test_conf("tunnel-a", "198.51.100.1:51820"),
         make_test_conf("tunnel-b", "198.51.100.2:51820"),
-        make_test_conf("tunnel-c", "198.51.100.3:51820")];
+        make_test_conf("tunnel-c", "198.51.100.3:51820"),
+    ];
 
     let registry = Arc::new(TunnelRegistry::new());
     for (idx, conf) in confs.iter().enumerate() {
@@ -132,7 +152,8 @@ async fn test_pairwise_f2_toml_and_f10_shared_listener_pools() {
     );
 
     // Router 1: public anonymous allowed
-    let router1 = MultiTenantRouter::from_settings(&cfg.shared_listeners[0], lc.clone(), reg.clone());
+    let router1 =
+        MultiTenantRouter::from_settings(&cfg.shared_listeners[0], lc.clone(), reg.clone());
     let sel_anon = router1.authenticate(None).expect("anonymous allowed");
     assert_eq!(sel_anon, TunnelSelector::DefaultPool);
 
@@ -141,12 +162,19 @@ async fn test_pairwise_f2_toml_and_f10_shared_listener_pools() {
 
     // Router 2: private requires auth
     let router2 = MultiTenantRouter::from_settings(&cfg.shared_listeners[1], lc, reg);
-    assert_eq!(router2.authenticate(None).unwrap_err(), ProxyAuthError::AuthRequired);
     assert_eq!(
-        router2.authenticate(Some(("user", "bad_pass"))).unwrap_err(),
+        router2.authenticate(None).unwrap_err(),
+        ProxyAuthError::AuthRequired
+    );
+    assert_eq!(
+        router2
+            .authenticate(Some(("user", "bad_pass")))
+            .unwrap_err(),
         ProxyAuthError::InvalidCredentials
     );
-    let sel_auth = router2.authenticate(Some(("wgcf-01", "secPass99"))).unwrap();
+    let sel_auth = router2
+        .authenticate(Some(("wgcf-01", "secPass99")))
+        .unwrap();
     assert_eq!(sel_auth, TunnelSelector::ById("wgcf-01".to_string()));
 }
 
@@ -159,7 +187,9 @@ async fn test_pairwise_f3_registry_and_f11_lifecycle_state() {
     for i in 1..=5 {
         let conf = make_test_conf(&format!("tun-{:02}", i), "127.0.0.1:51820");
         let id = conf.id.clone();
-        registry.register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy)).unwrap();
+        registry
+            .register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy))
+            .unwrap();
     }
 
     let lifecycle = LifecycleController::new(
@@ -209,7 +239,9 @@ async fn test_pairwise_f4_userspace_netstack_and_f6_socks5_connect() {
     }
 
     // Transmit into smoltcp bridge
-    let tx_token = bridge.transmit(smoltcp::time::Instant::from_millis(0)).unwrap();
+    let tx_token = bridge
+        .transmit(smoltcp::time::Instant::from_millis(0))
+        .unwrap();
     tx_token.consume(ip_buf.len(), |buf| {
         buf.copy_from_slice(&ip_buf);
     });
@@ -223,7 +255,10 @@ async fn test_pairwise_f4_userspace_netstack_and_f6_socks5_connect() {
     let raw = batch[0].clone().into_bytes();
     let sliced = etherparse::SlicedPacket::from_ip(raw.as_ref()).unwrap();
     if let Some(etherparse::InternetSlice::Ipv4(ipv4_header, _)) = sliced.ip {
-        assert_eq!(ipv4_header.destination_addr(), Ipv4Addr::new(198, 51, 100, 10));
+        assert_eq!(
+            ipv4_header.destination_addr(),
+            Ipv4Addr::new(198, 51, 100, 10)
+        );
     } else {
         panic!("Expected IPv4 header");
     }
@@ -262,7 +297,9 @@ async fn test_pairwise_f6_socks5_and_f11_lazy_activation() {
     let registry = Arc::new(TunnelRegistry::new());
     let conf = make_test_conf("lazy-s5-tunnel", "127.0.0.1:51820");
     let id = conf.id.clone();
-    registry.register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy))
+        .unwrap();
 
     let lifecycle = LifecycleController::new(
         Arc::clone(&registry),
@@ -312,16 +349,23 @@ async fn test_pairwise_f8_http_proxy_and_f10_shared_listener_auth() {
     let router = MultiTenantRouter::from_settings(&settings, lc, reg);
 
     // Missing auth header
-    assert_eq!(router.authenticate(None).unwrap_err(), ProxyAuthError::AuthRequired);
+    assert_eq!(
+        router.authenticate(None).unwrap_err(),
+        ProxyAuthError::AuthRequired
+    );
 
     // Wrong password
     assert_eq!(
-        router.authenticate(Some(("wgcf-pool", "wrong_pass"))).unwrap_err(),
+        router
+            .authenticate(Some(("wgcf-pool", "wrong_pass")))
+            .unwrap_err(),
         ProxyAuthError::InvalidCredentials
     );
 
     // Valid credentials
-    let sel = router.authenticate(Some(("wgcf-target", "secretHTTP"))).unwrap();
+    let sel = router
+        .authenticate(Some(("wgcf-target", "secretHTTP")))
+        .unwrap();
     assert_eq!(sel, TunnelSelector::ById("wgcf-target".to_string()));
 }
 
@@ -333,7 +377,9 @@ async fn test_pairwise_f8_http_proxy_and_f11_lazy_activation() {
     let registry = Arc::new(TunnelRegistry::new());
     let conf = make_test_conf("lazy-http-tunnel", "127.0.0.1:51820");
     let id = conf.id.clone();
-    registry.register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy))
+        .unwrap();
 
     let lifecycle = LifecycleController::new(
         Arc::clone(&registry),
@@ -385,7 +431,9 @@ async fn test_pairwise_f7_socks5_udp_and_f4_netstack_bridge() {
     let builder = PacketBuilder::ipv4([10, 0, 0, 2], dest_ip.octets(), 64).udp(20000, dest_port);
     builder.write(&mut ip_buf, payload).unwrap();
 
-    let tx_token = bridge.transmit(smoltcp::time::Instant::from_millis(0)).unwrap();
+    let tx_token = bridge
+        .transmit(smoltcp::time::Instant::from_millis(0))
+        .unwrap();
     tx_token.consume(ip_buf.len(), |buf| {
         buf.copy_from_slice(&ip_buf);
     });
@@ -422,14 +470,20 @@ async fn test_pairwise_f12_admin_api_and_f11_lifecycle_control() {
     let tunnels = client.list_tunnels(None).await.unwrap();
     assert_eq!(tunnels.as_array().unwrap().len(), 1);
     assert_eq!(tunnels[0]["id"], "wgcf-admin-ctrl");
-    assert_eq!(tunnels[0]["state"].as_str().unwrap().to_lowercase(), "dormant");
+    assert_eq!(
+        tunnels[0]["state"].as_str().unwrap().to_lowercase(),
+        "dormant"
+    );
 
     // Activate via Admin API
     let act_resp = client.activate_tunnel("wgcf-admin-ctrl").await.unwrap();
     assert_eq!(act_resp["status"], "activated");
 
     let tunnels_after = client.list_tunnels(None).await.unwrap();
-    assert_eq!(tunnels_after[0]["state"].as_str().unwrap().to_lowercase(), "active");
+    assert_eq!(
+        tunnels_after[0]["state"].as_str().unwrap().to_lowercase(),
+        "active"
+    );
 
     // Suspend via Admin API
     let deact_resp = client.deactivate_tunnel("wgcf-admin-ctrl").await.unwrap();
@@ -535,7 +589,8 @@ async fn test_pairwise_f10_shared_port_and_f7_udp_associate() {
     let reg = Arc::new(TunnelRegistry::new());
     for id in &["user-tun-01", "user-tun-02"] {
         let conf = make_test_conf(id, "127.0.0.1:51820");
-        reg.register(TunnelEntry::new(*id, conf, LifecycleMode::Lazy)).unwrap();
+        reg.register(TunnelEntry::new(*id, conf, LifecycleMode::Lazy))
+            .unwrap();
     }
 
     let lc = LifecycleController::new(

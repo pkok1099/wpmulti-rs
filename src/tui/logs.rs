@@ -24,7 +24,7 @@ impl TuiLogBuffer {
     }
 
     /// Push a single formatted log line into the ring buffer.
-    pub fn push_line(&self, line: String) {
+    pub fn push_line(&self, line: &str) {
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             return;
@@ -48,6 +48,7 @@ impl TuiLogBuffer {
 }
 
 /// Line-buffered writer passed to `tracing_subscriber` for each log event.
+#[derive(Debug)]
 pub struct TuiLogWriter {
     buffer: TuiLogBuffer,
     pending: Vec<u8>,
@@ -59,7 +60,7 @@ impl Write for TuiLogWriter {
         while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = self.pending.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&line_bytes).into_owned();
-            self.buffer.push_line(line);
+            self.buffer.push_line(&line);
         }
         Ok(buf.len())
     }
@@ -68,7 +69,7 @@ impl Write for TuiLogWriter {
         if !self.pending.is_empty() {
             let line = String::from_utf8_lossy(&self.pending).into_owned();
             self.pending.clear();
-            self.buffer.push_line(line);
+            self.buffer.push_line(&line);
         }
         Ok(())
     }

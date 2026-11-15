@@ -1,8 +1,8 @@
 //! Unit tests for Milestone 4: Multi-Tunnel Manager & Scalable Lifecycle.
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,11 +12,11 @@ use crate::config::{
     AuthMode, LifecycleMode, ListenerType, MainConfig, PerTunnelSettings, PoolStrategy,
     TunnelConfig, TunnelPortOverride, WgInterfaceConfig, WgPeerConfig,
 };
+use crate::core::TunnelManager;
 use crate::core::lifecycle::{LifecycleController, TunnelConnGuard};
 use crate::core::listener::ListenerSupervisor;
 use crate::core::registry::{TunnelEntry, TunnelRegistry, TunnelState, TunnelStats};
 use crate::core::router::MultiTenantRouter;
-use crate::core::TunnelManager;
 use crate::proxy::{PoolKeyword, ProxyAuthError, TunnelRouter, TunnelSelector};
 
 fn make_test_tunnel_config(id: &str) -> TunnelConfig {
@@ -209,7 +209,9 @@ async fn test_shared_port_router_auth_and_strategies() {
     for i in 1..=3 {
         let id = format!("wgcf-tenant-{:02}", i);
         let cfg = make_test_tunnel_config(&id);
-        registry.register(TunnelEntry::new(id, cfg, LifecycleMode::Lazy)).unwrap();
+        registry
+            .register(TunnelEntry::new(id, cfg, LifecycleMode::Lazy))
+            .unwrap();
     }
 
     let idle_timeout = Duration::from_secs(60);
@@ -239,7 +241,10 @@ async fn test_shared_port_router_auth_and_strategies() {
     assert_eq!(ok_auth, TunnelSelector::ById("wgcf-tenant-01".to_string()));
 
     // Test 4: Select tunnel ById activates target
-    let target = router.select_tunnel(&ok_auth).await.expect("select tunnel should succeed");
+    let target = router
+        .select_tunnel(&ok_auth)
+        .await
+        .expect("select tunnel should succeed");
     assert!(registry.get("wgcf-tenant-01").unwrap().is_active());
 
     // Test 5: Round-Robin Keyword cycling
@@ -277,8 +282,20 @@ async fn test_dedicated_and_shared_listeners() {
     let registry = Arc::new(TunnelRegistry::new());
     let cfg1 = make_test_tunnel_config("wgcf-listen-01");
     let cfg2 = make_test_tunnel_config("wgcf-listen-02");
-    registry.register(TunnelEntry::new("wgcf-listen-01", cfg1, LifecycleMode::Lazy)).unwrap();
-    registry.register(TunnelEntry::new("wgcf-listen-02", cfg2, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-listen-01",
+            cfg1,
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-listen-02",
+            cfg2,
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
 
     let idle_timeout = Duration::from_secs(60);
     let check_interval = Duration::from_secs(1);
@@ -326,7 +343,8 @@ async fn test_dedicated_and_shared_listeners() {
     assert_eq!(active_info.address.port(), port1);
 
     // Verify TCP connection succeeds to dedicated port
-    let stream_res = tokio::net::TcpStream::connect(SocketAddr::new("127.0.0.1".parse().unwrap(), port1)).await;
+    let stream_res =
+        tokio::net::TcpStream::connect(SocketAddr::new("127.0.0.1".parse().unwrap(), port1)).await;
     assert!(stream_res.is_ok(), "must connect to dedicated listener");
 
     // Clean shutdown
@@ -383,7 +401,11 @@ async fn test_metered_traffic_counters() {
     let registry = Arc::new(TunnelRegistry::new());
     let cfg = make_test_tunnel_config("wgcf-metered-01");
     let entry = registry
-        .register(TunnelEntry::new("wgcf-metered-01", cfg, LifecycleMode::Lazy))
+        .register(TunnelEntry::new(
+            "wgcf-metered-01",
+            cfg,
+            LifecycleMode::Lazy,
+        ))
         .unwrap();
 
     let (mut client_stream, server_stream) = tokio::io::duplex(4096);
@@ -508,10 +530,18 @@ async fn test_pool_isolation_rejects_unallowed_by_id() {
     let cfg_a = make_test_tunnel_config("wgcf-pool-allowed");
     let cfg_b = make_test_tunnel_config("wgcf-pool-forbidden");
     registry
-        .register(TunnelEntry::new("wgcf-pool-allowed", cfg_a, LifecycleMode::Lazy))
+        .register(TunnelEntry::new(
+            "wgcf-pool-allowed",
+            cfg_a,
+            LifecycleMode::Lazy,
+        ))
         .unwrap();
     registry
-        .register(TunnelEntry::new("wgcf-pool-forbidden", cfg_b, LifecycleMode::Lazy))
+        .register(TunnelEntry::new(
+            "wgcf-pool-forbidden",
+            cfg_b,
+            LifecycleMode::Lazy,
+        ))
         .unwrap();
 
     let lifecycle = LifecycleController::new(
@@ -533,9 +563,8 @@ async fn test_pool_isolation_rejects_unallowed_by_id() {
     // Attempt to select wgcf-pool-forbidden ById: must be rejected with NotFound
     let selector_forbidden = TunnelSelector::ById("wgcf-pool-forbidden".to_string());
     let res = router.select_tunnel(&selector_forbidden).await;
-    let err = match res {
-        Err(e) => e,
-        Ok(_) => panic!("selecting unallowed tunnel ById must fail"),
+    let Err(err) = res else {
+        panic!("selecting unallowed tunnel ById must fail");
     };
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     assert!(
@@ -547,7 +576,10 @@ async fn test_pool_isolation_rejects_unallowed_by_id() {
     // Selecting allowed tunnel ById must succeed
     let selector_allowed = TunnelSelector::ById("wgcf-pool-allowed".to_string());
     let res_allowed = router.select_tunnel(&selector_allowed).await;
-    assert!(res_allowed.is_ok(), "selecting allowed tunnel ById must succeed");
+    assert!(
+        res_allowed.is_ok(),
+        "selecting allowed tunnel ById must succeed"
+    );
 }
 
 // =============================================================================
@@ -590,7 +622,12 @@ async fn test_reload_applies_new_tunnel_config() {
         .get("wgcf-reload-hot")
         .expect("entry must exist in registry");
     assert_eq!(
-        reloaded_entry.config.read().interface.private_key.to_bytes(),
+        reloaded_entry
+            .config
+            .read()
+            .interface
+            .private_key
+            .to_bytes(),
         new_key,
         "reloaded entry must store new private key"
     );
@@ -618,7 +655,11 @@ async fn test_assigned_port_reflected_in_summary() {
     let registry = Arc::new(TunnelRegistry::new());
     let cfg = make_test_tunnel_config("wgcf-port-reflect-01");
     let entry = registry
-        .register(TunnelEntry::new("wgcf-port-reflect-01", cfg, LifecycleMode::Lazy))
+        .register(TunnelEntry::new(
+            "wgcf-port-reflect-01",
+            cfg,
+            LifecycleMode::Lazy,
+        ))
         .unwrap();
 
     // Initially assigned_port is None
@@ -708,13 +749,19 @@ async fn test_reload_detects_peer_endpoint_change() {
 
     // Modify peer endpoint IP without changing peer count or keys
     initial_cfg.peers[0].endpoint = "203.0.113.50:51820".to_string();
-    let report = manager.reload_with_tunnels(vec![initial_cfg.clone()]).await.unwrap();
+    let report = manager
+        .reload_with_tunnels(vec![initial_cfg.clone()])
+        .await
+        .unwrap();
     assert_eq!(report.updated, 1);
     assert_eq!(report.added, 0);
     assert_eq!(report.removed, 0);
 
     let current = manager.registry().get("tun-reload-diff").unwrap();
-    assert_eq!(current.config.read().peers[0].endpoint, "203.0.113.50:51820");
+    assert_eq!(
+        current.config.read().peers[0].endpoint,
+        "203.0.113.50:51820"
+    );
 }
 
 #[tokio::test]
@@ -727,15 +774,16 @@ async fn test_guarded_udp_socket_preserves_active_conns() {
         .register(TunnelEntry::new("tun-udp-guard", cfg, LifecycleMode::Lazy))
         .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     let (target, guard) = lifecycle.get_or_activate("tun-udp-guard").await.unwrap();
     assert_eq!(entry.stats.active_conns.load(Ordering::SeqCst), 1);
 
     // Create a GuardedTunnelTarget and bind UDP socket
-    let guarded_target = crate::core::lifecycle::GuardedTunnelTarget::new(
-        target,
-        guard,
-    );
+    let guarded_target = crate::core::lifecycle::GuardedTunnelTarget::new(target, guard);
 
     let socket = guarded_target.udp_bind(0).await.unwrap();
     assert_eq!(entry.stats.active_conns.load(Ordering::SeqCst), 1);
@@ -759,7 +807,11 @@ async fn test_boot_failure_reverts_state_to_dormant() {
         .register(TunnelEntry::new("tun-boot-fail", cfg, LifecycleMode::Lazy))
         .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     let res = lifecycle.get_or_activate("tun-boot-fail").await;
     assert!(res.is_err());
     assert_eq!(*entry.state.read(), TunnelState::Dormant);
@@ -768,14 +820,41 @@ async fn test_boot_failure_reverts_state_to_dormant() {
 #[tokio::test]
 async fn test_router_failover_strategies() {
     let registry = Arc::new(TunnelRegistry::new());
-    let e1 = registry.register(TunnelEntry::new("t1", make_test_tunnel_config("t1"), LifecycleMode::Lazy)).unwrap();
-    let e2 = registry.register(TunnelEntry::new("t2", make_test_tunnel_config("t2"), LifecycleMode::Lazy)).unwrap();
-    let e3 = registry.register(TunnelEntry::new("t3", make_test_tunnel_config("t3"), LifecycleMode::Lazy)).unwrap();
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e3 = registry
+        .register(TunnelEntry::new(
+            "t3",
+            make_test_tunnel_config("t3"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
 
     // 1. Fallback Strategy
-    let router_fallback = MultiTenantRouter::new(Arc::clone(&lifecycle), Arc::clone(&registry), PoolStrategy::Fallback, true);
+    let router_fallback = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::Fallback,
+        true,
+    );
     router_fallback.set_allowed_tunnels(Some(vec!["t1".into(), "t2".into(), "t3".into()]));
 
     // All healthy: primary t1 selected
@@ -793,7 +872,12 @@ async fn test_router_failover_strategies() {
     assert!(!e1.health.is_routable());
 
     // 2. Round-Robin skips Unhealthy t1
-    let router_rr = MultiTenantRouter::new(Arc::clone(&lifecycle), Arc::clone(&registry), PoolStrategy::RoundRobin, true);
+    let router_rr = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
     router_rr.set_allowed_tunnels(Some(vec!["t1".into(), "t2".into(), "t3".into()]));
 
     for _ in 0..10 {
@@ -809,7 +893,12 @@ async fn test_router_failover_strategies() {
     // 3. Least-Conn selects healthy even with higher connections
     e2.stats.active_conns.store(100, Ordering::Relaxed);
     e3.stats.active_conns.store(5, Ordering::Relaxed);
-    let router_lc = MultiTenantRouter::new(Arc::clone(&lifecycle), Arc::clone(&registry), PoolStrategy::LeastConn, true);
+    let router_lc = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::LeastConn,
+        true,
+    );
     router_lc.set_allowed_tunnels(Some(vec!["t1".into(), "t2".into(), "t3".into()]));
 
     // e1 has 0 conns, but is unhealthy! So e3 (5 conns) must be chosen over e2 (100 conns)
@@ -827,11 +916,32 @@ async fn test_router_failover_strategies() {
 #[test]
 fn test_router_all_unhealthy_fails() {
     let registry = Arc::new(TunnelRegistry::new());
-    let e1 = registry.register(TunnelEntry::new("t1", make_test_tunnel_config("t1"), LifecycleMode::Lazy)).unwrap();
-    let e2 = registry.register(TunnelEntry::new("t2", make_test_tunnel_config("t2"), LifecycleMode::Lazy)).unwrap();
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
-    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::RoundRobin, true);
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
     router.set_allowed_tunnels(Some(vec!["t1".into(), "t2".into()]));
 
     e1.health.mark_unhealthy(Duration::from_secs(60));
@@ -846,37 +956,68 @@ fn test_router_all_unhealthy_fails() {
 fn test_per_tunnel_auth_override_and_global_fallback() {
     let registry = Arc::new(TunnelRegistry::new());
     registry
-        .register(TunnelEntry::new("tun-vip", make_test_tunnel_config("tun-vip"), LifecycleMode::Lazy))
+        .register(TunnelEntry::new(
+            "tun-vip",
+            make_test_tunnel_config("tun-vip"),
+            LifecycleMode::Lazy,
+        ))
         .unwrap();
     registry
-        .register(TunnelEntry::new("tun-std", make_test_tunnel_config("tun-std"), LifecycleMode::Lazy))
+        .register(TunnelEntry::new(
+            "tun-std",
+            make_test_tunnel_config("tun-std"),
+            LifecycleMode::Lazy,
+        ))
         .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
     let mut passwords = std::collections::HashMap::new();
     passwords.insert("tun-vip".to_string(), "vip-secret".to_string());
 
-    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::RoundRobin, false)
-        .with_auth(AuthMode::PerTunnel, Some("global-secret".to_string()))
-        .with_per_tunnel_passwords(passwords);
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        false,
+    )
+    .with_auth(AuthMode::PerTunnel, Some("global-secret".to_string()))
+    .with_per_tunnel_passwords(passwords);
 
     // 1. Tunnel with override password requires its own password and rejects global password
     assert_eq!(
-        router.authenticate(Some(("tun-vip", "vip-secret"))).unwrap(),
+        router
+            .authenticate(Some(("tun-vip", "vip-secret")))
+            .unwrap(),
         TunnelSelector::ById("tun-vip".to_string())
     );
-    assert!(router.authenticate(Some(("tun-vip", "global-secret"))).is_err());
+    assert!(
+        router
+            .authenticate(Some(("tun-vip", "global-secret")))
+            .is_err()
+    );
 
     // 2. Tunnel without override password falls back to global_password
     assert_eq!(
-        router.authenticate(Some(("tun-std", "global-secret"))).unwrap(),
+        router
+            .authenticate(Some(("tun-std", "global-secret")))
+            .unwrap(),
         TunnelSelector::ById("tun-std".to_string())
     );
-    assert!(router.authenticate(Some(("tun-std", "vip-secret"))).is_err());
+    assert!(
+        router
+            .authenticate(Some(("tun-std", "vip-secret")))
+            .is_err()
+    );
 
     // 3. Pool keyword falls back to global_password
     assert_eq!(
-        router.authenticate(Some(("auto", "global-secret"))).unwrap(),
+        router
+            .authenticate(Some(("auto", "global-secret")))
+            .unwrap(),
         TunnelSelector::ByKeyword(PoolKeyword::Auto)
     );
     assert!(router.authenticate(Some(("auto", "vip-secret"))).is_err());
@@ -885,7 +1026,11 @@ fn test_per_tunnel_auth_override_and_global_fallback() {
     let mut passwords2 = std::collections::HashMap::new();
     passwords2.insert("tun-vip".to_string(), "vip-secret".to_string());
     let router_strict = MultiTenantRouter::new(
-        LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1)),
+        LifecycleController::new(
+            Arc::clone(&registry),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+        ),
         Arc::clone(&registry),
         PoolStrategy::RoundRobin,
         false,
@@ -894,9 +1039,19 @@ fn test_per_tunnel_auth_override_and_global_fallback() {
     .with_per_tunnel_passwords(passwords2);
 
     assert_eq!(
-        router_strict.authenticate(Some(("tun-vip", "vip-secret"))).unwrap(),
+        router_strict
+            .authenticate(Some(("tun-vip", "vip-secret")))
+            .unwrap(),
         TunnelSelector::ById("tun-vip".to_string())
     );
-    assert!(router_strict.authenticate(Some(("tun-std", "any-pass"))).is_err());
-    assert!(router_strict.authenticate(Some(("auto", "any-pass"))).is_err());
+    assert!(
+        router_strict
+            .authenticate(Some(("tun-std", "any-pass")))
+            .is_err()
+    );
+    assert!(
+        router_strict
+            .authenticate(Some(("auto", "any-pass")))
+            .is_err()
+    );
 }

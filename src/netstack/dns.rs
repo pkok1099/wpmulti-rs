@@ -3,12 +3,12 @@
 //! Queries are strictly routed inside the WireGuard tunnel over virtual UDP to
 //! eliminate host DNS leaks.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
 use thiserror::Error;
 
 use crate::netstack::stack::VirtualNetworkStack;
@@ -35,6 +35,7 @@ pub enum DnsError {
     InvalidDomain(&'static str),
 }
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryType {
     A = 1,
@@ -47,16 +48,14 @@ pub fn build_query(domain: &str, qtype: QueryType, id: u16) -> Result<Vec<u8>, D
     // Header (12 bytes)
     packet.extend_from_slice(&id.to_be_bytes());
     packet.extend_from_slice(&0x0100u16.to_be_bytes()); // QR=0, RD=1
-    packet.extend_from_slice(&1u16.to_be_bytes());      // QDCOUNT = 1
-    packet.extend_from_slice(&0u16.to_be_bytes());      // ANCOUNT = 0
-    packet.extend_from_slice(&0u16.to_be_bytes());      // NSCOUNT = 0
-    packet.extend_from_slice(&0u16.to_be_bytes());      // ARCOUNT = 0
+    packet.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+    packet.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT = 0
+    packet.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+    packet.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
 
     // Question: QNAME
     let clean = domain.trim().trim_end_matches('.');
-    if clean.is_empty() {
-        packet.push(0);
-    } else {
+    if !clean.is_empty() {
         for label in clean.split('.') {
             if label.is_empty() {
                 return Err(DnsError::InvalidDomain("empty label in domain"));
@@ -67,8 +66,8 @@ pub fn build_query(domain: &str, qtype: QueryType, id: u16) -> Result<Vec<u8>, D
             packet.push(label.len() as u8);
             packet.extend_from_slice(label.as_bytes());
         }
-        packet.push(0);
     }
+    packet.push(0);
 
     // QTYPE and QCLASS (1 = IN)
     packet.extend_from_slice(&(qtype as u16).to_be_bytes());
@@ -77,18 +76,34 @@ pub fn build_query(domain: &str, qtype: QueryType, id: u16) -> Result<Vec<u8>, D
     Ok(packet)
 }
 
+fn read_u16_be(buf: &[u8], offset: usize) -> Result<u16, DnsError> {
+    let slice = buf
+        .get(offset..offset + 2)
+        .ok_or(DnsError::PacketTooShort)?;
+    let arr: [u8; 2] = slice.try_into().map_err(|_| DnsError::PacketTooShort)?;
+    Ok(u16::from_be_bytes(arr))
+}
+
+fn read_u32_be(buf: &[u8], offset: usize) -> Result<u32, DnsError> {
+    let slice = buf
+        .get(offset..offset + 4)
+        .ok_or(DnsError::PacketTooShort)?;
+    let arr: [u8; 4] = slice.try_into().map_err(|_| DnsError::PacketTooShort)?;
+    Ok(u32::from_be_bytes(arr))
+}
+
 /// Parses an RFC 1035 DNS response packet, extracting IP addresses and minimum TTL.
 pub fn parse_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32), DnsError> {
     if buf.len() < 12 {
         return Err(DnsError::PacketTooShort);
     }
 
-    let id = u16::from_be_bytes([buf[0], buf[1]]);
+    let id = read_u16_be(buf, 0)?;
     if id != expected_id {
         return Err(DnsError::IdMismatch);
     }
 
-    let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    let flags = read_u16_be(buf, 2)?;
     let qr = (flags >> 15) & 1;
     if qr == 0 {
         return Err(DnsError::NotAResponse);
@@ -101,8 +116,8 @@ pub fn parse_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)
         return Err(DnsError::ServerError(rcode));
     }
 
-    let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
-    let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    let qdcount = read_u16_be(buf, 4)? as usize;
+    let ancount = read_u16_be(buf, 6)? as usize;
 
     let mut offset = 12;
 
@@ -128,30 +143,28 @@ pub fn parse_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)
             return Err(DnsError::PacketTooShort);
         }
 
-        let atype = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-        let _aclass = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
-        let ttl = u32::from_be_bytes([buf[offset + 4], buf[offset + 5], buf[offset + 6], buf[offset + 7]]);
-        let rdlength = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
+        let atype = read_u16_be(buf, offset)?;
+        let _aclass = read_u16_be(buf, offset + 2)?;
+        let ttl = read_u32_be(buf, offset + 4)?;
+        let rdlength = read_u16_be(buf, offset + 8)? as usize;
         offset += 10;
 
-        if offset + rdlength > buf.len() {
-            return Err(DnsError::PacketTooShort);
-        }
-
-        let rdata = &buf[offset..offset + rdlength];
+        let rdata = buf
+            .get(offset..offset + rdlength)
+            .ok_or(DnsError::PacketTooShort)?;
         offset += rdlength;
 
-        if atype == 1 && rdlength == 4 {
+        if atype == 1
+            && let Ok(octets) = <[u8; 4]>::try_from(rdata)
+        {
             // A Record (IPv4)
-            let ip = Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]);
-            ips.push(IpAddr::V4(ip));
+            ips.push(IpAddr::V4(Ipv4Addr::from(octets)));
             min_ttl = min_ttl.min(ttl);
-        } else if atype == 28 && rdlength == 16 {
+        } else if atype == 28
+            && let Ok(octets) = <[u8; 16]>::try_from(rdata)
+        {
             // AAAA Record (IPv6)
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(rdata);
-            let ip = Ipv6Addr::from(octets);
-            ips.push(IpAddr::V6(ip));
+            ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
             min_ttl = min_ttl.min(ttl);
         }
     }
@@ -173,21 +186,20 @@ fn skip_name(buf: &[u8], offset: usize) -> Result<usize, DnsError> {
     let mut curr = offset;
     let mut hops = 0;
 
-    while curr < buf.len() {
-        let len = buf[curr];
+    while let Some(&len) = buf.get(curr) {
         if len == 0 {
             if end_offset.is_none() {
                 end_offset = Some(curr + 1);
             }
             break;
         } else if (len & 0xC0) == 0xC0 {
-            if curr + 1 >= buf.len() {
+            let Some(&next_byte) = buf.get(curr + 1) else {
                 return Err(DnsError::PacketTooShort);
-            }
+            };
             if end_offset.is_none() {
                 end_offset = Some(curr + 2);
             }
-            let ptr = (((len & 0x3F) as usize) << 8) | (buf[curr + 1] as usize);
+            let ptr = (((len & 0x3F) as usize) << 8) | (next_byte as usize);
             if ptr >= buf.len() {
                 return Err(DnsError::PacketTooShort);
             }
@@ -217,6 +229,7 @@ struct DnsCacheEntry {
 }
 
 /// Thread-safe TTL-aware LRU cache for resolved DNS domain names.
+#[derive(Debug)]
 pub struct DnsLruCache {
     entries: RwLock<HashMap<String, DnsCacheEntry>>,
     capacity: usize,
@@ -231,8 +244,8 @@ impl DnsLruCache {
             entries: RwLock::new(HashMap::with_capacity(capacity)),
             capacity,
             access_counter: AtomicU64::new(0),
-            min_ttl: Duration::from_secs(5),     // Clamped min TTL
-            max_ttl: Duration::from_secs(86400), // Clamped max TTL (24h)
+            min_ttl: Duration::from_secs(5),   // Clamped min TTL
+            max_ttl: Duration::from_hours(24), // Clamped max TTL (24h)
         }
     }
 
@@ -240,14 +253,20 @@ impl DnsLruCache {
         let key = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let now = Instant::now();
 
-        {
+        let cached = {
             let entries = self.entries.read();
-            let entry = entries.get(&key)?;
-            if now < entry.expires_at {
-                let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                entry.last_accessed.store(access_time, Ordering::Relaxed);
-                return Some(entry.ips.clone());
-            }
+            entries.get(&key).and_then(|entry| {
+                if now < entry.expires_at {
+                    let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    entry.last_accessed.store(access_time, Ordering::Relaxed);
+                    Some(entry.ips.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(ips) = cached {
+            return Some(ips);
         }
 
         let mut entries = self.entries.write();
@@ -264,7 +283,7 @@ impl DnsLruCache {
             return;
         }
         let key = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        let ttl = Duration::from_secs(ttl_secs as u64).clamp(self.min_ttl, self.max_ttl);
+        let ttl = Duration::from_secs(u64::from(ttl_secs)).clamp(self.min_ttl, self.max_ttl);
         let expires_at = Instant::now() + ttl;
 
         let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -280,9 +299,9 @@ impl DnsLruCache {
                     .iter()
                     .min_by_key(|(_, v)| v.last_accessed.load(Ordering::Relaxed))
                     .map(|(k, _)| k.clone())
-                {
-                    entries.remove(&lru_key);
-                }
+            {
+                entries.remove(&lru_key);
+            }
         }
 
         entries.insert(
@@ -309,6 +328,7 @@ impl DnsLruCache {
 }
 
 /// In-tunnel DNS resolver guaranteeing zero host DNS leaks.
+#[derive(Debug)]
 pub struct InTunnelDnsResolver {
     dns_servers: Vec<SocketAddr>,
     cache: DnsLruCache,
@@ -322,7 +342,10 @@ pub struct InTunnelDnsResolver {
 impl InTunnelDnsResolver {
     /// Construct resolver from configured tunnel DNS addresses, with `1.1.1.1:53` fallback.
     pub fn new(configured_dns: &[IpAddr]) -> Self {
-        Self::with_fallback(configured_dns, "1.1.1.1:53".parse().unwrap())
+        Self::with_fallback(
+            configured_dns,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+        )
     }
 
     /// Construct resolver from configured tunnel DNS addresses and an explicit fallback server.
@@ -333,11 +356,11 @@ impl InTunnelDnsResolver {
         }
         if servers.is_empty() {
             servers.push(fallback);
-            let default_v4: SocketAddr = "1.1.1.1:53".parse().unwrap();
+            let default_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
             if fallback != default_v4 {
                 servers.push(default_v4);
             }
-            servers.push("1.0.0.1:53".parse().unwrap());
+            servers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 53));
         }
 
         Self {
@@ -372,19 +395,17 @@ impl InTunnelDnsResolver {
 
     /// Configure whether dual-stack domain resolution prefers IPv6 (`AAAA`) over IPv4 (`A`).
     pub fn set_prefer_ipv6(&self, prefer: bool) {
-        self.prefer_ipv6
-            .store(prefer, std::sync::atomic::Ordering::Relaxed);
+        self.prefer_ipv6.store(prefer, Ordering::Relaxed);
     }
 
     /// Configure strict IP family isolation mode (`DualStack`, `Ipv4Only`, `Ipv6Only`).
     pub fn set_ip_mode(&self, mode: crate::config::IpMode) {
-        self.ip_mode
-            .store(mode.to_u8(), std::sync::atomic::Ordering::Relaxed);
+        self.ip_mode.store(mode.to_u8(), Ordering::Relaxed);
     }
 
     /// Return the configured strict IP family isolation mode.
     pub fn ip_mode(&self) -> crate::config::IpMode {
-        crate::config::IpMode::from_u8(self.ip_mode.load(std::sync::atomic::Ordering::Relaxed))
+        crate::config::IpMode::from_u8(self.ip_mode.load(Ordering::Relaxed))
     }
 
     /// Resolve domain to a single IP address using the resolver's configured `IpMode`.
@@ -437,13 +458,13 @@ impl InTunnelDnsResolver {
         let cache_key = match mode {
             crate::config::IpMode::DualStack => {
                 if prefer_v6 {
-                    format!("ds6:{}", trimmed)
+                    format!("ds6:{trimmed}")
                 } else {
-                    format!("ds4:{}", trimmed)
+                    format!("ds4:{trimmed}")
                 }
             }
-            crate::config::IpMode::Ipv4Only => format!("v4:{}", trimmed),
-            crate::config::IpMode::Ipv6Only => format!("v6:{}", trimmed),
+            crate::config::IpMode::Ipv4Only => format!("v4:{trimmed}"),
+            crate::config::IpMode::Ipv6Only => format!("v6:{trimmed}"),
         };
 
         // Check LRU cache
@@ -469,12 +490,18 @@ impl InTunnelDnsResolver {
         if servers.is_empty() {
             match mode {
                 crate::config::IpMode::Ipv4Only => {
-                    servers.push("1.1.1.1:53".parse().unwrap());
-                    servers.push("1.0.0.1:53".parse().unwrap());
+                    servers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53));
+                    servers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 53));
                 }
                 crate::config::IpMode::Ipv6Only => {
-                    servers.push("[2606:4700:4700::1111]:53".parse().unwrap());
-                    servers.push("[2606:4700:4700::1001]:53".parse().unwrap());
+                    servers.push(SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+                        53,
+                    ));
+                    servers.push(SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
+                        53,
+                    ));
                 }
                 crate::config::IpMode::DualStack => {}
             }
@@ -520,15 +547,13 @@ impl InTunnelDnsResolver {
         mode: crate::config::IpMode,
         prefer_v6: bool,
     ) -> Result<Vec<IpAddr>, io::Error> {
-        let mut ips: Vec<IpAddr> = tokio::time::timeout(
-            self.timeout,
-            tokio::net::lookup_host((domain, 0u16)),
-        )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "host DNS lookup timed out"))??
-        .map(|s| s.ip())
-        .filter(|ip| mode.allows_ip(*ip))
-        .collect();
+        let mut ips: Vec<IpAddr> =
+            tokio::time::timeout(self.timeout, tokio::net::lookup_host((domain, 0u16)))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "host DNS lookup timed out"))??
+                .map(|s| s.ip())
+                .filter(|ip| mode.allows_ip(*ip))
+                .collect();
 
         if ips.is_empty() {
             return Err(io::Error::new(
@@ -556,7 +581,7 @@ impl InTunnelDnsResolver {
             crate::config::IpMode::Ipv4Only => &[QueryType::A],
             crate::config::IpMode::Ipv6Only => &[QueryType::AAAA],
             crate::config::IpMode::DualStack => {
-                if self.prefer_ipv6.load(std::sync::atomic::Ordering::Relaxed) {
+                if self.prefer_ipv6.load(Ordering::Relaxed) {
                     &[QueryType::AAAA, QueryType::A]
                 } else {
                     &[QueryType::A, QueryType::AAAA]
@@ -604,8 +629,11 @@ impl InTunnelDnsResolver {
                 ));
             }
 
-            let (ips, ttl) = parse_response(&buf[..len], tx_id)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let resp_slice = buf
+                .get(..len)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short DNS buffer"))?;
+            let (ips, ttl) =
+                parse_response(resp_slice, tx_id).map_err(|e| io::Error::other(e.to_string()))?;
 
             Ok((ips, ttl))
         })

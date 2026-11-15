@@ -1,29 +1,42 @@
+#![allow(
+    unreachable_pub,
+    unused_qualifications,
+    trivial_casts,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::type_complexity,
+    clippy::wildcard_enum_match_arm,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
+
 mod common;
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::{
-    generate_245_cloned_wgcf_configs, TestEnvironment,
-};
+use common::{TestEnvironment, generate_245_cloned_wgcf_configs};
 use etherparse::PacketBuilder;
 use gotatun::tun::IpRecv;
 use gotatun::x25519::{PublicKey, StaticSecret};
 use smoltcp::phy::{Device, TxToken};
 use tokio::task::JoinSet;
 use wpmulti::config::{
-    AuthMode, LifecycleMode, MainConfig, PoolStrategy, SharedListenerSettings,
-    TunnelConfig, TunnelPoolSelection, WgInterfaceConfig, WgPeerConfig,
+    AuthMode, LifecycleMode, MainConfig, PoolStrategy, SharedListenerSettings, TunnelConfig,
+    TunnelPoolSelection, WgInterfaceConfig, WgPeerConfig,
 };
 use wpmulti::core::{
-    LifecycleController, MultiTenantRouter, TunnelEntry, TunnelManager, TunnelRegistry,
-    TunnelState,
+    LifecycleController, MultiTenantRouter, TunnelEntry, TunnelManager, TunnelRegistry, TunnelState,
 };
-use wpmulti::netstack::{
-    DnsLruCache, InTunnelDnsResolver, VirtualNetworkStack, VirtualTunBridge,
-};
+use wpmulti::netstack::{DnsLruCache, InTunnelDnsResolver, VirtualNetworkStack, VirtualTunBridge};
 use wpmulti::proxy::{ProxyAuthError, TunnelRouter, TunnelSelector};
 
 fn make_test_conf(id: &str, endpoint: &str) -> TunnelConfig {
@@ -65,8 +78,8 @@ async fn test_adv_245_all_concurrent_activation_and_teardown() {
     assert_eq!(wgcf_set.tunnel_ids.len(), 245);
 
     // 2. Load configs via wpmulti core configuration loader
-    let loaded_tunnels = wpmulti::load_tunnel_configs_from_dir(env.conf_dir())
-        .expect("load 245 configs");
+    let loaded_tunnels =
+        wpmulti::load_tunnel_configs_from_dir(env.conf_dir()).expect("load 245 configs");
     assert_eq!(loaded_tunnels.len(), 245);
 
     let mut config = MainConfig::default();
@@ -82,9 +95,7 @@ async fn test_adv_245_all_concurrent_activation_and_teardown() {
     for i in 1..=245 {
         let mgr = Arc::clone(&manager);
         let tid = format!("wgcf-{:03}", i);
-        activate_set.spawn(async move {
-            mgr.activate_tunnel(&tid).await.map(|a| a.id.clone())
-        });
+        activate_set.spawn(async move { mgr.activate_tunnel(&tid).await.map(|a| a.id.clone()) });
     }
 
     let mut activated_count = 0;
@@ -112,9 +123,7 @@ async fn test_adv_245_all_concurrent_activation_and_teardown() {
     for i in 1..=245 {
         let mgr = Arc::clone(&manager);
         let tid = format!("wgcf-{:03}", i);
-        suspend_set.spawn(async move {
-            mgr.suspend_tunnel(&tid).await
-        });
+        suspend_set.spawn(async move { mgr.suspend_tunnel(&tid).await });
     }
 
     let mut suspended_count = 0;
@@ -142,7 +151,8 @@ async fn test_adv_socks5_http_high_concurrency_stress() {
     for i in 1..=10 {
         let id = format!("tenant-{:02}", i);
         let conf = make_test_conf(&id, "127.0.0.1:51820");
-        reg.register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy)).unwrap();
+        reg.register(TunnelEntry::new(&id, conf, LifecycleMode::Lazy))
+            .unwrap();
     }
 
     let lc = LifecycleController::new(
@@ -165,7 +175,8 @@ async fn test_adv_socks5_http_high_concurrency_stress() {
     let router = MultiTenantRouter::from_settings(&s5_settings, lc, reg);
 
     // Concurrently execute 100 authentication requests
-    let mut join_set: JoinSet<Result<(usize, &'static str, TunnelSelector), ProxyAuthError>> = JoinSet::new();
+    let mut join_set: JoinSet<Result<(usize, &'static str, TunnelSelector), ProxyAuthError>> =
+        JoinSet::new();
     for req_id in 0..100 {
         let r = Arc::clone(&router);
         join_set.spawn(async move {
@@ -243,7 +254,9 @@ async fn test_adv_socks5_http_high_concurrency_stress() {
 async fn test_adv_lazy_lifecycle_thundering_herd_and_idle_race() {
     let registry = Arc::new(TunnelRegistry::new());
     let conf = make_test_conf("herd-tun", "127.0.0.1:51820");
-    registry.register(TunnelEntry::new("herd-tun", conf, LifecycleMode::Lazy)).unwrap();
+    registry
+        .register(TunnelEntry::new("herd-tun", conf, LifecycleMode::Lazy))
+        .unwrap();
 
     let idle_timeout = Duration::from_millis(100);
     let check_interval = Duration::from_millis(25);
@@ -257,9 +270,7 @@ async fn test_adv_lazy_lifecycle_thundering_herd_and_idle_race() {
     let mut join_set = JoinSet::new();
     for _ in 0..50 {
         let lc = Arc::clone(&lifecycle);
-        join_set.spawn(async move {
-            lc.get_or_activate("herd-tun").await
-        });
+        join_set.spawn(async move { lc.get_or_activate("herd-tun").await });
     }
 
     let mut guards = Vec::new();
@@ -313,7 +324,9 @@ async fn test_adv_dns_leak_prevention_and_cache_churn() {
         join_set.spawn(async move {
             for i in 0..250 {
                 let domain = format!("host-{}-{}.churn.test", task_id, i);
-                let ip: IpAddr = format!("10.200.{}.{}", task_id + 1, (i % 250) + 1).parse().unwrap();
+                let ip: IpAddr = format!("10.200.{}.{}", task_id + 1, (i % 250) + 1)
+                    .parse()
+                    .unwrap();
                 c.insert(&domain, vec![ip], 60);
             }
         });
@@ -324,7 +337,11 @@ async fn test_adv_dns_leak_prevention_and_cache_churn() {
     }
 
     // Capacity must be strictly bounded at 256
-    assert!(cache.len() <= 256, "Cache size {} exceeded capacity 256", cache.len());
+    assert!(
+        cache.len() <= 256,
+        "Cache size {} exceeded capacity 256",
+        cache.len()
+    );
 
     // Verify InTunnelDnsResolver strictly fails without leaking when DNS server is unreachable
     let unreachable_dns: [IpAddr; 1] = ["192.0.2.1".parse().unwrap()]; // RFC 5737 TEST-NET-1 (unroutable)
@@ -346,7 +363,11 @@ async fn test_adv_dns_leak_prevention_and_cache_churn() {
     let elapsed = start.elapsed();
 
     // It MUST fail cleanly and NOT resolve via host system DNS
-    assert!(res.is_err(), "Expected DNS resolution failure, got {:?}", res);
+    assert!(
+        res.is_err(),
+        "Expected DNS resolution failure, got {:?}",
+        res
+    );
     // Verified query failed cleanly through timeout
     assert!(elapsed >= Duration::from_millis(50));
 }
@@ -368,7 +389,9 @@ async fn test_adv_ipv6_userspace_routing_and_boundaries() {
         .write(&mut min_buf, &[])
         .unwrap();
 
-    let tx = bridge.transmit(smoltcp::time::Instant::from_millis(0)).unwrap();
+    let tx = bridge
+        .transmit(smoltcp::time::Instant::from_millis(0))
+        .unwrap();
     tx.consume(min_buf.len(), |b| b.copy_from_slice(&min_buf));
 
     // 2. Exact MTU IPv6 packet (MTU 1420: 40-byte IPv6 header + 8-byte UDP header + 1372 payload)
@@ -380,7 +403,9 @@ async fn test_adv_ipv6_userspace_routing_and_boundaries() {
         .unwrap();
     assert_eq!(max_buf.len(), 1420);
 
-    let tx2 = bridge.transmit(smoltcp::time::Instant::from_millis(0)).unwrap();
+    let tx2 = bridge
+        .transmit(smoltcp::time::Instant::from_millis(0))
+        .unwrap();
     tx2.consume(max_buf.len(), |b| b.copy_from_slice(&max_buf));
 
     // 3. Receive and verify both packets through bridge_rx
@@ -409,7 +434,9 @@ async fn test_adv_ipv6_userspace_routing_and_boundaries() {
         .unwrap();
     assert!(jumbo_buf.len() > 1420);
 
-    let tx3 = bridge.transmit(smoltcp::time::Instant::from_millis(0)).unwrap();
+    let tx3 = bridge
+        .transmit(smoltcp::time::Instant::from_millis(0))
+        .unwrap();
     // Consuming jumbo size must be handled safely
     tx3.consume(jumbo_buf.len(), |b| {
         // bridge MTU limits buffer slice to bridge MTU
@@ -428,8 +455,17 @@ async fn test_adv_raw_malformed_socks5_packets() {
 
     let reg = Arc::new(TunnelRegistry::new());
     let conf = make_test_conf("s5-malform-tun", "127.0.0.1:51820");
-    reg.register(TunnelEntry::new("s5-malform-tun", conf, LifecycleMode::Lazy)).unwrap();
-    let lc = LifecycleController::new(Arc::clone(&reg), Duration::from_secs(60), Duration::from_millis(50));
+    reg.register(TunnelEntry::new(
+        "s5-malform-tun",
+        conf,
+        LifecycleMode::Lazy,
+    ))
+    .unwrap();
+    let lc = LifecycleController::new(
+        Arc::clone(&reg),
+        Duration::from_secs(60),
+        Duration::from_millis(50),
+    );
 
     let settings = SharedListenerSettings {
         name: "s5_malform".to_string(),
@@ -453,7 +489,11 @@ async fn test_adv_raw_malformed_socks5_packets() {
         let mut cl = client;
         cl.write_all(&[0x04, 0x01, 0x00]).await.unwrap();
         let res = srv_task.await.unwrap();
-        assert!(res.is_err(), "Expected error for SOCKS4 version, got {:?}", res);
+        assert!(
+            res.is_err(),
+            "Expected error for SOCKS4 version, got {:?}",
+            res
+        );
     }
 
     // Subtest B: Nmethods = 0
@@ -521,8 +561,17 @@ async fn test_adv_raw_malformed_http_requests() {
 
     let reg = Arc::new(TunnelRegistry::new());
     let conf = make_test_conf("http-malform-tun", "127.0.0.1:51820");
-    reg.register(TunnelEntry::new("http-malform-tun", conf, LifecycleMode::Lazy)).unwrap();
-    let lc = LifecycleController::new(Arc::clone(&reg), Duration::from_secs(60), Duration::from_millis(50));
+    reg.register(TunnelEntry::new(
+        "http-malform-tun",
+        conf,
+        LifecycleMode::Lazy,
+    ))
+    .unwrap();
+    let lc = LifecycleController::new(
+        Arc::clone(&reg),
+        Duration::from_secs(60),
+        Duration::from_millis(50),
+    );
 
     let settings = SharedListenerSettings {
         name: "http_malform".to_string(),
@@ -544,7 +593,9 @@ async fn test_adv_raw_malformed_http_requests() {
         let srv_task = tokio::spawn(async move { handle_http(server, r).await });
 
         let mut cl = client;
-        cl.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n").await.unwrap();
+        cl.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .await
+            .unwrap();
 
         let mut resp_buf = vec![0u8; 256];
         let n = cl.read(&mut resp_buf).await.unwrap();
@@ -577,8 +628,14 @@ async fn test_adv_raw_malformed_http_requests() {
         let srv_task = tokio::spawn(async move { handle_http(server, r).await });
 
         // Base64 of "http-malform-tun:httppass"
-        let auth_val = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"http-malform-tun:httppass");
-        let req = format!("CONNECT invalid_authority_no_port HTTP/1.1\r\nProxy-Authorization: Basic {}\r\n\r\n", auth_val);
+        let auth_val = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"http-malform-tun:httppass",
+        );
+        let req = format!(
+            "CONNECT invalid_authority_no_port HTTP/1.1\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            auth_val
+        );
 
         let mut cl = client;
         cl.write_all(req.as_bytes()).await.unwrap();
@@ -597,8 +654,14 @@ async fn test_adv_raw_malformed_http_requests() {
         let r = Arc::clone(&router);
         let srv_task = tokio::spawn(async move { handle_http(server, r).await });
 
-        let auth_val = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"http-malform-tun:httppass");
-        let req = format!("GET /index.html HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic {}\r\n\r\n", auth_val);
+        let auth_val = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"http-malform-tun:httppass",
+        );
+        let req = format!(
+            "GET /index.html HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            auth_val
+        );
 
         let mut cl = client;
         cl.write_all(req.as_bytes()).await.unwrap();
@@ -611,4 +674,3 @@ async fn test_adv_raw_malformed_http_requests() {
         assert!(res.is_err());
     }
 }
-

@@ -1,7 +1,25 @@
+#![allow(
+    unreachable_pub,
+    unused_qualifications,
+    trivial_casts,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::type_complexity,
+    clippy::wildcard_enum_match_arm,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
+
 use std::collections::HashMap;
 use std::fs;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tempfile::tempdir;
@@ -11,12 +29,12 @@ use wpmulti::api::handle_admin_request;
 use wpmulti::api::routes::HttpRequest;
 use wpmulti::cli::cmd_probe;
 use wpmulti::config::{
-    HealthCheckSettings, LifecycleMode, MainConfig, PoolStrategy, TunnelConfig,
-    WgInterfaceConfig, WgPeerConfig,
+    HealthCheckSettings, LifecycleMode, MainConfig, PoolStrategy, TunnelConfig, WgInterfaceConfig,
+    WgPeerConfig,
 };
 use wpmulti::core::{
-    ActiveProber, HealthStatus, LifecycleController, MultiTenantRouter,
-    TunnelEntry, TunnelHealthTracker, TunnelManager, TunnelRegistry, TunnelState,
+    ActiveProber, HealthStatus, LifecycleController, MultiTenantRouter, TunnelEntry,
+    TunnelHealthTracker, TunnelManager, TunnelRegistry, TunnelState,
 };
 
 fn make_test_tunnel_config(id: &str, endpoint: &str) -> TunnelConfig {
@@ -159,12 +177,39 @@ fn test_dormant_lazy_tunnel_preserves_zero_background_resources() {
 #[test]
 fn test_multitenant_router_failover_round_robin() {
     let registry = Arc::new(TunnelRegistry::new());
-    let _e1 = registry.register(TunnelEntry::new("t1", make_test_tunnel_config("t1", "1.1.1.1:51820"), LifecycleMode::Lazy)).unwrap();
-    let e2 = registry.register(TunnelEntry::new("t2", make_test_tunnel_config("t2", "1.1.1.2:51820"), LifecycleMode::Lazy)).unwrap();
-    let _e3 = registry.register(TunnelEntry::new("t3", make_test_tunnel_config("t3", "1.1.1.3:51820"), LifecycleMode::Lazy)).unwrap();
+    let _e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1", "1.1.1.1:51820"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2", "1.1.1.2:51820"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let _e3 = registry
+        .register(TunnelEntry::new(
+            "t3",
+            make_test_tunnel_config("t3", "1.1.1.3:51820"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
-    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::RoundRobin, true);
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
     let candidates = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
     router.set_allowed_tunnels(Some(candidates.clone()));
 
@@ -187,15 +232,36 @@ fn test_multitenant_router_failover_round_robin() {
 #[test]
 fn test_multitenant_router_failover_least_conn() {
     let registry = Arc::new(TunnelRegistry::new());
-    let e1 = registry.register(TunnelEntry::new("t1", make_test_tunnel_config("t1", "1.1.1.1:51820"), LifecycleMode::Lazy)).unwrap();
-    let e2 = registry.register(TunnelEntry::new("t2", make_test_tunnel_config("t2", "1.1.1.2:51820"), LifecycleMode::Lazy)).unwrap();
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1", "1.1.1.1:51820"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2", "1.1.1.2:51820"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
 
     // t1 has 0 active connections; t2 has 5 active connections
     e1.stats.active_conns.store(0, Ordering::Relaxed);
     e2.stats.active_conns.store(5, Ordering::Relaxed);
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
-    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::LeastConn, true);
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::LeastConn,
+        true,
+    );
     let candidates = vec!["t1".to_string(), "t2".to_string()];
     router.set_allowed_tunnels(Some(candidates.clone()));
 
@@ -213,13 +279,44 @@ fn test_multitenant_router_failover_least_conn() {
 #[test]
 fn test_multitenant_router_true_priority_fallback() {
     let registry = Arc::new(TunnelRegistry::new());
-    let e1 = registry.register(TunnelEntry::new("primary", make_test_tunnel_config("primary", "1.1.1.1:51820"), LifecycleMode::Lazy)).unwrap();
-    let e2 = registry.register(TunnelEntry::new("backup1", make_test_tunnel_config("backup1", "1.1.1.2:51820"), LifecycleMode::Lazy)).unwrap();
-    let e3 = registry.register(TunnelEntry::new("backup2", make_test_tunnel_config("backup2", "1.1.1.3:51820"), LifecycleMode::Lazy)).unwrap();
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "primary",
+            make_test_tunnel_config("primary", "1.1.1.1:51820"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "backup1",
+            make_test_tunnel_config("backup1", "1.1.1.2:51820"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e3 = registry
+        .register(TunnelEntry::new(
+            "backup2",
+            make_test_tunnel_config("backup2", "1.1.1.3:51820"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
 
-    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
-    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::Fallback, true);
-    let pool = vec!["primary".to_string(), "backup1".to_string(), "backup2".to_string()];
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::Fallback,
+        true,
+    );
+    let pool = vec![
+        "primary".to_string(),
+        "backup1".to_string(),
+        "backup2".to_string(),
+    ];
     router.set_allowed_tunnels(Some(pool.clone()));
 
     // 1. All healthy: primary candidate is always selected
@@ -258,8 +355,20 @@ fn test_multitenant_router_true_priority_fallback() {
 #[tokio::test]
 async fn test_active_prober_lifecycle() {
     let registry = Arc::new(TunnelRegistry::new());
-    let e1 = registry.register(TunnelEntry::new("lazy-1", make_test_tunnel_config("lazy-1", "1.1.1.1:51820"), LifecycleMode::Lazy)).unwrap();
-    let _e2 = registry.register(TunnelEntry::new("eager-1", make_test_tunnel_config("eager-1", "1.1.1.2:51820"), LifecycleMode::Eager)).unwrap();
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "lazy-1",
+            make_test_tunnel_config("lazy-1", "1.1.1.1:51820"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let _e2 = registry
+        .register(TunnelEntry::new(
+            "eager-1",
+            make_test_tunnel_config("eager-1", "1.1.1.2:51820"),
+            LifecycleMode::Eager,
+        ))
+        .unwrap();
 
     let prober = ActiveProber::new();
     let settings = HealthCheckSettings {
@@ -342,7 +451,13 @@ AllowedIPs = 0.0.0.0/0
     assert!(err_none.is_err());
 
     // 4. Validation: specifying both -c and -d returns error
-    let err_both = cmd_probe(Some(conf1), Some(dir.path().to_path_buf()), true, "5s".into()).await;
+    let err_both = cmd_probe(
+        Some(conf1),
+        Some(dir.path().to_path_buf()),
+        true,
+        "5s".into(),
+    )
+    .await;
     assert!(err_both.is_err());
 }
 
@@ -414,5 +529,7 @@ async fn test_admin_api_health_visibility() {
     assert!(metrics_text.contains("wpmulti_tunnel_health{tunnel_id=\"tun-ok-1\"} 1"));
     assert!(metrics_text.contains("wpmulti_tunnel_health{tunnel_id=\"tun-fail\"} 0"));
     assert!(metrics_text.contains("wpmulti_tunnel_consecutive_failures{tunnel_id=\"tun-fail\"}"));
-    assert!(metrics_text.contains("wpmulti_tunnel_cooldown_remaining_seconds{tunnel_id=\"tun-fail\"}"));
+    assert!(
+        metrics_text.contains("wpmulti_tunnel_cooldown_remaining_seconds{tunnel_id=\"tun-fail\"}")
+    );
 }

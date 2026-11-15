@@ -9,8 +9,8 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -24,6 +24,7 @@ use crate::proxy::{
 };
 
 /// Multi-tenant proxy router for shared listener ports.
+#[derive(Debug)]
 pub struct MultiTenantRouter {
     lifecycle: Arc<LifecycleController>,
     registry: Arc<TunnelRegistry>,
@@ -46,13 +47,7 @@ impl MultiTenantRouter {
         lifecycle: Arc<LifecycleController>,
         registry: Arc<TunnelRegistry>,
     ) -> Arc<Self> {
-        Self::from_settings_with_health(
-            settings,
-            lifecycle,
-            registry,
-            3,
-            Duration::from_secs(30),
-        )
+        Self::from_settings_with_health(settings, lifecycle, registry, 3, Duration::from_secs(30))
     }
 
     /// Create a new multi-tenant router from shared listener configuration with health parameters.
@@ -68,7 +63,7 @@ impl MultiTenantRouter {
             TunnelPoolSelection::Selected(list) => Some(list.as_slice().into()),
         };
         let ip_mode = IpMode::effective_with_global(settings.ip_mode, lifecycle.ip_mode())
-            .unwrap_or(lifecycle.ip_mode());
+            .unwrap_or_else(|_| lifecycle.ip_mode());
 
         Arc::new(Self {
             lifecycle,
@@ -174,11 +169,7 @@ impl MultiTenantRouter {
     /// Collect candidate tunnel IDs allowed for this pool.
     pub fn get_candidates(&self) -> Vec<String> {
         let allowed = self.allowed_tunnels.read().clone();
-        if let Some(list) = allowed {
-            list.to_vec()
-        } else {
-            self.registry.all_ids()
-        }
+        allowed.map_or_else(|| self.registry.all_ids(), |list| list.to_vec())
     }
 
     /// Filter candidates to only those whose health status is routable.
@@ -186,17 +177,19 @@ impl MultiTenantRouter {
         candidates
             .iter()
             .filter(|id| {
-                if let Some(entry) = self.registry.get(id) {
-                    !entry.is_disabled() && entry.health.is_routable()
-                } else {
-                    false
-                }
+                self.registry
+                    .get(id)
+                    .is_some_and(|entry| !entry.is_disabled() && entry.health.is_routable())
             })
             .collect()
     }
 
     /// Select a tunnel ID from slice based on keyword without cloning candidate lists.
-    fn select_by_keyword_slice(&self, keyword: PoolKeyword, candidates: &[String]) -> io::Result<String> {
+    fn select_by_keyword_slice(
+        &self,
+        keyword: PoolKeyword,
+        candidates: &[String],
+    ) -> io::Result<String> {
         let healthy = self.filter_healthy_candidates(candidates);
         if healthy.is_empty() {
             return Err(io::Error::new(
@@ -208,11 +201,17 @@ impl MultiTenantRouter {
         match keyword {
             PoolKeyword::Random => {
                 let idx = (rand::random::<u32>() as usize) % healthy.len();
-                Ok((*healthy[idx]).clone())
+                healthy
+                    .get(idx)
+                    .map(|s| (*s).clone())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "empty pool"))
             }
             PoolKeyword::RoundRobin | PoolKeyword::Auto => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len();
-                Ok((*healthy[idx]).clone())
+                healthy
+                    .get(idx)
+                    .map(|s| (*s).clone())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "empty pool"))
             }
             PoolKeyword::LeastConn => self.select_least_conn_refs(&healthy),
         }
@@ -261,7 +260,9 @@ impl MultiTenantRouter {
                 }
                 let target_idx = match keyword {
                     PoolKeyword::Random => (rand::random::<u32>() as usize) % healthy_count,
-                    _ => self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_count,
+                    PoolKeyword::Auto | PoolKeyword::RoundRobin | PoolKeyword::LeastConn => {
+                        self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_count
+                    }
                 };
                 entries
                     .iter()
@@ -347,7 +348,10 @@ impl MultiTenantRouter {
                     ));
                 }
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len();
-                Ok((*healthy[idx]).clone())
+                healthy
+                    .get(idx)
+                    .map(|s| (*s).clone())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "empty pool"))
             }
             PoolStrategy::Random => {
                 let healthy = self.filter_healthy_candidates(candidates);
@@ -358,7 +362,10 @@ impl MultiTenantRouter {
                     ));
                 }
                 let idx = (rand::random::<u32>() as usize) % healthy.len();
-                Ok((*healthy[idx]).clone())
+                healthy
+                    .get(idx)
+                    .map(|s| (*s).clone())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "empty pool"))
             }
             PoolStrategy::LeastConn => self.select_least_conn_slice(candidates),
         }
@@ -368,6 +375,59 @@ impl MultiTenantRouter {
     fn select_default_pool_registry(&self) -> io::Result<String> {
         let candidates = self.registry.all_ids();
         self.select_default_pool_slice(&candidates)
+    }
+}
+
+fn resolve_selector(
+    router: &MultiTenantRouter,
+    selector: &TunnelSelector,
+    allowed_guard: Option<&[String]>,
+) -> io::Result<String> {
+    match selector {
+        TunnelSelector::ById(id) => {
+            if let Some(allowed) = allowed_guard
+                && !allowed.is_empty()
+                && !allowed.iter().any(|s| s == id)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("tunnel '{id}' not allowed in this pool"),
+                ));
+            }
+            if router.registry.get(id).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("tunnel '{id}' not found in registry"),
+                ));
+            }
+            Ok(id.clone())
+        }
+        TunnelSelector::ByKeyword(keyword) => allowed_guard.map_or_else(
+            || router.select_by_keyword_registry(*keyword),
+            |allowed| router.select_by_keyword_slice(*keyword, allowed),
+        ),
+        TunnelSelector::ByTag(tag) => {
+            let matched = allowed_guard.map_or_else(
+                || {
+                    router
+                        .registry
+                        .all_ids()
+                        .into_iter()
+                        .find(|id| id.contains(tag))
+                },
+                |allowed| allowed.iter().find(|id| id.contains(tag)).cloned(),
+            );
+            matched.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no tunnel found matching tag '{tag}'"),
+                )
+            })
+        }
+        TunnelSelector::DefaultPool => allowed_guard.map_or_else(
+            || router.select_default_pool_registry(),
+            |allowed| router.select_default_pool_slice(allowed),
+        ),
     }
 }
 
@@ -444,70 +504,15 @@ impl TunnelRouter for MultiTenantRouter {
 
             let max_attempts = match selector {
                 TunnelSelector::ByKeyword(_) | TunnelSelector::DefaultPool => 3,
-                _ => 1,
+                TunnelSelector::ById(_) | TunnelSelector::ByTag(_) => 1,
             };
 
             let mut last_err = None;
-            let mut chosen: Option<(String, Arc<crate::core::registry::ActiveTunnel>, crate::core::lifecycle::TunnelConnGuard)> = None;
+            let mut chosen = None;
 
             for attempt in 0..max_attempts {
-                let target_id = match selector {
-                    TunnelSelector::ById(id) => {
-                        // Check if tunnel ID is recognized and allowed
-                        if let Some(ref allowed) = allowed_guard
-                            && !allowed.is_empty()
-                            && !allowed.iter().any(|s| s == id)
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!("tunnel '{}' not allowed in this pool", id),
-                            ));
-                        }
-                        if self.registry.get(id).is_none() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!("tunnel '{}' not found in registry", id),
-                            ));
-                        }
-                        id.clone()
-                    }
-                    TunnelSelector::ByKeyword(keyword) => {
-                        if let Some(ref allowed) = allowed_guard {
-                            self.select_by_keyword_slice(*keyword, allowed)?
-                        } else {
-                            self.select_by_keyword_registry(*keyword)?
-                        }
-                    }
-                    TunnelSelector::ByTag(tag) => {
-                        if let Some(ref allowed) = allowed_guard {
-                            let matched = allowed.iter().find(|id| id.contains(tag)).cloned();
-                            matched.ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::NotFound,
-                                    format!("no tunnel found matching tag '{}'", tag),
-                                )
-                            })?
-                        } else {
-                            let all = self.registry.all_ids();
-                            let matched = all.into_iter().find(|id| id.contains(tag));
-                            matched.ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::NotFound,
-                                    format!("no tunnel found matching tag '{}'", tag),
-                                )
-                            })?
-                        }
-                    }
-                    TunnelSelector::DefaultPool => {
-                        if let Some(ref allowed) = allowed_guard {
-                            self.select_default_pool_slice(allowed)?
-                        } else {
-                            self.select_default_pool_registry()?
-                        }
-                    }
-                };
+                let target_id = resolve_selector(self, selector, allowed_guard.as_deref())?;
 
-                // Dynamically activate or resume on demand with RAII connection guard
                 match self.lifecycle.get_or_activate(&target_id).await {
                     Ok((active_tunnel, guard)) => {
                         chosen = Some((target_id, active_tunnel, guard));
@@ -521,10 +526,8 @@ impl TunnelRouter for MultiTenantRouter {
                             max_attempts,
                             e
                         );
-                        last_err = Some(io::Error::other(format!(
-                            "tunnel activation failed: {:?}",
-                            e
-                        )));
+                        last_err =
+                            Some(io::Error::other(format!("tunnel activation failed: {e:?}")));
                         if attempt + 1 < max_attempts {
                             let backoff_ms = 100u64 << attempt; // 100ms, 200ms
                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -533,13 +536,10 @@ impl TunnelRouter for MultiTenantRouter {
                 }
             }
 
-            let (target_id, active_tunnel, guard) = match chosen {
-                Some(pair) => pair,
-                None => {
-                    return Err(last_err.unwrap_or_else(|| {
-                        io::Error::other("tunnel activation failed after retries")
-                    }));
-                }
+            let Some((target_id, active_tunnel, guard)) = chosen else {
+                return Err(last_err.unwrap_or_else(|| {
+                    io::Error::other("tunnel activation failed after retries")
+                }));
             };
 
             let entry = self.registry.get(&target_id);
@@ -557,19 +557,18 @@ impl TunnelRouter for MultiTenantRouter {
                 GuardedTunnelTarget::new(active_tunnel, guard)
             };
 
-            if self.ip_mode == IpMode::DualStack {
-                Ok(Arc::new(guarded) as Arc<dyn ProxyTunnelTarget>)
+            let target: Arc<dyn ProxyTunnelTarget> = if self.ip_mode == IpMode::DualStack {
+                Arc::new(guarded)
             } else {
-                Ok(Arc::new(IpFilteredTunnelTarget::new(
-                    Arc::new(guarded),
-                    self.ip_mode,
-                )) as Arc<dyn ProxyTunnelTarget>)
-            }
+                Arc::new(IpFilteredTunnelTarget::new(Arc::new(guarded), self.ip_mode))
+            };
+            Ok(target)
         })
     }
 }
 
 /// Dedicated router for per-tunnel ports forwarding all connections directly to a single tunnel.
+#[derive(Debug)]
 pub struct DedicatedTunnelRouter {
     tunnel_id: String,
     lifecycle: Arc<LifecycleController>,
@@ -621,37 +620,30 @@ impl TunnelRouter for DedicatedTunnelRouter {
                 .lifecycle
                 .get_or_activate(&self.tunnel_id)
                 .await
-                .map_err(|e| io::Error::other(format!("tunnel activation failed: {:?}", e)))?;
+                .map_err(|e| io::Error::other(format!("tunnel activation failed: {e:?}")))?;
 
             let entry = self.lifecycle.registry().get(&self.tunnel_id);
             let health = entry.as_ref().map(|e| Arc::clone(&e.health));
 
             let guarded = if let Some(h) = health {
-                GuardedTunnelTarget::new_with_health(
-                    active,
-                    guard,
-                    h,
-                    3,
-                    Duration::from_secs(30),
-                )
+                GuardedTunnelTarget::new_with_health(active, guard, h, 3, Duration::from_secs(30))
             } else {
                 GuardedTunnelTarget::new(active, guard)
             };
 
             let ip_mode = self.lifecycle.ip_mode();
-            if ip_mode == IpMode::DualStack {
-                Ok(Arc::new(guarded) as Arc<dyn ProxyTunnelTarget>)
+            let target: Arc<dyn ProxyTunnelTarget> = if ip_mode == IpMode::DualStack {
+                Arc::new(guarded)
             } else {
-                Ok(Arc::new(IpFilteredTunnelTarget::new(
-                    Arc::new(guarded),
-                    ip_mode,
-                )) as Arc<dyn ProxyTunnelTarget>)
-            }
+                Arc::new(IpFilteredTunnelTarget::new(Arc::new(guarded), ip_mode))
+            };
+            Ok(target)
         })
     }
 }
 
 /// Tunnel target wrapper enforcing a listener- or global-level [`IpMode`] on TCP, UDP, and DNS.
+#[derive(Debug)]
 pub struct IpFilteredTunnelTarget {
     inner: Arc<GuardedTunnelTarget>,
     ip_mode: IpMode,
@@ -659,7 +651,7 @@ pub struct IpFilteredTunnelTarget {
 
 impl IpFilteredTunnelTarget {
     /// Wrap a [`GuardedTunnelTarget`] with an [`IpMode`] filter.
-    pub fn new(inner: Arc<GuardedTunnelTarget>, ip_mode: IpMode) -> Self {
+    pub const fn new(inner: Arc<GuardedTunnelTarget>, ip_mode: IpMode) -> Self {
         Self { inner, ip_mode }
     }
 }
@@ -683,10 +675,11 @@ impl ProxyTunnelTarget for IpFilteredTunnelTarget {
         let ip_mode = self.ip_mode;
         Box::pin(async move {
             let sock = inner.udp_bind(local_port).await?;
-            Ok(Box::new(IpFilteredUdpSocket {
+            let filtered: Box<dyn ProxyUdpSocket> = Box::new(IpFilteredUdpSocket {
                 inner: sock,
                 ip_mode,
-            }) as Box<dyn ProxyUdpSocket>)
+            });
+            Ok(filtered)
         })
     }
 

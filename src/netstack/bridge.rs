@@ -4,10 +4,10 @@
 //! [`BridgeIpSend`] implementing [`gotatun::tun::IpSend`], and
 //! [`BridgeIpRecv`] implementing [`gotatun::tun::IpRecv`].
 
+use parking_lot::Mutex;
 use std::io;
 use std::sync::Arc;
-use parking_lot::Mutex;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 
 use gotatun::packet::{Ip, Packet, PacketBufPool};
 use gotatun::tun::{IpRecv, IpSend, MtuWatcher};
@@ -33,11 +33,25 @@ pub struct VirtualTunBridge {
     buf_pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
+impl std::fmt::Debug for VirtualTunBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtualTunBridge")
+            .field("mtu", &self.mtu)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Inbound handle passed to `gotatun` (`ip_tx`) implementing [`gotatun::tun::IpSend`].
 #[derive(Clone)]
 pub struct BridgeIpSend {
     rx_sender: mpsc::Sender<Packet<Ip>>,
     notify: Arc<Notify>,
+}
+
+impl std::fmt::Debug for BridgeIpSend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeIpSend").finish_non_exhaustive()
+    }
 }
 
 /// Outbound handle passed to `gotatun` (`ip_rx`) implementing [`gotatun::tun::IpRecv`].
@@ -46,6 +60,12 @@ pub struct BridgeIpRecv {
     mtu: MtuWatcher,
     notify: Arc<Notify>,
     buf_pool: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl std::fmt::Debug for BridgeIpRecv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeIpRecv").finish_non_exhaustive()
+    }
 }
 
 impl VirtualTunBridge {
@@ -95,7 +115,7 @@ impl VirtualTunBridge {
     }
 
     /// Get the configured MTU.
-    pub fn mtu(&self) -> u16 {
+    pub const fn mtu(&self) -> u16 {
         self.mtu
     }
 }
@@ -105,8 +125,14 @@ impl VirtualTunBridge {
 // ---------------------------------------------------------------------------
 
 impl Device for VirtualTunBridge {
-    type RxToken<'a> = VirtualTunRxToken where Self: 'a;
-    type TxToken<'a> = VirtualTunTxToken<'a> where Self: 'a;
+    type RxToken<'a>
+        = VirtualTunRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = VirtualTunTxToken<'a>
+    where
+        Self: 'a;
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
@@ -151,6 +177,12 @@ pub struct VirtualTunRxToken {
     packet: Packet<Ip>,
 }
 
+impl std::fmt::Debug for VirtualTunRxToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtualTunRxToken").finish_non_exhaustive()
+    }
+}
+
 impl RxToken for VirtualTunRxToken {
     fn consume<R, F>(self, f: F) -> R
     where
@@ -163,12 +195,13 @@ impl RxToken for VirtualTunRxToken {
 }
 
 /// Token representing an outgoing transmission slot from smoltcp to WireGuard.
+#[derive(Debug)]
 pub struct VirtualTunTxToken<'a> {
     tx_sender: &'a mpsc::Sender<Vec<u8>>,
     buf_pool: &'a Mutex<Vec<Vec<u8>>>,
 }
 
-impl<'a> TxToken for VirtualTunTxToken<'a> {
+impl TxToken for VirtualTunTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -252,14 +285,14 @@ impl IpRecv for BridgeIpRecv {
 impl BridgeIpRecv {
     /// Convert raw bytes from smoltcp into a pooled [`Packet<Ip>`].
     #[inline]
-    pub fn to_packet_pub(raw: Vec<u8>, pool: &mut PacketBufPool) -> io::Result<Packet<Ip>> {
+    pub fn to_packet_pub(raw: &[u8], pool: &PacketBufPool) -> io::Result<Packet<Ip>> {
         Self::to_packet(raw, pool)
     }
 
     #[inline]
     fn to_packet_and_recycle(
         mut raw: Vec<u8>,
-        pool: &mut PacketBufPool,
+        pool: &PacketBufPool,
         buf_pool: &Arc<Mutex<Vec<Vec<u8>>>>,
     ) -> io::Result<Packet<Ip>> {
         let mut pkt = pool.get();
@@ -280,10 +313,10 @@ impl BridgeIpRecv {
     }
 
     #[inline]
-    fn to_packet(raw: Vec<u8>, pool: &mut PacketBufPool) -> io::Result<Packet<Ip>> {
+    fn to_packet(raw: &[u8], pool: &PacketBufPool) -> io::Result<Packet<Ip>> {
         let mut pkt = pool.get();
         pkt.truncate(raw.len());
-        pkt.copy_from_slice(&raw);
+        pkt.copy_from_slice(raw);
         pkt.try_into_ip().map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -5,8 +5,8 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -22,10 +22,10 @@ use crate::proxy::router::{
     SingleTunnelRouter, TargetAddr, TunnelRouter, TunnelSelector,
 };
 use crate::proxy::socks5::{
-    build_socks5_udp_packet, handle_socks5, parse_socks5_udp_packet, send_socks5_reply,
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, CMD_CONNECT, CMD_UDP_ASSOCIATE, METHOD_NO_ACCEPTABLE,
     METHOD_NO_AUTH, METHOD_USER_PASS, REP_CONN_REFUSED, REP_HOST_UNREACHABLE, REP_SUCCESS,
-    RFC1929_VERSION, SOCKS5_VERSION,
+    RFC1929_VERSION, SOCKS5_VERSION, build_socks5_udp_packet, handle_socks5,
+    parse_socks5_udp_packet, send_socks5_reply,
 };
 
 /// Mock tunnel target with configurable DNS resolution table and connection interception.
@@ -194,7 +194,8 @@ async fn spawn_mock_http_server(response_body: &'static str) -> SocketAddr {
 #[tokio::test]
 async fn test_socks5_greeting_no_auth() {
     let target = Arc::new(DirectTunnelTarget);
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("test-tunnel", target, None));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("test-tunnel", target, None));
 
     let (client, server) = tokio::io::duplex(1024);
     tokio::spawn(async move {
@@ -203,7 +204,10 @@ async fn test_socks5_greeting_no_auth() {
 
     let mut client = client;
     // Offer [0x00] (No Auth)
-    client.write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH]).await.unwrap();
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
 
     let mut resp = [0u8; 2];
     client.read_exact(&mut resp).await.unwrap();
@@ -252,7 +256,10 @@ async fn test_socks5_greeting_no_acceptable_method() {
 
     let mut client = client;
     // Client only offers [0x00]; server requires auth -> must return 0xFF
-    client.write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH]).await.unwrap();
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
 
     let mut resp = [0u8; 2];
     client.read_exact(&mut resp).await.unwrap();
@@ -277,7 +284,10 @@ async fn test_socks5_rfc1929_auth_success_and_failure() {
         });
 
         // Greeting
-        client.write_all(&[SOCKS5_VERSION, 1, METHOD_USER_PASS]).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, 1, METHOD_USER_PASS])
+            .await
+            .unwrap();
         let mut g_resp = [0u8; 2];
         client.read_exact(&mut g_resp).await.unwrap();
         assert_eq!(g_resp, [SOCKS5_VERSION, METHOD_USER_PASS]);
@@ -304,7 +314,10 @@ async fn test_socks5_rfc1929_auth_success_and_failure() {
         });
 
         // Greeting
-        client.write_all(&[SOCKS5_VERSION, 1, METHOD_USER_PASS]).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, 1, METHOD_USER_PASS])
+            .await
+            .unwrap();
         let mut g_resp = [0u8; 2];
         client.read_exact(&mut g_resp).await.unwrap();
         assert_eq!(g_resp, [SOCKS5_VERSION, METHOD_USER_PASS]);
@@ -329,13 +342,13 @@ async fn test_socks5_rfc1929_auth_success_and_failure() {
 #[tokio::test]
 async fn test_socks5_connect_ipv4() {
     let echo_addr = spawn_echo_tcp_server().await;
-    let echo_v4 = match echo_addr {
-        SocketAddr::V4(v4) => v4,
-        _ => unreachable!(),
+    let SocketAddr::V4(echo_v4) = echo_addr else {
+        unreachable!();
     };
 
     let target = Arc::new(DirectTunnelTarget);
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("test-tunnel", target, None));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("test-tunnel", target, None));
 
     let (mut client, server) = tokio::io::duplex(2048);
     tokio::spawn(async move {
@@ -343,7 +356,10 @@ async fn test_socks5_connect_ipv4() {
     });
 
     // 1. Greeting
-    client.write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH]).await.unwrap();
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
     let mut g_resp = [0u8; 2];
     client.read_exact(&mut g_resp).await.unwrap();
     assert_eq!(g_resp[1], METHOD_NO_AUTH);
@@ -373,24 +389,26 @@ async fn test_socks5_connect_ipv4() {
 #[tokio::test]
 async fn test_socks5_connect_ipv6() {
     let maybe_echo_addr = spawn_echo_tcp_server_ipv6().await;
-    let echo_addr = match maybe_echo_addr {
-        Some(a) => a,
-        None => return, // IPv6 disabled on host; skip
+    let Some(echo_addr) = maybe_echo_addr else {
+        return; // IPv6 disabled on host; skip
     };
-    let echo_v6 = match echo_addr {
-        SocketAddr::V6(v6) => v6,
-        _ => unreachable!(),
+    let SocketAddr::V6(echo_v6) = echo_addr else {
+        unreachable!();
     };
 
     let target = Arc::new(DirectTunnelTarget);
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("test-tunnel-v6", target, None));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("test-tunnel-v6", target, None));
 
     let (mut client, server) = tokio::io::duplex(2048);
     tokio::spawn(async move {
         let _ = handle_socks5(server, router).await;
     });
 
-    client.write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH]).await.unwrap();
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
     let mut g_resp = [0u8; 2];
     client.read_exact(&mut g_resp).await.unwrap();
 
@@ -417,9 +435,11 @@ async fn test_socks5_connect_domain_with_tunnel_resolution() {
     let echo_ip = echo_addr.ip();
     let echo_port = echo_addr.port();
 
-    let mock_target = Arc::new(MockTunnelTarget::new("tunnel-01").with_dns("echo.tunnel.local", echo_ip));
+    let mock_target =
+        Arc::new(MockTunnelTarget::new("tunnel-01").with_dns("echo.tunnel.local", echo_ip));
     assert_eq!(mock_target.id(), "tunnel-01");
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("tunnel-01", mock_target, None));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("tunnel-01", mock_target, None));
 
     let (mut client, server) = tokio::io::duplex(2048);
     tokio::spawn(async move {
@@ -427,7 +447,10 @@ async fn test_socks5_connect_domain_with_tunnel_resolution() {
     });
 
     // 1. Greeting
-    client.write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH]).await.unwrap();
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
     let mut g_resp = [0u8; 2];
     client.read_exact(&mut g_resp).await.unwrap();
     assert_eq!(g_resp[1], METHOD_NO_AUTH);
@@ -456,14 +479,18 @@ async fn test_socks5_connect_domain_with_tunnel_resolution() {
 #[tokio::test]
 async fn test_socks5_connect_unreachable_target_returns_error() {
     let target = Arc::new(DirectTunnelTarget);
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("test-tunnel", target, None));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("test-tunnel", target, None));
 
     let (mut client, server) = tokio::io::duplex(1024);
     tokio::spawn(async move {
         let _ = handle_socks5(server, router).await;
     });
 
-    client.write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH]).await.unwrap();
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
     let mut g_resp = [0u8; 2];
     client.read_exact(&mut g_resp).await.unwrap();
 
@@ -487,7 +514,9 @@ async fn test_socks5_connect_unreachable_target_returns_error() {
 async fn test_send_socks5_reply_helper() {
     let (mut client, mut server) = tokio::io::duplex(128);
     let test_addr: SocketAddr = "192.168.1.10:8080".parse().unwrap();
-    send_socks5_reply(&mut server, REP_SUCCESS, test_addr).await.unwrap();
+    send_socks5_reply(&mut server, REP_SUCCESS, test_addr)
+        .await
+        .unwrap();
 
     let mut buf = [0u8; 10];
     client.read_exact(&mut buf).await.unwrap();
@@ -513,7 +542,8 @@ fn test_socks5_udp_header_encode_decode() {
     let payload = b"dns_query_data";
     let packet = build_socks5_udp_packet(&v4_target, payload);
 
-    let (parsed_target, parsed_payload) = parse_socks5_udp_packet(&packet).expect("failed to parse v4");
+    let (parsed_target, parsed_payload) =
+        parse_socks5_udp_packet(&packet).expect("failed to parse v4");
     assert_eq!(parsed_target, v4_target);
     assert_eq!(parsed_payload, payload);
 
@@ -525,14 +555,16 @@ fn test_socks5_udp_header_encode_decode() {
         0,
     )));
     let packet_v6 = build_socks5_udp_packet(&v6_target, payload);
-    let (parsed_v6, parsed_payload_v6) = parse_socks5_udp_packet(&packet_v6).expect("failed to parse v6");
+    let (parsed_v6, parsed_payload_v6) =
+        parse_socks5_udp_packet(&packet_v6).expect("failed to parse v6");
     assert_eq!(parsed_v6, v6_target);
     assert_eq!(parsed_payload_v6, payload);
 
     // 3. Domain Target
     let domain_target = TargetAddr::Domain("dns.google.com".to_string(), 853);
     let packet_dom = build_socks5_udp_packet(&domain_target, payload);
-    let (parsed_dom, parsed_payload_dom) = parse_socks5_udp_packet(&packet_dom).expect("failed to parse domain");
+    let (parsed_dom, parsed_payload_dom) =
+        parse_socks5_udp_packet(&packet_dom).expect("failed to parse domain");
     assert_eq!(parsed_dom, domain_target);
     assert_eq!(parsed_payload_dom, payload);
 
@@ -550,7 +582,8 @@ async fn test_socks5_udp_associate_relay() {
     let echo_udp_addr = spawn_echo_udp_server().await;
 
     let target = Arc::new(DirectTunnelTarget);
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("udp-tunnel", target, None));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("udp-tunnel", target, None));
 
     // Bind real TCP listener for SOCKS5 server to exercise real UDP relay sockets
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -567,13 +600,27 @@ async fn test_socks5_udp_associate_relay() {
     let mut tcp_client = TcpStream::connect(s5_addr).await.unwrap();
 
     // 1. Greeting
-    tcp_client.write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH]).await.unwrap();
+    tcp_client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
     let mut g_resp = [0u8; 2];
     tcp_client.read_exact(&mut g_resp).await.unwrap();
     assert_eq!(g_resp[1], METHOD_NO_AUTH);
 
     // 2. CMD_UDP_ASSOCIATE
-    let cmd = [SOCKS5_VERSION, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
+    let cmd = [
+        SOCKS5_VERSION,
+        CMD_UDP_ASSOCIATE,
+        0x00,
+        ATYP_IPV4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
     tcp_client.write_all(&cmd).await.unwrap();
 
     let mut reply_hdr = [0u8; 4];
@@ -586,7 +633,11 @@ async fn test_socks5_udp_associate_relay() {
             tcp_client.read_exact(&mut buf).await.unwrap();
             let ip = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
             let port = u16::from_be_bytes([buf[4], buf[5]]);
-            let ip = if ip.is_unspecified() { s5_addr.ip() } else { IpAddr::V4(ip) };
+            let ip = if ip.is_unspecified() {
+                s5_addr.ip()
+            } else {
+                IpAddr::V4(ip)
+            };
             SocketAddr::new(ip, port)
         }
         _ => panic!("Expected IPv4 relay address"),
@@ -602,13 +653,15 @@ async fn test_socks5_udp_associate_relay() {
 
     // 4. Client receives echoed datagram from relay socket
     let mut resp_buf = vec![0u8; 2048];
-    let (n, from_relay) = tokio::time::timeout(Duration::from_secs(2), client_udp.recv_from(&mut resp_buf))
-        .await
-        .expect("Timeout waiting for relayed UDP")
-        .unwrap();
+    let (n, from_relay) =
+        tokio::time::timeout(Duration::from_secs(2), client_udp.recv_from(&mut resp_buf))
+            .await
+            .expect("Timeout waiting for relayed UDP")
+            .unwrap();
 
     assert_eq!(from_relay, relay_addr);
-    let (from_target, echoed_payload) = parse_socks5_udp_packet(&resp_buf[..n]).expect("Failed to parse echoed packet");
+    let (from_target, echoed_payload) =
+        parse_socks5_udp_packet(&resp_buf[..n]).expect("Failed to parse echoed packet");
     assert_eq!(from_target, target_dest);
     assert_eq!(echoed_payload, payload);
 }
@@ -619,9 +672,18 @@ async fn test_socks5_udp_associate_relay() {
 
 #[test]
 fn test_parse_authority() {
-    assert_eq!(parse_authority("example.com:443"), Some(("example.com".to_string(), 443)));
-    assert_eq!(parse_authority("1.2.3.4:8080"), Some(("1.2.3.4".to_string(), 8080)));
-    assert_eq!(parse_authority("[::1]:9000"), Some(("::1".to_string(), 9000)));
+    assert_eq!(
+        parse_authority("example.com:443"),
+        Some(("example.com".to_string(), 443))
+    );
+    assert_eq!(
+        parse_authority("1.2.3.4:8080"),
+        Some(("1.2.3.4".to_string(), 8080))
+    );
+    assert_eq!(
+        parse_authority("[::1]:9000"),
+        Some(("::1".to_string(), 9000))
+    );
     assert_eq!(parse_authority("invalid"), None);
     assert_eq!(parse_authority("example.com:notaport"), None);
 }
@@ -633,12 +695,18 @@ fn test_extract_basic_auth() {
         "proxy-authorization".to_string(),
         format_basic_auth("user1", "pass1"),
     );
-    assert_eq!(extract_basic_auth(&headers), Some(("user1".to_string(), "pass1".to_string())));
+    assert_eq!(
+        extract_basic_auth(&headers),
+        Some(("user1".to_string(), "pass1".to_string()))
+    );
 
     let mut empty_headers = HashMap::new();
     assert_eq!(extract_basic_auth(&empty_headers), None);
 
-    empty_headers.insert("proxy-authorization".to_string(), "Bearer token123".to_string());
+    empty_headers.insert(
+        "proxy-authorization".to_string(),
+        "Bearer token123".to_string(),
+    );
     assert_eq!(extract_basic_auth(&empty_headers), None);
 }
 
@@ -650,7 +718,9 @@ async fn test_read_http_request_headers_unit() {
         server.write_all(raw).await.unwrap();
     });
 
-    let (method, uri, version, headers, leftover) = read_http_request_headers_buffered(&mut client).await.unwrap();
+    let (method, uri, version, headers, leftover) = read_http_request_headers_buffered(&mut client)
+        .await
+        .unwrap();
     assert_eq!(method, "GET");
     assert_eq!(uri, "http://example.com/index.html");
     assert_eq!(version, "HTTP/1.1");
@@ -663,14 +733,18 @@ async fn test_read_http_request_headers_unit() {
 async fn test_http_connect_no_auth() {
     let echo_addr = spawn_echo_tcp_server().await;
     let target = Arc::new(DirectTunnelTarget);
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("http-tunnel", target, None));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("http-tunnel", target, None));
 
     let (mut client, server) = tokio::io::duplex(2048);
     tokio::spawn(async move {
         let _ = handle_http(server, router).await;
     });
 
-    let connect_req = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", echo_addr, echo_addr);
+    let connect_req = format!(
+        "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+        echo_addr, echo_addr
+    );
     client.write_all(connect_req.as_bytes()).await.unwrap();
 
     // Read 200 Connection Established response
@@ -703,7 +777,10 @@ async fn test_http_basic_auth_challenge_and_success() {
             let _ = handle_http(server, r).await;
         });
 
-        let req = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", echo_addr, echo_addr);
+        let req = format!(
+            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+            echo_addr, echo_addr
+        );
         client.write_all(req.as_bytes()).await.unwrap();
 
         let (status, _, headers, _) = read_http_headers_helper(&mut client).await.unwrap();
@@ -748,7 +825,10 @@ async fn test_http_basic_auth_challenge_and_success() {
         let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
         assert_eq!(status, 200);
 
-        client.write_all(b"authenticated_http_tunnel").await.unwrap();
+        client
+            .write_all(b"authenticated_http_tunnel")
+            .await
+            .unwrap();
         let mut buf = [0u8; 25];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"authenticated_http_tunnel");
@@ -759,7 +839,8 @@ async fn test_http_basic_auth_challenge_and_success() {
 async fn test_http_forward_proxy() {
     let mock_server_addr = spawn_mock_http_server("forward_proxy_payload_ok").await;
     let target = Arc::new(DirectTunnelTarget);
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("fwd-tunnel", target, None));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("fwd-tunnel", target, None));
 
     let (mut client, server) = tokio::io::duplex(4096);
     tokio::spawn(async move {
@@ -782,16 +863,16 @@ async fn test_http_forward_proxy_ipv6_bracket() {
     let mock_server_addr = spawn_mock_http_server("ipv6_bracket_ok").await;
     // mock_server_addr is IPv4 127.0.0.1:port. Now test IPv6 mock server if IPv6 available
     if let Some(v6_addr) = spawn_echo_tcp_server_ipv6().await {
-        let (host, port) = match parse_authority(&format!("[::1]:{}", v6_addr.port())) {
-            Some(hp) => hp,
-            None => panic!("failed to parse [::1]:port"),
+        let Some((host, port)) = parse_authority(&format!("[::1]:{}", v6_addr.port())) else {
+            panic!("failed to parse [::1]:port");
         };
         assert_eq!(host, "::1");
         assert_eq!(port, v6_addr.port());
     }
 
     let target = Arc::new(DirectTunnelTarget);
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("fwd-tunnel-v6", target, None));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("fwd-tunnel-v6", target, None));
     let (mut client, server) = tokio::io::duplex(4096);
     tokio::spawn(async move {
         let _ = handle_http(server, router).await;
@@ -818,7 +899,10 @@ async fn test_http_bad_request_handling() {
         let _ = handle_http(server, router).await;
     });
 
-    client.write_all(b"MALFORMED_REQUEST_LINE\r\n\r\n").await.unwrap();
+    client
+        .write_all(b"MALFORMED_REQUEST_LINE\r\n\r\n")
+        .await
+        .unwrap();
     let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
     assert_eq!(status, 400);
 }
@@ -830,14 +914,38 @@ async fn test_http_bad_request_handling() {
 #[test]
 fn test_tunnel_selector_parsing() {
     assert_eq!(TunnelSelector::parse(""), TunnelSelector::DefaultPool);
-    assert_eq!(TunnelSelector::parse("default"), TunnelSelector::DefaultPool);
-    assert_eq!(TunnelSelector::parse("auto"), TunnelSelector::ByKeyword(PoolKeyword::Auto));
-    assert_eq!(TunnelSelector::parse("random"), TunnelSelector::ByKeyword(PoolKeyword::Random));
-    assert_eq!(TunnelSelector::parse("round-robin"), TunnelSelector::ByKeyword(PoolKeyword::RoundRobin));
-    assert_eq!(TunnelSelector::parse("roundrobin"), TunnelSelector::ByKeyword(PoolKeyword::RoundRobin));
-    assert_eq!(TunnelSelector::parse("least-conn"), TunnelSelector::ByKeyword(PoolKeyword::LeastConn));
-    assert_eq!(TunnelSelector::parse("tag:streaming"), TunnelSelector::ByTag("streaming".to_string()));
-    assert_eq!(TunnelSelector::parse("wgcf-042"), TunnelSelector::ById("wgcf-042".to_string()));
+    assert_eq!(
+        TunnelSelector::parse("default"),
+        TunnelSelector::DefaultPool
+    );
+    assert_eq!(
+        TunnelSelector::parse("auto"),
+        TunnelSelector::ByKeyword(PoolKeyword::Auto)
+    );
+    assert_eq!(
+        TunnelSelector::parse("random"),
+        TunnelSelector::ByKeyword(PoolKeyword::Random)
+    );
+    assert_eq!(
+        TunnelSelector::parse("round-robin"),
+        TunnelSelector::ByKeyword(PoolKeyword::RoundRobin)
+    );
+    assert_eq!(
+        TunnelSelector::parse("roundrobin"),
+        TunnelSelector::ByKeyword(PoolKeyword::RoundRobin)
+    );
+    assert_eq!(
+        TunnelSelector::parse("least-conn"),
+        TunnelSelector::ByKeyword(PoolKeyword::LeastConn)
+    );
+    assert_eq!(
+        TunnelSelector::parse("tag:streaming"),
+        TunnelSelector::ByTag("streaming".to_string())
+    );
+    assert_eq!(
+        TunnelSelector::parse("wgcf-042"),
+        TunnelSelector::ById("wgcf-042".to_string())
+    );
 }
 
 #[tokio::test]
@@ -856,20 +964,41 @@ async fn test_pool_router_routing_and_round_robin() {
     let sel1 = pool.authenticate(Some(("wgcf-001", "globalpass"))).unwrap();
     assert_eq!(sel1, TunnelSelector::ById("wgcf-001".to_string()));
     let target1 = pool.select_tunnel(&sel1).await.unwrap();
-    assert!(Arc::ptr_eq(&target1, &(Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>)));
+    assert!(Arc::ptr_eq(
+        &target1,
+        &(Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>)
+    ));
 
     // 2. Authenticate with "auto" keyword
     let sel_auto = pool.authenticate(Some(("auto", "globalpass"))).unwrap();
     assert_eq!(sel_auto, TunnelSelector::ByKeyword(PoolKeyword::Auto));
 
     // 3. Test round-robin cycling
-    let t_first = pool.select_tunnel(&TunnelSelector::DefaultPool).await.unwrap();
-    let t_second = pool.select_tunnel(&TunnelSelector::DefaultPool).await.unwrap();
-    let t_third = pool.select_tunnel(&TunnelSelector::DefaultPool).await.unwrap();
+    let t_first = pool
+        .select_tunnel(&TunnelSelector::DefaultPool)
+        .await
+        .unwrap();
+    let t_second = pool
+        .select_tunnel(&TunnelSelector::DefaultPool)
+        .await
+        .unwrap();
+    let t_third = pool
+        .select_tunnel(&TunnelSelector::DefaultPool)
+        .await
+        .unwrap();
 
-    assert!(Arc::ptr_eq(&t_first, &(Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>)));
-    assert!(Arc::ptr_eq(&t_second, &(Arc::clone(&t2) as Arc<dyn ProxyTunnelTarget>)));
-    assert!(Arc::ptr_eq(&t_third, &(Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>)));
+    assert!(Arc::ptr_eq(
+        &t_first,
+        &(Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>)
+    ));
+    assert!(Arc::ptr_eq(
+        &t_second,
+        &(Arc::clone(&t2) as Arc<dyn ProxyTunnelTarget>)
+    ));
+    assert!(Arc::ptr_eq(
+        &t_third,
+        &(Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>)
+    ));
 }
 
 // -----------------------------------------------------------------------------
@@ -897,7 +1026,9 @@ async fn read_http_headers_helper<R: AsyncReadExt + Unpin>(
     }
     let header_str = String::from_utf8_lossy(&header_bytes);
     let mut lines = header_str.split("\r\n");
-    let status_line = lines.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty status line"))?;
+    let status_line = lines
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty status line"))?;
     let parts: Vec<&str> = status_line.split_whitespace().collect();
     let status_code: u16 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let reason = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
@@ -915,10 +1046,11 @@ async fn read_http_headers_helper<R: AsyncReadExt + Unpin>(
     let mut body = Vec::new();
     if let Some(len_str) = headers.get("content-length")
         && let Ok(len) = len_str.parse::<usize>()
-            && len > 0 {
-                body.resize(len, 0);
-                reader.read_exact(&mut body).await?;
-            }
+        && len > 0
+    {
+        body.resize(len, 0);
+        reader.read_exact(&mut body).await?;
+    }
 
     Ok((status_code, reason, headers, body))
 }

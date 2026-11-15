@@ -8,10 +8,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::toml_config::{DnsStrategy, LogLevel};
-use crate::config::{parse_duration_str, IpMode, LifecycleMode, MainConfig, TuiSortField};
-use crate::core::{
-    ActiveListenerInfo, ReloadReport, TunnelManager, TunnelState, TunnelSummary,
-};
+use crate::config::{IpMode, LifecycleMode, MainConfig, TuiSortField, parse_duration_str};
+use crate::core::{ActiveListenerInfo, ReloadReport, TunnelManager, TunnelState, TunnelSummary};
 use crate::tui::logs::TuiLogBuffer;
 
 /// Active tab in the nyx-style multi-tab TUI.
@@ -26,44 +24,44 @@ pub enum TuiTab {
 
 impl TuiTab {
     /// All tabs in display order.
-    pub const ALL: [TuiTab; 5] = [
-        TuiTab::Tunnels,
-        TuiTab::Logs,
-        TuiTab::Listeners,
-        TuiTab::Config,
-        TuiTab::Probe,
+    pub const ALL: [Self; 5] = [
+        Self::Tunnels,
+        Self::Logs,
+        Self::Listeners,
+        Self::Config,
+        Self::Probe,
     ];
 
     /// Short human-readable label for the tab bar.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            TuiTab::Tunnels => "1:Tunnels",
-            TuiTab::Logs => "2:Logs",
-            TuiTab::Listeners => "3:Listeners",
-            TuiTab::Config => "4:Config",
-            TuiTab::Probe => "5:Probe",
+            Self::Tunnels => "1:Tunnels",
+            Self::Logs => "2:Logs",
+            Self::Listeners => "3:Listeners",
+            Self::Config => "4:Config",
+            Self::Probe => "5:Probe",
         }
     }
 
     /// Cycle to the next tab.
-    pub fn next(self) -> Self {
+    pub const fn next(self) -> Self {
         match self {
-            TuiTab::Tunnels => TuiTab::Logs,
-            TuiTab::Logs => TuiTab::Listeners,
-            TuiTab::Listeners => TuiTab::Config,
-            TuiTab::Config => TuiTab::Probe,
-            TuiTab::Probe => TuiTab::Tunnels,
+            Self::Tunnels => Self::Logs,
+            Self::Logs => Self::Listeners,
+            Self::Listeners => Self::Config,
+            Self::Config => Self::Probe,
+            Self::Probe => Self::Tunnels,
         }
     }
 
     /// Cycle to the previous tab.
-    pub fn prev(self) -> Self {
+    pub const fn prev(self) -> Self {
         match self {
-            TuiTab::Tunnels => TuiTab::Probe,
-            TuiTab::Logs => TuiTab::Tunnels,
-            TuiTab::Listeners => TuiTab::Logs,
-            TuiTab::Config => TuiTab::Listeners,
-            TuiTab::Probe => TuiTab::Config,
+            Self::Tunnels => Self::Probe,
+            Self::Logs => Self::Tunnels,
+            Self::Listeners => Self::Logs,
+            Self::Config => Self::Listeners,
+            Self::Probe => Self::Config,
         }
     }
 }
@@ -82,7 +80,7 @@ pub struct TuiProbeResult {
 pub const CONFIG_ROW_COUNT: usize = 8;
 
 /// Data source powering the TUI dashboard: either an in-process manager or a remote Admin API.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum TuiDataSource {
     InProcess(Arc<TunnelManager>),
     Remote {
@@ -94,7 +92,9 @@ pub enum TuiDataSource {
 /// Validate that a string contains no HTTP control characters (`\r`, `\n`, `\0`) or whitespace.
 fn validate_http_token_or_segment(val: &str, field: &str) -> Result<(), String> {
     if val.bytes().any(|b| b <= 0x20 || b == 0x7f) {
-        return Err(format!("Invalid {} (contains control characters or whitespace)", field));
+        return Err(format!(
+            "Invalid {field} (contains control characters or whitespace)"
+        ));
     }
     Ok(())
 }
@@ -106,18 +106,19 @@ fn parse_admin_http_url(admin_url: &str) -> Result<String, String> {
         return Err("HTTPS is not supported for Admin API; use http://".to_string());
     }
     let authority = url.strip_prefix("http://").unwrap_or(url);
-    if authority.is_empty() || authority.contains('/') || authority.bytes().any(|b| b <= 0x20 || b == 0x7f) {
-        return Err(format!("Invalid Admin API URL '{}'", admin_url));
+    if authority.is_empty()
+        || authority.contains('/')
+        || authority.bytes().any(|b| b <= 0x20 || b == 0x7f)
+    {
+        return Err(format!("Invalid Admin API URL '{admin_url}'"));
     }
-    let has_port = if let Some(rest) = authority.strip_prefix('[') {
-        rest.contains("]:")
-    } else {
-        authority.contains(':')
-    };
+    let has_port = authority
+        .strip_prefix('[')
+        .map_or_else(|| authority.contains(':'), |rest| rest.contains("]:"));
     if has_port {
         Ok(authority.to_string())
     } else {
-        Ok(format!("{}:80", authority))
+        Ok(format!("{authority}:80"))
     }
 }
 
@@ -149,23 +150,24 @@ pub(crate) async fn admin_http_request_with_body(
     let io_timeout = Duration::from_secs(10);
     let mut stream = tokio::time::timeout(io_timeout, tokio::net::TcpStream::connect(&host_port))
         .await
-        .map_err(|_| format!("Timed out connecting to Admin API at '{}'", admin_url))?
-        .map_err(|e| format!("Failed to connect to Admin API at '{}': {}", admin_url, e))?;
+        .map_err(|_| format!("Timed out connecting to Admin API at '{admin_url}'"))?
+        .map_err(|e| format!("Failed to connect to Admin API at '{admin_url}': {e}"))?;
 
-    let mut req = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\n",
-        method, path, host_port
-    );
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host_port}\r\n");
     if let Some(payload) = body_bytes {
-        req.push_str(&format!(
-            "Content-Type: application/json\r\nContent-Length: {}\r\n",
-            payload.len()
-        ));
+        let _ = std::fmt::Write::write_fmt(
+            &mut req,
+            format_args!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                payload.len()
+            ),
+        );
     } else if method == "POST" {
         req.push_str("Content-Length: 0\r\n");
     }
     if let Some(token) = auth_token {
-        req.push_str(&format!("Authorization: Bearer {}\r\n", token));
+        let _ =
+            std::fmt::Write::write_fmt(&mut req, format_args!("Authorization: Bearer {token}\r\n"));
     }
     req.push_str("Connection: close\r\n\r\n");
 
@@ -177,36 +179,39 @@ pub(crate) async fn admin_http_request_with_body(
     tokio::time::timeout(io_timeout, stream.write_all(&wire))
         .await
         .map_err(|_| "Timed out writing Admin API request".to_string())?
-        .map_err(|e| format!("Write failed: {}", e))?;
+        .map_err(|e| format!("Write failed: {e}"))?;
 
     let mut resp_buf = Vec::new();
     tokio::time::timeout(io_timeout, stream.read_to_end(&mut resp_buf))
         .await
         .map_err(|_| "Timed out reading Admin API response".to_string())?
-        .map_err(|e| format!("Read failed: {}", e))?;
+        .map_err(|e| format!("Read failed: {e}"))?;
 
     let header_end = resp_buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| "Malformed HTTP response from Admin API".to_string())?;
 
-    let header_str = std::str::from_utf8(&resp_buf[..header_end])
+    let header_bytes = resp_buf
+        .get(..header_end)
+        .ok_or_else(|| "Malformed HTTP response from Admin API".to_string())?;
+    let header_str = std::str::from_utf8(header_bytes)
         .map_err(|_| "Non-UTF8 HTTP response headers from Admin API".to_string())?;
     let status_line = header_str.lines().next().unwrap_or("");
     let status_code: u16 = status_line
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| format!("Invalid HTTP status line: '{}'", status_line))?;
+        .ok_or_else(|| format!("Invalid HTTP status line: '{status_line}'"))?;
 
-    let body = &resp_buf[header_end + 4..];
+    let body = resp_buf.get(header_end + 4..).unwrap_or_default();
     if !(200..300).contains(&status_code) {
         if let Ok(json_err) = serde_json::from_slice::<serde_json::Value>(body)
             && let Some(msg) = json_err.get("error").and_then(|v| v.as_str())
         {
-            return Err(format!("HTTP {}: {}", status_code, msg));
+            return Err(format!("HTTP {status_code}: {msg}"));
         }
-        return Err(format!("HTTP error {}", status_code));
+        return Err(format!("HTTP error {status_code}"));
     }
 
     Ok(body.to_vec())
@@ -216,14 +221,15 @@ impl TuiDataSource {
     /// Retrieve list of all tunnels from the data source.
     pub async fn fetch_tunnels(&self) -> Result<Vec<TunnelSummary>, String> {
         match self {
-            TuiDataSource::InProcess(mgr) => Ok(mgr.get_tunnel_stats()),
-            TuiDataSource::Remote {
+            Self::InProcess(mgr) => Ok(mgr.get_tunnel_stats()),
+            Self::Remote {
                 admin_url,
                 auth_token,
             } => {
-                let body = admin_http_request(admin_url, "GET", "/tunnels", auth_token.as_deref()).await?;
+                let body =
+                    admin_http_request(admin_url, "GET", "/tunnels", auth_token.as_deref()).await?;
                 let tunnels: Vec<TunnelSummary> = serde_json::from_slice(&body)
-                    .map_err(|e| format!("Failed to deserialize tunnels response: {}", e))?;
+                    .map_err(|e| format!("Failed to deserialize tunnels response: {e}"))?;
                 Ok(tunnels)
             }
         }
@@ -232,17 +238,17 @@ impl TuiDataSource {
     /// Activate a dormant or suspended tunnel.
     pub async fn activate_tunnel(&self, id: &str) -> Result<(), String> {
         match self {
-            TuiDataSource::InProcess(mgr) => mgr
+            Self::InProcess(mgr) => mgr
                 .activate_tunnel(id)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string()),
-            TuiDataSource::Remote {
+            Self::Remote {
                 admin_url,
                 auth_token,
             } => {
                 validate_http_token_or_segment(id, "tunnel id")?;
-                let path = format!("/tunnels/{}/activate", id);
+                let path = format!("/tunnels/{id}/activate");
                 let _ = admin_http_request(admin_url, "POST", &path, auth_token.as_deref()).await?;
                 Ok(())
             }
@@ -252,16 +258,13 @@ impl TuiDataSource {
     /// Suspend an active tunnel.
     pub async fn suspend_tunnel(&self, id: &str) -> Result<(), String> {
         match self {
-            TuiDataSource::InProcess(mgr) => mgr
-                .suspend_tunnel(id)
-                .await
-                .map_err(|e| e.to_string()),
-            TuiDataSource::Remote {
+            Self::InProcess(mgr) => mgr.suspend_tunnel(id).await.map_err(|e| e.to_string()),
+            Self::Remote {
                 admin_url,
                 auth_token,
             } => {
                 validate_http_token_or_segment(id, "tunnel id")?;
-                let path = format!("/tunnels/{}/suspend", id);
+                let path = format!("/tunnels/{id}/suspend");
                 let _ = admin_http_request(admin_url, "POST", &path, auth_token.as_deref()).await?;
                 Ok(())
             }
@@ -270,14 +273,18 @@ impl TuiDataSource {
 
     /// Trigger configuration reload.
     /// Enable or disable one or more tunnels (`A`, `1`, `1-200`, `all`).
-    pub async fn set_tunnels_disabled(&self, target: &str, disabled: bool) -> Result<usize, String> {
+    pub async fn set_tunnels_disabled(
+        &self,
+        target: &str,
+        disabled: bool,
+    ) -> Result<usize, String> {
         match self {
-            TuiDataSource::InProcess(mgr) => mgr
+            Self::InProcess(mgr) => mgr
                 .set_tunnels_disabled(target, disabled)
                 .await
                 .map(|v| v.len())
-                .map_err(|e| format!("{:?}", e)),
-            TuiDataSource::Remote {
+                .map_err(|e| format!("{e:?}")),
+            Self::Remote {
                 admin_url,
                 auth_token,
             } => {
@@ -298,29 +305,29 @@ impl TuiDataSource {
                 .await?;
                 let val: serde_json::Value =
                     serde_json::from_slice(&resp).map_err(|e| e.to_string())?;
-                Ok(val["count"].as_u64().unwrap_or(0) as usize)
+                Ok(val
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize)
             }
         }
     }
 
     pub async fn reload(&self) -> Result<ReloadReport, String> {
         match self {
-            TuiDataSource::InProcess(mgr) => mgr
-                .reload()
-                .await
-                .map_err(|e| e.to_string()),
-            TuiDataSource::Remote {
+            Self::InProcess(mgr) => mgr.reload().await.map_err(|e| e.to_string()),
+            Self::Remote {
                 admin_url,
                 auth_token,
             } => {
-                let body = admin_http_request(admin_url, "POST", "/reload", auth_token.as_deref()).await?;
-
                 #[derive(serde::Deserialize)]
                 struct ReloadResp {
                     report: Option<ReloadReport>,
                 }
+                let body =
+                    admin_http_request(admin_url, "POST", "/reload", auth_token.as_deref()).await?;
                 let parsed: ReloadResp = serde_json::from_slice(&body)
-                    .map_err(|e| format!("Failed to parse reload response: {}", e))?;
+                    .map_err(|e| format!("Failed to parse reload response: {e}"))?;
                 Ok(parsed.report.unwrap_or_default())
             }
         }
@@ -329,15 +336,15 @@ impl TuiDataSource {
     /// Fetch daemon log lines (in-process buffer or `GET /logs`).
     pub async fn fetch_logs(&self) -> Result<Vec<String>, String> {
         match self {
-            TuiDataSource::InProcess(mgr) => Ok(mgr.log_buffer().snapshot()),
-            TuiDataSource::Remote {
+            Self::InProcess(mgr) => Ok(mgr.log_buffer().snapshot()),
+            Self::Remote {
                 admin_url,
                 auth_token,
             } => {
                 let body =
                     admin_http_request(admin_url, "GET", "/logs", auth_token.as_deref()).await?;
                 serde_json::from_slice::<Vec<String>>(&body)
-                    .map_err(|e| format!("Invalid /logs JSON: {}", e))
+                    .map_err(|e| format!("Invalid /logs JSON: {e}"))
             }
         }
     }
@@ -345,15 +352,16 @@ impl TuiDataSource {
     /// Retrieve active listeners from the data source.
     pub async fn fetch_listeners(&self) -> Result<Vec<ActiveListenerInfo>, String> {
         match self {
-            TuiDataSource::InProcess(mgr) => Ok(mgr.listeners().list_listeners()),
-            TuiDataSource::Remote {
+            Self::InProcess(mgr) => Ok(mgr.listeners().list_listeners()),
+            Self::Remote {
                 admin_url,
                 auth_token,
             } => {
                 let body =
-                    admin_http_request(admin_url, "GET", "/listeners", auth_token.as_deref()).await?;
+                    admin_http_request(admin_url, "GET", "/listeners", auth_token.as_deref())
+                        .await?;
                 serde_json::from_slice(&body)
-                    .map_err(|e| format!("Failed to deserialize listeners response: {}", e))
+                    .map_err(|e| format!("Failed to deserialize listeners response: {e}"))
             }
         }
     }
@@ -361,15 +369,15 @@ impl TuiDataSource {
     /// Retrieve current configuration snapshot from the data source.
     pub async fn fetch_config(&self) -> Result<MainConfig, String> {
         match self {
-            TuiDataSource::InProcess(mgr) => Ok(mgr.config_snapshot()),
-            TuiDataSource::Remote {
+            Self::InProcess(mgr) => Ok(mgr.config_snapshot()),
+            Self::Remote {
                 admin_url,
                 auth_token,
             } => {
                 let body =
                     admin_http_request(admin_url, "GET", "/config", auth_token.as_deref()).await?;
                 serde_json::from_slice(&body)
-                    .map_err(|e| format!("Failed to deserialize config response: {}", e))
+                    .map_err(|e| format!("Failed to deserialize config response: {e}"))
             }
         }
     }
@@ -377,15 +385,15 @@ impl TuiDataSource {
     /// Apply updated runtime configuration to the data source.
     pub async fn apply_config(&self, cfg: &MainConfig) -> Result<(), String> {
         match self {
-            TuiDataSource::InProcess(mgr) => mgr
+            Self::InProcess(mgr) => mgr
                 .update_runtime_config(cfg.clone())
                 .map_err(|e| e.to_string()),
-            TuiDataSource::Remote {
+            Self::Remote {
                 admin_url,
                 auth_token,
             } => {
                 let json_bytes =
-                    serde_json::to_vec(cfg).map_err(|e| format!("Serialize error: {}", e))?;
+                    serde_json::to_vec(cfg).map_err(|e| format!("Serialize error: {e}"))?;
                 let _ = admin_http_request_with_body(
                     admin_url,
                     "POST",
@@ -403,7 +411,7 @@ impl TuiDataSource {
     pub async fn probe_tunnel(&self, id: &str, endpoint: &str) -> TuiProbeResult {
         let start = Instant::now();
         match self {
-            TuiDataSource::InProcess(mgr) => match mgr.activate_tunnel(id).await {
+            Self::InProcess(mgr) => match mgr.activate_tunnel(id).await {
                 Ok(active) => {
                     let probe_timeout = mgr.config_snapshot().health_check.probe_timeout;
                     let peer_pubkey = mgr
@@ -458,7 +466,7 @@ impl TuiDataSource {
                     message: e.to_string(),
                 },
             },
-            TuiDataSource::Remote { .. } => match self.activate_tunnel(id).await {
+            Self::Remote { .. } => match self.activate_tunnel(id).await {
                 Ok(()) => TuiProbeResult {
                     id: id.to_string(),
                     endpoint: endpoint.to_string(),
@@ -479,6 +487,7 @@ impl TuiDataSource {
 }
 
 /// Central state model for the TUI monitor dashboard.
+#[derive(Debug)]
 pub struct TuiApp {
     pub data_source: TuiDataSource,
     pub active_tab: TuiTab,
@@ -605,10 +614,10 @@ impl TuiApp {
 
     /// Return filtered log lines from `log_buffer` or `remote_logs` (oldest to newest).
     pub fn filtered_logs(&self) -> Vec<String> {
-        let all = match &self.log_buffer {
-            Some(buf) => buf.snapshot(),
-            None => self.remote_logs.clone(),
-        };
+        let all = self
+            .log_buffer
+            .as_ref()
+            .map_or_else(|| self.remote_logs.clone(), TuiLogBuffer::snapshot);
         match &self.log_level_filter {
             None => all,
             Some(lvl) => all.into_iter().filter(|l| l.contains(lvl)).collect(),
@@ -621,21 +630,81 @@ impl TuiApp {
     /// Return `(label, current_value, is_cycle_toggle)` for a Config tab row.
     pub fn config_row_display(cfg: &MainConfig, idx: usize) -> (&'static str, String, bool) {
         match idx {
-            0 => ("global.log_level", format!("{:?}", cfg.global.log_level).to_lowercase(), true),
-            1 => ("global.ip_mode", format!("{:?}", cfg.global.ip_mode).to_lowercase(), true),
-            2 => ("global.dns_strategy", format!("{:?}", cfg.global.dns_strategy).to_lowercase(), true),
-            3 => ("global.dns_preference", format!("{:?}", cfg.global.dns_preference).to_lowercase(), true),
-            4 => ("global.dns_fallback", cfg.global.dns_fallback.to_string(), false),
-            5 => ("global.max_active_tunnels", cfg.global.max_active_tunnels.to_string(), false),
-            6 => ("lifecycle.mode", format!("{:?}", cfg.lifecycle.mode).to_lowercase(), true),
-            7 => ("lifecycle.idle_timeout", format!("{}s", cfg.lifecycle.idle_timeout.as_secs()), false),
-            8 => ("lifecycle.handshake_timeout", format!("{}s", cfg.lifecycle.handshake_timeout.as_secs()), false),
-            9 => ("health_check.probe_interval", format!("{}s", cfg.health_check.probe_interval.as_secs()), false),
-            10 => ("health_check.probe_timeout", format!("{}s", cfg.health_check.probe_timeout.as_secs()), false),
-            11 => ("health_check.threshold", cfg.health_check.threshold.to_string(), false),
-            12 => ("health_check.cooldown", format!("{}s", cfg.health_check.cooldown.as_secs()), false),
-            13 => ("per_tunnel.enabled", cfg.per_tunnel.enabled.to_string(), true),
-            _ => ("tui.refresh_rate_ms", cfg.tui.refresh_rate_ms.to_string(), false),
+            0 => (
+                "global.log_level",
+                format!("{:?}", cfg.global.log_level).to_lowercase(),
+                true,
+            ),
+            1 => (
+                "global.ip_mode",
+                format!("{:?}", cfg.global.ip_mode).to_lowercase(),
+                true,
+            ),
+            2 => (
+                "global.dns_strategy",
+                format!("{:?}", cfg.global.dns_strategy).to_lowercase(),
+                true,
+            ),
+            3 => (
+                "global.dns_preference",
+                format!("{:?}", cfg.global.dns_preference).to_lowercase(),
+                true,
+            ),
+            4 => (
+                "global.dns_fallback",
+                cfg.global.dns_fallback.to_string(),
+                false,
+            ),
+            5 => (
+                "global.max_active_tunnels",
+                cfg.global.max_active_tunnels.to_string(),
+                false,
+            ),
+            6 => (
+                "lifecycle.mode",
+                format!("{:?}", cfg.lifecycle.mode).to_lowercase(),
+                true,
+            ),
+            7 => (
+                "lifecycle.idle_timeout",
+                format!("{}s", cfg.lifecycle.idle_timeout.as_secs()),
+                false,
+            ),
+            8 => (
+                "lifecycle.handshake_timeout",
+                format!("{}s", cfg.lifecycle.handshake_timeout.as_secs()),
+                false,
+            ),
+            9 => (
+                "health_check.probe_interval",
+                format!("{}s", cfg.health_check.probe_interval.as_secs()),
+                false,
+            ),
+            10 => (
+                "health_check.probe_timeout",
+                format!("{}s", cfg.health_check.probe_timeout.as_secs()),
+                false,
+            ),
+            11 => (
+                "health_check.threshold",
+                cfg.health_check.threshold.to_string(),
+                false,
+            ),
+            12 => (
+                "health_check.cooldown",
+                format!("{}s", cfg.health_check.cooldown.as_secs()),
+                false,
+            ),
+            13 => (
+                "per_tunnel.enabled",
+                cfg.per_tunnel.enabled.to_string(),
+                true,
+            ),
+            _ => (
+                "tui.refresh_rate_ms",
+                cfg.tui.refresh_rate_ms.to_string(),
+                false,
+            ),
         }
     }
 
@@ -714,13 +783,13 @@ impl TuiApp {
             4 => {
                 let addr: std::net::SocketAddr = trimmed
                     .parse()
-                    .map_err(|_| format!("Invalid socket address '{}'", trimmed))?;
+                    .map_err(|_| format!("Invalid socket address '{trimmed}'"))?;
                 cfg.global.dns_fallback = addr;
             }
             5 => {
                 let n: usize = trimmed
                     .parse()
-                    .map_err(|_| format!("Invalid integer '{}'", trimmed))?;
+                    .map_err(|_| format!("Invalid integer '{trimmed}'"))?;
                 cfg.global.max_active_tunnels = n;
             }
             7 => {
@@ -738,7 +807,7 @@ impl TuiApp {
             11 => {
                 let n: usize = trimmed
                     .parse()
-                    .map_err(|_| format!("Invalid integer '{}'", trimmed))?;
+                    .map_err(|_| format!("Invalid integer '{trimmed}'"))?;
                 cfg.health_check.threshold = n;
             }
             12 => {
@@ -747,7 +816,7 @@ impl TuiApp {
             14 => {
                 let ms: u64 = trimmed
                     .parse()
-                    .map_err(|_| format!("Invalid integer '{}'", trimmed))?;
+                    .map_err(|_| format!("Invalid integer '{trimmed}'"))?;
                 cfg.tui.refresh_rate_ms = ms;
             }
             _ => {}
@@ -762,7 +831,7 @@ impl TuiApp {
     pub async fn save_config_and_reload(&mut self) -> Result<(), String> {
         if let (Some(cfg), Some(path)) = (&self.config_snapshot, &self.config_path) {
             let serialized = toml::to_string_pretty(cfg)
-                .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
+                .map_err(|e| format!("Failed to serialize TOML: {e}"))?;
             std::fs::write(path, serialized)
                 .map_err(|e| format!("Failed to write '{}': {}", path.display(), e))?;
         }
@@ -779,15 +848,20 @@ impl TuiApp {
         let target = self
             .selected_tunnel()
             .or_else(|| self.tunnels.first())
-            .map(|t| (t.id.clone(), t.endpoint.clone().unwrap_or_else(|| "-".into())));
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.endpoint.clone().unwrap_or_else(|| "-".into()),
+                )
+            });
         let Some((id, endpoint)) = target else {
             self.set_status("No tunnels available to probe");
             return;
         };
         let res = self.data_source.probe_tunnel(&id, &endpoint).await;
         self.set_status(format!("Probe {}: {}", res.id, res.message));
-        if let Some(pos) = self.probe_results.iter().position(|r| r.id == res.id) {
-            self.probe_results[pos] = res;
+        if let Some(slot) = self.probe_results.iter_mut().find(|r| r.id == res.id) {
+            *slot = res;
         } else {
             self.probe_results.push(res);
         }
@@ -799,7 +873,12 @@ impl TuiApp {
             .tunnels
             .iter()
             .take(16)
-            .map(|t| (t.id.clone(), t.endpoint.clone().unwrap_or_else(|| "-".into())))
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.endpoint.clone().unwrap_or_else(|| "-".into()),
+                )
+            })
             .collect();
         if targets.is_empty() {
             self.set_status("No tunnels available to probe");
@@ -813,7 +892,7 @@ impl TuiApp {
         let total = results.len();
         self.probe_results = results;
         self.probe_scroll = 0;
-        self.set_status(format!("Probed {} tunnels: {} OK", total, ok_count));
+        self.set_status(format!("Probed {total} tunnels: {ok_count} OK"));
     }
 
     /// Update tunnel dataset and refresh filtered/sorted view.
@@ -839,10 +918,10 @@ impl TuiApp {
             && let Some(pos) = self
                 .filtered_indices
                 .iter()
-                .position(|&idx| self.tunnels[idx].id == id)
-            {
-                self.selected_index = pos;
-            }
+                .position(|&idx| self.tunnels.get(idx).is_some_and(|t| t.id == id))
+        {
+            self.selected_index = pos;
+        }
     }
 
     /// Re-filter and sort active indices based on search query and sort criteria.
@@ -873,8 +952,9 @@ impl TuiApp {
         let ascending = self.sort_ascending;
 
         indices.sort_by(|&a, &b| {
-            let ta = &tunnels[a];
-            let tb = &tunnels[b];
+            let (Some(ta), Some(tb)) = (tunnels.get(a), tunnels.get(b)) else {
+                return std::cmp::Ordering::Equal;
+            };
             let ord = match field {
                 TuiSortField::Id => ta.id.cmp(&tb.id),
                 TuiSortField::Status => {
@@ -891,11 +971,7 @@ impl TuiApp {
                 TuiSortField::Tx => ta.tx_bytes.cmp(&tb.tx_bytes),
             };
 
-            if ascending {
-                ord
-            } else {
-                ord.reverse()
-            }
+            if ascending { ord } else { ord.reverse() }
         });
 
         self.filtered_indices = indices;
@@ -908,14 +984,16 @@ impl TuiApp {
     }
 
     /// Move selection down by 1.
-    pub fn select_next(&mut self) {
-        if !self.filtered_indices.is_empty() && self.selected_index + 1 < self.filtered_indices.len() {
+    pub const fn select_next(&mut self) {
+        if !self.filtered_indices.is_empty()
+            && self.selected_index + 1 < self.filtered_indices.len()
+        {
             self.selected_index += 1;
         }
     }
 
     /// Move selection up by 1.
-    pub fn select_prev(&mut self) {
+    pub const fn select_prev(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
         }
@@ -924,22 +1002,23 @@ impl TuiApp {
     /// Page down by specified row count.
     pub fn page_down(&mut self, page_size: usize) {
         if !self.filtered_indices.is_empty() {
-            self.selected_index = (self.selected_index + page_size).min(self.filtered_indices.len() - 1);
+            self.selected_index =
+                (self.selected_index + page_size).min(self.filtered_indices.len() - 1);
         }
     }
 
     /// Page up by specified row count.
-    pub fn page_up(&mut self, page_size: usize) {
+    pub const fn page_up(&mut self, page_size: usize) {
         self.selected_index = self.selected_index.saturating_sub(page_size);
     }
 
     /// Jump directly to top of tunnel list.
-    pub fn scroll_to_top(&mut self) {
+    pub const fn scroll_to_top(&mut self) {
         self.selected_index = 0;
     }
 
     /// Jump directly to bottom of tunnel list.
-    pub fn scroll_to_bottom(&mut self) {
+    pub const fn scroll_to_bottom(&mut self) {
         if !self.filtered_indices.is_empty() {
             self.selected_index = self.filtered_indices.len() - 1;
         }
@@ -978,9 +1057,10 @@ impl TuiApp {
     /// Clear status message if it has been displayed longer than `max_age`.
     pub fn clear_status_if_expired(&mut self, max_age: Duration) {
         if let Some((_, ts)) = &self.status_message
-            && ts.elapsed() > max_age {
-                self.status_message = None;
-            }
+            && ts.elapsed() > max_age
+        {
+            self.status_message = None;
+        }
     }
 
     /// Fetch latest tunnel states (and active tab data + bandwidth samples) from data source.
@@ -993,8 +1073,10 @@ impl TuiApp {
             (self.prev_total_rx, self.prev_total_tx, self.last_sample_at)
         {
             let elapsed = now.duration_since(prev_at).as_secs_f64().max(0.05);
-            let rx_bps = (total_rx.saturating_sub(prev_rx) as f64 / elapsed) as u64;
-            let tx_bps = (total_tx.saturating_sub(prev_tx) as f64 / elapsed) as u64;
+            #[allow(clippy::cast_sign_loss)]
+            let rx_bps = (total_rx.saturating_sub(prev_rx) as f64 / elapsed).max(0.0) as u64;
+            #[allow(clippy::cast_sign_loss)]
+            let tx_bps = (total_tx.saturating_sub(prev_tx) as f64 / elapsed).max(0.0) as u64;
             self.current_rx_bps = rx_bps;
             self.current_tx_bps = tx_bps;
             if self.rx_rates.len() >= 40 {
@@ -1036,7 +1118,7 @@ impl TuiApp {
         if let Some(t) = self.selected_tunnel() {
             let id = t.id.clone();
             self.data_source.activate_tunnel(&id).await?;
-            self.set_status(format!("Activated tunnel '{}'", id));
+            self.set_status(format!("Activated tunnel '{id}'"));
             self.refresh().await?;
             Ok(())
         } else {
@@ -1049,7 +1131,7 @@ impl TuiApp {
         if let Some(t) = self.selected_tunnel() {
             let id = t.id.clone();
             self.data_source.suspend_tunnel(&id).await?;
-            self.set_status(format!("Suspended tunnel '{}'", id));
+            self.set_status(format!("Suspended tunnel '{id}'"));
             self.refresh().await?;
             Ok(())
         } else {
@@ -1082,19 +1164,20 @@ impl TuiApp {
         if trimmed.is_empty() {
             return Ok(());
         }
-        let (disabled, target) = if let Some(rest) = trimmed.strip_prefix('+') {
-            (false, rest.trim())
-        } else if let Some(rest) = trimmed.strip_prefix('-') {
-            (true, rest.trim())
-        } else {
-            (true, trimmed)
-        };
+        let (disabled, target) = trimmed.strip_prefix('+').map_or_else(
+            || {
+                trimmed
+                    .strip_prefix('-')
+                    .map_or((true, trimmed), |rest| (true, rest.trim()))
+            },
+            |rest| (false, rest.trim()),
+        );
         let count = self
             .data_source
             .set_tunnels_disabled(target, disabled)
             .await?;
         let action = if disabled { "Disabled" } else { "Enabled" };
-        self.set_status(format!("{} {} tunnel(s) ({})", action, count, target));
+        self.set_status(format!("{action} {count} tunnel(s) ({target})"));
         let _ = self.refresh().await;
         Ok(())
     }
@@ -1110,7 +1193,7 @@ impl TuiApp {
     }
 
     /// Adjust viewport scroll offset so selected row is guaranteed visible.
-    pub fn update_scroll(&mut self, viewport_height: usize) {
+    pub const fn update_scroll(&mut self, viewport_height: usize) {
         if viewport_height == 0 || self.filtered_indices.is_empty() {
             self.scroll_offset = 0;
             return;

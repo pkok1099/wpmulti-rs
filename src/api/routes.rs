@@ -41,7 +41,7 @@ impl HttpResponse {
     }
 
     /// Construct a 200 OK text response (e.g. for Prometheus metrics).
-    pub fn ok_text(text: String, content_type: &'static str) -> Self {
+    pub const fn ok_text(text: String, content_type: &'static str) -> Self {
         Self {
             status: 200,
             reason: "OK",
@@ -123,23 +123,21 @@ impl HttpResponse {
 
 /// Parse raw HTTP/1.1 request bytes.
 pub fn parse_http_request(bytes: &[u8]) -> Result<HttpRequest, String> {
-    let mut header_end = 0;
-    while header_end + 3 < bytes.len() {
-        if &bytes[header_end..header_end + 4] == b"\r\n\r\n" {
-            break;
-        }
-        header_end += 1;
-    }
+    let header_end = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "Incomplete HTTP headers".to_string())?;
 
-    if header_end + 3 >= bytes.len() {
-        return Err("Incomplete HTTP headers".to_string());
-    }
-
-    let header_str = std::str::from_utf8(&bytes[..header_end])
-        .map_err(|e| format!("Invalid UTF-8 in headers: {}", e))?;
+    let header_bytes = bytes
+        .get(..header_end)
+        .ok_or_else(|| "Incomplete HTTP headers".to_string())?;
+    let header_str =
+        std::str::from_utf8(header_bytes).map_err(|e| format!("Invalid UTF-8 in headers: {e}"))?;
     let mut lines = header_str.split("\r\n");
 
-    let req_line = lines.next().ok_or_else(|| "Missing request line".to_string())?;
+    let req_line = lines
+        .next()
+        .ok_or_else(|| "Missing request line".to_string())?;
     let mut req_parts = req_line.split_whitespace();
     let method = req_parts
         .next()
@@ -165,7 +163,7 @@ pub fn parse_http_request(bytes: &[u8]) -> Result<HttpRequest, String> {
     }
 
     let body_start = header_end + 4;
-    let body = bytes[body_start..].to_vec();
+    let body = bytes.get(body_start..).unwrap_or_default().to_vec();
 
     Ok(HttpRequest {
         method,
@@ -201,6 +199,187 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn is_authorized(req: &HttpRequest, auth_token: Option<&str>) -> bool {
+    let Some(expected_token) = auth_token else {
+        return true;
+    };
+    let Some(h) = req.headers.get("authorization") else {
+        return false;
+    };
+    h.strip_prefix("Bearer ")
+        .is_some_and(|token| constant_time_eq(token.trim().as_bytes(), expected_token.as_bytes()))
+}
+
+fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> HttpResponse {
+    let stats = manager.get_tunnel_stats();
+    let total_tunnels = stats.len();
+    let active_tunnels = stats
+        .iter()
+        .filter(|s| s.state == TunnelState::Active)
+        .count();
+    let suspended_tunnels = stats
+        .iter()
+        .filter(|s| s.state == TunnelState::Suspended)
+        .count();
+    let dormant_tunnels = stats
+        .iter()
+        .filter(|s| s.state == TunnelState::Dormant)
+        .count();
+    let healthy_tunnels = stats
+        .iter()
+        .filter(|s| s.health == crate::core::HealthStatus::Healthy)
+        .count();
+    let unhealthy_tunnels = stats
+        .iter()
+        .filter(|s| s.health == crate::core::HealthStatus::Unhealthy)
+        .count();
+    let total_connections: u64 = stats.iter().map(|s| s.total_conns).sum();
+    let active_connections: usize = stats.iter().map(|s| s.active_conns).sum();
+    let rx_bytes: u64 = stats.iter().map(|s| s.rx_bytes).sum();
+    let tx_bytes: u64 = stats.iter().map(|s| s.tx_bytes).sum();
+    let listeners = manager.listeners().list_listeners();
+
+    HttpResponse::ok_json(&json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": uptime_secs,
+        "total_tunnels": total_tunnels,
+        "active_tunnels": active_tunnels,
+        "suspended_tunnels": suspended_tunnels,
+        "dormant_tunnels": dormant_tunnels,
+        "healthy_tunnels": healthy_tunnels,
+        "unhealthy_tunnels": unhealthy_tunnels,
+        "total_connections": total_connections,
+        "active_connections": active_connections,
+        "rx_bytes": rx_bytes,
+        "tx_bytes": tx_bytes,
+        "listeners": listeners
+    }))
+}
+
+fn handle_list_tunnels_request(req: &HttpRequest, manager: &Arc<TunnelManager>) -> HttpResponse {
+    let params = parse_query_params(req.query.as_deref());
+    let query_filter = params.get("q").map(|s| s.to_lowercase());
+    let state_filter = params.get("state").map(|s| s.to_lowercase());
+    let mut tunnels = manager.get_tunnel_stats();
+
+    if let Some(q) = query_filter {
+        tunnels.retain(|t| {
+            t.id.to_lowercase().contains(&q)
+                || t.endpoint
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&q)
+        });
+    }
+    if let Some(st) = state_filter {
+        tunnels.retain(|t| t.state.to_string().to_lowercase() == st);
+    }
+
+    HttpResponse::ok_json(&tunnels)
+}
+
+fn tunnel_action_response<T>(
+    res: Result<T, CoreError>,
+    id: &str,
+    status_label: &str,
+    err_prefix: &str,
+    manager: &Arc<TunnelManager>,
+) -> HttpResponse {
+    match res {
+        Ok(_) => {
+            let summary = manager.registry().get(id).map(|e| e.summary());
+            HttpResponse::ok_json(&json!({
+                "status": status_label,
+                "tunnel": summary
+            }))
+        }
+        Err(CoreError::TunnelNotFound(_)) => {
+            HttpResponse::not_found(&format!("Tunnel '{id}' not found"))
+        }
+        Err(e) => HttpResponse::internal_error(&format!("{err_prefix}: {e}")),
+    }
+}
+
+async fn handle_batch_toggle(
+    path: &str,
+    body: &[u8],
+    manager: &Arc<TunnelManager>,
+) -> HttpResponse {
+    #[derive(serde::Deserialize)]
+    struct BatchReq {
+        target: String,
+    }
+    let disabled = path.ends_with("/disable");
+    let payload = match serde_json::from_slice::<BatchReq>(body) {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::bad_request(&format!("Invalid JSON body: {e}")),
+    };
+    match manager
+        .set_tunnels_disabled(&payload.target, disabled)
+        .await
+    {
+        Ok(updated) => HttpResponse::ok_json(&json!({
+            "status": if disabled { "disabled" } else { "enabled" },
+            "count": updated.len(),
+            "tunnels": updated
+        })),
+        Err(CoreError::TunnelNotFound(msg)) => {
+            HttpResponse::not_found(&format!("Tunnel target not found: {msg}"))
+        }
+        Err(e) => HttpResponse::bad_request(&format!("Invalid target: {e}")),
+    }
+}
+
+async fn handle_tunnel_subroute(
+    method: &str,
+    sub: &str,
+    manager: &Arc<TunnelManager>,
+) -> HttpResponse {
+    if let Some((id, action)) = sub.split_once('/') {
+        return match (method, action) {
+            ("POST", "activate") => tunnel_action_response(
+                manager.activate_tunnel(id).await,
+                id,
+                "activated",
+                "Activation error",
+                manager,
+            ),
+            ("POST", "suspend" | "deactivate") => tunnel_action_response(
+                manager.suspend_tunnel(id).await,
+                id,
+                "suspended",
+                "Suspend error",
+                manager,
+            ),
+            ("POST", "disable") => tunnel_action_response(
+                manager.set_tunnels_disabled(id, true).await,
+                id,
+                "disabled",
+                "Disable error",
+                manager,
+            ),
+            ("POST", "enable") => tunnel_action_response(
+                manager.set_tunnels_disabled(id, false).await,
+                id,
+                "enabled",
+                "Enable error",
+                manager,
+            ),
+            _ => HttpResponse::not_found("Action not found"),
+        };
+    }
+
+    match method {
+        "GET" => manager.registry().get(sub).map_or_else(
+            || HttpResponse::not_found(&format!("Tunnel '{sub}' not found")),
+            |entry| HttpResponse::ok_json(&entry.summary()),
+        ),
+        _ => HttpResponse::bad_request("Method not allowed"),
+    }
+}
+
 /// Core routing function for incoming Admin REST API requests.
 pub async fn handle_admin_request(
     req: &HttpRequest,
@@ -208,260 +387,55 @@ pub async fn handle_admin_request(
     auth_token: Option<&str>,
     uptime_secs: u64,
 ) -> HttpResponse {
-    // 1. Verify authentication token if configured
-    if let Some(expected_token) = auth_token {
-        let auth_hdr = req.headers.get("authorization");
-        let authorized = match auth_hdr {
-            Some(h) => {
-                if let Some(token) = h.strip_prefix("Bearer ") {
-                    constant_time_eq(token.trim().as_bytes(), expected_token.as_bytes())
-                } else {
-                    false
-                }
-            }
-            None => false,
-        };
-
-        if !authorized {
-            return HttpResponse::unauthorized();
-        }
+    if !is_authorized(req, auth_token) {
+        return HttpResponse::unauthorized();
     }
 
     let method = req.method.as_str();
     let path = req.path.as_str();
 
-    // 2. Dispatch routes
     match (method, path) {
-        // GET /health
-        ("GET", "/health") => {
-            HttpResponse::ok_json(&json!({
-                "status": "ok",
-                "version": env!("CARGO_PKG_VERSION"),
-                "uptime_secs": uptime_secs
-            }))
-        }
-
-        // GET /status
-        ("GET", "/status") => {
-            let stats = manager.get_tunnel_stats();
-            let total_tunnels = stats.len();
-            let active_tunnels = stats.iter().filter(|s| s.state == TunnelState::Active).count();
-            let suspended_tunnels = stats.iter().filter(|s| s.state == TunnelState::Suspended).count();
-            let dormant_tunnels = stats.iter().filter(|s| s.state == TunnelState::Dormant).count();
-            let healthy_tunnels = stats.iter().filter(|s| s.health == crate::core::HealthStatus::Healthy).count();
-            let unhealthy_tunnels = stats.iter().filter(|s| s.health == crate::core::HealthStatus::Unhealthy).count();
-            let total_connections: u64 = stats.iter().map(|s| s.total_conns).sum();
-            let active_connections: usize = stats.iter().map(|s| s.active_conns).sum();
-            let rx_bytes: u64 = stats.iter().map(|s| s.rx_bytes).sum();
-            let tx_bytes: u64 = stats.iter().map(|s| s.tx_bytes).sum();
-            let listeners = manager.listeners().list_listeners();
-
-            HttpResponse::ok_json(&json!({
-                "status": "ok",
-                "version": env!("CARGO_PKG_VERSION"),
-                "uptime_secs": uptime_secs,
-                "total_tunnels": total_tunnels,
-                "active_tunnels": active_tunnels,
-                "suspended_tunnels": suspended_tunnels,
-                "dormant_tunnels": dormant_tunnels,
-                "healthy_tunnels": healthy_tunnels,
-                "unhealthy_tunnels": unhealthy_tunnels,
-                "total_connections": total_connections,
-                "active_connections": active_connections,
-                "rx_bytes": rx_bytes,
-                "tx_bytes": tx_bytes,
-                "listeners": listeners
-            }))
-        }
-
-        // GET /tunnels
-        ("GET", "/tunnels") => {
-            let params = parse_query_params(req.query.as_deref());
-            let query_filter = params.get("q").map(|s| s.to_lowercase());
-            let state_filter = params.get("state").map(|s| s.to_lowercase());
-
-            let mut tunnels = manager.get_tunnel_stats();
-
-            if let Some(q) = query_filter {
-                tunnels.retain(|t| {
-                    t.id.to_lowercase().contains(&q)
-                        || t.endpoint.as_deref().unwrap_or("").to_lowercase().contains(&q)
-                });
-            }
-
-            if let Some(st) = state_filter {
-                tunnels.retain(|t| t.state.to_string().to_lowercase() == st);
-            }
-
-            HttpResponse::ok_json(&tunnels)
-        }
-
-        // GET /listeners
-        ("GET", "/logs") => {
-            let logs = manager.log_buffer().snapshot();
-            HttpResponse::ok_json(&logs)
-        }
-        ("GET", "/listeners") => {
-            let listeners = manager.listeners().list_listeners();
-            HttpResponse::ok_json(&listeners)
-        }
-
-        // GET /config
-        ("GET", "/config") => {
-            let cfg = manager.config_snapshot();
-            HttpResponse::ok_json(&cfg)
-        }
-
-        // POST /config
-        ("POST", "/config") => {
-            match serde_json::from_slice::<crate::config::MainConfig>(&req.body) {
-                Ok(new_cfg) => match manager.update_runtime_config(new_cfg) {
-                    Ok(()) => HttpResponse::ok_json(&json!({ "status": "updated" })),
-                    Err(e) => HttpResponse::bad_request(&format!("Invalid config: {}", e)),
+        ("GET", "/health") => HttpResponse::ok_json(&json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_secs": uptime_secs
+        })),
+        ("GET", "/status") => handle_status_request(manager, uptime_secs),
+        ("GET", "/tunnels") => handle_list_tunnels_request(req, manager),
+        ("GET", "/logs") => HttpResponse::ok_json(&manager.log_buffer().snapshot()),
+        ("GET", "/listeners") => HttpResponse::ok_json(&manager.listeners().list_listeners()),
+        ("GET", "/config") => HttpResponse::ok_json(&manager.config_snapshot()),
+        ("POST", "/config") => match serde_json::from_slice::<crate::config::MainConfig>(&req.body)
+        {
+            Ok(new_cfg) => match manager.update_runtime_config(new_cfg) {
+                Ok(()) => HttpResponse::ok_json(&json!({ "status": "updated" })),
+                Err(e) => HttpResponse::bad_request(&format!("Invalid config: {e}")),
+            },
+            Err(e) => HttpResponse::bad_request(&format!("Invalid JSON config: {e}")),
+        },
+        ("POST", "/reload") => match manager.reload().await {
+            Ok(report) => HttpResponse::ok_json(&json!({
+                "status": "reloaded",
+                "report": {
+                    "added": report.added,
+                    "removed": report.removed,
+                    "updated": report.updated,
+                    "total": report.total
                 },
-                Err(e) => HttpResponse::bad_request(&format!("Invalid JSON config: {}", e)),
-            }
+                "reloaded": report.total
+            })),
+            Err(e) => HttpResponse::internal_error(&format!("Reload failed: {e}")),
+        },
+        ("GET", "/metrics") => HttpResponse::ok_text(
+            generate_prometheus_metrics(manager),
+            "text/plain; version=0.0.4; charset=utf-8",
+        ),
+        ("POST", "/tunnels/batch/disable" | "/tunnels/batch/enable") => {
+            handle_batch_toggle(path, &req.body, manager).await
         }
-
-        // POST /reload
-        ("POST", "/reload") => {
-            match manager.reload().await {
-                Ok(report) => HttpResponse::ok_json(&json!({
-                    "status": "reloaded",
-                    "report": {
-                        "added": report.added,
-                        "removed": report.removed,
-                        "updated": report.updated,
-                        "total": report.total
-                    },
-                    "reloaded": report.total
-                })),
-                Err(e) => HttpResponse::internal_error(&format!("Reload failed: {}", e)),
-            }
-        }
-
-        // GET /metrics
-        ("GET", "/metrics") => {
-            let metrics_text = generate_prometheus_metrics(manager);
-            HttpResponse::ok_text(
-                metrics_text,
-                "text/plain; version=0.0.4; charset=utf-8",
-            )
-        }
-
-        // POST /tunnels/batch/disable and POST /tunnels/batch/enable
-        ("POST", "/tunnels/batch/disable") | ("POST", "/tunnels/batch/enable") => {
-            let disabled = path.ends_with("/disable");
-            #[derive(serde::Deserialize)]
-            struct BatchReq {
-                target: String,
-            }
-            match serde_json::from_slice::<BatchReq>(&req.body) {
-                Ok(payload) => match manager.set_tunnels_disabled(&payload.target, disabled).await {
-                    Ok(updated) => HttpResponse::ok_json(&json!({
-                        "status": if disabled { "disabled" } else { "enabled" },
-                        "count": updated.len(),
-                        "tunnels": updated
-                    })),
-                    Err(CoreError::TunnelNotFound(msg)) => {
-                        HttpResponse::not_found(&format!("Tunnel target not found: {}", msg))
-                    }
-                    Err(e) => HttpResponse::bad_request(&format!("Invalid target: {}", e)),
-                },
-                Err(e) => HttpResponse::bad_request(&format!("Invalid JSON body: {}", e)),
-            }
-        }
-
-        // Parameterized routes /tunnels/:id and /tunnels/:id/action
         _ if path.starts_with("/tunnels/") => {
-            let sub = &path["/tunnels/".len()..];
-            if let Some((id, action)) = sub.split_once('/') {
-                match (method, action) {
-                    ("POST", "activate") => {
-                        match manager.activate_tunnel(id).await {
-                            Ok(_) => {
-                                let summary = manager.registry().get(id).map(|e| e.summary());
-                                HttpResponse::ok_json(&json!({
-                                    "status": "activated",
-                                    "tunnel": summary
-                                }))
-                            }
-                            Err(CoreError::TunnelNotFound(_)) => {
-                                HttpResponse::not_found(&format!("Tunnel '{}' not found", id))
-                            }
-                            Err(e) => {
-                                HttpResponse::internal_error(&format!("Activation error: {}", e))
-                            }
-                        }
-                    }
-                    ("POST", "suspend") | ("POST", "deactivate") => {
-                        match manager.suspend_tunnel(id).await {
-                            Ok(_) => {
-                                let summary = manager.registry().get(id).map(|e| e.summary());
-                                HttpResponse::ok_json(&json!({
-                                    "status": "suspended",
-                                    "tunnel": summary
-                                }))
-                            }
-                            Err(CoreError::TunnelNotFound(_)) => {
-                                HttpResponse::not_found(&format!("Tunnel '{}' not found", id))
-                            }
-                            Err(e) => {
-                                HttpResponse::internal_error(&format!("Suspend error: {}", e))
-                            }
-                        }
-                    }
-                    ("POST", "disable") => {
-                        match manager.set_tunnels_disabled(id, true).await {
-                            Ok(_) => {
-                                let summary = manager.registry().get(id).map(|e| e.summary());
-                                HttpResponse::ok_json(&json!({
-                                    "status": "disabled",
-                                    "tunnel": summary
-                                }))
-                            }
-                            Err(CoreError::TunnelNotFound(_)) => {
-                                HttpResponse::not_found(&format!("Tunnel '{}' not found", id))
-                            }
-                            Err(e) => {
-                                HttpResponse::internal_error(&format!("Disable error: {}", e))
-                            }
-                        }
-                    }
-                    ("POST", "enable") => {
-                        match manager.set_tunnels_disabled(id, false).await {
-                            Ok(_) => {
-                                let summary = manager.registry().get(id).map(|e| e.summary());
-                                HttpResponse::ok_json(&json!({
-                                    "status": "enabled",
-                                    "tunnel": summary
-                                }))
-                            }
-                            Err(CoreError::TunnelNotFound(_)) => {
-                                HttpResponse::not_found(&format!("Tunnel '{}' not found", id))
-                            }
-                            Err(e) => {
-                                HttpResponse::internal_error(&format!("Enable error: {}", e))
-                            }
-                        }
-                    }
-                    _ => HttpResponse::not_found("Action not found"),
-                }
-            } else {
-                let id = sub;
-                match method {
-                    "GET" => {
-                        if let Some(entry) = manager.registry().get(id) {
-                            HttpResponse::ok_json(&entry.summary())
-                        } else {
-                            HttpResponse::not_found(&format!("Tunnel '{}' not found", id))
-                        }
-                    }
-                    _ => HttpResponse::bad_request("Method not allowed"),
-                }
-            }
+            handle_tunnel_subroute(method, &path["/tunnels/".len()..], manager).await
         }
-
         _ => HttpResponse::not_found("Not found"),
     }
 }

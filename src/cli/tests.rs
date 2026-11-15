@@ -72,7 +72,14 @@ fn test_cli_parse_top() {
 
 #[test]
 fn test_cli_parse_validate() {
-    let args = vec!["wpmulti", "validate", "--config", "test.toml", "--dir", "configs/"];
+    let args = vec![
+        "wpmulti",
+        "validate",
+        "--config",
+        "test.toml",
+        "--dir",
+        "configs/",
+    ];
     let cli = Cli::try_parse_from(args).expect("parse validate");
     assert_eq!(
         cli.command,
@@ -141,12 +148,7 @@ fn test_cli_parse_probe_options() {
         }
     );
 
-    let args_dir = vec![
-        "wpmulti",
-        "probe",
-        "-d",
-        "/etc/wireguard",
-    ];
+    let args_dir = vec!["wpmulti", "probe", "-d", "/etc/wireguard"];
     let cli_dir = Cli::try_parse_from(args_dir).expect("parse probe dir");
     assert_eq!(
         cli_dir.command,
@@ -181,14 +183,9 @@ AllowedIPs = 0.0.0.0/0
     .expect("write wg conf");
 
     // Probe single with short timeout (unreachable test endpoint will fail/timeout without panicking)
-    let results = cmd_probe(
-        Some(conf_path),
-        None,
-        true,
-        "100ms".to_string(),
-    )
-    .await
-    .expect("cmd_probe");
+    let results = cmd_probe(Some(conf_path), None, true, "100ms".to_string())
+        .await
+        .expect("cmd_probe");
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "probe-01");

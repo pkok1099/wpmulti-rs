@@ -78,3 +78,73 @@ assets = [
     ["README.md", "usr/share/doc/wpmulti/README.md", "644"],
     ["THIRD_PARTY_NOTICES.md", "usr/share/doc/wpmulti/THIRD_PARTY_NOTICES.md", "644"],
 ]
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+elided_lifetimes_in_paths = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# pedantic noise allowances (keep safety & structure strict)
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+doc_markdown = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+module_name_repetitions = "allow"
+
+# dipertahankan
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+cognitive_complexity = "warn"
+trivially_copy_pass_by_ref = "warn"
+inefficient_to_string = "warn"
+implicit_clone = "warn"
+
+# match / enum
+wildcard_in_or_patterns = "deny"
+wildcard_enum_match_arm = "deny"
+match_wildcard_for_single_variants = "deny"
+unnested_or_patterns = "deny"
+
+# supaya clippy.toml efektif
+struct_excessive_bools = "warn"
+fn_params_excessive_bools = "warn"
+
+# async / lock
+await_holding_lock = "deny"
+large_futures = "warn"
+
+# anti-crash
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+
+# unsafe
+undocumented_unsafe_blocks = "deny"
+
+#misc
+nursery = { level = "warn", priority = -1 }
+
+redundant_clone = "warn"
+large_types_passed_by_value = "warn"
+needless_pass_by_value = "warn"
+large_stack_arrays = "warn"
+large_stack_frames = "warn"
+format_push_string = "warn"
+rc_buffer = "warn"
+box_collection = "warn"
+significant_drop_tightening = "warn"

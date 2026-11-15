@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::api::routes::{handle_admin_request, HttpRequest};
+use crate::api::routes::{HttpRequest, handle_admin_request};
 use crate::api::server::AdminServer;
 use crate::config::{MainConfig, TunnelConfig, WgInterfaceConfig, WgPeerConfig};
 use crate::core::TunnelManager;
@@ -130,7 +130,10 @@ async fn test_list_tunnels_query_filter() {
     let json_val: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
     let arr = json_val.as_array().expect("array of tunnels");
     assert_eq!(arr.len(), 2);
-    assert!(arr.iter().all(|t| t["id"].as_str().unwrap().contains("wgcf")));
+    assert!(
+        arr.iter()
+            .all(|t| t["id"].as_str().unwrap().contains("wgcf"))
+    );
 }
 
 #[tokio::test]
@@ -306,7 +309,10 @@ async fn test_auth_token_unauthorized_and_authorized() {
 
     // 2. Wrong Bearer token
     let mut bad_headers = HashMap::new();
-    bad_headers.insert("authorization".to_string(), "Bearer wrong_token".to_string());
+    bad_headers.insert(
+        "authorization".to_string(),
+        "Bearer wrong_token".to_string(),
+    );
     let req_bad = HttpRequest {
         method: "GET".to_string(),
         path: "/health".to_string(),
@@ -361,11 +367,7 @@ async fn test_admin_server_e2e_tcp() {
 #[tokio::test]
 async fn test_admin_server_content_length_limit() {
     let manager = create_test_manager();
-    let server = AdminServer::new(
-        "127.0.0.1:0".parse().unwrap(),
-        manager,
-        None,
-    );
+    let server = AdminServer::new("127.0.0.1:0".parse().unwrap(), manager, None);
     let bound_addr = server.start().await.expect("server started");
 
     let mut client = TcpStream::connect(bound_addr).await.expect("connect");

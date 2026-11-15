@@ -193,7 +193,10 @@ impl Socks5TestClient {
     }
 
     /// Send CONNECT command and obtain transparent TCP stream to destination
-    pub async fn cmd_connect(mut self, target: Socks5Target) -> std::io::Result<tokio::net::TcpStream> {
+    pub async fn cmd_connect(
+        mut self,
+        target: Socks5Target,
+    ) -> std::io::Result<tokio::net::TcpStream> {
         let (rep, _bound_addr) = self.send_command(CMD_CONNECT, &target).await?;
         if rep != REP_SUCCESS {
             return Err(std::io::Error::new(
@@ -205,18 +208,37 @@ impl Socks5TestClient {
     }
 
     /// Helper: CONNECT to IPv4 target
-    pub async fn cmd_connect_ipv4(self, ip: Ipv4Addr, port: u16) -> std::io::Result<tokio::net::TcpStream> {
-        self.cmd_connect(Socks5Target::Ip(SocketAddr::V4(SocketAddrV4::new(ip, port)))).await
+    pub async fn cmd_connect_ipv4(
+        self,
+        ip: Ipv4Addr,
+        port: u16,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        self.cmd_connect(Socks5Target::Ip(SocketAddr::V4(SocketAddrV4::new(
+            ip, port,
+        ))))
+        .await
     }
 
     /// Helper: CONNECT to Domain target
-    pub async fn cmd_connect_domain(self, domain: &str, port: u16) -> std::io::Result<tokio::net::TcpStream> {
-        self.cmd_connect(Socks5Target::Domain(domain.to_string(), port)).await
+    pub async fn cmd_connect_domain(
+        self,
+        domain: &str,
+        port: u16,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        self.cmd_connect(Socks5Target::Domain(domain.to_string(), port))
+            .await
     }
 
     /// Helper: CONNECT to IPv6 target
-    pub async fn cmd_connect_ipv6(self, ip: Ipv6Addr, port: u16) -> std::io::Result<tokio::net::TcpStream> {
-        self.cmd_connect(Socks5Target::Ip(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)))).await
+    pub async fn cmd_connect_ipv6(
+        self,
+        ip: Ipv6Addr,
+        port: u16,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        self.cmd_connect(Socks5Target::Ip(SocketAddr::V6(SocketAddrV6::new(
+            ip, port, 0, 0,
+        ))))
+        .await
     }
 
     /// Send UDP ASSOCIATE command and obtain a managed UDP relay session
@@ -395,7 +417,9 @@ impl Socks5UdpSession {
         let mut resp_buf = vec![0u8; 65536];
         tokio::time::timeout(timeout, self.recv_from(&mut resp_buf))
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "udp echo response timed out"))?
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "udp echo response timed out")
+            })?
             .map(|(len, _)| {
                 resp_buf.truncate(len);
                 resp_buf
