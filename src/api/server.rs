@@ -120,6 +120,9 @@ impl AdminServer {
     }
 }
 
+/// Maximum time allowed to read a single HTTP request from an Admin API client.
+const ADMIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Handle a single incoming HTTP connection.
 async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
@@ -130,56 +133,71 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let mut buf = Vec::with_capacity(4096);
     let mut temp = [0u8; 1024];
 
-    // Read headers until \r\n\r\n
-    loop {
-        let n = match stream.read(&mut temp).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => return,
-        };
-        buf.extend_from_slice(&temp[..n]);
+    // Read headers until \r\n\r\n with overall read timeout (Slowloris protection)
+    let read_res = tokio::time::timeout(ADMIN_READ_TIMEOUT, async {
+        loop {
+            let n = match stream.read(&mut temp).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => return Err(()),
+            };
+            buf.extend_from_slice(&temp[..n]);
 
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            // Check Content-Length to read remainder of body if any
-            let header_str = String::from_utf8_lossy(&buf[..pos]);
-            let mut content_len = 0;
-            for line in header_str.lines() {
-                if let Some((k, v)) = line.split_once(':')
-                    && k.trim().eq_ignore_ascii_case("content-length") {
-                    content_len = v.trim().parse::<usize>().unwrap_or(0);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                // Check Content-Length to read remainder of body if any
+                let header_str = String::from_utf8_lossy(&buf[..pos]);
+                let mut content_len = 0;
+                for line in header_str.lines() {
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length") {
+                        content_len = v.trim().parse::<usize>().unwrap_or(0);
+                    }
                 }
-            }
 
-            if content_len > 65536 {
-                let resp = HttpResponse::payload_too_large("Request body too large (max 64 KiB)");
-                let _ = stream.write_all(&resp.to_bytes()).await;
-                return;
-            }
-
-            let required_total = pos + 4 + content_len;
-            if required_total > 131072 {
-                let resp = HttpResponse::payload_too_large("Request too large");
-                let _ = stream.write_all(&resp.to_bytes()).await;
-                return;
-            }
-
-            while buf.len() < required_total {
-                let n = match stream.read(&mut temp).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => return,
-                };
-                buf.extend_from_slice(&temp[..n]);
-                if buf.len() > required_total {
-                    break;
+                if content_len > 65536 {
+                    let resp = HttpResponse::payload_too_large("Request body too large (max 64 KiB)");
+                    let _ = stream.write_all(&resp.to_bytes()).await;
+                    return Err(());
                 }
+
+                let required_total = pos + 4 + content_len;
+                if required_total > 131072 {
+                    let resp = HttpResponse::payload_too_large("Request too large");
+                    let _ = stream.write_all(&resp.to_bytes()).await;
+                    return Err(());
+                }
+
+                while buf.len() < required_total {
+                    let n = match stream.read(&mut temp).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => return Err(()),
+                    };
+                    buf.extend_from_slice(&temp[..n]);
+                    if buf.len() > required_total {
+                        break;
+                    }
+                }
+                break;
             }
-            break;
+
+            if buf.len() > 65536 {
+                let resp = HttpResponse::bad_request("Request header too large");
+                let _ = stream.write_all(&resp.to_bytes()).await;
+                return Err(());
+            }
         }
+        Ok(())
+    })
+    .await;
 
-        if buf.len() > 65536 {
-            let resp = HttpResponse::bad_request("Request header too large");
+    match read_res {
+        Ok(Ok(())) => {}
+        Ok(Err(())) => return,
+        Err(_) => {
+            let resp = HttpResponse::bad_request("Request read timed out");
             let _ = stream.write_all(&resp.to_bytes()).await;
+            let _ = stream.flush().await;
             return;
         }
     }

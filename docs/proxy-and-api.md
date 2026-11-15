@@ -50,8 +50,11 @@ wpmulti top --admin-url http://127.0.0.1:9090
 
 ### TUI Keyboard Controls
 - `/` — Search / filter tunnels by ID or endpoint (`Enter` / `Esc` to finish)
-- `s` — Cycle sort field (`Id` → `Status` → `Conns` → `Rx` → `Tx`)
-- `r` — Force refresh
+- `Tab` — Cycle sort field (`ID` → `Status` → `Conns` → `RX` → `TX`)
+- `a` / `A` — Activate selected tunnel
+- `s` / `S` — Suspend selected tunnel
+- `r` / `R` — Trigger hot-reload of tunnel configurations
+- `j` / `k` or `↑` / `↓` — Move selection (`g` / `G` for top / bottom)
 - `q` / `Q` — Quit TUI
 
 ---

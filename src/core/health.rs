@@ -225,11 +225,15 @@ impl ActiveProber {
         *self.task_handle.lock() = Some(handle);
     }
 
-    /// Run a single probe pass over all Eager tunnels.
+    /// Run a single probe pass over all Eager tunnels with bounded concurrency.
     pub async fn probe_eager_tunnels(
         registry: &Arc<TunnelRegistry>,
         settings: &HealthCheckSettings,
     ) {
+        const MAX_CONCURRENT_PROBES: usize = 64;
+        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES));
+        let mut set = tokio::task::JoinSet::new();
+
         for entry in registry.all_entries() {
             // STRICTLY SKIP LAZY TUNNELS to guarantee 0% idle CPU and 0 sockets
             if entry.lifecycle_mode != LifecycleMode::Eager {
@@ -247,16 +251,26 @@ impl ActiveProber {
                 };
 
                 let health = Arc::clone(&entry.health);
+                let stats = Arc::clone(&entry.stats);
                 let threshold = settings.threshold;
                 let cooldown = settings.cooldown;
                 let timeout = settings.probe_timeout;
                 let active_clone = Arc::clone(&active);
+                let sem_clone = Arc::clone(&sem);
 
-                tokio::spawn(async move {
+                set.spawn(async move {
+                    let Ok(_permit) = sem_clone.acquire_owned().await else {
+                        return;
+                    };
                     let probe_res = tokio::time::timeout(timeout, active_clone.device.force_handshake(&peer_pubkey)).await;
                     match probe_res {
                         Ok(Ok(())) => {
                             health.record_success();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            stats.record_handshake(now);
                         }
                         Ok(Err(e)) => {
                             tracing::debug!("Active probe handshake failed for eager tunnel: {}", e);
@@ -270,6 +284,8 @@ impl ActiveProber {
                 });
             }
         }
+
+        while set.join_next().await.is_some() {}
     }
 
     /// Stop the prober background task and wait for its clean shutdown.

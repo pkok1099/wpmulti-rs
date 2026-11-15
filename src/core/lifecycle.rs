@@ -255,11 +255,43 @@ impl AsyncWrite for GuardedStream {
     }
 }
 
+/// RAII guard ensuring `TunnelState::Activating` reverts to `Dormant` if activation is cancelled.
+struct ActivatingGuard<'a> {
+    entry: &'a TunnelEntry,
+    defused: bool,
+}
+
+impl<'a> ActivatingGuard<'a> {
+    fn new(entry: &'a TunnelEntry) -> Self {
+        *entry.state.write() = TunnelState::Activating;
+        Self {
+            entry,
+            defused: false,
+        }
+    }
+
+    fn defuse(mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for ActivatingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.defused {
+            *self.entry.state.write() = TunnelState::Dormant;
+        }
+    }
+}
+
 /// Controller orchestrating lazy on-demand activation, native suspend/resume, and idle teardown.
 pub struct LifecycleController {
     registry: Arc<TunnelRegistry>,
     idle_timeout: Duration,
     check_interval: Duration,
+    handshake_timeout_ms: std::sync::atomic::AtomicU64,
+    max_active_tunnels: std::sync::atomic::AtomicUsize,
+    dns_fallback: Mutex<SocketAddr>,
+    dns_strategy: std::sync::atomic::AtomicU8,
     shutdown_tx: watch::Sender<bool>,
     teardown_handle: Mutex<Option<JoinHandle<()>>>,
     prefer_ipv6: std::sync::atomic::AtomicBool,
@@ -278,11 +310,55 @@ impl LifecycleController {
             registry,
             idle_timeout,
             check_interval,
+            handshake_timeout_ms: std::sync::atomic::AtomicU64::new(10_000),
+            max_active_tunnels: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            dns_fallback: Mutex::new("1.1.1.1:53".parse().unwrap()),
+            dns_strategy: std::sync::atomic::AtomicU8::new(0),
             shutdown_tx,
             teardown_handle: Mutex::new(None),
             prefer_ipv6: std::sync::atomic::AtomicBool::new(false),
             ip_mode: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    /// Configure the maximum number of concurrently active tunnels (`usize::MAX` = unlimited).
+    pub fn set_max_active_tunnels(&self, max: usize) {
+        self.max_active_tunnels.store(max.max(1), Ordering::Relaxed);
+    }
+
+    /// Configure the fallback DNS server address used when `.conf` has no `DNS` entries.
+    pub fn set_dns_fallback(&self, addr: SocketAddr) {
+        *self.dns_fallback.lock() = addr;
+    }
+
+    /// Configure the DNS resolution strategy (`TunnelOnly`, `TunnelFirst`, `Host`).
+    pub fn set_dns_strategy(&self, strategy: crate::config::toml_config::DnsStrategy) {
+        let val = match strategy {
+            crate::config::toml_config::DnsStrategy::TunnelOnly => 0,
+            crate::config::toml_config::DnsStrategy::TunnelFirst => 1,
+            crate::config::toml_config::DnsStrategy::Host => 2,
+        };
+        self.dns_strategy.store(val, Ordering::Relaxed);
+    }
+
+    /// Return the configured DNS resolution strategy.
+    pub fn dns_strategy(&self) -> crate::config::toml_config::DnsStrategy {
+        match self.dns_strategy.load(Ordering::Relaxed) {
+            1 => crate::config::toml_config::DnsStrategy::TunnelFirst,
+            2 => crate::config::toml_config::DnsStrategy::Host,
+            _ => crate::config::toml_config::DnsStrategy::TunnelOnly,
+        }
+    }
+
+    /// Configure the handshake / endpoint resolution timeout for tunnel activation.
+    pub fn set_handshake_timeout(&self, timeout: Duration) {
+        let ms = timeout.as_millis().min(u64::MAX as u128) as u64;
+        self.handshake_timeout_ms.store(ms.max(1), Ordering::Relaxed);
+    }
+
+    /// Return the configured handshake / endpoint resolution timeout.
+    pub fn handshake_timeout(&self) -> Duration {
+        Duration::from_millis(self.handshake_timeout_ms.load(Ordering::Relaxed))
     }
 
     /// Configure whether dual-stack domain resolution prefers IPv6 (`AAAA`) over IPv4 (`A`).
@@ -371,6 +447,44 @@ impl LifecycleController {
         Ok(())
     }
 
+    /// Ensure active tunnel count is below `max_active_tunnels`, evicting oldest idle lazy tunnels if needed.
+    async fn enforce_max_active_tunnels(&self, target_id: &str) -> Result<(), CoreError> {
+        let max_active = self.max_active_tunnels.load(Ordering::Relaxed);
+        if max_active == usize::MAX || self.registry.active_count() < max_active {
+            return Ok(());
+        }
+
+        let mut candidates: Vec<(u64, String)> = self
+            .registry
+            .all_entries()
+            .into_iter()
+            .filter(|e| {
+                e.id != target_id
+                    && e.lifecycle_mode == LifecycleMode::Lazy
+                    && *e.state.read() == TunnelState::Active
+                    && e.stats.active_conns.load(Ordering::SeqCst) == 0
+            })
+            .map(|e| (e.stats.last_active_at.load(Ordering::Relaxed), e.id.clone()))
+            .collect();
+
+        candidates.sort_by_key(|(last_active, _)| *last_active);
+
+        for (_, evict_id) in candidates {
+            if self.registry.active_count() < max_active {
+                break;
+            }
+            let _ = self.suspend_tunnel(&evict_id).await;
+        }
+
+        if self.registry.active_count() >= max_active {
+            return Err(CoreError::ActivationFailed(
+                target_id.to_string(),
+                format!("max_active_tunnels ({}) limit reached", max_active),
+            ));
+        }
+        Ok(())
+    }
+
     /// Get an active tunnel handle or dynamically boot/resume it on demand.
     ///
     /// Returns both the [`ActiveTunnel`] and a fresh [`TunnelConnGuard`].
@@ -382,6 +496,10 @@ impl LifecycleController {
             .registry
             .get(id)
             .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
+
+        if *entry.state.read() != TunnelState::Active {
+            self.enforce_max_active_tunnels(id).await?;
+        }
 
         let _lock = entry.activation_lock.lock().await;
 
@@ -416,23 +534,28 @@ impl LifecycleController {
                 Ok((active, guard))
             }
             TunnelState::Dormant | TunnelState::Activating => {
-                *entry.state.write() = TunnelState::Activating;
+                let activating_guard = ActivatingGuard::new(&entry);
+                let dns_fallback = *self.dns_fallback.lock();
                 match Self::boot_tunnel(
                     &entry,
                     self.ip_mode(),
                     self.prefer_ipv6.load(Ordering::Relaxed),
+                    self.handshake_timeout(),
+                    dns_fallback,
+                    self.dns_strategy(),
                 )
                 .await
                 {
                     Ok(active) => {
                         *entry.active.write() = Some(Arc::clone(&active));
                         *entry.state.write() = TunnelState::Active;
+                        activating_guard.defuse();
 
                         let guard = TunnelConnGuard::new(id, Arc::clone(&entry.stats));
                         Ok((active, guard))
                     }
                     Err(e) => {
-                        *entry.state.write() = TunnelState::Dormant;
+                        drop(activating_guard);
                         entry.health.record_failure(3, Duration::from_secs(30));
                         Err(e)
                     }
@@ -447,6 +570,10 @@ impl LifecycleController {
             .registry
             .get(id)
             .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
+
+        if *entry.state.read() != TunnelState::Active {
+            self.enforce_max_active_tunnels(id).await?;
+        }
 
         let _lock = entry.activation_lock.lock().await;
 
@@ -488,21 +615,26 @@ impl LifecycleController {
                 Ok(active)
             }
             TunnelState::Dormant | TunnelState::Activating => {
-                *entry.state.write() = TunnelState::Activating;
+                let activating_guard = ActivatingGuard::new(&entry);
+                let dns_fallback = *self.dns_fallback.lock();
                 match Self::boot_tunnel(
                     &entry,
                     self.ip_mode(),
                     self.prefer_ipv6.load(Ordering::Relaxed),
+                    self.handshake_timeout(),
+                    dns_fallback,
+                    self.dns_strategy(),
                 )
                 .await
                 {
                     Ok(active) => {
                         *entry.active.write() = Some(Arc::clone(&active));
                         *entry.state.write() = TunnelState::Active;
+                        activating_guard.defuse();
                         Ok(active)
                     }
                     Err(e) => {
-                        *entry.state.write() = TunnelState::Dormant;
+                        drop(activating_guard);
                         Err(e)
                     }
                 }
@@ -544,6 +676,9 @@ impl LifecycleController {
         entry: &TunnelEntry,
         ip_mode: crate::config::IpMode,
         prefer_ipv6: bool,
+        handshake_timeout: Duration,
+        dns_fallback: SocketAddr,
+        dns_strategy: crate::config::toml_config::DnsStrategy,
     ) -> Result<Arc<ActiveTunnel>, CoreError> {
         let (config_interface, config_peers) = {
             let cfg = entry.config.read();
@@ -559,8 +694,21 @@ impl LifecycleController {
             let mut peer = gotatun::device::Peer::new(p_cfg.public_key);
             if let Ok(addr) = p_cfg.endpoint.parse::<SocketAddr>() {
                 peer.endpoint = Some(addr);
-            } else if let Ok(mut addrs) = tokio::net::lookup_host(&p_cfg.endpoint).await {
-                peer.endpoint = addrs.next();
+            } else {
+                match tokio::time::timeout(handshake_timeout, tokio::net::lookup_host(&p_cfg.endpoint)).await {
+                    Ok(Ok(mut addrs)) => {
+                        peer.endpoint = addrs.next();
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!("Failed to resolve peer endpoint '{}': {}", p_cfg.endpoint, e);
+                    }
+                    Err(_) => {
+                        return Err(CoreError::ActivationFailed(
+                            entry.id.clone(),
+                            format!("endpoint DNS lookup timed out for '{}'", p_cfg.endpoint),
+                        ));
+                    }
+                }
             }
             peer.allowed_ips = p_cfg.allowed_ips.clone();
             peer.preshared_key = p_cfg.preshared_key;
@@ -585,7 +733,16 @@ impl LifecycleController {
         })?;
 
         // Build smoltcp VirtualNetworkStack
-        let netstack = match VirtualNetworkStack::new_with_mode(&config_interface, bridge, ip_mode, prefer_ipv6).await {
+        let netstack = match VirtualNetworkStack::new_with_options(
+            &config_interface,
+            bridge,
+            ip_mode,
+            prefer_ipv6,
+            dns_fallback,
+            dns_strategy,
+        )
+        .await
+        {
             Ok(ns) => ns,
             Err(e) => {
                 let _ = device.suspend().await;

@@ -61,6 +61,10 @@ pub enum Commands {
         /// Admin API URL to connect to (e.g. http://127.0.0.1:9090)
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
+
+        /// Bearer authentication token for protected Admin API
+        #[clap(long)]
+        auth_token: Option<String>,
     },
     /// Validate configuration and tunnel files without starting listeners
     #[clap(after_help = "EXAMPLES:\n  \
@@ -81,6 +85,10 @@ pub enum Commands {
         /// Admin API URL to connect to (e.g. http://127.0.0.1:9090)
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
+
+        /// Bearer authentication token for protected Admin API
+        #[clap(long)]
+        auth_token: Option<String>,
     },
     /// Probe WireGuard tunnel configs for connectivity, RTT latency, and exit IP
     #[clap(after_help = "EXAMPLES:\n  \
@@ -111,18 +119,26 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Run { config, dir, tui } => cmd_run(config, dir, tui).await,
-        Commands::Top { admin_url } => cmd_top(admin_url).await,
-        Commands::Validate { config, dir } => {
-            cmd_validate(config, dir)?;
-            Ok(())
-        }
-        Commands::Status { admin_url } => {
-            cmd_status(admin_url).await?;
-            Ok(())
-        }
-        Commands::Probe { config, dir, json, timeout } => {
-            cmd_probe(config, dir, json, timeout).await?;
-            Ok(())
+        other => {
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .try_init();
+            match other {
+                Commands::Top { admin_url, auth_token } => cmd_top(admin_url, auth_token).await,
+                Commands::Validate { config, dir } => {
+                    cmd_validate(config, dir)?;
+                    Ok(())
+                }
+                Commands::Status { admin_url, auth_token } => {
+                    cmd_status(admin_url, auth_token).await?;
+                    Ok(())
+                }
+                Commands::Probe { config, dir, json, timeout } => {
+                    cmd_probe(config, dir, json, timeout).await?;
+                    Ok(())
+                }
+                Commands::Run { .. } => unreachable!(),
+            }
         }
     }
 }

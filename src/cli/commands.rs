@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::api::AdminServer;
 use crate::config::{
@@ -35,6 +34,24 @@ pub async fn cmd_run(
 
     if let Some(dir) = dir_path {
         config.global.config_dir = dir;
+    }
+
+    let max_level = match config.global.log_level {
+        crate::config::LogLevel::Trace => tracing::Level::TRACE,
+        crate::config::LogLevel::Debug => tracing::Level::DEBUG,
+        crate::config::LogLevel::Info => tracing::Level::INFO,
+        crate::config::LogLevel::Warn => tracing::Level::WARN,
+        crate::config::LogLevel::Error => tracing::Level::ERROR,
+    };
+    if tui_mode {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .with_writer(std::io::sink)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .try_init();
     }
 
     let tunnels = if config.global.config_dir.exists() {
@@ -137,33 +154,20 @@ pub fn cmd_validate(
 }
 
 /// Execute the `wpmulti status` command: fetches daemon status from Admin API and prints to stdout.
-pub async fn cmd_status(admin_url: String) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let url = admin_url.trim_end_matches('/');
-    let host_port = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
+pub async fn cmd_status(
+    admin_url: String,
+    auth_token: Option<String>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let body = crate::tui::app::admin_http_request(
+        &admin_url,
+        "GET",
+        "/status",
+        auth_token.as_deref(),
+    )
+    .await
+    .map_err(|e| std::io::Error::other(e))?;
 
-    let mut stream = tokio::net::TcpStream::connect(host_port)
-        .await
-        .map_err(|e| format!("Failed to connect to Admin API at '{}': {}", url, e))?;
-
-    let req = format!(
-        "GET /status HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        host_port
-    );
-    stream.write_all(req.as_bytes()).await?;
-
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-
-    let body_offset = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-        .unwrap_or(0);
-
-    let val: serde_json::Value = serde_json::from_slice(&buf[body_offset..])
+    let val: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
 
     println!("{}", serde_json::to_string_pretty(&val)?);
@@ -171,10 +175,13 @@ pub async fn cmd_status(admin_url: String) -> Result<serde_json::Value, Box<dyn 
 }
 
 /// Execute the `wpmulti top` command: launches the standalone interactive TUI monitor.
-pub async fn cmd_top(admin_url: String) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn cmd_top(
+    admin_url: String,
+    auth_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let source = TuiDataSource::Remote {
         admin_url,
-        auth_token: None,
+        auth_token,
     };
     let app = TuiApp::new(source, crate::config::TuiSortField::Id);
     run_terminal_tui(app, 500).await?;
@@ -365,11 +372,28 @@ pub async fn cmd_probe(
         return Ok(Vec::new());
     }
 
-    let mut results = Vec::with_capacity(configs_with_path.len());
-    for (cfg, file) in configs_with_path {
-        let res = run_probe_single(&cfg, file, timeout).await;
-        results.push(res);
+    const MAX_CONCURRENT_PROBES: usize = 32;
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES));
+    let mut set = tokio::task::JoinSet::new();
+    let total = configs_with_path.len();
+
+    for (idx, (cfg, file)) in configs_with_path.into_iter().enumerate() {
+        let sem_clone = Arc::clone(&sem);
+        set.spawn(async move {
+            let _permit = sem_clone.acquire_owned().await.ok();
+            let res = run_probe_single(&cfg, file, timeout).await;
+            (idx, res)
+        });
     }
+
+    let mut indexed_results = Vec::with_capacity(total);
+    while let Some(joined) = set.join_next().await {
+        if let Ok(item) = joined {
+            indexed_results.push(item);
+        }
+    }
+    indexed_results.sort_by_key(|(idx, _)| *idx);
+    let results: Vec<ProbeResult> = indexed_results.into_iter().map(|(_, r)| r).collect();
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&results)?);

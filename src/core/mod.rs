@@ -101,6 +101,10 @@ impl TunnelManager {
             config.global.dns_preference == crate::config::toml_config::DnsPreference::Ipv6First,
         );
         lifecycle.set_ip_mode(config.global.ip_mode);
+        lifecycle.set_handshake_timeout(config.lifecycle.handshake_timeout);
+        lifecycle.set_max_active_tunnels(config.global.max_active_tunnels);
+        lifecycle.set_dns_fallback(config.global.dns_fallback);
+        lifecycle.set_dns_strategy(config.global.dns_strategy);
 
         let listeners = Arc::new(ListenerSupervisor::new());
         let prober = Arc::new(ActiveProber::new());
@@ -253,7 +257,9 @@ impl TunnelManager {
         new_tunnels: Vec<TunnelConfig>,
     ) -> Result<ReloadReport, CoreError> {
         let mut report = ReloadReport::default();
-        let default_mode = self.config.read().lifecycle.mode;
+        let cfg_snapshot = self.config.read().clone();
+        let default_mode = cfg_snapshot.lifecycle.mode;
+        let eager_tunnels = &cfg_snapshot.lifecycle.eager_tunnels;
 
         let mut incoming_ids = std::collections::HashSet::new();
         for t_cfg in new_tunnels {
@@ -284,9 +290,33 @@ impl TunnelManager {
                     report.updated += 1;
                 }
             } else {
-                // New tunnel added
-                let entry = TunnelEntry::new(t_cfg.id.clone(), t_cfg, default_mode);
-                self.registry.register(entry)?;
+                // New tunnel added: respect eager_tunnels list
+                let mode = if eager_tunnels.contains(&t_cfg.id) {
+                    LifecycleMode::Eager
+                } else {
+                    default_mode
+                };
+                let new_id = t_cfg.id.clone();
+                let entry = self
+                    .registry
+                    .register(TunnelEntry::new(new_id.clone(), t_cfg, mode))?;
+
+                if cfg_snapshot.per_tunnel.enabled && self.listeners.is_started() {
+                    let _ = self
+                        .listeners
+                        .start_dedicated_for_tunnel(
+                            &entry,
+                            &cfg_snapshot.per_tunnel,
+                            cfg_snapshot.global.bind_address,
+                            &self.lifecycle,
+                        )
+                        .await;
+                }
+
+                if mode == LifecycleMode::Eager && self.listeners.is_started() {
+                    let _ = self.lifecycle.activate_tunnel(&new_id).await;
+                }
+
                 report.added += 1;
             }
         }
@@ -295,6 +325,9 @@ impl TunnelManager {
         let existing_ids = self.registry.all_ids();
         for id in existing_ids {
             if !incoming_ids.contains(&id) {
+                if self.listeners.is_started() {
+                    self.listeners.stop_dedicated_for_tunnel(&id).await;
+                }
                 let _ = self.lifecycle.close_tunnel(&id).await;
                 self.registry.remove(&id);
                 report.removed += 1;

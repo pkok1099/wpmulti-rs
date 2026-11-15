@@ -189,6 +189,18 @@ fn parse_query_params(query: Option<&str>) -> HashMap<String, String> {
     map
 }
 
+/// Constant-time byte slice comparison to prevent timing side-channels on bearer tokens.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Core routing function for incoming Admin REST API requests.
 pub async fn handle_admin_request(
     req: &HttpRequest,
@@ -202,7 +214,7 @@ pub async fn handle_admin_request(
         let authorized = match auth_hdr {
             Some(h) => {
                 if let Some(token) = h.strip_prefix("Bearer ") {
-                    token.trim() == expected_token
+                    constant_time_eq(token.trim().as_bytes(), expected_token.as_bytes())
                 } else {
                     false
                 }

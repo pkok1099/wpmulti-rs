@@ -27,9 +27,9 @@ use wpmulti::netstack::{
     build_query, parse_response, DnsLruCache, QueryType, VirtualTunBridge,
 };
 use wpmulti::proxy::{
-    build_socks5_udp_packet, extract_basic_auth, parse_authority, parse_socks5_udp_packet,
-    PoolKeyword, TargetAddr, TunnelRouter, TunnelSelector,
-    CMD_CONNECT, CMD_UDP_ASSOCIATE, METHOD_NO_AUTH, METHOD_USER_PASS, REP_SUCCESS,
+    build_socks5_udp_packet, extract_basic_auth, handle_http, handle_socks5_with_addrs,
+    parse_authority, parse_socks5_udp_packet, DirectTunnelTarget, PoolKeyword, SingleTunnelRouter,
+    TargetAddr, TunnelRouter, TunnelSelector, METHOD_NO_AUTH, METHOD_USER_PASS,
 };
 use wpmulti::tui::{format_bytes, render_dashboard, TuiApp, TuiDataSource};
 
@@ -574,18 +574,46 @@ fn test_f5_dns_response_decoding_success() {
 // Feature 6: SOCKS5 TCP CONNECT (F6)
 // =============================================================================
 
-#[tokio::test]
-async fn test_f6_socks5_greeting_no_auth() {
+async fn spawn_real_socks5_server(
+    expected_pass: Option<&str>,
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "e2e-socks5",
+        Arc::new(DirectTunnelTarget),
+        expected_pass.map(|s| ("admin".to_string(), s.to_string())),
+    ));
     tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 3];
-        s.read_exact(&mut buf).await.unwrap();
-        assert_eq!(buf[0], 0x05);
-        s.write_all(&[0x05, 0x00]).await.unwrap();
+        if let Ok((stream, peer_addr)) = listener.accept().await {
+            let local_ip = stream.local_addr().ok().map(|a| a.ip());
+            let _ = handle_socks5_with_addrs(stream, router, local_ip, Some(peer_addr.ip())).await;
+        }
     });
+    addr
+}
+
+async fn spawn_real_http_server(
+    expected_pass: Option<&str>,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "e2e-http",
+        Arc::new(DirectTunnelTarget),
+        expected_pass.map(|s| ("admin".to_string(), s.to_string())),
+    ));
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let _ = handle_http(stream, router).await;
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn test_f6_socks5_greeting_no_auth() {
+    let addr = spawn_real_socks5_server(None).await;
 
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
     let method = client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
@@ -594,17 +622,7 @@ async fn test_f6_socks5_greeting_no_auth() {
 
 #[tokio::test]
 async fn test_f6_socks5_greeting_user_pass_negotiation() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut hdr = [0u8; 2];
-        s.read_exact(&mut hdr).await.unwrap();
-        let mut m = vec![0u8; hdr[1] as usize];
-        s.read_exact(&mut m).await.unwrap();
-        s.write_all(&[0x05, METHOD_USER_PASS]).await.unwrap();
-    });
+    let addr = spawn_real_socks5_server(Some("pass123")).await;
 
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
     let method = client.greeting(&[METHOD_NO_AUTH, METHOD_USER_PASS]).await.unwrap();
@@ -613,79 +631,51 @@ async fn test_f6_socks5_greeting_user_pass_negotiation() {
 
 #[tokio::test]
 async fn test_f6_socks5_rfc1929_authentication_success() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut g = [0u8; 3];
-        s.read_exact(&mut g).await.unwrap();
-        s.write_all(&[0x05, 0x02]).await.unwrap();
-
-        let mut auth = [0u8; 2];
-        s.read_exact(&mut auth).await.unwrap();
-        let mut uname = vec![0u8; auth[1] as usize];
-        s.read_exact(&mut uname).await.unwrap();
-        let mut plen = [0u8; 1];
-        s.read_exact(&mut plen).await.unwrap();
-        let mut pass = vec![0u8; plen[0] as usize];
-        s.read_exact(&mut pass).await.unwrap();
-
-        assert_eq!(&uname, b"admin");
-        assert_eq!(&pass, b"pass123");
-        s.write_all(&[0x01, 0x00]).await.unwrap();
-    });
+    let addr = spawn_real_socks5_server(Some("pass123")).await;
 
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
-    client.greeting(&[0x02]).await.unwrap();
+    let method = client.greeting(&[METHOD_USER_PASS]).await.unwrap();
+    assert_eq!(method, METHOD_USER_PASS);
     client.authenticate("admin", "pass123").await.expect("Auth should succeed");
 }
 
 #[tokio::test]
 async fn test_f6_socks5_connect_ipv4_success() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut g = [0u8; 3];
-        s.read_exact(&mut g).await.unwrap();
-        s.write_all(&[0x05, 0x00]).await.unwrap();
-
-        let mut cmd = [0u8; 10];
-        s.read_exact(&mut cmd).await.unwrap();
-        assert_eq!(cmd[1], CMD_CONNECT);
-        s.write_all(&[0x05, REP_SUCCESS, 0x00, 0x01, 127, 0, 0, 1, 0x1F, 0x90]).await.unwrap();
+        let (_s, _) = echo_listener.accept().await.unwrap();
     });
 
+    let addr = spawn_real_socks5_server(None).await;
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
-    client.greeting(&[0x00]).await.unwrap();
-    let _stream = client.cmd_connect_ipv4(Ipv4Addr::new(93, 184, 216, 34), 80).await.unwrap();
+    client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
+    let ip = match echo_addr.ip() {
+        IpAddr::V4(v4) => v4,
+        _ => unreachable!(),
+    };
+    let _stream = client.cmd_connect_ipv4(ip, echo_addr.port()).await.unwrap();
 }
 
 #[tokio::test]
 async fn test_f6_socks5_connect_streaming_echo() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut g = [0u8; 3];
-        s.read_exact(&mut g).await.unwrap();
-        s.write_all(&[0x05, 0x00]).await.unwrap();
-
-        let mut cmd = [0u8; 10];
-        s.read_exact(&mut cmd).await.unwrap();
-        s.write_all(&[0x05, REP_SUCCESS, 0x00, 0x01, 127, 0, 0, 1, 0x1F, 0x90]).await.unwrap();
-
+        let (mut s, _) = echo_listener.accept().await.unwrap();
         let mut buf = [0u8; 11];
         s.read_exact(&mut buf).await.unwrap();
         s.write_all(&buf).await.unwrap();
     });
 
+    let addr = spawn_real_socks5_server(None).await;
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
-    client.greeting(&[0x00]).await.unwrap();
-    let mut stream = client.cmd_connect_ipv4(Ipv4Addr::new(1, 1, 1, 1), 80).await.unwrap();
+    client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
+    let ip = match echo_addr.ip() {
+        IpAddr::V4(v4) => v4,
+        _ => unreachable!(),
+    };
+    let mut stream = client.cmd_connect_ipv4(ip, echo_addr.port()).await.unwrap();
 
     stream.write_all(b"socks5_echo").await.unwrap();
     let mut resp = [0u8; 11];
@@ -699,36 +689,13 @@ async fn test_f6_socks5_connect_streaming_echo() {
 
 #[tokio::test]
 async fn test_f7_socks5_udp_associate_handshake() {
-    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let relay_addr = udp.local_addr().unwrap();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut g = [0u8; 3];
-        s.read_exact(&mut g).await.unwrap();
-        s.write_all(&[0x05, 0x00]).await.unwrap();
-
-        let mut cmd = [0u8; 10];
-        s.read_exact(&mut cmd).await.unwrap();
-        assert_eq!(cmd[1], CMD_UDP_ASSOCIATE);
-
-        let mut resp = vec![0x05, REP_SUCCESS, 0x00, 0x01];
-        if let SocketAddr::V4(v4) = relay_addr {
-            resp.extend_from_slice(&v4.ip().octets());
-            resp.extend_from_slice(&v4.port().to_be_bytes());
-        }
-        s.write_all(&resp).await.unwrap();
-        let mut dummy = [0u8; 1];
-        let _ = s.read(&mut dummy).await;
-    });
+    let server_addr = spawn_real_socks5_server(None).await;
 
     let mut client = Socks5TestClient::connect(server_addr).await.unwrap();
-    client.greeting(&[0x00]).await.unwrap();
+    client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
     let session = client.cmd_udp_associate(None).await.unwrap();
-    assert_eq!(session.relay_addr(), relay_addr);
+    assert_eq!(session.relay_addr().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_ne!(session.relay_addr().port(), 0);
 }
 
 #[test]
@@ -766,41 +733,21 @@ fn test_f7_socks5_udp_packet_encapsulate_domain() {
 
 #[tokio::test]
 async fn test_f7_socks5_udp_associate_echo_roundtrip() {
-    let udp_relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let relay_addr = udp_relay.local_addr().unwrap();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut g = [0u8; 3];
-        s.read_exact(&mut g).await.unwrap();
-        s.write_all(&[0x05, 0x00]).await.unwrap();
-
-        let mut cmd = [0u8; 10];
-        s.read_exact(&mut cmd).await.unwrap();
-        let mut resp = vec![0x05, 0x00, 0x00, 0x01];
-        if let SocketAddr::V4(v4) = relay_addr {
-            resp.extend_from_slice(&v4.ip().octets());
-            resp.extend_from_slice(&v4.port().to_be_bytes());
-        }
-        s.write_all(&resp).await.unwrap();
-        let mut dummy = [0u8; 1];
-        let _ = s.read(&mut dummy).await;
-    });
-
+    let echo_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_udp.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = [0u8; 1024];
-        let (n, client_addr) = udp_relay.recv_from(&mut buf).await.unwrap();
-        udp_relay.send_to(&buf[..n], client_addr).await.unwrap();
+        let (n, client_addr) = echo_udp.recv_from(&mut buf).await.unwrap();
+        echo_udp.send_to(&buf[..n], client_addr).await.unwrap();
     });
 
+    let server_addr = spawn_real_socks5_server(None).await;
+
     let mut client = Socks5TestClient::connect(server_addr).await.unwrap();
-    client.greeting(&[0x00]).await.unwrap();
+    client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
     let session = client.cmd_udp_associate(None).await.unwrap();
 
-    let target = Socks5Target::Ip("8.8.8.8:53".parse().unwrap());
+    let target = Socks5Target::Ip(echo_addr);
     let echo = session
         .query_echo(&target, b"udp_ping_payload", Duration::from_secs(2))
         .await
@@ -829,19 +776,14 @@ fn test_f8_http_connect_authority_parsing() {
 
 #[tokio::test]
 async fn test_f8_http_connect_handshake_200_ok() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 128];
-        let n = s.read(&mut buf).await.unwrap();
-        let req = String::from_utf8_lossy(&buf[..n]);
-        assert!(req.starts_with("CONNECT secure.example.com:443 HTTP/1.1"));
-        s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+        let (_s, _) = target_listener.accept().await.unwrap();
     });
 
-    let _stream = HttpProxyTestClient::connect_tunnel(addr, "secure.example.com:443", None)
+    let addr = spawn_real_http_server(None).await;
+    let _stream = HttpProxyTestClient::connect_tunnel(addr, &target_addr.to_string(), None)
         .await
         .unwrap();
 }
@@ -858,26 +800,24 @@ fn test_f8_http_basic_auth_header_generation_and_parse() {
 
 #[tokio::test]
 async fn test_f8_http_forward_proxy_request_parsing() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
+    let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = origin_listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
+        let (mut s, _) = origin_listener.accept().await.unwrap();
         let mut buf = [0u8; 256];
-        let n = s.read(&mut buf).await.unwrap();
-        let req = String::from_utf8_lossy(&buf[..n]);
-        assert!(req.starts_with("GET http://httpbin.org/get HTTP/1.1"));
-
+        let _ = s.read(&mut buf).await.unwrap();
         let resp_body = "forward_ok";
         let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             resp_body.len(),
             resp_body
         );
         s.write_all(resp.as_bytes()).await.unwrap();
     });
 
-    let resp = HttpProxyTestClient::forward_request(addr, "GET", "http://httpbin.org/get", None)
+    let addr = spawn_real_http_server(None).await;
+    let url = format!("http://{}/get", origin_addr);
+    let resp = HttpProxyTestClient::forward_request(addr, "GET", &url, None)
         .await
         .unwrap();
     assert!(resp.is_success());
@@ -886,28 +826,17 @@ async fn test_f8_http_forward_proxy_request_parsing() {
 
 #[tokio::test]
 async fn test_f8_http_connect_tunnel_data_streaming() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut header_bytes = Vec::new();
-        let mut byte_buf = [0u8; 1];
-        while header_bytes.len() < 4096 {
-            s.read_exact(&mut byte_buf).await.unwrap();
-            header_bytes.push(byte_buf[0]);
-            if header_bytes.ends_with(b"\r\n\r\n") {
-                break;
-            }
-        }
-        s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
-
+        let (mut s, _) = target_listener.accept().await.unwrap();
         let mut echo_buf = [0u8; 12];
         s.read_exact(&mut echo_buf).await.unwrap();
         s.write_all(&echo_buf).await.unwrap();
     });
 
-    let mut stream = HttpProxyTestClient::connect_tunnel(addr, "api.service.internal:443", None)
+    let addr = spawn_real_http_server(None).await;
+    let mut stream = HttpProxyTestClient::connect_tunnel(addr, &target_addr.to_string(), None)
         .await
         .unwrap();
 

@@ -131,8 +131,13 @@ impl VirtualNetworkStack {
                 .map_err(|e| io::Error::other(format!("add default ipv4 route failed: {:?}", e)))?;
         }
 
-        if local_v6.is_some() {
-            let gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        if let Some(v6_ip) = local_v6 {
+            let default_gw = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+            let gateway = if v6_ip == std::net::Ipv6Addr::from(default_gw) {
+                Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2)
+            } else {
+                default_gw
+            };
             iface.routes_mut()
                 .add_default_ipv6_route(gateway)
                 .map_err(|e| io::Error::other(format!("add default ipv6 route failed: {:?}", e)))?;
@@ -178,6 +183,29 @@ impl VirtualNetworkStack {
         self.dns_resolver.set_prefer_ipv6(prefer);
     }
 
+    /// Configure the DNS resolution strategy (`TunnelOnly`, `TunnelFirst`, `Host`).
+    pub fn set_dns_strategy(&self, strategy: crate::config::toml_config::DnsStrategy) {
+        self.dns_resolver.set_dns_strategy(strategy);
+    }
+
+    /// Construct a new [`VirtualNetworkStack`] with explicit IP mode, DNS fallback, and DNS strategy.
+    pub async fn new_with_options(
+        config: &WgInterfaceConfig,
+        bridge: VirtualTunBridge,
+        ip_mode: crate::config::IpMode,
+        prefer_ipv6: bool,
+        dns_fallback: SocketAddr,
+        dns_strategy: crate::config::toml_config::DnsStrategy,
+    ) -> Result<Self, io::Error> {
+        let mut stack = Self::new_with_mode(config, bridge, ip_mode, prefer_ipv6).await?;
+        let resolver = InTunnelDnsResolver::with_fallback(&config.dns, dns_fallback);
+        resolver.set_ip_mode(ip_mode);
+        resolver.set_prefer_ipv6(prefer_ipv6);
+        resolver.set_dns_strategy(dns_strategy);
+        stack.dns_resolver = resolver;
+        Ok(stack)
+    }
+
     /// Access the wakeup notification handle.
     pub fn notify(&self) -> &Arc<Notify> {
         &self.notify
@@ -199,30 +227,44 @@ impl VirtualNetworkStack {
         49152 + (val % 16384)
     }
 
+    /// Check if `port` is currently bound or in use by any socket in `sockets`.
+    fn is_port_in_use(sockets: &SocketSet<'_>, port: u16) -> bool {
+        sockets.iter().any(|(_, sock)| match sock {
+            smoltcp::socket::Socket::Tcp(tcp_sock) => {
+                tcp_sock.local_endpoint().is_some_and(|ep| ep.port == port)
+            }
+            smoltcp::socket::Socket::Udp(udp_sock) => udp_sock.endpoint().port == port,
+            _ => false,
+        })
+    }
+
+    /// Allocate an ephemeral port that is not currently used by any socket in `sockets`.
+    fn alloc_free_ephemeral_port(&self, sockets: &SocketSet<'_>) -> u16 {
+        for _ in 0..16384 {
+            let port = self.alloc_ephemeral_port();
+            if !Self::is_port_in_use(sockets, port) {
+                return port;
+            }
+        }
+        self.alloc_ephemeral_port()
+    }
+
     /// Initiate an asynchronous TCP connection to the destination address.
     pub async fn tcp_connect(&self, dst: SocketAddr) -> Result<VirtualTcpStream, io::Error> {
         // Validate protocol compatibility
-        let local_addr = match dst {
-            SocketAddr::V4(_) => {
-                let v4 = self.local_v4.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "interface does not have an IPv4 address configured",
-                    )
-                })?;
-                let port = self.alloc_ephemeral_port();
-                SocketAddr::new(IpAddr::V4(v4), port)
-            }
-            SocketAddr::V6(_) => {
-                let v6 = self.local_v6.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "interface does not have an IPv6 address configured",
-                    )
-                })?;
-                let port = self.alloc_ephemeral_port();
-                SocketAddr::new(IpAddr::V6(v6), port)
-            }
+        let local_ip = match dst {
+            SocketAddr::V4(_) => IpAddr::V4(self.local_v4.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "interface does not have an IPv4 address configured",
+                )
+            })?),
+            SocketAddr::V6(_) => IpAddr::V6(self.local_v6.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "interface does not have an IPv6 address configured",
+                )
+            })?),
         };
 
         // Allocate socket buffers
@@ -234,18 +276,19 @@ impl VirtualNetworkStack {
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
 
-        let local_port = local_addr.port();
         let remote_endpoint: IpEndpoint = to_smoltcp_endpoint(dst);
 
-        // Initiate connection under lock
-        let handle = {
+        // Initiate connection under lock with collision-free ephemeral port
+        let (handle, local_port) = {
             let mut inner = self.inner.lock();
+            let port = self.alloc_free_ephemeral_port(&inner.sockets);
             let cx = inner.iface.context();
             socket
-                .connect(cx, remote_endpoint, local_port)
+                .connect(cx, remote_endpoint, port)
                 .map_err(|e| io::Error::other(format!("tcp connect failed: {:?}", e)))?;
-            inner.sockets.add(socket)
+            (inner.sockets.add(socket), port)
         };
+        let local_addr = SocketAddr::new(local_ip, local_port);
 
         // Wake reactor to transmit SYN packet
         self.notify.notify_one();
@@ -309,12 +352,6 @@ impl VirtualNetworkStack {
         tx_buf_size: usize,
         queue_capacity: usize,
     ) -> Result<VirtualUdpSocket, io::Error> {
-        let port = if local_port == 0 {
-            self.alloc_ephemeral_port()
-        } else {
-            local_port
-        };
-
         let rx_meta = vec![UdpPacketMetadata::EMPTY; queue_capacity];
         let rx_buf = vec![0u8; rx_buf_size];
         let tx_meta = vec![UdpPacketMetadata::EMPTY; queue_capacity];
@@ -324,13 +361,17 @@ impl VirtualNetworkStack {
         let tx_buffer = UdpPacketBuffer::new(tx_meta, tx_buf);
         let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
 
-        socket
-            .bind(port)
-            .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, format!("udp bind failed: {:?}", e)))?;
-
-        let handle = {
+        let (handle, port) = {
             let mut inner = self.inner.lock();
-            inner.sockets.add(socket)
+            let port = if local_port == 0 {
+                self.alloc_free_ephemeral_port(&inner.sockets)
+            } else {
+                local_port
+            };
+            socket
+                .bind(port)
+                .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, format!("udp bind failed: {:?}", e)))?;
+            (inner.sockets.add(socket), port)
         };
 
         self.notify.notify_one();

@@ -432,10 +432,11 @@ impl PoolRouter {
         }
 
         let selected_id = match self.strategy {
-            PoolStrategy::RoundRobin | PoolStrategy::LeastConn | PoolStrategy::Fallback => {
+            PoolStrategy::RoundRobin | PoolStrategy::LeastConn => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % inner.keys.len();
                 &inner.keys[idx]
             }
+            PoolStrategy::Fallback => &inner.keys[0],
             PoolStrategy::Random => {
                 let idx = (rand::random::<u32>() as usize) % inner.keys.len();
                 &inner.keys[idx]

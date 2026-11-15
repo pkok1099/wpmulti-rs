@@ -25,9 +25,10 @@ use wpmulti::core::{
 };
 use wpmulti::netstack::{parse_response, DnsError, DnsLruCache, VirtualTunBridge};
 use wpmulti::proxy::{
-    parse_authority, parse_socks5_udp_packet, PoolKeyword, ProxyAuthError,
-    TunnelRouter, TunnelSelector, CMD_BIND, METHOD_GSSAPI, METHOD_NO_ACCEPTABLE,
-    REP_CMD_NOT_SUPPORTED,
+    handle_http, handle_socks5_with_addrs, parse_authority, parse_socks5_udp_packet,
+    DirectTunnelTarget, DynStream, PoolKeyword, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket,
+    SingleTunnelRouter, TunnelRouter, TunnelSelector, CMD_BIND, METHOD_GSSAPI,
+    METHOD_NO_ACCEPTABLE, METHOD_NO_AUTH, METHOD_USER_PASS, REP_CMD_NOT_SUPPORTED,
 };
 use wpmulti::tui::{format_bytes, render_dashboard, TuiApp, TuiDataSource};
 
@@ -448,17 +449,92 @@ fn test_f5_bnd_dns_lru_cache_capacity_eviction() {
 // Feature 6 Boundaries: SOCKS5 TCP CONNECT (F6)
 // =============================================================================
 
-#[tokio::test]
-async fn test_f6_bnd_socks5_no_acceptable_methods() {
+struct FailingTunnelTarget;
+
+impl ProxyTunnelTarget for FailingTunnelTarget {
+    fn tcp_connect<'a>(
+        &'a self,
+        _dst: std::net::SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<DynStream>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::HostUnreachable,
+                "simulated unroutable target",
+            ))
+        })
+    }
+
+    fn udp_bind<'a>(
+        &'a self,
+        _local_port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::HostUnreachable,
+                "simulated unroutable udp target",
+            ))
+        })
+    }
+
+    fn resolve_in_tunnel<'a>(
+        &'a self,
+        _domain: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<std::net::IpAddr>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "simulated dns failure",
+            ))
+        })
+    }
+}
+
+async fn spawn_real_socks5_server_with_target(
+    target: Arc<dyn ProxyTunnelTarget>,
+    expected_pass: Option<&str>,
+) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "e2e-bnd-socks5",
+        target,
+        expected_pass.map(|s| ("wrong_user".to_string(), s.to_string())),
+    ));
     tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 3];
-        s.read_exact(&mut buf).await.unwrap();
-        s.write_all(&[0x05, METHOD_NO_ACCEPTABLE]).await.unwrap();
+        if let Ok((stream, peer_addr)) = listener.accept().await {
+            let local_ip = stream.local_addr().ok().map(|a| a.ip());
+            let _ = handle_socks5_with_addrs(stream, router, local_ip, Some(peer_addr.ip())).await;
+        }
     });
+    addr
+}
+
+async fn spawn_real_http_server_with_target(
+    target: Arc<dyn ProxyTunnelTarget>,
+    expected_pass: Option<&str>,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "e2e-bnd-http",
+        target,
+        expected_pass.map(|s| ("wrong_user".to_string(), s.to_string())),
+    ));
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let _ = handle_http(stream, router).await;
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn test_f6_bnd_socks5_no_acceptable_methods() {
+    let addr = spawn_real_socks5_server_with_target(Arc::new(DirectTunnelTarget), None).await;
 
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
     let method = client.greeting(&[METHOD_GSSAPI]).await.unwrap();
@@ -467,20 +543,7 @@ async fn test_f6_bnd_socks5_no_acceptable_methods() {
 
 #[tokio::test]
 async fn test_f6_bnd_socks5_unsupported_command_bind() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut g = [0u8; 3];
-        s.read_exact(&mut g).await.unwrap();
-        s.write_all(&[0x05, 0x00]).await.unwrap();
-
-        let mut cmd = [0u8; 10];
-        s.read_exact(&mut cmd).await.unwrap();
-        assert_eq!(cmd[1], CMD_BIND);
-        s.write_all(&[0x05, REP_CMD_NOT_SUPPORTED, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
-    });
+    let addr = spawn_real_socks5_server_with_target(Arc::new(DirectTunnelTarget), None).await;
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
@@ -497,72 +560,33 @@ async fn test_f6_bnd_socks5_unsupported_command_bind() {
 
 #[tokio::test]
 async fn test_f6_bnd_socks5_invalid_version_header() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 3];
-        s.read_exact(&mut buf).await.unwrap();
-        if buf[0] != 0x05 {
-            drop(s);
-        }
-    });
+    let addr = spawn_real_socks5_server_with_target(Arc::new(DirectTunnelTarget), None).await;
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(&[0x04, 0x01, 0x00]).await.unwrap();
     let mut resp = [0u8; 2];
-    let n = stream.read(&mut resp).await.unwrap();
-    assert_eq!(n, 0);
+    let res = stream.read(&mut resp).await;
+    assert!(matches!(res, Ok(0) | Err(_)));
 }
 
 #[tokio::test]
 async fn test_f6_bnd_socks5_auth_bad_credentials() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut g = [0u8; 3];
-        s.read_exact(&mut g).await.unwrap();
-        s.write_all(&[0x05, 0x02]).await.unwrap();
-
-        let mut auth = [0u8; 2];
-        s.read_exact(&mut auth).await.unwrap();
-        let mut uname = vec![0u8; auth[1] as usize];
-        s.read_exact(&mut uname).await.unwrap();
-        let mut plen = [0u8; 1];
-        s.read_exact(&mut plen).await.unwrap();
-        let mut pass = vec![0u8; plen[0] as usize];
-        s.read_exact(&mut pass).await.unwrap();
-
-        s.write_all(&[0x01, 0x01]).await.unwrap();
-    });
+    let addr =
+        spawn_real_socks5_server_with_target(Arc::new(DirectTunnelTarget), Some("correct_pass")).await;
 
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
-    client.greeting(&[0x02]).await.unwrap();
+    let method = client.greeting(&[METHOD_USER_PASS]).await.unwrap();
+    assert_eq!(method, METHOD_USER_PASS);
     let res = client.authenticate("wrong_user", "bad_pass").await;
     assert!(res.is_err());
 }
 
 #[tokio::test]
 async fn test_f6_bnd_socks5_connect_unroutable_target() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut g = [0u8; 3];
-        s.read_exact(&mut g).await.unwrap();
-        s.write_all(&[0x05, 0x00]).await.unwrap();
-
-        let mut cmd = [0u8; 10];
-        s.read_exact(&mut cmd).await.unwrap();
-        s.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
-    });
+    let addr = spawn_real_socks5_server_with_target(Arc::new(FailingTunnelTarget), None).await;
 
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
-    client.greeting(&[0x00]).await.unwrap();
+    client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
     let res = client.cmd_connect_ipv4(Ipv4Addr::new(192, 0, 2, 1), 80).await;
     assert!(res.is_err());
 }
@@ -606,26 +630,25 @@ async fn test_f7_bnd_socks5_udp_control_stream_drop_cleans_up() {
     let addr = listener.local_addr().unwrap();
 
     let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "e2e-bnd-udp",
+        Arc::new(DirectTunnelTarget),
+        None,
+    ));
 
     tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut g = [0u8; 3];
-        s.read_exact(&mut g).await.unwrap();
-        s.write_all(&[0x05, 0x00]).await.unwrap();
-
-        let mut cmd = [0u8; 10];
-        s.read_exact(&mut cmd).await.unwrap();
-        s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x12, 0x34]).await.unwrap();
-
-        let mut dummy = [0u8; 1];
-        let _ = s.read(&mut dummy).await;
+        let (stream, peer_addr) = listener.accept().await.unwrap();
+        let local_ip = stream.local_addr().ok().map(|a| a.ip());
+        let _ = handle_socks5_with_addrs(stream, router, local_ip, Some(peer_addr.ip())).await;
         let _ = drop_tx.send(true);
     });
 
-    let client = Socks5TestClient::connect(addr).await.unwrap();
-    drop(client);
+    let mut client = Socks5TestClient::connect(addr).await.unwrap();
+    client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
+    let session = client.cmd_udp_associate(None).await.unwrap();
+    drop(session);
 
-    let clean = tokio::time::timeout(Duration::from_millis(200), drop_rx).await;
+    let clean = tokio::time::timeout(Duration::from_millis(500), drop_rx).await;
     assert!(clean.is_ok());
 }
 
@@ -635,15 +658,7 @@ async fn test_f7_bnd_socks5_udp_control_stream_drop_cleans_up() {
 
 #[tokio::test]
 async fn test_f8_bnd_http_malformed_request_line() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 128];
-        let _ = s.read(&mut buf).await.unwrap();
-        s.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").await.unwrap();
-    });
+    let addr = spawn_real_http_server_with_target(Arc::new(DirectTunnelTarget), None).await;
 
     let (resp, _) = HttpProxyTestClient::send_raw(addr, "MALFORMED_LINE\r\n\r\n").await.unwrap();
     assert_eq!(resp.status_code, 400);
@@ -657,18 +672,8 @@ fn test_f8_bnd_http_authority_missing_port() {
 
 #[tokio::test]
 async fn test_f8_bnd_http_auth_missing_or_bad_credentials() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 256];
-        let _ = s.read(&mut buf).await.unwrap();
-        let challenge = "HTTP/1.1 407 Proxy Authentication Required\r\n\
-                         Proxy-Authenticate: Basic realm=\"wpmulti\"\r\n\
-                         Content-Length: 0\r\n\r\n";
-        s.write_all(challenge.as_bytes()).await.unwrap();
-    });
+    let addr =
+        spawn_real_http_server_with_target(Arc::new(DirectTunnelTarget), Some("secret")).await;
 
     let (resp, _) = HttpProxyTestClient::send_raw(addr, "CONNECT target:443 HTTP/1.1\r\n\r\n").await.unwrap();
     assert_eq!(resp.status_code, 407);
@@ -677,15 +682,7 @@ async fn test_f8_bnd_http_auth_missing_or_bad_credentials() {
 
 #[tokio::test]
 async fn test_f8_bnd_http_header_too_large() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 512];
-        let _ = s.read(&mut buf).await.unwrap();
-        s.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n").await.unwrap();
-    });
+    let addr = spawn_real_http_server_with_target(Arc::new(DirectTunnelTarget), None).await;
 
     let big_header = format!("CONNECT target:443 HTTP/1.1\r\nX-Padding: {}\r\n\r\n", "A".repeat(17000));
     let (resp, _) = HttpProxyTestClient::send_raw(addr, &big_header).await.unwrap();
@@ -694,17 +691,9 @@ async fn test_f8_bnd_http_header_too_large() {
 
 #[tokio::test]
 async fn test_f8_bnd_http_connect_unreachable_target() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let addr = spawn_real_http_server_with_target(Arc::new(FailingTunnelTarget), None).await;
 
-    tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 256];
-        let _ = s.read(&mut buf).await.unwrap();
-        s.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await.unwrap();
-    });
-
-    let (resp, _) = HttpProxyTestClient::send_raw(addr, "CONNECT unreachable:80 HTTP/1.1\r\n\r\n").await.unwrap();
+    let (resp, _) = HttpProxyTestClient::send_raw(addr, "CONNECT 192.0.2.1:80 HTTP/1.1\r\n\r\n").await.unwrap();
     assert_eq!(resp.status_code, 502);
 }
 

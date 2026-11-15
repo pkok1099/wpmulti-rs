@@ -4,7 +4,7 @@
 //! TCP stream tunneling via `CMD_CONNECT`, and UDP datagram relaying via `CMD_UDP_ASSOCIATE`.
 
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -190,7 +190,23 @@ pub fn build_socks5_udp_packet(target: &TargetAddr, payload: &[u8]) -> Vec<u8> {
 ///
 /// Accepts an incoming client stream, executes the greeting and authentication handshake,
 /// processes commands (`CONNECT` or `UDP ASSOCIATE`), and routes traffic to the virtual tunnel.
-pub async fn handle_socks5<S>(mut stream: S, router: Arc<dyn TunnelRouter>) -> io::Result<()>
+pub async fn handle_socks5<S>(stream: S, router: Arc<dyn TunnelRouter>) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_socks5_with_addrs(stream, router, None, None).await
+}
+
+/// Core SOCKS5 connection handler with explicit local and peer IP addresses from the TCP control socket.
+///
+/// When `local_ip` and `peer_ip` are provided, `UDP ASSOCIATE` binds the relay socket to `local_ip`
+/// (returning a non-unspecified `BND.ADDR`) and restricts the first UDP datagram to `peer_ip`.
+pub async fn handle_socks5_with_addrs<S>(
+    mut stream: S,
+    router: Arc<dyn TunnelRouter>,
+    local_ip: Option<IpAddr>,
+    peer_ip: Option<IpAddr>,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -360,7 +376,7 @@ where
             handle_connect(stream, router, &selector, target).await
         }
         CMD_UDP_ASSOCIATE => {
-            handle_udp_associate(stream, router, &selector).await
+            handle_udp_associate(stream, router, &selector, local_ip, peer_ip).await
         }
         other => {
             let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
@@ -436,6 +452,8 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     router: Arc<dyn TunnelRouter>,
     selector: &TunnelSelector,
+    local_ip: Option<IpAddr>,
+    peer_ip: Option<IpAddr>,
 ) -> io::Result<()> {
     let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
 
@@ -449,16 +467,29 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
-    // Bind local Tokio UDP relay socket
-    let relay_socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+    // Bind local Tokio UDP relay socket on the control socket's local IP (fallback to loopback)
+    let bind_ip = match local_ip {
+        Some(ip) if !ip.is_unspecified() => ip,
+        _ => IpAddr::V4(Ipv4Addr::LOCALHOST),
+    };
+    let bind_addr = SocketAddr::new(bind_ip, 0);
+    let relay_socket = match tokio::net::UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("Failed to bind Tokio UDP relay socket: {:?}", e);
+            tracing::error!("Failed to bind Tokio UDP relay socket on {}: {:?}", bind_addr, e);
             let _ = send_socks5_reply(&mut stream, REP_GENERAL_FAILURE, dummy_addr).await;
             return Err(e);
         }
     };
-    let relay_addr = relay_socket.local_addr()?;
+    let mut relay_addr = relay_socket.local_addr()?;
+    if relay_addr.ip().is_unspecified() {
+        let fallback_ip = if relay_addr.is_ipv6() {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        };
+        relay_addr.set_ip(fallback_ip);
+    }
 
     // Bind virtual UDP socket inside the tunnel
     let virtual_udp = match target_tunnel.udp_bind(0).await {
@@ -474,7 +505,18 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     send_socks5_reply(&mut stream, REP_SUCCESS, relay_addr).await?;
 
     // Run UDP relay session driven by the TCP control connection lifecycle
-    run_udp_relay_loop(&mut stream, relay_socket, virtual_udp, target_tunnel).await
+    run_udp_relay_loop(&mut stream, relay_socket, virtual_udp, target_tunnel, peer_ip).await
+}
+
+/// Normalizes IPv4-mapped IPv6 addresses to IPv4 for consistent peer IP comparison.
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
 }
 
 /// Loops relaying UDP datagrams between client and tunnel until client TCP closes.
@@ -483,10 +525,12 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
     relay_socket: tokio::net::UdpSocket,
     virtual_udp: Box<dyn ProxyUdpSocket>,
     target_tunnel: Arc<dyn ProxyTunnelTarget>,
+    expected_client_ip: Option<IpAddr>,
 ) -> io::Result<()> {
     let relay_socket = Arc::new(relay_socket);
     let mut tcp_byte = [0u8; 1];
     let mut client_udp_addr: Option<SocketAddr> = None;
+    let normalized_expected_ip = expected_client_ip.map(normalize_ip);
 
     let mut relay_buf = vec![0u8; 65536];
     let mut virtual_buf = vec![0u8; 65536];
@@ -521,6 +565,16 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
                                 continue;
                             }
                         } else {
+                            if let Some(expected_ip) = normalized_expected_ip
+                                && normalize_ip(from_addr.ip()) != expected_ip
+                            {
+                                tracing::warn!(
+                                    "Rejecting UDP associate packet from {} (does not match control TCP peer IP {})",
+                                    from_addr,
+                                    expected_ip
+                                );
+                                continue;
+                            }
                             client_udp_addr = Some(from_addr);
                         }
                         if let Some((target_addr, payload)) = parse_socks5_udp_packet(&relay_buf[..n]) {

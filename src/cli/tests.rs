@@ -54,6 +54,7 @@ fn test_cli_parse_top() {
         cli_default.command,
         Commands::Top {
             admin_url: "http://127.0.0.1:9090".to_string(),
+            auth_token: None,
         }
     );
 
@@ -64,6 +65,7 @@ fn test_cli_parse_top() {
         cli_custom.command,
         Commands::Top {
             admin_url: "http://10.0.0.1:8080".to_string(),
+            auth_token: None,
         }
     );
 }
@@ -89,6 +91,7 @@ fn test_cli_parse_status() {
         cli.command,
         Commands::Status {
             admin_url: "http://127.0.0.1:9090".to_string(),
+            auth_token: None,
         }
     );
 }

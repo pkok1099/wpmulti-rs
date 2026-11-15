@@ -8,7 +8,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use thiserror::Error;
 
 use crate::netstack::stack::VirtualNetworkStack;
@@ -209,16 +209,16 @@ fn skip_name(buf: &[u8], offset: usize) -> Result<usize, DnsError> {
     end_offset.ok_or(DnsError::PacketTooShort)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct DnsCacheEntry {
     ips: Vec<IpAddr>,
     expires_at: Instant,
-    last_accessed: u64,
+    last_accessed: AtomicU64,
 }
 
 /// Thread-safe TTL-aware LRU cache for resolved DNS domain names.
 pub struct DnsLruCache {
-    entries: Mutex<HashMap<String, DnsCacheEntry>>,
+    entries: RwLock<HashMap<String, DnsCacheEntry>>,
     capacity: usize,
     access_counter: AtomicU64,
     min_ttl: Duration,
@@ -228,7 +228,7 @@ pub struct DnsLruCache {
 impl DnsLruCache {
     pub fn new(capacity: usize) -> Self {
         Self {
-            entries: Mutex::new(HashMap::with_capacity(capacity)),
+            entries: RwLock::new(HashMap::with_capacity(capacity)),
             capacity,
             access_counter: AtomicU64::new(0),
             min_ttl: Duration::from_secs(5),     // Clamped min TTL
@@ -238,17 +238,26 @@ impl DnsLruCache {
 
     pub fn get(&self, domain: &str) -> Option<Vec<IpAddr>> {
         let key = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        let mut entries = self.entries.lock();
         let now = Instant::now();
 
-        if let Some(entry) = entries.get_mut(&key) {
-            if now < entry.expires_at {
-                let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                entry.last_accessed = access_time;
-                return Some(entry.ips.clone());
+        {
+            let entries = self.entries.read();
+            if let Some(entry) = entries.get(&key) {
+                if now < entry.expires_at {
+                    let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    entry.last_accessed.store(access_time, Ordering::Relaxed);
+                    return Some(entry.ips.clone());
+                }
             } else {
-                entries.remove(&key);
+                return None;
             }
+        }
+
+        let mut entries = self.entries.write();
+        if let Some(entry) = entries.get(&key)
+            && now >= entry.expires_at
+        {
+            entries.remove(&key);
         }
         None
     }
@@ -263,7 +272,7 @@ impl DnsLruCache {
 
         let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
-        let mut entries = self.entries.lock();
+        let mut entries = self.entries.write();
 
         if entries.len() >= self.capacity && !entries.contains_key(&key) {
             let now = Instant::now();
@@ -272,7 +281,7 @@ impl DnsLruCache {
             if entries.len() >= self.capacity
                 && let Some(lru_key) = entries
                     .iter()
-                    .min_by_key(|(_, v)| v.last_accessed)
+                    .min_by_key(|(_, v)| v.last_accessed.load(Ordering::Relaxed))
                     .map(|(k, _)| k.clone())
                 {
                     entries.remove(&lru_key);
@@ -284,17 +293,17 @@ impl DnsLruCache {
             DnsCacheEntry {
                 ips,
                 expires_at,
-                last_accessed: access_time,
+                last_accessed: AtomicU64::new(access_time),
             },
         );
     }
 
     pub fn clear(&self) {
-        self.entries.lock().clear();
+        self.entries.write().clear();
     }
 
     pub fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.entries.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -310,17 +319,27 @@ pub struct InTunnelDnsResolver {
     max_retries: usize,
     prefer_ipv6: std::sync::atomic::AtomicBool,
     ip_mode: std::sync::atomic::AtomicU8,
+    dns_strategy: std::sync::atomic::AtomicU8,
 }
 
 impl InTunnelDnsResolver {
-    /// Construct resolver from configured tunnel DNS addresses, with 1.1.1.1 fallback.
+    /// Construct resolver from configured tunnel DNS addresses, with `1.1.1.1:53` fallback.
     pub fn new(configured_dns: &[IpAddr]) -> Self {
+        Self::with_fallback(configured_dns, "1.1.1.1:53".parse().unwrap())
+    }
+
+    /// Construct resolver from configured tunnel DNS addresses and an explicit fallback server.
+    pub fn with_fallback(configured_dns: &[IpAddr], fallback: SocketAddr) -> Self {
         let mut servers = Vec::new();
         for &ip in configured_dns {
             servers.push(SocketAddr::new(ip, 53));
         }
         if servers.is_empty() {
-            servers.push("1.1.1.1:53".parse().unwrap());
+            servers.push(fallback);
+            let default_v4: SocketAddr = "1.1.1.1:53".parse().unwrap();
+            if fallback != default_v4 {
+                servers.push(default_v4);
+            }
             servers.push("1.0.0.1:53".parse().unwrap());
         }
 
@@ -331,6 +350,26 @@ impl InTunnelDnsResolver {
             max_retries: 2,
             prefer_ipv6: std::sync::atomic::AtomicBool::new(false),
             ip_mode: std::sync::atomic::AtomicU8::new(0),
+            dns_strategy: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    /// Configure the DNS resolution strategy (`TunnelOnly`, `TunnelFirst`, `Host`).
+    pub fn set_dns_strategy(&self, strategy: crate::config::toml_config::DnsStrategy) {
+        let val = match strategy {
+            crate::config::toml_config::DnsStrategy::TunnelOnly => 0,
+            crate::config::toml_config::DnsStrategy::TunnelFirst => 1,
+            crate::config::toml_config::DnsStrategy::Host => 2,
+        };
+        self.dns_strategy.store(val, Ordering::Relaxed);
+    }
+
+    /// Return the configured DNS resolution strategy.
+    pub fn dns_strategy(&self) -> crate::config::toml_config::DnsStrategy {
+        match self.dns_strategy.load(Ordering::Relaxed) {
+            1 => crate::config::toml_config::DnsStrategy::TunnelFirst,
+            2 => crate::config::toml_config::DnsStrategy::Host,
+            _ => crate::config::toml_config::DnsStrategy::TunnelOnly,
         }
     }
 
@@ -397,8 +436,15 @@ impl InTunnelDnsResolver {
             return Ok(vec![ip]);
         }
 
+        let prefer_v6 = self.prefer_ipv6.load(Ordering::Relaxed);
         let cache_key = match mode {
-            crate::config::IpMode::DualStack => trimmed.to_string(),
+            crate::config::IpMode::DualStack => {
+                if prefer_v6 {
+                    format!("ds6:{}", trimmed)
+                } else {
+                    format!("ds4:{}", trimmed)
+                }
+            }
             crate::config::IpMode::Ipv4Only => format!("v4:{}", trimmed),
             crate::config::IpMode::Ipv6Only => format!("v6:{}", trimmed),
         };
@@ -406,6 +452,13 @@ impl InTunnelDnsResolver {
         // Check LRU cache
         if let Some(cached) = self.cache.get(&cache_key) {
             return Ok(cached);
+        }
+
+        let strategy = self.dns_strategy();
+        if strategy == crate::config::toml_config::DnsStrategy::Host {
+            let ips = self.resolve_via_host(trimmed, mode, prefer_v6).await?;
+            self.cache.insert(&cache_key, ips.clone(), 60);
+            return Ok(ips);
         }
 
         // Filter DNS servers by active IpMode; fall back to well-known servers of that family
@@ -453,7 +506,45 @@ impl InTunnelDnsResolver {
             }
         }
 
+        if strategy == crate::config::toml_config::DnsStrategy::TunnelFirst
+            && let Ok(ips) = self.resolve_via_host(trimmed, mode, prefer_v6).await
+        {
+            self.cache.insert(&cache_key, ips.clone(), 60);
+            return Ok(ips);
+        }
+
         Err(last_err)
+    }
+
+    /// Resolve a domain via the host OS resolver, filtering by `IpMode` and sorting by `prefer_ipv6`.
+    async fn resolve_via_host(
+        &self,
+        domain: &str,
+        mode: crate::config::IpMode,
+        prefer_v6: bool,
+    ) -> Result<Vec<IpAddr>, io::Error> {
+        let mut ips: Vec<IpAddr> = tokio::time::timeout(
+            self.timeout,
+            tokio::net::lookup_host((domain, 0u16)),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "host DNS lookup timed out"))??
+        .map(|s| s.ip())
+        .filter(|ip| mode.allows_ip(*ip))
+        .collect();
+
+        if ips.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no permitted IP addresses returned by host DNS",
+            ));
+        }
+
+        ips.sort_by_key(|ip| match (prefer_v6, ip) {
+            (true, IpAddr::V6(_)) | (false, IpAddr::V4(_)) => 0u8,
+            _ => 1u8,
+        });
+        Ok(ips)
     }
 
     /// Query a single upstream DNS server according to `IpMode` and `prefer_ipv6`.

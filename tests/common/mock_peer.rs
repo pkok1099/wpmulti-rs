@@ -361,7 +361,20 @@ impl MockIpEngine {
     }
 
     pub fn process_packet(&mut self, ip_bytes: &[u8], controls: &MockPeerControls) -> Option<Vec<u8>> {
-        let sliced = SlicedPacket::from_ip(ip_bytes).ok()?;
+        if ip_bytes.is_empty() {
+            return None;
+        }
+        // Strip trailing WireGuard 16-byte padding using IPv4 total_len / IPv6 payload_len
+        let true_len = match ip_bytes[0] >> 4 {
+            4 if ip_bytes.len() >= 20 => {
+                (u16::from_be_bytes([ip_bytes[2], ip_bytes[3]]) as usize).min(ip_bytes.len())
+            }
+            6 if ip_bytes.len() >= 40 => {
+                (40 + u16::from_be_bytes([ip_bytes[4], ip_bytes[5]]) as usize).min(ip_bytes.len())
+            }
+            _ => ip_bytes.len(),
+        };
+        let sliced = SlicedPacket::from_ip(&ip_bytes[..true_len]).ok()?;
 
         let (src_ip, dst_ip) = match sliced.ip? {
             etherparse::InternetSlice::Ipv4(v4, _) => {

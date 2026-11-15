@@ -19,7 +19,7 @@ use crate::core::lifecycle::LifecycleController;
 use crate::core::registry::TunnelRegistry;
 use crate::core::router::{DedicatedTunnelRouter, MultiTenantRouter};
 use crate::core::CoreError;
-use crate::proxy::{handle_http, handle_socks5, TunnelRouter};
+use crate::proxy::{handle_http, handle_socks5_with_addrs, TunnelRouter};
 
 /// Diagnostic metadata for an active TCP listener.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +45,7 @@ struct ListenerHandle {
 pub struct ListenerSupervisor {
     shutdown_tx: watch::Sender<bool>,
     handles: Mutex<Vec<ListenerHandle>>,
+    started: std::sync::atomic::AtomicBool,
 }
 
 impl Default for ListenerSupervisor {
@@ -60,7 +61,13 @@ impl ListenerSupervisor {
         Self {
             shutdown_tx,
             handles: Mutex::new(Vec::new()),
+            started: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Return whether `start_all` has been invoked on this supervisor.
+    pub fn is_started(&self) -> bool {
+        self.started.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Start all listeners configured in [`MainConfig`].
@@ -99,6 +106,7 @@ impl ListenerSupervisor {
             started.push(info);
         }
 
+        self.started.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(started)
     }
 
@@ -213,6 +221,7 @@ impl ListenerSupervisor {
             }
         }
 
+        self.started.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(started)
     }
 
@@ -288,8 +297,133 @@ impl ListenerSupervisor {
         handles.iter().map(|h| h.info.clone()).collect()
     }
 
+    /// Stop and remove dedicated listeners belonging to `tunnel_id` (used during hot-reload).
+    pub async fn stop_dedicated_for_tunnel(&self, tunnel_id: &str) {
+        let removed: Vec<ListenerHandle> = {
+            let mut guard = self.handles.lock();
+            let mut kept = Vec::with_capacity(guard.len());
+            let mut to_stop = Vec::new();
+            for h in guard.drain(..) {
+                if !h.info.is_shared && h.info.tunnel_id.as_deref() == Some(tunnel_id) {
+                    to_stop.push(h);
+                } else {
+                    kept.push(h);
+                }
+            }
+            *guard = kept;
+            to_stop
+        };
+
+        for handle in removed {
+            handle.task.abort();
+            let _ = handle.task.await;
+        }
+    }
+
+    /// Start dedicated SOCKS5/HTTP listeners for a single newly added tunnel (used during hot-reload).
+    pub async fn start_dedicated_for_tunnel(
+        &self,
+        entry: &Arc<crate::core::registry::TunnelEntry>,
+        per_tunnel: &PerTunnelSettings,
+        bind_address: IpAddr,
+        lifecycle: &Arc<LifecycleController>,
+    ) -> Result<Vec<ActiveListenerInfo>, CoreError> {
+        let mut started = Vec::new();
+        let next_port_offset = {
+            let handles = self.handles.lock();
+            handles.iter().filter(|h| !h.info.is_shared).count() as u16
+        };
+
+        if let Some(base_socks5) = per_tunnel.base_socks5_port {
+            let port = per_tunnel
+                .overrides
+                .get(&entry.id)
+                .and_then(|o| o.socks5_port)
+                .unwrap_or_else(|| base_socks5.wrapping_add(next_port_offset));
+
+            let bind_addr = SocketAddr::new(bind_address, port);
+            let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
+                CoreError::ListenerError(format!(
+                    "failed to bind dedicated SOCKS5 listener for tunnel '{}' on {}: {:?}",
+                    entry.id, bind_addr, e
+                ))
+            })?;
+            entry.set_assigned_port(port);
+
+            let router = Arc::new(DedicatedTunnelRouter::new(
+                entry.id.clone(),
+                Arc::clone(lifecycle),
+                None,
+            ));
+            let info = ActiveListenerInfo {
+                name: format!("dedicated-socks5-{}", entry.id),
+                address: bind_addr,
+                listener_type: ListenerType::Socks5,
+                is_shared: false,
+                tunnel_id: Some(entry.id.clone()),
+            };
+            let task = tokio::spawn(run_listener_loop(
+                listener,
+                router,
+                ListenerType::Socks5,
+                self.shutdown_tx.subscribe(),
+            ));
+            self.handles.lock().push(ListenerHandle {
+                info: info.clone(),
+                task,
+            });
+            started.push(info);
+        }
+
+        if let Some(base_http) = per_tunnel.base_http_port {
+            let port = per_tunnel
+                .overrides
+                .get(&entry.id)
+                .and_then(|o| o.http_port)
+                .unwrap_or_else(|| base_http.wrapping_add(next_port_offset));
+
+            let bind_addr = SocketAddr::new(bind_address, port);
+            let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
+                CoreError::ListenerError(format!(
+                    "failed to bind dedicated HTTP listener for tunnel '{}' on {}: {:?}",
+                    entry.id, bind_addr, e
+                ))
+            })?;
+            if entry.assigned_port.read().is_none() {
+                entry.set_assigned_port(port);
+            }
+
+            let router = Arc::new(DedicatedTunnelRouter::new(
+                entry.id.clone(),
+                Arc::clone(lifecycle),
+                None,
+            ));
+            let info = ActiveListenerInfo {
+                name: format!("dedicated-http-{}", entry.id),
+                address: bind_addr,
+                listener_type: ListenerType::Http,
+                is_shared: false,
+                tunnel_id: Some(entry.id.clone()),
+            };
+            let task = tokio::spawn(run_listener_loop(
+                listener,
+                router,
+                ListenerType::Http,
+                self.shutdown_tx.subscribe(),
+            ));
+            self.handles.lock().push(ListenerHandle {
+                info: info.clone(),
+                task,
+            });
+            started.push(info);
+        }
+
+        Ok(started)
+    }
+
     /// Gracefully stop and join all running listeners.
     pub async fn stop(&self) {
+        self.started.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = self.shutdown_tx.send(true);
         let mut handles = {
             let mut guard = self.handles.lock();
@@ -326,12 +460,14 @@ async fn run_listener_loop(
             }
             res = listener.accept() => {
                 match res {
-                    Ok((stream, _peer_addr)) => {
+                    Ok((stream, peer_addr)) => {
                         let r = Arc::clone(&router);
+                        let local_ip = stream.local_addr().ok().map(|a| a.ip());
+                        let peer_ip = Some(peer_addr.ip());
                         client_tasks.spawn(async move {
                             match listener_type {
                                 ListenerType::Socks5 => {
-                                    let _ = handle_socks5(stream, r).await;
+                                    let _ = handle_socks5_with_addrs(stream, r, local_ip, peer_ip).await;
                                 }
                                 ListenerType::Http => {
                                     let _ = handle_http(stream, r).await;

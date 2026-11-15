@@ -18,6 +18,107 @@ pub enum TuiDataSource {
     },
 }
 
+/// Validate that a string contains no HTTP control characters (`\r`, `\n`, `\0`) or whitespace.
+fn validate_http_token_or_segment(val: &str, field: &str) -> Result<(), String> {
+    if val.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(format!("Invalid {} (contains control characters or whitespace)", field));
+    }
+    Ok(())
+}
+
+/// Parse an Admin API URL (`http://host[:port]`) into `host:port`.
+fn parse_admin_http_url(admin_url: &str) -> Result<String, String> {
+    let url = admin_url.trim().trim_end_matches('/');
+    if url.starts_with("https://") {
+        return Err("HTTPS is not supported for Admin API; use http://".to_string());
+    }
+    let authority = url.strip_prefix("http://").unwrap_or(url);
+    if authority.is_empty() || authority.contains('/') || authority.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(format!("Invalid Admin API URL '{}'", admin_url));
+    }
+    let has_port = if let Some(rest) = authority.strip_prefix('[') {
+        rest.contains("]:")
+    } else {
+        authority.contains(':')
+    };
+    if has_port {
+        Ok(authority.to_string())
+    } else {
+        Ok(format!("{}:80", authority))
+    }
+}
+
+/// Execute an HTTP/1.1 request against the Admin API, validating HTTP status and returning body bytes.
+pub(crate) async fn admin_http_request(
+    admin_url: &str,
+    method: &str,
+    path: &str,
+    auth_token: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let host_port = parse_admin_http_url(admin_url)?;
+    validate_http_token_or_segment(path, "request path")?;
+    if let Some(tok) = auth_token
+        && tok.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+    {
+        return Err("Invalid auth_token (contains CR/LF/NUL)".to_string());
+    }
+
+    let io_timeout = Duration::from_secs(10);
+    let mut stream = tokio::time::timeout(io_timeout, tokio::net::TcpStream::connect(&host_port))
+        .await
+        .map_err(|_| format!("Timed out connecting to Admin API at '{}'", admin_url))?
+        .map_err(|e| format!("Failed to connect to Admin API at '{}': {}", admin_url, e))?;
+
+    let mut req = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\n",
+        method, path, host_port
+    );
+    if method == "POST" {
+        req.push_str("Content-Length: 0\r\n");
+    }
+    if let Some(token) = auth_token {
+        req.push_str(&format!("Authorization: Bearer {}\r\n", token));
+    }
+    req.push_str("Connection: close\r\n\r\n");
+
+    tokio::time::timeout(io_timeout, stream.write_all(req.as_bytes()))
+        .await
+        .map_err(|_| "Timed out writing Admin API request".to_string())?
+        .map_err(|e| format!("Write failed: {}", e))?;
+
+    let mut resp_buf = Vec::new();
+    tokio::time::timeout(io_timeout, stream.read_to_end(&mut resp_buf))
+        .await
+        .map_err(|_| "Timed out reading Admin API response".to_string())?
+        .map_err(|e| format!("Read failed: {}", e))?;
+
+    let header_end = resp_buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "Malformed HTTP response from Admin API".to_string())?;
+
+    let header_str = std::str::from_utf8(&resp_buf[..header_end])
+        .map_err(|_| "Non-UTF8 HTTP response headers from Admin API".to_string())?;
+    let status_line = header_str.lines().next().unwrap_or("");
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("Invalid HTTP status line: '{}'", status_line))?;
+
+    let body = &resp_buf[header_end + 4..];
+    if !(200..300).contains(&status_code) {
+        if let Ok(json_err) = serde_json::from_slice::<serde_json::Value>(body)
+            && let Some(msg) = json_err.get("error").and_then(|v| v.as_str())
+        {
+            return Err(format!("HTTP {}: {}", status_code, msg));
+        }
+        return Err(format!("HTTP error {}", status_code));
+    }
+
+    Ok(body.to_vec())
+}
+
 impl TuiDataSource {
     /// Retrieve list of all tunnels from the data source.
     pub async fn fetch_tunnels(&self) -> Result<Vec<TunnelSummary>, String> {
@@ -27,43 +128,8 @@ impl TuiDataSource {
                 admin_url,
                 auth_token,
             } => {
-                let url = admin_url.trim_end_matches('/');
-                let host_port = url
-                    .strip_prefix("http://")
-                    .or_else(|| url.strip_prefix("https://"))
-                    .unwrap_or(url);
-
-                let mut stream = tokio::net::TcpStream::connect(host_port)
-                    .await
-                    .map_err(|e| format!("Failed to connect to Admin API at '{}': {}", url, e))?;
-
-                let mut req = format!(
-                    "GET /tunnels HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
-                    host_port
-                );
-                if let Some(token) = auth_token {
-                    req.push_str(&format!("Authorization: Bearer {}\r\n", token));
-                }
-                req.push_str("\r\n");
-
-                stream
-                    .write_all(req.as_bytes())
-                    .await
-                    .map_err(|e| format!("Write failed: {}", e))?;
-
-                let mut resp_buf = Vec::new();
-                stream
-                    .read_to_end(&mut resp_buf)
-                    .await
-                    .map_err(|e| format!("Read failed: {}", e))?;
-
-                let body_offset = resp_buf
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .map(|p| p + 4)
-                    .unwrap_or(0);
-
-                let tunnels: Vec<TunnelSummary> = serde_json::from_slice(&resp_buf[body_offset..])
+                let body = admin_http_request(admin_url, "GET", "/tunnels", auth_token.as_deref()).await?;
+                let tunnels: Vec<TunnelSummary> = serde_json::from_slice(&body)
                     .map_err(|e| format!("Failed to deserialize tunnels response: {}", e))?;
                 Ok(tunnels)
             }
@@ -82,28 +148,9 @@ impl TuiDataSource {
                 admin_url,
                 auth_token,
             } => {
-                let url = admin_url.trim_end_matches('/');
-                let host_port = url
-                    .strip_prefix("http://")
-                    .or_else(|| url.strip_prefix("https://"))
-                    .unwrap_or(url);
-
-                let mut stream = tokio::net::TcpStream::connect(host_port)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                let mut req = format!(
-                    "POST /tunnels/{}/activate HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n",
-                    id, host_port
-                );
-                if let Some(tok) = auth_token {
-                    req.push_str(&format!("Authorization: Bearer {}\r\n", tok));
-                }
-                req.push_str("\r\n");
-
-                stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
-                let mut buf = Vec::new();
-                stream.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
+                validate_http_token_or_segment(id, "tunnel id")?;
+                let path = format!("/tunnels/{}/activate", id);
+                let _ = admin_http_request(admin_url, "POST", &path, auth_token.as_deref()).await?;
                 Ok(())
             }
         }
@@ -120,28 +167,9 @@ impl TuiDataSource {
                 admin_url,
                 auth_token,
             } => {
-                let url = admin_url.trim_end_matches('/');
-                let host_port = url
-                    .strip_prefix("http://")
-                    .or_else(|| url.strip_prefix("https://"))
-                    .unwrap_or(url);
-
-                let mut stream = tokio::net::TcpStream::connect(host_port)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                let mut req = format!(
-                    "POST /tunnels/{}/suspend HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n",
-                    id, host_port
-                );
-                if let Some(tok) = auth_token {
-                    req.push_str(&format!("Authorization: Bearer {}\r\n", tok));
-                }
-                req.push_str("\r\n");
-
-                stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
-                let mut buf = Vec::new();
-                stream.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
+                validate_http_token_or_segment(id, "tunnel id")?;
+                let path = format!("/tunnels/{}/suspend", id);
+                let _ = admin_http_request(admin_url, "POST", &path, auth_token.as_deref()).await?;
                 Ok(())
             }
         }
@@ -158,40 +186,13 @@ impl TuiDataSource {
                 admin_url,
                 auth_token,
             } => {
-                let url = admin_url.trim_end_matches('/');
-                let host_port = url
-                    .strip_prefix("http://")
-                    .or_else(|| url.strip_prefix("https://"))
-                    .unwrap_or(url);
-
-                let mut stream = tokio::net::TcpStream::connect(host_port)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                let mut req = format!(
-                    "POST /reload HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n",
-                    host_port
-                );
-                if let Some(tok) = auth_token {
-                    req.push_str(&format!("Authorization: Bearer {}\r\n", tok));
-                }
-                req.push_str("\r\n");
-
-                stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
-                let mut buf = Vec::new();
-                stream.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
-
-                let body_offset = buf
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .map(|p| p + 4)
-                    .unwrap_or(0);
+                let body = admin_http_request(admin_url, "POST", "/reload", auth_token.as_deref()).await?;
 
                 #[derive(serde::Deserialize)]
                 struct ReloadResp {
                     report: Option<ReloadReport>,
                 }
-                let parsed: ReloadResp = serde_json::from_slice(&buf[body_offset..])
+                let parsed: ReloadResp = serde_json::from_slice(&body)
                     .map_err(|e| format!("Failed to parse reload response: {}", e))?;
                 Ok(parsed.report.unwrap_or_default())
             }

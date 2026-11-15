@@ -13,5 +13,5 @@ Please include:
 
 ## Security Recommendations
 
-- **Admin API**: Keep `admin.listen` bound to `127.0.0.1` or an isolated management interface; do not expose the Admin REST API directly to untrusted public networks.
+- **Admin API**: Keep `admin.bind` bound to `127.0.0.1` or an isolated management interface; do not expose the Admin REST API directly to untrusted public networks.
 - **WireGuard Configs**: Never commit `.conf` files containing real private keys or `wpmulti.toml` credentials to version control.

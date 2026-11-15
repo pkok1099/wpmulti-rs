@@ -23,7 +23,7 @@
 | `serde` | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde |
 | `serde_json` | 1.0.154 | MIT OR Apache-2.0 | https://github.com/serde-rs/json |
 | `smoltcp` | 0.14.0 | 0BSD | https://github.com/smoltcp-rs/smoltcp.git |
-| `thiserror` | 2.0.21 | MIT OR Apache-2.0 | https://github.com/dtolnay/thiserror |
+| `thiserror` | 1.0.69 | MIT OR Apache-2.0 | https://github.com/dtolnay/thiserror |
 | `tokio` | 1.54.1 | MIT | https://github.com/tokio-rs/tokio |
 | `toml` | 0.8.23 | MIT OR Apache-2.0 | https://github.com/toml-rs/toml |
 | `tracing` | 0.1.44 | MIT | https://github.com/tokio-rs/tracing |
