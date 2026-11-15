@@ -1,0 +1,54 @@
+# Example wpmulti configuration file
+# Copy to wpmulti.toml and run: wpmulti run -c wpmulti.toml
+
+[global]
+config_dir = "./confs"
+bind_address = "127.0.0.1"
+log_level = "info"                  # trace | debug | info | warn | error
+dns_fallback = "1.1.1.1:53"
+dns_strategy = "tunnel_only"        # tunnel_only | tunnel_first | host
+max_active_tunnels = 1000
+
+[lifecycle]
+mode = "lazy"                       # lazy | eager
+idle_timeout = "5m"                 # ms, s, m, h, d or integer seconds
+handshake_timeout = "10s"
+eager_tunnels = []                  # e.g. ["wgcf-001"]
+
+[per_tunnel]
+enabled = true
+base_socks5_port = 11000            # SOCKS5 ports: 11000 + index
+base_http_port = 30000              # HTTP ports:   30000 + index
+
+# Optional explicit port overrides per tunnel ID:
+# [per_tunnel.overrides.wgcf-001]
+# socks5_port = 15001
+# http_port = 35001
+
+[[shared_listener]]
+name = "shared-socks"
+type = "socks5"                     # socks5 | http
+bind = "127.0.0.1:1080"
+auth_mode = "per_tunnel"            # none | global | per_tunnel
+# global_password = "secret"
+default_strategy = "round-robin"    # round-robin | random | least-conn | fallback
+allow_anonymous = true
+pool = "all"                        # "all" or ["wgcf-001", "wgcf-002"]
+
+[[shared_listener]]
+name = "shared-http"
+type = "http"
+bind = "127.0.0.1:8080"
+auth_mode = "per_tunnel"
+default_strategy = "round-robin"
+allow_anonymous = true
+pool = "all"
+
+[admin]
+enabled = true
+bind = "127.0.0.1:9090"
+# auth_token = "change-me"
+
+[tui]
+refresh_rate_ms = 500
+default_sort = "id"                 # id | status | conns | rx | tx

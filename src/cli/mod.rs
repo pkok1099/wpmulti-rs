@@ -14,7 +14,20 @@ pub use commands::{cmd_run, cmd_status, cmd_top, cmd_validate};
 #[clap(
     name = "wpmulti",
     version = env!("CARGO_PKG_VERSION"),
-    about = "High-concurrency multi-tunnel WireGuard proxy daemon for gotatun"
+    about = "High-concurrency multi-tunnel WireGuard proxy daemon for gotatun",
+    long_about = "wpmulti runs hundreds or thousands of WireGuard configs simultaneously in userspace \
+                  (using gotatun + smoltcp, no kernel TUN interfaces required) and exposes them as \
+                  SOCKS5 (TCP + UDP ASSOCIATE) and HTTP/HTTPS CONNECT proxies.",
+    after_help = "EXAMPLES:\n  \
+                  wpmulti validate -d ./confs\n  \
+                  wpmulti run -d ./confs --tui\n  \
+                  wpmulti run -c wpmulti.toml\n  \
+                  wpmulti top --admin-url http://127.0.0.1:9090\n  \
+                  wpmulti status --admin-url http://127.0.0.1:9090\n\n\
+                  PROXY USAGE:\n  \
+                  Per-tunnel default ports : SOCKS5 10000+N, HTTP 20000+N\n  \
+                  Shared port routing      : username = <tunnel_id> | auto | random | round-robin | least-conn\n  \
+                  Example curl             : curl -x socks5h://wgcf-001@127.0.0.1:1080 https://ifconfig.co"
 )]
 pub struct Cli {
     #[clap(subcommand)]
@@ -25,12 +38,16 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Commands {
     /// Start the multi-tunnel proxy daemon
+    #[clap(after_help = "EXAMPLES:\n  \
+                         wpmulti run -d ./confs\n  \
+                         wpmulti run -d ./confs --tui\n  \
+                         wpmulti run -c wpmulti.toml")]
     Run {
         /// Path to main configuration file (e.g. wpmulti.toml)
         #[clap(short, long)]
         config: Option<PathBuf>,
 
-        /// Path to directory containing WireGuard .conf files
+        /// Path to directory containing WireGuard .conf files (overrides global.config_dir)
         #[clap(short, long)]
         dir: Option<PathBuf>,
 
@@ -39,12 +56,16 @@ pub enum Commands {
         tui: bool,
     },
     /// Launch the standalone interactive TUI monitor
+    #[clap(after_help = "EXAMPLE:\n  wpmulti top --admin-url http://127.0.0.1:9090")]
     Top {
         /// Admin API URL to connect to (e.g. http://127.0.0.1:9090)
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
     },
     /// Validate configuration and tunnel files without starting listeners
+    #[clap(after_help = "EXAMPLES:\n  \
+                         wpmulti validate -d ./confs\n  \
+                         wpmulti validate -c wpmulti.toml")]
     Validate {
         /// Path to main configuration file (e.g. wpmulti.toml)
         #[clap(short, long)]
@@ -55,6 +76,7 @@ pub enum Commands {
         dir: Option<PathBuf>,
     },
     /// Query daemon status from Admin API and print to stdout
+    #[clap(after_help = "EXAMPLE:\n  wpmulti status --admin-url http://127.0.0.1:9090")]
     Status {
         /// Admin API URL to connect to (e.g. http://127.0.0.1:9090)
         #[clap(long, default_value = "http://127.0.0.1:9090")]
