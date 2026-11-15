@@ -77,3 +77,9 @@ curl -x http://auto@127.0.0.1:8080 https://ifconfig.co
 - [Configuration Reference (`wpmulti.toml` & `.conf`)](docs/configuration.md)
 - [Proxy Modes, Routing, TUI & Admin API](docs/proxy-and-api.md)
 - [Architecture, Performance & Hardening](docs/architecture-and-performance.md)
+
+## License & Acknowledgments
+
+`wpmulti` is licensed under the [Mozilla Public License 2.0 (MPL-2.0)](LICENSE).
+
+Built on [`gotatun`](https://github.com/mullvad/gotatun) (Mullvad VPN) and [`smoltcp`](https://github.com/smoltcp-rs/smoltcp). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for full dependency attributions and licenses.
