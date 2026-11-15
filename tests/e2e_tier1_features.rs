@@ -468,7 +468,10 @@ async fn test_f4_bridge_rx_pipeline_delivers_packet() {
 
     rx_token.consume(|buffer| {
         let sliced = etherparse::SlicedPacket::from_ip(buffer).unwrap();
-        assert_eq!(sliced.payload, raw_payload);
+        let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
+            panic!("Expected UDP transport");
+        };
+        assert_eq!(udp.payload(), raw_payload);
     });
 }
 
@@ -526,7 +529,10 @@ async fn test_f4_bridge_dual_stack_ipv4_and_ipv6() {
         .unwrap();
     rx_token.consume(|buffer| {
         let sliced = etherparse::SlicedPacket::from_ip(buffer).unwrap();
-        assert_eq!(sliced.payload, v6_payload);
+        let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
+            panic!("Expected UDP transport");
+        };
+        assert_eq!(udp.payload(), v6_payload);
     });
 }
 

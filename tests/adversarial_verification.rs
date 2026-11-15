@@ -417,13 +417,19 @@ async fn test_adv_ipv6_userspace_routing_and_boundaries() {
     // Verify min packet
     let p0 = pkts[0].clone().into_bytes();
     let s0 = etherparse::SlicedPacket::from_ip(p0.as_ref()).unwrap();
-    assert_eq!(s0.payload.len(), 0);
+    let Some(etherparse::TransportSlice::Udp(u0)) = s0.transport else {
+        panic!("expected udp");
+    };
+    assert_eq!(u0.payload().len(), 0);
 
     // Verify max MTU packet
     let p1 = pkts[1].clone().into_bytes();
     let s1 = etherparse::SlicedPacket::from_ip(p1.as_ref()).unwrap();
-    assert_eq!(s1.payload.len(), 1372);
-    assert_eq!(s1.payload, &max_payload[..]);
+    let Some(etherparse::TransportSlice::Udp(u1)) = s1.transport else {
+        panic!("expected udp");
+    };
+    assert_eq!(u1.payload().len(), 1372);
+    assert_eq!(u1.payload(), &max_payload[..]);
 
     // 4. Boundary: Jumbo packet exceeding MTU (1500 bytes on 1420 bridge)
     let jumbo_payload = vec![0xBB; 1460];

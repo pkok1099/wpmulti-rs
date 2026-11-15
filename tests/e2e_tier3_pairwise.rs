@@ -254,9 +254,9 @@ async fn test_pairwise_f4_userspace_netstack_and_f6_socks5_connect() {
 
     let raw = batch[0].clone().into_bytes();
     let sliced = etherparse::SlicedPacket::from_ip(raw.as_ref()).unwrap();
-    if let Some(etherparse::InternetSlice::Ipv4(ipv4_header, _)) = sliced.ip {
+    if let Some(etherparse::NetSlice::Ipv4(ipv4)) = sliced.net {
         assert_eq!(
-            ipv4_header.destination_addr(),
+            ipv4.header().destination_addr(),
             Ipv4Addr::new(198, 51, 100, 10)
         );
     } else {
@@ -445,7 +445,10 @@ async fn test_pairwise_f7_socks5_udp_and_f4_netstack_bridge() {
 
     let rx_bytes = batch[0].clone().into_bytes();
     let sliced = etherparse::SlicedPacket::from_ip(rx_bytes.as_ref()).unwrap();
-    assert_eq!(sliced.payload, app_payload);
+    let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
+        panic!("Expected UDP transport");
+    };
+    assert_eq!(udp.payload(), app_payload);
 }
 
 // =============================================================================

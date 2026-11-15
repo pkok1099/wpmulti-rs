@@ -150,13 +150,16 @@ async fn test_scenario_1_245_cloned_wgcf_concurrency_and_ipv6() {
 
     let raw = batch[0].clone().into_bytes();
     let sliced = etherparse::SlicedPacket::from_ip(raw.as_ref()).unwrap();
-    if let Some(etherparse::InternetSlice::Ipv6(ipv6_header, _)) = sliced.ip {
-        assert_eq!(ipv6_header.destination_addr(), dst_ipv6);
-        assert_eq!(ipv6_header.source_addr(), src_ipv6);
+    if let Some(etherparse::NetSlice::Ipv6(ipv6)) = sliced.net {
+        assert_eq!(ipv6.header().destination_addr(), dst_ipv6);
+        assert_eq!(ipv6.header().source_addr(), src_ipv6);
     } else {
         panic!("Expected IPv6 header");
     }
-    assert_eq!(sliced.payload, ipv6_payload);
+    let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
+        panic!("Expected UDP transport");
+    };
+    assert_eq!(udp.payload(), ipv6_payload);
 }
 
 // =============================================================================
@@ -505,7 +508,10 @@ async fn test_scenario_6_high_concurrency_udp_associate_streaming() {
         for pkt in iter {
             let raw = pkt.into_bytes();
             let sliced = etherparse::SlicedPacket::from_ip(raw.as_ref()).unwrap();
-            assert!(sliced.payload.starts_with(b"client_"));
+            let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
+                panic!("Expected UDP transport");
+            };
+            assert!(udp.payload().starts_with(b"client_"));
             received_count += 1;
         }
     }

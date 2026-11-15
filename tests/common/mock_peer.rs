@@ -73,7 +73,7 @@ pub struct MockWireGuardPeer {
 impl MockWireGuardPeer {
     /// Start listening on an ephemeral port on 127.0.0.1 with a random private key.
     pub async fn start_ephemeral() -> eyre::Result<Self> {
-        let secret = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+        let secret = x25519::StaticSecret::from(rand::random::<[u8; 32]>());
         Self::start("127.0.0.1:0".parse().unwrap(), secret.to_bytes(), None).await
     }
 
@@ -380,21 +380,22 @@ impl MockIpEngine {
         };
         let sliced = SlicedPacket::from_ip(&ip_bytes[..true_len]).ok()?;
 
-        let (src_ip, dst_ip) = match sliced.ip? {
-            etherparse::InternetSlice::Ipv4(v4, _) => {
+        let (src_ip, dst_ip) = match sliced.net? {
+            etherparse::NetSlice::Ipv4(v4) => {
                 self.stats.ipv4_packets.fetch_add(1, Ordering::Relaxed);
                 (
-                    IpAddr::V4(v4.source_addr()),
-                    IpAddr::V4(v4.destination_addr()),
+                    IpAddr::V4(v4.header().source_addr()),
+                    IpAddr::V4(v4.header().destination_addr()),
                 )
             }
-            etherparse::InternetSlice::Ipv6(v6, _) => {
+            etherparse::NetSlice::Ipv6(v6) => {
                 self.stats.ipv6_packets.fetch_add(1, Ordering::Relaxed);
                 (
-                    IpAddr::V6(v6.source_addr()),
-                    IpAddr::V6(v6.destination_addr()),
+                    IpAddr::V6(v6.header().source_addr()),
+                    IpAddr::V6(v6.header().destination_addr()),
                 )
             }
+            _ => return None,
         };
 
         match sliced.transport? {
@@ -453,8 +454,8 @@ impl MockIpEngine {
                 } else if tcp.rst() {
                     self.tcp_conns.remove(&key);
                     None
-                } else if !sliced.payload.is_empty() {
-                    let payload = sliced.payload;
+                } else if !tcp.payload().is_empty() {
+                    let payload = tcp.payload();
                     self.stats
                         .tcp_bytes_echoed
                         .fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -493,12 +494,12 @@ impl MockIpEngine {
                     self.stats
                         .dns_queries_answered
                         .fetch_add(1, Ordering::Relaxed);
-                    let resp = self.handle_dns_query(sliced.payload)?;
+                    let resp = self.handle_dns_query(udp.payload())?;
                     self.build_udp(dst_ip, src_ip, dst_port, src_port, &resp)
                 } else {
                     // UDP Echo
                     self.stats.udp_echo_packets.fetch_add(1, Ordering::Relaxed);
-                    self.build_udp(dst_ip, src_ip, dst_port, src_port, sliced.payload)
+                    self.build_udp(dst_ip, src_ip, dst_port, src_port, udp.payload())
                 }
             }
             _ => None,

@@ -484,7 +484,10 @@ async fn test_udp_socket_send_and_recv_loopback() {
 
     // Verify it is an IPv4 UDP packet
     let parsed = etherparse::SlicedPacket::from_ip(raw_out).unwrap();
-    assert_eq!(parsed.payload, b"PING_DATAGRAM");
+    let Some(etherparse::TransportSlice::Udp(udp_slice)) = parsed.transport else {
+        panic!("expected udp");
+    };
+    assert_eq!(udp_slice.payload(), b"PING_DATAGRAM");
 
     // 3. Inject a reply UDP packet back via BridgeIpSend
     let builder = PacketBuilder::ipv4([1, 1, 1, 1], [10, 2, 0, 2], 64).udp(53, 12345);
@@ -555,7 +558,11 @@ async fn test_in_tunnel_dns_resolution_and_cache() {
         let raw = (*pkt).as_bytes();
 
         let parsed = etherparse::SlicedPacket::from_ip(raw).unwrap();
-        let dns_query = parsed.payload;
+        let udp_hdr = match &parsed.transport {
+            Some(etherparse::TransportSlice::Udp(u)) => u,
+            _ => panic!("expected udp"),
+        };
+        let dns_query = udp_hdr.payload();
         let tx_id = u16::from_be_bytes([dns_query[0], dns_query[1]]);
 
         // Build mock DNS response pointing to 93.184.216.34
@@ -576,16 +583,13 @@ async fn test_in_tunnel_dns_resolution_and_cache() {
         dns_resp.extend_from_slice(&[0x00, 0x04]); // Len=4
         dns_resp.extend_from_slice(&[93, 184, 216, 34]);
 
-        let (src_ip, dst_ip) = match parsed.ip.unwrap() {
-            etherparse::InternetSlice::Ipv4(v4, _) => (v4.source(), v4.destination()),
+        let (src_ip, dst_ip) = match parsed.net.unwrap() {
+            etherparse::NetSlice::Ipv4(v4) => (v4.header().source(), v4.header().destination()),
             _ => panic!("expected ipv4"),
         };
-        let udp_hdr = match parsed.transport.unwrap() {
-            etherparse::TransportSlice::Udp(u) => (u.source_port(), u.destination_port()),
-            _ => panic!("expected udp"),
-        };
+        let udp_ports = (udp_hdr.source_port(), udp_hdr.destination_port());
 
-        let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64).udp(udp_hdr.1, udp_hdr.0);
+        let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64).udp(udp_ports.1, udp_ports.0);
         let mut reply_raw = Vec::new();
         builder.write(&mut reply_raw, &dns_resp).unwrap();
 
@@ -654,8 +658,8 @@ async fn test_tcp_stream_handshake_and_exchange() {
         drop(packets);
 
         let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
-        let (src_ip, dst_ip) = match parsed.ip.unwrap() {
-            etherparse::InternetSlice::Ipv4(ip, _) => (ip.source(), ip.destination()),
+        let (src_ip, dst_ip) = match parsed.net.unwrap() {
+            etherparse::NetSlice::Ipv4(ip) => (ip.header().source(), ip.header().destination()),
             _ => panic!("expected ipv4 tcp"),
         };
         let etherparse::TransportSlice::Tcp(tcp_hdr) = parsed.transport.unwrap() else {
@@ -705,10 +709,11 @@ async fn test_tcp_stream_handshake_and_exchange() {
         drop(packets);
 
         let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
-        assert_eq!(parsed.payload, b"PING_DATA");
         let etherparse::TransportSlice::Tcp(tcp_hdr) = parsed.transport.unwrap() else {
             panic!("expected tcp");
         };
+        let payload_len = tcp_hdr.payload().len() as u32;
+        assert_eq!(tcp_hdr.payload(), b"PING_DATA");
 
         // 5. Send server data (b"PONG_DATA") + ACK
         let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64)
@@ -718,7 +723,7 @@ async fn test_tcp_stream_handshake_and_exchange() {
                 server_isn + 1,
                 65535,
             )
-            .ack(tcp_hdr.sequence_number() + parsed.payload.len() as u32);
+            .ack(tcp_hdr.sequence_number() + payload_len);
 
         let mut data_raw = Vec::new();
         builder.write(&mut data_raw, b"PONG_DATA").unwrap();
@@ -738,7 +743,7 @@ async fn test_tcp_stream_handshake_and_exchange() {
                 65535,
             )
             .fin()
-            .ack(tcp_hdr.sequence_number() + parsed.payload.len() as u32);
+            .ack(tcp_hdr.sequence_number() + payload_len);
 
         let mut fin_raw = Vec::new();
         builder.write(&mut fin_raw, &[]).unwrap();

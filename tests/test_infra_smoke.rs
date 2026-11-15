@@ -51,7 +51,7 @@ async fn test_mock_peer_handshake_and_l3_echo() {
     let peer_pubkey = mock.public_key();
 
     // Setup client WireGuard tunnel using gotatun
-    let client_secret = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+    let client_secret = x25519::StaticSecret::from(rand::random::<[u8; 32]>());
     let mut client_tunn = Tunn::new(
         client_secret,
         x25519::PublicKey::from(peer_pubkey),
@@ -136,7 +136,10 @@ async fn test_mock_peer_handshake_and_l3_echo() {
         TunnResult::WriteToTunnel(decrypted_ip) => {
             let sliced = etherparse::SlicedPacket::from_ip(decrypted_ip.as_ref())
                 .expect("Failed to slice decrypted IP packet");
-            assert_eq!(sliced.payload, echo_payload);
+            let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
+                panic!("Expected UDP transport");
+            };
+            assert_eq!(udp.payload(), echo_payload);
         }
         other => panic!("Expected WriteToTunnel from echoed UDP, got {:?}", other),
     }
@@ -185,14 +188,15 @@ async fn test_mock_peer_handshake_and_l3_echo() {
         TunnResult::WriteToTunnel(decrypted_ip) => {
             let sliced = etherparse::SlicedPacket::from_ip(decrypted_ip.as_ref())
                 .expect("Failed to slice decrypted DNS packet");
-            assert!(sliced.payload.len() >= 12);
-            assert_eq!(&sliced.payload[0..2], &0x1234u16.to_be_bytes()); // TxID matches
-            let flags = u16::from_be_bytes([sliced.payload[2], sliced.payload[3]]);
+            let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
+                panic!("Expected UDP transport");
+            };
+            let dns_payload = udp.payload();
+            assert!(dns_payload.len() >= 12);
+            assert_eq!(&dns_payload[0..2], &0x1234u16.to_be_bytes()); // TxID matches
+            let flags = u16::from_be_bytes([dns_payload[2], dns_payload[3]]);
             assert_eq!(flags, 0x8180); // Response, NoError
-            assert_eq!(
-                u16::from_be_bytes([sliced.payload[6], sliced.payload[7]]),
-                1
-            ); // ANCOUNT: 1
+            assert_eq!(u16::from_be_bytes([dns_payload[6], dns_payload[7]]), 1); // ANCOUNT: 1
         }
         other => panic!("Expected WriteToTunnel from DNS, got {:?}", other),
     }
@@ -273,7 +277,10 @@ async fn test_mock_peer_handshake_and_l3_echo() {
         TunnResult::WriteToTunnel(decrypted_ip) => {
             let sliced = etherparse::SlicedPacket::from_ip(decrypted_ip.as_ref())
                 .expect("Failed to slice decrypted TCP Echo");
-            assert_eq!(sliced.payload, tcp_payload);
+            let Some(etherparse::TransportSlice::Tcp(tcp)) = sliced.transport else {
+                panic!("Expected TCP transport");
+            };
+            assert_eq!(tcp.payload(), tcp_payload);
         }
         other => panic!("Expected WriteToTunnel from TCP Echo, got {:?}", other),
     }
@@ -315,7 +322,10 @@ async fn test_mock_peer_handshake_and_l3_echo() {
         TunnResult::WriteToTunnel(decrypted_ip) => {
             let sliced = etherparse::SlicedPacket::from_ip(decrypted_ip.as_ref())
                 .expect("Failed to slice decrypted IPv6 packet");
-            assert_eq!(sliced.payload, echo_v6_payload);
+            let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
+                panic!("Expected UDP transport");
+            };
+            assert_eq!(udp.payload(), echo_v6_payload);
         }
         other => panic!(
             "Expected WriteToTunnel from echoed IPv6 UDP, got {:?}",
@@ -826,7 +836,7 @@ async fn test_full_e2e_pipeline_socks5_and_http_via_mock_wg_peer() {
     let peer_pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(mock.public_key());
 
     // 2. Build TunnelConfig pointing to MockWireGuardPeer
-    let client_secret = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+    let client_secret = x25519::StaticSecret::from(rand::random::<[u8; 32]>());
     let client_priv_b64 =
         base64::engine::general_purpose::STANDARD.encode(client_secret.to_bytes());
 
