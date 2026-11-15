@@ -482,6 +482,8 @@ pub struct TuiApp {
     // Probe tab state
     pub probe_results: Vec<TuiProbeResult>,
     pub probe_scroll: usize,
+    // Animation tick counter (incremented every 100ms UI frame)
+    pub anim_tick: u64,
 }
 
 impl TuiApp {
@@ -519,6 +521,7 @@ impl TuiApp {
             config_editing: None,
             probe_results: Vec::new(),
             probe_scroll: 0,
+            anim_tick: 0,
         }
     }
 
@@ -777,6 +780,18 @@ impl TuiApp {
     }
 
     /// Update tunnel dataset and refresh filtered/sorted view.
+    /// Return the top `limit` busiest tunnels sorted by total `rx_bytes + tx_bytes`.
+    pub fn top_tunnels(&self, limit: usize) -> Vec<(&str, u64)> {
+        let mut items: Vec<(&str, u64)> = self
+            .tunnels
+            .iter()
+            .map(|t| (t.id.as_str(), t.rx_bytes.saturating_add(t.tx_bytes)))
+            .collect();
+        items.sort_by_key(|b| std::cmp::Reverse(b.1));
+        items.truncate(limit);
+        items
+    }
+
     pub fn set_tunnels(&mut self, tunnels: Vec<TunnelSummary>) {
         let prev_selected_id = self.selected_tunnel().map(|t| t.id.clone());
         self.tunnels = tunnels;

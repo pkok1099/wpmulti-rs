@@ -3,7 +3,10 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -12,8 +15,17 @@ use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, Tabs};
+use ratatui::widgets::{
+    Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, Gauge, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Sparkline, Table, Tabs,
+};
 use ratatui::{Frame, Terminal};
+
+const ACCENT_CYAN: Color = Color::Rgb(0, 215, 255);
+const RX_EMERALD: Color = Color::Rgb(80, 250, 123);
+const TX_AMBER: Color = Color::Rgb(255, 184, 108);
+const MUTED_SLATE: Color = Color::Rgb(98, 114, 164);
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 use crate::core::health::HealthStatus;
 use crate::core::TunnelState;
@@ -173,11 +185,19 @@ fn draw_header_and_tabs(f: &mut Frame, app: &TuiApp, area: Rect) {
         .filter(|t| t.state == TunnelState::Active)
         .count();
     let total_conns: usize = app.tunnels.iter().map(|t| t.active_conns).sum();
+    let spinner = SPINNER_FRAMES[(app.anim_tick as usize) % SPINNER_FRAMES.len()];
+    let live_dot = if (app.anim_tick / 5).is_multiple_of(2) {
+        "● LIVE"
+    } else {
+        "○ LIVE"
+    };
     let title = if area.width < 60 {
-        format!(" wpmulti v{} ", env!("CARGO_PKG_VERSION"))
+        format!(" {} wpmulti v{} ", spinner, env!("CARGO_PKG_VERSION"))
     } else {
         format!(
-            " wpmulti v{} | Tunnels: {} ({} active) | Conns: {} ",
+            " {} {} wpmulti v{} | Tunnels: {} ({} active) | Conns: {} ",
+            spinner,
+            live_dot,
             env!("CARGO_PKG_VERSION"),
             app.tunnels.len(),
             active_count,
@@ -198,42 +218,54 @@ fn draw_header_and_tabs(f: &mut Frame, app: &TuiApp, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(MUTED_SLATE))
                 .title(Span::styled(
                     title,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(ACCENT_CYAN)
                         .add_modifier(Modifier::BOLD),
                 )),
         )
         .select(selected_idx)
+        .divider(" │ ")
         .style(Style::default().fg(Color::Gray))
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(ACCENT_CYAN)
                 .add_modifier(Modifier::BOLD),
         );
     f.render_widget(tabs, area);
 }
 
 fn draw_tunnels_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
-    let show_sparkline = area.height >= 10 && area.width >= 40;
-    let (spark_area, table_area) = if show_sparkline {
+    let show_top = area.height >= 15 && area.width >= 56;
+    let (top_area, table_area) = if show_top {
         let split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .constraints([Constraint::Length(8), Constraint::Min(4)])
             .split(area);
         (Some(split[0]), split[1])
     } else {
         (None, area)
     };
 
-    if let Some(s_area) = spark_area {
+    if let Some(t_area) = top_area {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(s_area);
+            .constraints([
+                Constraint::Percentage(42),
+                Constraint::Percentage(36),
+                Constraint::Percentage(22),
+            ])
+            .split(t_area);
 
+        // Left: Stacked RX & TX thick Sparklines (equal 4-row height each)
+        let spark_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(4), Constraint::Length(4)])
+            .split(cols[0]);
         let rx_data: Vec<u64> = app.rx_rates.iter().copied().collect();
         let tx_data: Vec<u64> = app.tx_rates.iter().copied().collect();
 
@@ -241,21 +273,89 @@ fn draw_tunnels_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!(" RX {}/s ", format_bytes(app.current_rx_bps))),
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(MUTED_SLATE))
+                    .title(Span::styled(
+                        format!(" ▼ RX {}/s ", format_bytes(app.current_rx_bps)),
+                        Style::default().fg(RX_EMERALD).add_modifier(Modifier::BOLD),
+                    )),
             )
             .data(&rx_data)
-            .style(Style::default().fg(Color::Green));
+            .style(Style::default().fg(RX_EMERALD));
         let tx_spark = Sparkline::default()
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!(" TX {}/s ", format_bytes(app.current_tx_bps))),
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(MUTED_SLATE))
+                    .title(Span::styled(
+                        format!(" ▲ TX {}/s ", format_bytes(app.current_tx_bps)),
+                        Style::default().fg(TX_AMBER).add_modifier(Modifier::BOLD),
+                    )),
             )
             .data(&tx_data)
-            .style(Style::default().fg(Color::Yellow));
+            .style(Style::default().fg(TX_AMBER));
+        f.render_widget(rx_spark, spark_rows[0]);
+        f.render_widget(tx_spark, spark_rows[1]);
 
-        f.render_widget(rx_spark, cols[0]);
-        f.render_widget(tx_spark, cols[1]);
+        // Middle: Top 5 Busiest Tunnels BarChart
+        let top = app.top_tunnels(5);
+        let bars: Vec<Bar> = top
+            .iter()
+            .map(|(id, total)| {
+                let short: String = id.chars().take(8).collect();
+                Bar::default()
+                    .value(*total)
+                    .label(Line::from(short))
+                    .text_value(format_bytes(*total))
+                    .style(Style::default().fg(ACCENT_CYAN))
+            })
+            .collect();
+        let barchart = BarChart::default()
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(MUTED_SLATE))
+                    .title(Span::styled(
+                        " Top 5 Tunnels ",
+                        Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .data(BarGroup::default().bars(&bars))
+            .bar_width(7)
+            .bar_gap(1)
+            .value_style(Style::default().fg(Color::White))
+            .label_style(Style::default().fg(Color::Gray));
+        f.render_widget(barchart, cols[1]);
+
+        // Right: Pool Health Gauge
+        let total = app.tunnels.len().max(1);
+        let healthy = app
+            .tunnels
+            .iter()
+            .filter(|t| t.health == HealthStatus::Healthy)
+            .count();
+        let ratio = (healthy as f64 / total as f64).clamp(0.0, 1.0);
+        let gauge_color = if ratio >= 0.8 {
+            RX_EMERALD
+        } else if ratio >= 0.4 {
+            TX_AMBER
+        } else {
+            Color::Rgb(255, 85, 85)
+        };
+        let gauge = Gauge::default()
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(MUTED_SLATE))
+                    .title(" Pool Health "),
+            )
+            .gauge_style(Style::default().fg(gauge_color).bg(Color::Rgb(40, 42, 54)))
+            .ratio(ratio)
+            .label(format!("{}/{} ({:.0}%)", healthy, app.tunnels.len(), ratio * 100.0));
+        f.render_widget(gauge, cols[2]);
     }
 
     let w = table_area.width;
@@ -358,8 +458,23 @@ fn draw_tunnels_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header_row)
-        .block(Block::default().borders(Borders::ALL).title(pos_title));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(pos_title),
+        );
     f.render_widget(table, table_area);
+
+    if total_visible > visible_rows.max(1) {
+        let mut sb_state = ScrollbarState::new(total_visible).position(app.selected_index);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            table_area,
+            &mut sb_state,
+        );
+    }
 }
 
 fn draw_logs_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
@@ -649,7 +764,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
     }
 }
 
@@ -657,7 +772,7 @@ impl Drop for TerminalGuard {
 pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout);
@@ -665,23 +780,40 @@ pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Resu
 
     let _ = app.refresh().await;
     let mut last_refresh = Instant::now();
+    let mut last_anim = Instant::now();
     let refresh_interval = Duration::from_millis(refresh_rate_ms.max(100));
 
     while app.running {
+        if last_anim.elapsed() >= Duration::from_millis(100) {
+            app.anim_tick = app.anim_tick.wrapping_add(1);
+            last_anim = Instant::now();
+        }
         terminal.draw(|f| draw_dashboard(f, &mut app))?;
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && key.code == KeyCode::Char('c')
-            {
-                app.running = false;
-                break;
-            }
-            if let Some(tui_key) = map_crossterm_key(key.code) {
-                handle_tui_key(&mut app, tui_key).await;
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        app.running = false;
+                        break;
+                    }
+                    if let Some(tui_key) = map_crossterm_key(key.code) {
+                        handle_tui_key(&mut app, tui_key).await;
+                    }
+                }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollDown => handle_tui_key(&mut app, TuiKey::Down).await,
+                    MouseEventKind::ScrollUp => handle_tui_key(&mut app, TuiKey::Up).await,
+                    MouseEventKind::Down(MouseButton::Left) if mouse.row == 1 => {
+                        if let Some(tab) = tab_at_column(mouse.column as usize) {
+                            app.set_tab(tab);
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
             }
         }
 
@@ -692,6 +824,23 @@ pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Resu
     }
 
     Ok(())
+}
+
+/// Map a terminal column inside the Tabs row (`row == 1`) to the matching [`TuiTab`].
+fn tab_at_column(col: usize) -> Option<TuiTab> {
+    // Tabs widget renders inside left border (col 1) with default " " padding and " │ " divider.
+    let mut cursor = 1usize;
+    for (idx, &tab) in TuiTab::ALL.iter().enumerate() {
+        let label_len = tab.label().chars().count() + 2;
+        if col >= cursor && col < cursor + label_len {
+            return Some(tab);
+        }
+        cursor += label_len;
+        if idx + 1 < TuiTab::ALL.len() {
+            cursor += 3; // " │ "
+        }
+    }
+    None
 }
 
 fn map_crossterm_key(code: KeyCode) -> Option<TuiKey> {
@@ -819,10 +968,10 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
                 TuiKey::Up | TuiKey::Char('k') => {
                     app.config_selected = app.config_selected.saturating_sub(1);
                 }
-                TuiKey::Down | TuiKey::Char('j') => {
-                    if app.config_selected + 1 < TuiApp::CONFIG_ROW_COUNT {
-                        app.config_selected += 1;
-                    }
+                TuiKey::Down | TuiKey::Char('j')
+                    if app.config_selected + 1 < TuiApp::CONFIG_ROW_COUNT =>
+                {
+                    app.config_selected += 1;
                 }
                 TuiKey::Enter | TuiKey::Char(' ') => {
                     if let Err(e) = app.activate_config_row().await {
@@ -840,10 +989,10 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
                 TuiKey::Up | TuiKey::Char('k') => {
                     app.probe_scroll = app.probe_scroll.saturating_sub(1);
                 }
-                TuiKey::Down | TuiKey::Char('j') => {
-                    if app.probe_scroll + 1 < app.probe_results.len() {
-                        app.probe_scroll += 1;
-                    }
+                TuiKey::Down | TuiKey::Char('j')
+                    if app.probe_scroll + 1 < app.probe_results.len() =>
+                {
+                    app.probe_scroll += 1;
                 }
                 TuiKey::Char('p') => app.probe_selected_tunnel().await,
                 TuiKey::Char('P') => app.probe_all_tunnels().await,
