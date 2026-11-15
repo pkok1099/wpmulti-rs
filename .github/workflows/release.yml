@@ -85,6 +85,20 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cargo_args }}
 
+      - name: Install cargo-deb
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cargo-deb --locked
+
+      - name: Build Debian .deb package
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo deb --locked --target ${{ matrix.target }} --no-build --output .
+
+      - name: Build Termux .deb package
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          chmod +x packaging/termux/build-termux-deb.sh
+          ./packaging/termux/build-termux-deb.sh "target/${{ matrix.target }}/release/wpmulti" "${GITHUB_REF_NAME}" .
+
       - name: Package artifact
         run: |
           TAG="${GITHUB_REF_NAME}"
@@ -98,7 +112,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
-          path: "*.tar.gz"
+          path: |
+            *.tar.gz
+            *.deb
 
   release:
     needs: build
@@ -112,7 +128,7 @@ jobs:
 
       - name: Generate SHA256 checksums
         working-directory: dist
-        run: sha256sum *.tar.gz > SHA256SUMS.txt
+        run: sha256sum *.tar.gz *.deb > SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -1,0 +1,32 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        if ! getent group wpmulti >/dev/null 2>&1; then
+            addgroup --system wpmulti
+        fi
+        if ! getent passwd wpmulti >/dev/null 2>&1; then
+            adduser --system --ingroup wpmulti --no-create-home --home /nonexistent \
+                --shell /usr/sbin/nologin --gecos "wpmulti daemon user" wpmulti
+        fi
+
+        install -d -o root -g wpmulti -m 0750 /etc/wpmulti
+        install -d -o root -g wpmulti -m 0750 /etc/wpmulti/confs
+        if [ -f /etc/wpmulti/wpmulti.toml ]; then
+            chown root:wpmulti /etc/wpmulti/wpmulti.toml
+            chmod 0640 /etc/wpmulti/wpmulti.toml
+        fi
+
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+
+        echo "wpmulti installed."
+        echo "  1. Place your WireGuard .conf files in /etc/wpmulti/confs/"
+        echo "  2. Edit /etc/wpmulti/wpmulti.toml if needed"
+        echo "  3. Enable & start: sudo systemctl enable --now wpmulti"
+        ;;
+esac
+
+exit 0

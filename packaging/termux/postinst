@@ -1,0 +1,13 @@
+#!/data/data/com.termux/files/usr/bin/sh
+set -e
+
+PREFIX="/data/data/com.termux/files/usr"
+mkdir -p "$PREFIX/etc/wpmulti/confs"
+mkdir -p "$PREFIX/var/log/wpmulti"
+
+echo "wpmulti installed for Termux."
+echo "  1. Place your WireGuard .conf files in \$PREFIX/etc/wpmulti/confs/"
+echo "  2. Edit \$PREFIX/etc/wpmulti/wpmulti.toml if needed"
+echo "  3. Run manually: wpmulti run -c \$PREFIX/etc/wpmulti/wpmulti.toml"
+echo "  4. Or with termux-services: pkg install termux-services && sv-enable wpmulti"
+exit 0

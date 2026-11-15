@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|purge)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+if [ "$1" = "purge" ]; then
+    rmdir /etc/wpmulti/confs >/dev/null 2>&1 || true
+    rmdir /etc/wpmulti >/dev/null 2>&1 || true
+fi
+
+exit 0
