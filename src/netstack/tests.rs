@@ -706,4 +706,83 @@ mod tests {
         peer_task.await.unwrap();
         stack.close().await;
     }
+
+    // =========================================================================
+    // 8. IpMode Isolation Tests (ipv4_only & ipv6_only)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_stack_ipv4_only_isolation() {
+        let config = make_test_config("10.2.0.2/32", Some("fd00::2/128"));
+        let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+
+        let stack = VirtualNetworkStack::new_with_mode(
+            &config,
+            bridge,
+            crate::config::IpMode::Ipv4Only,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stack.local_v4(), Some(Ipv4Addr::new(10, 2, 0, 2)));
+        assert_eq!(stack.local_v6(), None);
+
+        // IPv6 TCP connect must be blocked immediately
+        let v6_dst: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        let tcp_err = stack.tcp_connect(v6_dst).await.unwrap_err();
+        assert_eq!(tcp_err.kind(), std::io::ErrorKind::AddrNotAvailable);
+
+        // IPv6 UDP send_to must be blocked immediately
+        let udp = stack.udp_bind(0).await.unwrap();
+        let udp_err = udp.send_to(b"hello", v6_dst).await.unwrap_err();
+        assert_eq!(udp_err.kind(), std::io::ErrorKind::AddrNotAvailable);
+
+        // IPv6 literal resolution must be blocked, IPv4 literal allowed
+        let dns_v6_err = stack.resolve_in_tunnel("2606:4700:4700::1111").await.unwrap_err();
+        assert_eq!(dns_v6_err.kind(), std::io::ErrorKind::AddrNotAvailable);
+        let dns_v4 = stack.resolve_in_tunnel("1.1.1.1").await.unwrap();
+        assert_eq!(dns_v4, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+
+        stack.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_stack_ipv6_only_isolation() {
+        let config = make_test_config("10.2.0.2/32", Some("fd00::2/128"));
+        let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+
+        let stack = VirtualNetworkStack::new_with_mode(
+            &config,
+            bridge,
+            crate::config::IpMode::Ipv6Only,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stack.local_v4(), None);
+        assert_eq!(stack.local_v6(), Some("fd00::2".parse::<Ipv6Addr>().unwrap()));
+
+        // IPv4 TCP connect must be blocked immediately
+        let v4_dst: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let tcp_err = stack.tcp_connect(v4_dst).await.unwrap_err();
+        assert_eq!(tcp_err.kind(), std::io::ErrorKind::AddrNotAvailable);
+
+        // IPv4 UDP send_to must be blocked immediately
+        let udp = stack.udp_bind(0).await.unwrap();
+        let udp_err = udp.send_to(b"hello", v4_dst).await.unwrap_err();
+        assert_eq!(udp_err.kind(), std::io::ErrorKind::AddrNotAvailable);
+
+        // IPv4 literal resolution must be blocked, IPv6 literal allowed
+        let dns_v4_err = stack.resolve_in_tunnel("1.1.1.1").await.unwrap_err();
+        assert_eq!(dns_v4_err.kind(), std::io::ErrorKind::AddrNotAvailable);
+        let dns_v6 = stack.resolve_in_tunnel("2606:4700:4700::1111").await.unwrap();
+        assert_eq!(
+            dns_v6,
+            IpAddr::V6("2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap())
+        );
+
+        stack.close().await;
+    }
 }

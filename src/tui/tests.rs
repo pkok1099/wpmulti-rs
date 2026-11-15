@@ -207,3 +207,77 @@ async fn test_tui_in_process_activation_and_suspension() {
     app.suspend_selected().await.expect("suspend");
     assert_eq!(app.tunnels[0].state, TunnelState::Suspended);
 }
+
+#[test]
+fn test_parse_key_sequence_arrows_and_nav() {
+    use crate::tui::ui::{parse_key_sequence, parse_keys_from_bytes, parse_next_key, TuiKey};
+
+    assert_eq!(parse_key_sequence(b"\x1b[A"), Some(TuiKey::Up));
+    assert_eq!(parse_key_sequence(b"\x1b[B"), Some(TuiKey::Down));
+    assert_eq!(parse_key_sequence(b"\x1bOA"), Some(TuiKey::Up));
+    assert_eq!(parse_key_sequence(b"\x1bOB"), Some(TuiKey::Down));
+    assert_eq!(parse_key_sequence(b"\x1b[5~"), Some(TuiKey::PageUp));
+    assert_eq!(parse_key_sequence(b"\x1b[6~"), Some(TuiKey::PageDown));
+    assert_eq!(parse_key_sequence(b"\x1b[H"), Some(TuiKey::Home));
+    assert_eq!(parse_key_sequence(b"\x1b[F"), Some(TuiKey::End));
+    assert_eq!(parse_key_sequence(b"\x1b[7~"), Some(TuiKey::Home));
+    assert_eq!(parse_key_sequence(b"\x1b[8~"), Some(TuiKey::End));
+    assert_eq!(parse_key_sequence(b"\x1b"), Some(TuiKey::Esc));
+    assert_eq!(parse_key_sequence(b"j"), Some(TuiKey::Char('j')));
+    assert_eq!(parse_key_sequence(b""), None);
+
+    // Incomplete CSI prefix waits for more bytes
+    assert_eq!(parse_next_key(b"\x1b["), (None, 0));
+
+    // Coalesced reads & UTF-8 input
+    assert_eq!(
+        parse_keys_from_bytes(b"\x1b[A\x1b[Bjq"),
+        vec![TuiKey::Up, TuiKey::Down, TuiKey::Char('j'), TuiKey::Char('q')]
+    );
+    assert_eq!(
+        parse_keys_from_bytes("αβ".as_bytes()),
+        vec![TuiKey::Char('α'), TuiKey::Char('β')]
+    );
+}
+
+#[test]
+fn test_render_dashboard_small_terminal_auto_resize() {
+    use crate::tui::ui::render_dashboard;
+
+    let mut app = TuiApp::new(
+        TuiDataSource::Remote {
+            admin_url: "http://127.0.0.1:9090".to_string(),
+            auth_token: None,
+        },
+        TuiSortField::Id,
+    );
+    app.set_tunnels(vec![
+        make_dummy_summary("wgcf-very-long-tunnel-name-001", TunnelState::Active, 2, 1024, 2048),
+        make_dummy_summary("wgcf-002", TunnelState::Dormant, 0, 0, 0),
+    ]);
+
+    // Minimum clamped terminal (24x8): compact header, no trailing newline
+    let min_render = render_dashboard(&mut app, 24, 8);
+    assert!(min_render.contains("wpmulti v"));
+    assert!(!min_render.ends_with('\n'));
+
+    // Very small terminal (50x12) uses compact header and omits ENDPOINT/PORT/TX
+    let compact = render_dashboard(&mut app, 50, 12);
+    assert!(compact.contains("wpmulti v"));
+    assert!(!compact.contains("ENDPOINT"));
+    assert!(compact.contains("Tunnel 1 of 2"));
+    assert!(!compact.ends_with('\n'));
+
+    // Medium terminal (80x20) shows full box header and PORT, omits ENDPOINT
+    let medium = render_dashboard(&mut app, 80, 20);
+    assert!(medium.contains("PORT"));
+    assert!(!medium.contains("ENDPOINT"));
+
+    // Active search & status banner render cleanly
+    app.is_searching = true;
+    app.search_query = "wgcf".to_string();
+    app.status_message = Some(("Reloaded".to_string(), std::time::Instant::now()));
+    let with_status = render_dashboard(&mut app, 80, 20);
+    assert!(with_status.contains("Search: wgcf"));
+    assert!(with_status.contains(">>> Reloaded"));
+}

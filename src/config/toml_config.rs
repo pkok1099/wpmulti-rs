@@ -134,6 +134,89 @@ pub enum DnsStrategy {
     Host,
 }
 
+/// IP address family preference when resolving dual-stack domains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsPreference {
+    #[default]
+    Ipv4First,
+    Ipv6First,
+}
+
+/// Strict IP family isolation mode for tunnel traffic and DNS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IpMode {
+    #[default]
+    DualStack,
+    Ipv4Only,
+    Ipv6Only,
+}
+
+impl IpMode {
+    /// Returns true if the given IP address is permitted under this mode.
+    pub fn allows_ip(&self, ip: IpAddr) -> bool {
+        match self {
+            IpMode::DualStack => true,
+            IpMode::Ipv4Only => ip.is_ipv4(),
+            IpMode::Ipv6Only => ip.is_ipv6(),
+        }
+    }
+
+    /// Validate that `ip` is permitted under this mode, returning `AddrNotAvailable` otherwise.
+    pub fn check_ip(&self, ip: IpAddr, context: &str) -> std::io::Result<()> {
+        if self.allows_ip(ip) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("{} {} blocked by ip_mode {:?}", context, ip, self),
+            ))
+        }
+    }
+
+    /// Encode this mode into a compact `u8` representation for atomic storage.
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            IpMode::DualStack => 0,
+            IpMode::Ipv4Only => 1,
+            IpMode::Ipv6Only => 2,
+        }
+    }
+
+    /// Decode a `u8` representation back into [`IpMode`].
+    pub const fn from_u8(code: u8) -> Self {
+        match code {
+            1 => IpMode::Ipv4Only,
+            2 => IpMode::Ipv6Only,
+            _ => IpMode::DualStack,
+        }
+    }
+
+    /// Combine a listener-level override with the global `IpMode`.
+    /// Rejects contradictory strict modes (e.g. global `ipv4_only` + listener `ipv6_only`).
+    pub fn effective_with_global(listener_override: Option<IpMode>, global: IpMode) -> Result<IpMode, String> {
+        match (global, listener_override) {
+            (g, None) => Ok(g),
+            (IpMode::DualStack, Some(l)) => Ok(l),
+            (IpMode::Ipv4Only, Some(IpMode::Ipv4Only)) => Ok(IpMode::Ipv4Only),
+            (IpMode::Ipv6Only, Some(IpMode::Ipv6Only)) => Ok(IpMode::Ipv6Only),
+            (IpMode::Ipv4Only, Some(IpMode::DualStack)) => Err(
+                "listener ip_mode 'dual_stack' cannot loosen global ip_mode 'ipv4_only'".to_string(),
+            ),
+            (IpMode::Ipv6Only, Some(IpMode::DualStack)) => Err(
+                "listener ip_mode 'dual_stack' cannot loosen global ip_mode 'ipv6_only'".to_string(),
+            ),
+            (IpMode::Ipv4Only, Some(IpMode::Ipv6Only)) => Err(
+                "listener ip_mode 'ipv6_only' conflicts with global ip_mode 'ipv4_only'".to_string(),
+            ),
+            (IpMode::Ipv6Only, Some(IpMode::Ipv4Only)) => Err(
+                "listener ip_mode 'ipv4_only' conflicts with global ip_mode 'ipv6_only'".to_string(),
+            ),
+        }
+    }
+}
+
 /// Tunnel lifecycle mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -253,6 +336,12 @@ pub struct GlobalSettings {
     #[serde(default)]
     pub dns_strategy: DnsStrategy,
 
+    #[serde(default)]
+    pub dns_preference: DnsPreference,
+
+    #[serde(default)]
+    pub ip_mode: IpMode,
+
     #[serde(default = "default_max_active_tunnels")]
     pub max_active_tunnels: usize,
 }
@@ -281,6 +370,8 @@ impl Default for GlobalSettings {
             log_level: LogLevel::default(),
             dns_fallback: default_dns_fallback(),
             dns_strategy: DnsStrategy::default(),
+            dns_preference: DnsPreference::default(),
+            ip_mode: IpMode::default(),
             max_active_tunnels: default_max_active_tunnels(),
         }
     }
@@ -394,6 +485,9 @@ pub struct SharedListenerSettings {
 
     #[serde(default)]
     pub pool: TunnelPoolSelection,
+
+    #[serde(default)]
+    pub ip_mode: Option<IpMode>,
 }
 
 fn default_false() -> bool {
@@ -529,6 +623,12 @@ impl MainConfig {
                 return Err(ConfigError::Validation(format!(
                     "Port conflict: shared_listener '{}' bind address '{}' is already in use",
                     listener.name, listener.bind
+                )));
+            }
+            if let Err(msg) = IpMode::effective_with_global(listener.ip_mode, self.global.ip_mode) {
+                return Err(ConfigError::Validation(format!(
+                    "shared_listener '{}': {}",
+                    listener.name, msg
                 )));
             }
             if listener.auth_mode == AuthMode::Global {

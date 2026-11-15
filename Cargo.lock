@@ -1652,6 +1652,7 @@ dependencies = [
  "gotatun-crypto",
  "gotatun-packet",
  "ipnetwork",
+ "libc",
  "parking_lot",
  "rand",
  "rand_core 0.6.4",

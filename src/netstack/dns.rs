@@ -308,6 +308,8 @@ pub struct InTunnelDnsResolver {
     cache: DnsLruCache,
     timeout: Duration,
     max_retries: usize,
+    prefer_ipv6: std::sync::atomic::AtomicBool,
+    ip_mode: std::sync::atomic::AtomicU8,
 }
 
 impl InTunnelDnsResolver {
@@ -327,16 +329,45 @@ impl InTunnelDnsResolver {
             cache: DnsLruCache::new(2048),
             timeout: Duration::from_millis(1500),
             max_retries: 2,
+            prefer_ipv6: std::sync::atomic::AtomicBool::new(false),
+            ip_mode: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
-    /// Resolve domain to a single IP address (prefers IPv4 if available, or first resolved).
+    /// Configure whether dual-stack domain resolution prefers IPv6 (`AAAA`) over IPv4 (`A`).
+    pub fn set_prefer_ipv6(&self, prefer: bool) {
+        self.prefer_ipv6
+            .store(prefer, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Configure strict IP family isolation mode (`DualStack`, `Ipv4Only`, `Ipv6Only`).
+    pub fn set_ip_mode(&self, mode: crate::config::IpMode) {
+        self.ip_mode
+            .store(mode.to_u8(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Return the configured strict IP family isolation mode.
+    pub fn ip_mode(&self) -> crate::config::IpMode {
+        crate::config::IpMode::from_u8(self.ip_mode.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Resolve domain to a single IP address using the resolver's configured `IpMode`.
     pub async fn resolve(
         &self,
         stack: &VirtualNetworkStack,
         domain: &str,
     ) -> Result<IpAddr, io::Error> {
-        let addrs = self.resolve_all(stack, domain).await?;
+        self.resolve_with_mode(stack, domain, self.ip_mode()).await
+    }
+
+    /// Resolve domain to a single IP address enforced by an explicit `IpMode`.
+    pub async fn resolve_with_mode(
+        &self,
+        stack: &VirtualNetworkStack,
+        domain: &str,
+        mode: crate::config::IpMode,
+    ) -> Result<IpAddr, io::Error> {
+        let addrs = self.resolve_all_with_mode(stack, domain, mode).await?;
         addrs.into_iter().next().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "no IP addresses found for domain")
         })
@@ -348,25 +379,65 @@ impl InTunnelDnsResolver {
         stack: &VirtualNetworkStack,
         domain: &str,
     ) -> Result<Vec<IpAddr>, io::Error> {
+        self.resolve_all_with_mode(stack, domain, self.ip_mode())
+            .await
+    }
+
+    /// Resolve domain to all resolved addresses permitted by `mode`.
+    pub async fn resolve_all_with_mode(
+        &self,
+        stack: &VirtualNetworkStack,
+        domain: &str,
+        mode: crate::config::IpMode,
+    ) -> Result<Vec<IpAddr>, io::Error> {
         let trimmed = domain.trim().trim_end_matches('.');
         // Fast-path: check if domain is already a valid IP literal
         if let Ok(ip) = trimmed.parse::<IpAddr>() {
+            mode.check_ip(ip, "IP address")?;
             return Ok(vec![ip]);
         }
 
+        let cache_key = match mode {
+            crate::config::IpMode::DualStack => trimmed.to_string(),
+            crate::config::IpMode::Ipv4Only => format!("v4:{}", trimmed),
+            crate::config::IpMode::Ipv6Only => format!("v6:{}", trimmed),
+        };
+
         // Check LRU cache
-        if let Some(cached) = self.cache.get(trimmed) {
+        if let Some(cached) = self.cache.get(&cache_key) {
             return Ok(cached);
+        }
+
+        // Filter DNS servers by active IpMode; fall back to well-known servers of that family
+        let mut servers: Vec<SocketAddr> = self
+            .dns_servers
+            .iter()
+            .copied()
+            .filter(|s| mode.allows_ip(s.ip()))
+            .collect();
+
+        if servers.is_empty() {
+            match mode {
+                crate::config::IpMode::Ipv4Only => {
+                    servers.push("1.1.1.1:53".parse().unwrap());
+                    servers.push("1.0.0.1:53".parse().unwrap());
+                }
+                crate::config::IpMode::Ipv6Only => {
+                    servers.push("[2606:4700:4700::1111]:53".parse().unwrap());
+                    servers.push("[2606:4700:4700::1001]:53".parse().unwrap());
+                }
+                crate::config::IpMode::DualStack => {}
+            }
         }
 
         // Query tunnel DNS servers strictly inside the WireGuard tunnel
         let mut last_err = io::Error::new(io::ErrorKind::TimedOut, "DNS resolution timed out");
 
-        for &server in &self.dns_servers {
+        for &server in &servers {
             for retry in 0..self.max_retries {
-                match self.query_server(stack, trimmed, server).await {
+                match self.query_server(stack, trimmed, server, mode).await {
                     Ok((ips, ttl)) => {
-                        self.cache.insert(trimmed, ips.clone(), ttl);
+                        self.cache.insert(&cache_key, ips.clone(), ttl);
                         return Ok(ips);
                     }
                     Err(e) => {
@@ -385,17 +456,53 @@ impl InTunnelDnsResolver {
         Err(last_err)
     }
 
+    /// Query a single upstream DNS server according to `IpMode` and `prefer_ipv6`.
     async fn query_server(
         &self,
         stack: &VirtualNetworkStack,
         domain: &str,
         server: SocketAddr,
+        mode: crate::config::IpMode,
+    ) -> Result<(Vec<IpAddr>, u32), io::Error> {
+        let qtypes: &[QueryType] = match mode {
+            crate::config::IpMode::Ipv4Only => &[QueryType::A],
+            crate::config::IpMode::Ipv6Only => &[QueryType::AAAA],
+            crate::config::IpMode::DualStack => {
+                if self.prefer_ipv6.load(std::sync::atomic::Ordering::Relaxed) {
+                    &[QueryType::AAAA, QueryType::A]
+                } else {
+                    &[QueryType::A, QueryType::AAAA]
+                }
+            }
+        };
+
+        let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no DNS records found");
+        for &qtype in qtypes {
+            match self.query_record(stack, domain, server, qtype).await {
+                Ok((mut ips, ttl)) => {
+                    ips.retain(|ip| mode.allows_ip(*ip));
+                    if !ips.is_empty() {
+                        return Ok((ips, ttl));
+                    }
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
+    }
+
+    async fn query_record(
+        &self,
+        stack: &VirtualNetworkStack,
+        domain: &str,
+        server: SocketAddr,
+        qtype: QueryType,
     ) -> Result<(Vec<IpAddr>, u32), io::Error> {
         tokio::time::timeout(self.timeout, async {
             let socket = stack.udp_bind(0).await?;
             let tx_id = rand::random::<u16>();
 
-            let query = build_query(domain, QueryType::A, tx_id)
+            let query = build_query(domain, qtype, tx_id)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
             socket.send_to(&query, server).await?;

@@ -7,17 +7,19 @@
 
 use std::future::Future;
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::config::{AuthMode, PoolStrategy, SharedListenerSettings, TunnelPoolSelection};
+use crate::config::{AuthMode, IpMode, PoolStrategy, SharedListenerSettings, TunnelPoolSelection};
 use crate::core::lifecycle::{GuardedTunnelTarget, LifecycleController};
 use crate::core::registry::TunnelRegistry;
 use crate::proxy::{
-    PoolKeyword, ProxyAuthError, ProxyTunnelTarget, TunnelRouter, TunnelSelector,
+    DynStream, PoolKeyword, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket, TunnelRouter,
+    TunnelSelector,
 };
 
 /// Multi-tenant proxy router for shared listener ports.
@@ -29,6 +31,7 @@ pub struct MultiTenantRouter {
     auth_mode: AuthMode,
     global_password: Option<String>,
     allow_anonymous: bool,
+    ip_mode: IpMode,
     rr_counter: AtomicUsize,
 }
 
@@ -43,6 +46,8 @@ impl MultiTenantRouter {
             TunnelPoolSelection::All => None,
             TunnelPoolSelection::Selected(list) => Some(list.clone()),
         };
+        let ip_mode = IpMode::effective_with_global(settings.ip_mode, lifecycle.ip_mode())
+            .unwrap_or(lifecycle.ip_mode());
 
         Arc::new(Self {
             lifecycle,
@@ -52,6 +57,7 @@ impl MultiTenantRouter {
             auth_mode: settings.auth_mode,
             global_password: settings.global_password.clone(),
             allow_anonymous: settings.allow_anonymous,
+            ip_mode,
             rr_counter: AtomicUsize::new(0),
         })
     }
@@ -63,6 +69,7 @@ impl MultiTenantRouter {
         default_strategy: PoolStrategy,
         allow_anonymous: bool,
     ) -> Arc<Self> {
+        let ip_mode = lifecycle.ip_mode();
         Arc::new(Self {
             lifecycle,
             registry,
@@ -71,6 +78,7 @@ impl MultiTenantRouter {
             auth_mode: AuthMode::None,
             global_password: None,
             allow_anonymous,
+            ip_mode,
             rr_counter: AtomicUsize::new(0),
         })
     }
@@ -102,6 +110,7 @@ impl MultiTenantRouter {
             auth_mode: self.auth_mode,
             global_password: self.global_password.clone(),
             allow_anonymous: self.allow_anonymous,
+            ip_mode: self.ip_mode,
             rr_counter: AtomicUsize::new(self.rr_counter.load(Ordering::Relaxed)),
         }
     }
@@ -277,7 +286,14 @@ impl TunnelRouter for MultiTenantRouter {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tunnel activation failed: {:?}", e)))?;
 
             let guarded = GuardedTunnelTarget::new(active_tunnel, guard);
-            Ok(Arc::new(guarded) as Arc<dyn ProxyTunnelTarget>)
+            if self.ip_mode == IpMode::DualStack {
+                Ok(Arc::new(guarded) as Arc<dyn ProxyTunnelTarget>)
+            } else {
+                Ok(Arc::new(IpFilteredTunnelTarget::new(
+                    Arc::new(guarded),
+                    self.ip_mode,
+                )) as Arc<dyn ProxyTunnelTarget>)
+            }
         })
     }
 }
@@ -334,7 +350,102 @@ impl TunnelRouter for DedicatedTunnelRouter {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tunnel activation failed: {:?}", e)))?;
 
             let guarded = GuardedTunnelTarget::new(active, guard);
-            Ok(Arc::new(guarded) as Arc<dyn ProxyTunnelTarget>)
+            let ip_mode = self.lifecycle.ip_mode();
+            if ip_mode == IpMode::DualStack {
+                Ok(Arc::new(guarded) as Arc<dyn ProxyTunnelTarget>)
+            } else {
+                Ok(Arc::new(IpFilteredTunnelTarget::new(
+                    Arc::new(guarded),
+                    ip_mode,
+                )) as Arc<dyn ProxyTunnelTarget>)
+            }
         })
+    }
+}
+
+/// Tunnel target wrapper enforcing a listener- or global-level [`IpMode`] on TCP, UDP, and DNS.
+pub struct IpFilteredTunnelTarget {
+    inner: Arc<GuardedTunnelTarget>,
+    ip_mode: IpMode,
+}
+
+impl IpFilteredTunnelTarget {
+    /// Wrap a [`GuardedTunnelTarget`] with an [`IpMode`] filter.
+    pub fn new(inner: Arc<GuardedTunnelTarget>, ip_mode: IpMode) -> Self {
+        Self { inner, ip_mode }
+    }
+}
+
+impl ProxyTunnelTarget for IpFilteredTunnelTarget {
+    fn tcp_connect<'a>(
+        &'a self,
+        dst: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
+        if let Err(e) = self.ip_mode.check_ip(dst.ip(), "TCP destination") {
+            return Box::pin(async move { Err(e) });
+        }
+        self.inner.tcp_connect(dst)
+    }
+
+    fn udp_bind<'a>(
+        &'a self,
+        local_port: u16,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
+        let inner = Arc::clone(&self.inner);
+        let ip_mode = self.ip_mode;
+        Box::pin(async move {
+            let sock = inner.udp_bind(local_port).await?;
+            Ok(Box::new(IpFilteredUdpSocket {
+                inner: sock,
+                ip_mode,
+            }) as Box<dyn ProxyUdpSocket>)
+        })
+    }
+
+    fn resolve_in_tunnel<'a>(
+        &'a self,
+        domain: &'a str,
+    ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
+        self.inner
+            .tunnel()
+            .resolve_in_tunnel_with_mode(domain, self.ip_mode)
+    }
+}
+
+/// UDP socket wrapper enforcing an [`IpMode`] filter on outbound datagrams.
+struct IpFilteredUdpSocket {
+    inner: Box<dyn ProxyUdpSocket>,
+    ip_mode: IpMode,
+}
+
+impl ProxyUdpSocket for IpFilteredUdpSocket {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        if let Err(e) = self.ip_mode.check_ip(target.ip(), "UDP destination") {
+            return Box::pin(async move { Err(e) });
+        }
+        self.inner.send_to(buf, target)
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
+        let ip_mode = self.ip_mode;
+        Box::pin(async move {
+            loop {
+                let (len, peer) = self.inner.recv_from(buf).await?;
+                if ip_mode.allows_ip(peer.ip()) {
+                    return Ok((len, peer));
+                }
+            }
+        })
+    }
+
+    fn local_port(&self) -> u16 {
+        self.inner.local_port()
     }
 }

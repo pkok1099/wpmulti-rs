@@ -155,6 +155,8 @@ pub struct LifecycleController {
     check_interval: Duration,
     shutdown_tx: watch::Sender<bool>,
     teardown_handle: Mutex<Option<JoinHandle<()>>>,
+    prefer_ipv6: std::sync::atomic::AtomicBool,
+    ip_mode: std::sync::atomic::AtomicU8,
 }
 
 impl LifecycleController {
@@ -171,7 +173,24 @@ impl LifecycleController {
             check_interval,
             shutdown_tx,
             teardown_handle: Mutex::new(None),
+            prefer_ipv6: std::sync::atomic::AtomicBool::new(false),
+            ip_mode: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    /// Configure whether dual-stack domain resolution prefers IPv6 (`AAAA`) over IPv4 (`A`).
+    pub fn set_prefer_ipv6(&self, prefer: bool) {
+        self.prefer_ipv6.store(prefer, Ordering::Relaxed);
+    }
+
+    /// Configure the global IP stack mode for newly booted tunnels.
+    pub fn set_ip_mode(&self, mode: crate::config::IpMode) {
+        self.ip_mode.store(mode.to_u8(), Ordering::Relaxed);
+    }
+
+    /// Return the configured global IP stack mode.
+    pub fn ip_mode(&self) -> crate::config::IpMode {
+        crate::config::IpMode::from_u8(self.ip_mode.load(Ordering::Relaxed))
     }
 
     /// Start the background debounced idle teardown task.
@@ -263,7 +282,12 @@ impl LifecycleController {
             }
             TunnelState::Dormant | TunnelState::Activating => {
                 *entry.state.write() = TunnelState::Activating;
-                let active = Self::boot_tunnel(&entry).await?;
+                let active = Self::boot_tunnel(
+            &entry,
+            self.ip_mode(),
+            self.prefer_ipv6.load(Ordering::Relaxed),
+        )
+        .await?;
                 *entry.active.write() = Some(Arc::clone(&active));
                 *entry.state.write() = TunnelState::Active;
 
@@ -321,7 +345,12 @@ impl LifecycleController {
             }
             TunnelState::Dormant | TunnelState::Activating => {
                 *entry.state.write() = TunnelState::Activating;
-                let active = Self::boot_tunnel(&entry).await?;
+                let active = Self::boot_tunnel(
+            &entry,
+            self.ip_mode(),
+            self.prefer_ipv6.load(Ordering::Relaxed),
+        )
+        .await?;
                 *entry.active.write() = Some(Arc::clone(&active));
                 *entry.state.write() = TunnelState::Active;
                 Ok(active)
@@ -358,7 +387,11 @@ impl LifecycleController {
     }
 
     /// Build a new [`ActiveTunnel`] from a dormant [`TunnelEntry`].
-    async fn boot_tunnel(entry: &TunnelEntry) -> Result<Arc<ActiveTunnel>, CoreError> {
+    async fn boot_tunnel(
+        entry: &TunnelEntry,
+        ip_mode: crate::config::IpMode,
+        prefer_ipv6: bool,
+    ) -> Result<Arc<ActiveTunnel>, CoreError> {
         let (config_interface, config_peers) = {
             let cfg = entry.config.read();
             (cfg.interface.clone(), cfg.peers.clone())
@@ -399,7 +432,7 @@ impl LifecycleController {
         })?;
 
         // Build smoltcp VirtualNetworkStack
-        let netstack = VirtualNetworkStack::new(&config_interface, bridge)
+        let netstack = VirtualNetworkStack::new_with_mode(&config_interface, bridge, ip_mode, prefer_ipv6)
             .await
             .map_err(|e| {
                 CoreError::ActivationFailed(entry.id.clone(), format!("failed to build netstack: {:?}", e))

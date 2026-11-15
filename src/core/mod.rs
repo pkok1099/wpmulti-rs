@@ -26,7 +26,7 @@ pub use registry::{
     ActiveTunnel, MeteredStream, MeteredUdpSocket, TunnelEntry, TunnelRegistry, TunnelState,
     TunnelStats, TunnelSummary, WgDevice,
 };
-pub use router::{DedicatedTunnelRouter, MultiTenantRouter};
+pub use router::{DedicatedTunnelRouter, IpFilteredTunnelTarget, MultiTenantRouter};
 
 /// Core error types originating in multi-tunnel management.
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +93,10 @@ impl TunnelManager {
             idle_timeout,
             check_interval,
         );
+        lifecycle.set_prefer_ipv6(
+            config.global.dns_preference == crate::config::toml_config::DnsPreference::Ipv6First,
+        );
+        lifecycle.set_ip_mode(config.global.ip_mode);
 
         let listeners = Arc::new(ListenerSupervisor::new());
 
@@ -125,11 +129,44 @@ impl TunnelManager {
         // 1. Start lifecycle teardown background task
         self.lifecycle.start();
 
-        // 2. Eagerly activate Eager tunnels
-        for entry in self.registry.all_entries() {
-            if entry.lifecycle_mode == LifecycleMode::Eager {
-                tracing::info!("Eagerly booting Eager tunnel '{}'", entry.id);
-                self.lifecycle.activate_tunnel(&entry.id).await?;
+        // 2. Eagerly activate Eager tunnels in parallel (bounded concurrency)
+        let eager_ids: Vec<String> = self
+            .registry
+            .all_entries()
+            .into_iter()
+            .filter(|e| e.lifecycle_mode == LifecycleMode::Eager)
+            .map(|e| e.id.clone())
+            .collect();
+
+        if !eager_ids.is_empty() {
+            const MAX_CONCURRENT_BOOTS: usize = 64;
+            let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BOOTS));
+            let mut set = tokio::task::JoinSet::new();
+
+            for id in eager_ids {
+                let lifecycle = Arc::clone(&self.lifecycle);
+                let sem = Arc::clone(&sem);
+                set.spawn(async move {
+                    let _permit = sem.acquire_owned().await.map_err(|_| {
+                        CoreError::Other("Boot semaphore closed".to_string())
+                    })?;
+                    tracing::info!("Eagerly booting Eager tunnel '{}'", id);
+                    lifecycle.activate_tunnel(&id).await?;
+                    Ok::<(), CoreError>(())
+                });
+            }
+
+            while let Some(res) = set.join_next().await {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => {
+                        return Err(CoreError::Other(format!(
+                            "Parallel tunnel boot task failed: {}",
+                            e
+                        )));
+                    }
+                }
             }
         }
 
@@ -151,12 +188,18 @@ impl TunnelManager {
         // 2. Stop lifecycle controller
         self.lifecycle.stop().await;
 
-        // 3. Suspend all currently active tunnels
+        // 3. Suspend all currently active tunnels in parallel
+        let mut set = tokio::task::JoinSet::new();
         for entry in self.registry.all_entries() {
             if entry.is_active() {
-                let _ = self.lifecycle.suspend_tunnel(&entry.id).await;
+                let lifecycle = Arc::clone(&self.lifecycle);
+                let id = entry.id.clone();
+                set.spawn(async move {
+                    let _ = lifecycle.suspend_tunnel(&id).await;
+                });
             }
         }
+        while set.join_next().await.is_some() {}
 
         Ok(())
     }

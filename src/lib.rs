@@ -25,10 +25,10 @@ pub use core::{
 pub use config::{
     load_tunnel_config_from_file, load_tunnel_config_from_str, load_tunnel_configs_from_dir,
     parse_duration_str, parse_wg_conf, parse_wg_conf_file, strip_comment, AdminSettings,
-    AuthMode, ConfigError, DnsStrategy, GlobalSettings, LifecycleMode, LifecycleSettings,
-    ListenerType, LogLevel, MainConfig, PerTunnelSettings, PoolStrategy, SharedListenerSettings,
-    TuiSettings, TuiSortField, TunnelConfig, TunnelPoolSelection, TunnelPortOverride,
-    WgConfig, WgConfError, WgInterfaceConfig, WgPeerConfig,
+    AuthMode, ConfigError, DnsPreference, DnsStrategy, GlobalSettings, IpMode, LifecycleMode,
+    LifecycleSettings, ListenerType, LogLevel, MainConfig, PerTunnelSettings, PoolStrategy,
+    SharedListenerSettings, TuiSettings, TuiSortField, TunnelConfig, TunnelPoolSelection,
+    TunnelPortOverride, WgConfig, WgConfError, WgInterfaceConfig, WgPeerConfig,
 };
 pub use netstack::{
     build_query, parse_response, to_smoltcp_endpoint, to_std_socket_addr, BridgeIpRecv,

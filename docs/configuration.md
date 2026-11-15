@@ -13,6 +13,7 @@ bind_address = "127.0.0.1"
 log_level = "info"                  # trace | debug | info | warn | error
 dns_fallback = "1.1.1.1:53"
 dns_strategy = "tunnel_only"        # tunnel_only | tunnel_first | host
+ip_mode = "dual_stack"              # dual_stack | ipv4_only | ipv6_only
 max_active_tunnels = 1000
 
 [lifecycle]
@@ -39,6 +40,7 @@ auth_mode = "per_tunnel"            # none | global | per_tunnel
 default_strategy = "round-robin"    # round-robin | random | least-conn | fallback
 allow_anonymous = true              # allow requests with no username (uses default_strategy)
 pool = "all"                        # "all" or ["wgcf-001", "wgcf-002"]
+# ip_mode = "ipv6_only"             # optional per-listener override when global ip_mode = "dual_stack"
 
 [[shared_listener]]
 name = "shared-http"

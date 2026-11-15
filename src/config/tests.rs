@@ -439,3 +439,83 @@ fn test_load_tunnel_configs_from_dir_not_found() {
     let res = load_tunnel_configs_from_dir(non_existent);
     assert!(matches!(res, Err(ConfigError::DirectoryNotFound(_))));
 }
+
+// =========================================================================
+// 11. IpMode Parsing, Helpers & Validation
+// =========================================================================
+#[test]
+fn test_ip_mode_helpers_and_parsing() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let v4 = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+    let v6 = IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111));
+
+    assert!(IpMode::DualStack.allows_ip(v4));
+    assert!(IpMode::DualStack.allows_ip(v6));
+    assert!(IpMode::Ipv4Only.allows_ip(v4));
+    assert!(!IpMode::Ipv4Only.allows_ip(v6));
+    assert!(!IpMode::Ipv6Only.allows_ip(v4));
+    assert!(IpMode::Ipv6Only.allows_ip(v6));
+
+    assert_eq!(
+        IpMode::effective_with_global(Some(IpMode::Ipv6Only), IpMode::DualStack),
+        Ok(IpMode::Ipv6Only)
+    );
+    assert_eq!(
+        IpMode::effective_with_global(None, IpMode::Ipv4Only),
+        Ok(IpMode::Ipv4Only)
+    );
+
+    let toml_str = r#"
+        [global]
+        ip_mode = "ipv6_only"
+    "#;
+    let cfg: MainConfig = toml::from_str(toml_str).expect("parse ip_mode");
+    assert_eq!(cfg.global.ip_mode, IpMode::Ipv6Only);
+    cfg.validate().expect("global ipv6_only without listener override is valid");
+}
+
+#[test]
+fn test_ip_mode_listener_validation() {
+    // Valid: global dual_stack with ipv4_only listener override
+    let valid_toml = r#"
+        [global]
+        ip_mode = "dual_stack"
+
+        [[shared_listener]]
+        name = "v4-socks"
+        type = "socks5"
+        bind = "127.0.0.1:1080"
+        ip_mode = "ipv4_only"
+    "#;
+    let cfg: MainConfig = toml::from_str(valid_toml).unwrap();
+    cfg.validate().expect("dual_stack global allows ipv4_only listener");
+
+    // Invalid: global ipv4_only with ipv6_only listener override
+    let conflict_toml = r#"
+        [global]
+        ip_mode = "ipv4_only"
+
+        [[shared_listener]]
+        name = "bad-socks"
+        type = "socks5"
+        bind = "127.0.0.1:1080"
+        ip_mode = "ipv6_only"
+    "#;
+    let cfg: MainConfig = toml::from_str(conflict_toml).unwrap();
+    assert!(cfg.validate().is_err(), "conflicting ip_mode must fail validation");
+
+    // Invalid: global ipv6_only with dual_stack listener override (cannot loosen)
+    let loosen_toml = r#"
+        [global]
+        ip_mode = "ipv6_only"
+
+        [[shared_listener]]
+        name = "loosen-socks"
+        type = "socks5"
+        bind = "127.0.0.1:1080"
+        ip_mode = "dual_stack"
+    "#;
+    let cfg: MainConfig = toml::from_str(loosen_toml).unwrap();
+    assert!(cfg.validate().is_err(), "loosening global ip_mode must fail validation");
+}

@@ -172,6 +172,7 @@ async fn test_scenario_2_shared_port_multi_user_socks5_and_http() {
         default_strategy: PoolStrategy::RoundRobin,
         allow_anonymous: false,
         pool: TunnelPoolSelection::All,
+        ip_mode: None,
     };
     let s5_router = MultiTenantRouter::from_settings(&s5_settings, lc.clone(), reg.clone());
 
@@ -185,6 +186,7 @@ async fn test_scenario_2_shared_port_multi_user_socks5_and_http() {
         default_strategy: PoolStrategy::LeastConn,
         allow_anonymous: false,
         pool: TunnelPoolSelection::All,
+        ip_mode: None,
     };
     let http_router = MultiTenantRouter::from_settings(&http_settings, lc, reg);
 

@@ -302,6 +302,7 @@ async fn test_pairwise_f8_http_proxy_and_f10_shared_listener_auth() {
         default_strategy: PoolStrategy::RoundRobin,
         allow_anonymous: false,
         pool: TunnelPoolSelection::All,
+        ip_mode: None,
     };
 
     let reg = Arc::new(TunnelRegistry::new());
@@ -554,6 +555,7 @@ async fn test_pairwise_f10_shared_port_and_f7_udp_associate() {
         default_strategy: PoolStrategy::RoundRobin,
         allow_anonymous: true,
         pool: TunnelPoolSelection::All,
+        ip_mode: None,
     };
 
     let router = MultiTenantRouter::from_settings(&settings, lc, reg);

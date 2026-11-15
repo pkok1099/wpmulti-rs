@@ -54,8 +54,18 @@ pub struct VirtualNetworkStack {
 
 impl VirtualNetworkStack {
     /// Construct a new virtual network stack from WireGuard interface configuration
-    /// and a [`VirtualTunBridge`].
-    pub async fn new(config: &WgInterfaceConfig, mut bridge: VirtualTunBridge) -> Result<Self, io::Error> {
+    /// and a [`VirtualTunBridge`] in `DualStack` mode.
+    pub async fn new(config: &WgInterfaceConfig, bridge: VirtualTunBridge) -> Result<Self, io::Error> {
+        Self::new_with_mode(config, bridge, crate::config::IpMode::DualStack, false).await
+    }
+
+    /// Construct a new virtual network stack with an explicit [`IpMode`] and IPv6 DNS preference.
+    pub async fn new_with_mode(
+        config: &WgInterfaceConfig,
+        mut bridge: VirtualTunBridge,
+        ip_mode: crate::config::IpMode,
+        prefer_ipv6: bool,
+    ) -> Result<Self, io::Error> {
         let notify = bridge.notify_handle();
 
         // 1. Configure smoltcp interface with Medium::Ip
@@ -64,7 +74,7 @@ impl VirtualNetworkStack {
 
         let mut iface = Interface::new(iface_config, &mut bridge, SmolInstant::now());
 
-        // 2. Configure dual-stack IP addresses
+        // 2. Configure IP addresses filtered by IpMode
         let mut local_v4 = None;
         let mut local_v6 = None;
 
@@ -78,7 +88,7 @@ impl VirtualNetworkStack {
         iface.update_ip_addrs(|ip_addrs| {
             for net in &config.addresses {
                 match net {
-                    ipnetwork::IpNetwork::V4(v4) => {
+                    ipnetwork::IpNetwork::V4(v4) if ip_mode != crate::config::IpMode::Ipv6Only => {
                         let smol_addr = v4.ip();
                         let cidr = IpCidr::Ipv4(Ipv4Cidr::new(smol_addr, v4.prefix()));
                         if let Err(_) = ip_addrs.push(cidr) {
@@ -87,7 +97,7 @@ impl VirtualNetworkStack {
                             local_v4 = Some(v4.ip());
                         }
                     }
-                    ipnetwork::IpNetwork::V6(v6) => {
+                    ipnetwork::IpNetwork::V6(v6) if ip_mode != crate::config::IpMode::Ipv4Only => {
                         let smol_addr = v6.ip();
                         let cidr = IpCidr::Ipv6(Ipv6Cidr::new(smol_addr, v6.prefix()));
                         if let Err(_) = ip_addrs.push(cidr) {
@@ -96,9 +106,17 @@ impl VirtualNetworkStack {
                             local_v6 = Some(v6.ip());
                         }
                     }
+                    _ => {}
                 }
             }
         });
+
+        if local_v4.is_none() && local_v6.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("interface has no usable IP addresses for ip_mode {:?}", ip_mode),
+            ));
+        }
 
         // 3. Configure point-to-point default routes
         if let Some(v4_ip) = local_v4 {
@@ -135,6 +153,8 @@ impl VirtualNetworkStack {
 
         let initial_port = 49152 + (rand::random::<u16>() % 1000);
         let resolver = InTunnelDnsResolver::new(&config.dns);
+        resolver.set_ip_mode(ip_mode);
+        resolver.set_prefer_ipv6(prefer_ipv6);
 
         Ok(Self {
             inner,
@@ -151,6 +171,11 @@ impl VirtualNetworkStack {
     /// Access the shared inner stack state.
     pub fn inner(&self) -> &Arc<Mutex<StackInner>> {
         &self.inner
+    }
+
+    /// Configure whether dual-stack domain resolution prefers IPv6 (`AAAA`) over IPv4 (`A`).
+    pub fn set_prefer_ipv6(&self, prefer: bool) {
+        self.dns_resolver.set_prefer_ipv6(prefer);
     }
 
     /// Access the wakeup notification handle.
@@ -303,12 +328,27 @@ impl VirtualNetworkStack {
         };
 
         self.notify.notify_one();
-        Ok(VirtualUdpSocket::new(handle, Arc::clone(&self.inner), Arc::clone(&self.notify), port))
+        Ok(VirtualUdpSocket::new(
+            handle,
+            Arc::clone(&self.inner),
+            Arc::clone(&self.notify),
+            port,
+            self.dns_resolver.ip_mode(),
+        ))
     }
 
     /// Resolve a domain name inside the WireGuard tunnel.
     pub async fn resolve_in_tunnel(&self, domain: &str) -> Result<IpAddr, io::Error> {
         self.dns_resolver.resolve(self, domain).await
+    }
+
+    /// Resolve a domain name inside the WireGuard tunnel using an explicit [`IpMode`].
+    pub async fn resolve_in_tunnel_with_mode(
+        &self,
+        domain: &str,
+        mode: crate::config::IpMode,
+    ) -> Result<IpAddr, io::Error> {
+        self.dns_resolver.resolve_with_mode(self, domain, mode).await
     }
 
     /// Cleanly shutdown the virtual network stack and stop the reactor.

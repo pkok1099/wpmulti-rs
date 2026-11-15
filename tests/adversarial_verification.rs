@@ -160,6 +160,7 @@ async fn test_adv_socks5_http_high_concurrency_stress() {
         default_strategy: PoolStrategy::RoundRobin,
         allow_anonymous: false,
         pool: TunnelPoolSelection::All,
+        ip_mode: None,
     };
     let router = MultiTenantRouter::from_settings(&s5_settings, lc, reg);
 
@@ -439,6 +440,7 @@ async fn test_adv_raw_malformed_socks5_packets() {
         default_strategy: PoolStrategy::RoundRobin,
         allow_anonymous: false,
         pool: TunnelPoolSelection::All,
+        ip_mode: None,
     };
     let router = MultiTenantRouter::from_settings(&settings, lc, reg);
 
@@ -531,6 +533,7 @@ async fn test_adv_raw_malformed_http_requests() {
         default_strategy: PoolStrategy::RoundRobin,
         allow_anonymous: false,
         pool: TunnelPoolSelection::All,
+        ip_mode: None,
     };
     let router = MultiTenantRouter::from_settings(&settings, lc, reg);
 
