@@ -1,12 +1,85 @@
 //! Application state and business logic for the interactive TUI monitor.
 
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::TuiSortField;
-use crate::core::{ReloadReport, TunnelManager, TunnelState, TunnelSummary};
+use crate::config::toml_config::{DnsStrategy, LogLevel};
+use crate::config::{parse_duration_str, IpMode, LifecycleMode, MainConfig, TuiSortField};
+use crate::core::{
+    ActiveListenerInfo, ReloadReport, TunnelManager, TunnelState, TunnelSummary,
+};
+use crate::tui::logs::TuiLogBuffer;
+
+/// Active tab in the nyx-style multi-tab TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiTab {
+    Tunnels,
+    Logs,
+    Listeners,
+    Config,
+    Probe,
+}
+
+impl TuiTab {
+    /// All tabs in display order.
+    pub const ALL: [TuiTab; 5] = [
+        TuiTab::Tunnels,
+        TuiTab::Logs,
+        TuiTab::Listeners,
+        TuiTab::Config,
+        TuiTab::Probe,
+    ];
+
+    /// Short human-readable label for the tab bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            TuiTab::Tunnels => "1:Tunnels",
+            TuiTab::Logs => "2:Logs",
+            TuiTab::Listeners => "3:Listeners",
+            TuiTab::Config => "4:Config",
+            TuiTab::Probe => "5:Probe",
+        }
+    }
+
+    /// Cycle to the next tab.
+    pub fn next(self) -> Self {
+        match self {
+            TuiTab::Tunnels => TuiTab::Logs,
+            TuiTab::Logs => TuiTab::Listeners,
+            TuiTab::Listeners => TuiTab::Config,
+            TuiTab::Config => TuiTab::Probe,
+            TuiTab::Probe => TuiTab::Tunnels,
+        }
+    }
+
+    /// Cycle to the previous tab.
+    pub fn prev(self) -> Self {
+        match self {
+            TuiTab::Tunnels => TuiTab::Probe,
+            TuiTab::Logs => TuiTab::Tunnels,
+            TuiTab::Listeners => TuiTab::Logs,
+            TuiTab::Config => TuiTab::Listeners,
+            TuiTab::Probe => TuiTab::Config,
+        }
+    }
+}
+
+/// Result of a live handshake/connectivity probe triggered from the TUI Probe tab.
+#[derive(Debug, Clone)]
+pub struct TuiProbeResult {
+    pub id: String,
+    pub endpoint: String,
+    pub ok: bool,
+    pub rtt_ms: Option<u64>,
+    pub message: String,
+}
+
+/// Number of editable runtime configuration rows in the Config tab.
+pub const CONFIG_ROW_COUNT: usize = 8;
 
 /// Data source powering the TUI dashboard: either an in-process manager or a remote Admin API.
 #[derive(Clone)]
@@ -55,6 +128,16 @@ pub(crate) async fn admin_http_request(
     path: &str,
     auth_token: Option<&str>,
 ) -> Result<Vec<u8>, String> {
+    admin_http_request_with_body(admin_url, method, path, auth_token, None).await
+}
+
+pub(crate) async fn admin_http_request_with_body(
+    admin_url: &str,
+    method: &str,
+    path: &str,
+    auth_token: Option<&str>,
+    body_bytes: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
     let host_port = parse_admin_http_url(admin_url)?;
     validate_http_token_or_segment(path, "request path")?;
     if let Some(tok) = auth_token
@@ -73,7 +156,12 @@ pub(crate) async fn admin_http_request(
         "{} {} HTTP/1.1\r\nHost: {}\r\n",
         method, path, host_port
     );
-    if method == "POST" {
+    if let Some(payload) = body_bytes {
+        req.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            payload.len()
+        ));
+    } else if method == "POST" {
         req.push_str("Content-Length: 0\r\n");
     }
     if let Some(token) = auth_token {
@@ -81,7 +169,12 @@ pub(crate) async fn admin_http_request(
     }
     req.push_str("Connection: close\r\n\r\n");
 
-    tokio::time::timeout(io_timeout, stream.write_all(req.as_bytes()))
+    let mut wire = req.into_bytes();
+    if let Some(payload) = body_bytes {
+        wire.extend_from_slice(payload);
+    }
+
+    tokio::time::timeout(io_timeout, stream.write_all(&wire))
         .await
         .map_err(|_| "Timed out writing Admin API request".to_string())?
         .map_err(|e| format!("Write failed: {}", e))?;
@@ -198,11 +291,147 @@ impl TuiDataSource {
             }
         }
     }
+
+    /// Retrieve active listeners from the data source.
+    pub async fn fetch_listeners(&self) -> Result<Vec<ActiveListenerInfo>, String> {
+        match self {
+            TuiDataSource::InProcess(mgr) => Ok(mgr.listeners().list_listeners()),
+            TuiDataSource::Remote {
+                admin_url,
+                auth_token,
+            } => {
+                let body =
+                    admin_http_request(admin_url, "GET", "/listeners", auth_token.as_deref()).await?;
+                serde_json::from_slice(&body)
+                    .map_err(|e| format!("Failed to deserialize listeners response: {}", e))
+            }
+        }
+    }
+
+    /// Retrieve current configuration snapshot from the data source.
+    pub async fn fetch_config(&self) -> Result<MainConfig, String> {
+        match self {
+            TuiDataSource::InProcess(mgr) => Ok(mgr.config_snapshot()),
+            TuiDataSource::Remote {
+                admin_url,
+                auth_token,
+            } => {
+                let body =
+                    admin_http_request(admin_url, "GET", "/config", auth_token.as_deref()).await?;
+                serde_json::from_slice(&body)
+                    .map_err(|e| format!("Failed to deserialize config response: {}", e))
+            }
+        }
+    }
+
+    /// Apply updated runtime configuration to the data source.
+    pub async fn apply_config(&self, cfg: &MainConfig) -> Result<(), String> {
+        match self {
+            TuiDataSource::InProcess(mgr) => mgr
+                .update_runtime_config(cfg.clone())
+                .map_err(|e| e.to_string()),
+            TuiDataSource::Remote {
+                admin_url,
+                auth_token,
+            } => {
+                let json_bytes =
+                    serde_json::to_vec(cfg).map_err(|e| format!("Serialize error: {}", e))?;
+                let _ = admin_http_request_with_body(
+                    admin_url,
+                    "POST",
+                    "/config",
+                    auth_token.as_deref(),
+                    Some(&json_bytes),
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Probe a single tunnel by activating it (and performing a handshake check when in-process).
+    pub async fn probe_tunnel(&self, id: &str, endpoint: &str) -> TuiProbeResult {
+        let start = Instant::now();
+        match self {
+            TuiDataSource::InProcess(mgr) => match mgr.activate_tunnel(id).await {
+                Ok(active) => {
+                    let probe_timeout = mgr.config_snapshot().health_check.probe_timeout;
+                    let peer_pubkey = mgr
+                        .registry()
+                        .get(id)
+                        .and_then(|entry| entry.config.read().peers.first().map(|p| p.public_key));
+                    match peer_pubkey {
+                        Some(pubkey) => {
+                            match tokio::time::timeout(
+                                probe_timeout,
+                                active.device.force_handshake(&pubkey),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => TuiProbeResult {
+                                    id: id.to_string(),
+                                    endpoint: endpoint.to_string(),
+                                    ok: true,
+                                    rtt_ms: Some(start.elapsed().as_millis() as u64),
+                                    message: "Handshake OK".to_string(),
+                                },
+                                Ok(Err(e)) => TuiProbeResult {
+                                    id: id.to_string(),
+                                    endpoint: endpoint.to_string(),
+                                    ok: false,
+                                    rtt_ms: None,
+                                    message: e.to_string(),
+                                },
+                                Err(_) => TuiProbeResult {
+                                    id: id.to_string(),
+                                    endpoint: endpoint.to_string(),
+                                    ok: false,
+                                    rtt_ms: None,
+                                    message: "Handshake timed out".to_string(),
+                                },
+                            }
+                        }
+                        None => TuiProbeResult {
+                            id: id.to_string(),
+                            endpoint: endpoint.to_string(),
+                            ok: false,
+                            rtt_ms: None,
+                            message: "No peer public key configured".to_string(),
+                        },
+                    }
+                }
+                Err(e) => TuiProbeResult {
+                    id: id.to_string(),
+                    endpoint: endpoint.to_string(),
+                    ok: false,
+                    rtt_ms: None,
+                    message: e.to_string(),
+                },
+            },
+            TuiDataSource::Remote { .. } => match self.activate_tunnel(id).await {
+                Ok(()) => TuiProbeResult {
+                    id: id.to_string(),
+                    endpoint: endpoint.to_string(),
+                    ok: true,
+                    rtt_ms: Some(start.elapsed().as_millis() as u64),
+                    message: "Activated OK".to_string(),
+                },
+                Err(e) => TuiProbeResult {
+                    id: id.to_string(),
+                    endpoint: endpoint.to_string(),
+                    ok: false,
+                    rtt_ms: None,
+                    message: e,
+                },
+            },
+        }
+    }
 }
 
 /// Central state model for the TUI monitor dashboard.
 pub struct TuiApp {
     pub data_source: TuiDataSource,
+    pub active_tab: TuiTab,
     pub tunnels: Vec<TunnelSummary>,
     pub filtered_indices: Vec<usize>,
     pub selected_index: usize,
@@ -213,6 +442,29 @@ pub struct TuiApp {
     pub sort_ascending: bool,
     pub status_message: Option<(String, Instant)>,
     pub running: bool,
+    // Bandwidth sparkline state (bytes/sec samples)
+    pub rx_rates: VecDeque<u64>,
+    pub tx_rates: VecDeque<u64>,
+    pub current_rx_bps: u64,
+    pub current_tx_bps: u64,
+    pub prev_total_rx: Option<u64>,
+    pub prev_total_tx: Option<u64>,
+    pub last_sample_at: Option<Instant>,
+    // Live Logs tab state
+    pub log_buffer: Option<TuiLogBuffer>,
+    pub log_scroll: usize,
+    pub log_level_filter: Option<String>,
+    // Listeners tab state
+    pub listeners: Vec<ActiveListenerInfo>,
+    pub listener_scroll: usize,
+    // Config tab state
+    pub config_snapshot: Option<MainConfig>,
+    pub config_path: Option<PathBuf>,
+    pub config_selected: usize,
+    pub config_editing: Option<String>,
+    // Probe tab state
+    pub probe_results: Vec<TuiProbeResult>,
+    pub probe_scroll: usize,
 }
 
 impl TuiApp {
@@ -220,6 +472,7 @@ impl TuiApp {
     pub fn new(data_source: TuiDataSource, sort_field: TuiSortField) -> Self {
         Self {
             data_source,
+            active_tab: TuiTab::Tunnels,
             tunnels: Vec::new(),
             filtered_indices: Vec::new(),
             selected_index: 0,
@@ -230,7 +483,234 @@ impl TuiApp {
             sort_ascending: true,
             status_message: None,
             running: true,
+            rx_rates: VecDeque::with_capacity(64),
+            tx_rates: VecDeque::with_capacity(64),
+            current_rx_bps: 0,
+            current_tx_bps: 0,
+            prev_total_rx: None,
+            prev_total_tx: None,
+            last_sample_at: None,
+            log_buffer: None,
+            log_scroll: 0,
+            log_level_filter: None,
+            listeners: Vec::new(),
+            listener_scroll: 0,
+            config_snapshot: None,
+            config_path: None,
+            config_selected: 0,
+            config_editing: None,
+            probe_results: Vec::new(),
+            probe_scroll: 0,
         }
+    }
+
+    /// Attach an in-memory log buffer for the Live Logs tab.
+    pub fn with_log_buffer(mut self, buffer: TuiLogBuffer) -> Self {
+        self.log_buffer = Some(buffer);
+        self
+    }
+
+    /// Attach the path to `wpmulti.toml` so the Config tab can save changes back to disk.
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
+        self
+    }
+
+    /// Switch active tab and cancel any active inline edit/search mode.
+    pub fn set_tab(&mut self, tab: TuiTab) {
+        self.active_tab = tab;
+        self.is_searching = false;
+        self.config_editing = None;
+    }
+
+    /// Cycle to the next TUI tab.
+    pub fn next_tab(&mut self) {
+        self.set_tab(self.active_tab.next());
+    }
+
+    /// Cycle to the previous TUI tab.
+    pub fn prev_tab(&mut self) {
+        self.set_tab(self.active_tab.prev());
+    }
+
+    /// Cycle the log level filter (`None` -> `ERROR` -> `WARN` -> `INFO` -> `DEBUG`).
+    pub fn cycle_log_filter(&mut self) {
+        self.log_level_filter = match self.log_level_filter.as_deref() {
+            None => Some("ERROR".to_string()),
+            Some("ERROR") => Some("WARN".to_string()),
+            Some("WARN") => Some("INFO".to_string()),
+            Some("INFO") => Some("DEBUG".to_string()),
+            _ => None,
+        };
+        self.log_scroll = 0;
+    }
+
+    /// Return filtered log lines from `log_buffer` (oldest to newest).
+    pub fn filtered_logs(&self) -> Vec<String> {
+        let Some(buf) = &self.log_buffer else {
+            return Vec::new();
+        };
+        let all = buf.snapshot();
+        match &self.log_level_filter {
+            None => all,
+            Some(lvl) => all.into_iter().filter(|l| l.contains(lvl)).collect(),
+        }
+    }
+
+    /// Return `(label, current_value, is_cycle_toggle)` for a Config tab row.
+    pub fn config_row_display(cfg: &MainConfig, idx: usize) -> (&'static str, String, bool) {
+        match idx {
+            0 => ("global.log_level", format!("{:?}", cfg.global.log_level).to_lowercase(), true),
+            1 => ("global.ip_mode", format!("{:?}", cfg.global.ip_mode).to_lowercase(), true),
+            2 => ("global.dns_strategy", format!("{:?}", cfg.global.dns_strategy).to_lowercase(), true),
+            3 => ("global.max_active_tunnels", cfg.global.max_active_tunnels.to_string(), false),
+            4 => ("lifecycle.mode", format!("{:?}", cfg.lifecycle.mode).to_lowercase(), true),
+            5 => ("lifecycle.idle_timeout", format!("{}s", cfg.lifecycle.idle_timeout.as_secs()), false),
+            6 => ("lifecycle.handshake_timeout", format!("{}s", cfg.lifecycle.handshake_timeout.as_secs()), false),
+            _ => ("per_tunnel.enabled", cfg.per_tunnel.enabled.to_string(), true),
+        }
+    }
+
+    /// Either cycle a toggle/enum config field immediately or start inline text editing.
+    pub async fn activate_config_row(&mut self) -> Result<(), String> {
+        let Some(mut cfg) = self.config_snapshot.clone() else {
+            self.config_snapshot = self.data_source.fetch_config().await.ok();
+            return Ok(());
+        };
+        let idx = self.config_selected;
+        match idx {
+            0 => {
+                cfg.global.log_level = match cfg.global.log_level {
+                    LogLevel::Trace => LogLevel::Debug,
+                    LogLevel::Debug => LogLevel::Info,
+                    LogLevel::Info => LogLevel::Warn,
+                    LogLevel::Warn => LogLevel::Error,
+                    LogLevel::Error => LogLevel::Trace,
+                };
+            }
+            1 => {
+                cfg.global.ip_mode = match cfg.global.ip_mode {
+                    IpMode::DualStack => IpMode::Ipv4Only,
+                    IpMode::Ipv4Only => IpMode::Ipv6Only,
+                    IpMode::Ipv6Only => IpMode::DualStack,
+                };
+            }
+            2 => {
+                cfg.global.dns_strategy = match cfg.global.dns_strategy {
+                    DnsStrategy::TunnelOnly => DnsStrategy::TunnelFirst,
+                    DnsStrategy::TunnelFirst => DnsStrategy::Host,
+                    DnsStrategy::Host => DnsStrategy::TunnelOnly,
+                };
+            }
+            4 => {
+                cfg.lifecycle.mode = match cfg.lifecycle.mode {
+                    LifecycleMode::Lazy => LifecycleMode::Eager,
+                    LifecycleMode::Eager => LifecycleMode::Lazy,
+                };
+            }
+            7 => {
+                cfg.per_tunnel.enabled = !cfg.per_tunnel.enabled;
+            }
+            _ => {
+                let (_, val, _) = Self::config_row_display(&cfg, idx);
+                self.config_editing = Some(val);
+                return Ok(());
+            }
+        }
+        self.data_source.apply_config(&cfg).await?;
+        self.config_snapshot = Some(cfg);
+        self.set_status("Updated runtime configuration");
+        Ok(())
+    }
+
+    /// Commit inline edited text for the selected Config tab field.
+    pub async fn commit_config_edit(&mut self) -> Result<(), String> {
+        let Some(raw) = self.config_editing.take() else {
+            return Ok(());
+        };
+        let Some(mut cfg) = self.config_snapshot.clone() else {
+            return Err("Config snapshot not loaded".to_string());
+        };
+        let trimmed = raw.trim();
+        match self.config_selected {
+            3 => {
+                let n: usize = trimmed
+                    .parse()
+                    .map_err(|_| format!("Invalid integer '{}'", trimmed))?;
+                cfg.global.max_active_tunnels = n;
+            }
+            5 => {
+                let dur = parse_duration_str(trimmed).map_err(|e| e.to_string())?;
+                cfg.lifecycle.idle_timeout = dur;
+            }
+            6 => {
+                let dur = parse_duration_str(trimmed).map_err(|e| e.to_string())?;
+                cfg.lifecycle.handshake_timeout = dur;
+            }
+            _ => {}
+        }
+        self.data_source.apply_config(&cfg).await?;
+        self.config_snapshot = Some(cfg);
+        self.set_status("Applied runtime config change");
+        Ok(())
+    }
+
+    /// Persist `config_snapshot` to `config_path` (if set) and trigger `reload()`.
+    pub async fn save_config_and_reload(&mut self) -> Result<(), String> {
+        if let (Some(cfg), Some(path)) = (&self.config_snapshot, &self.config_path) {
+            let serialized = toml::to_string_pretty(cfg)
+                .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
+            std::fs::write(path, serialized)
+                .map_err(|e| format!("Failed to write '{}': {}", path.display(), e))?;
+        }
+        let rep = self.data_source.reload().await?;
+        self.set_status(format!(
+            "Saved & reloaded: +{} -{} ~{} ({} total)",
+            rep.added, rep.removed, rep.updated, rep.total
+        ));
+        Ok(())
+    }
+
+    /// Probe the currently selected tunnel (or first tunnel) and record the result.
+    pub async fn probe_selected_tunnel(&mut self) {
+        let target = self
+            .selected_tunnel()
+            .or_else(|| self.tunnels.first())
+            .map(|t| (t.id.clone(), t.endpoint.clone().unwrap_or_else(|| "-".into())));
+        let Some((id, endpoint)) = target else {
+            self.set_status("No tunnels available to probe");
+            return;
+        };
+        let res = self.data_source.probe_tunnel(&id, &endpoint).await;
+        self.set_status(format!("Probe {}: {}", res.id, res.message));
+        if let Some(pos) = self.probe_results.iter().position(|r| r.id == res.id) {
+            self.probe_results[pos] = res;
+        } else {
+            self.probe_results.push(res);
+        }
+    }
+
+    /// Probe up to 16 tunnels sequentially/concurrently and update `probe_results`.
+    pub async fn probe_all_tunnels(&mut self) {
+        let targets: Vec<(String, String)> = self
+            .tunnels
+            .iter()
+            .take(16)
+            .map(|t| (t.id.clone(), t.endpoint.clone().unwrap_or_else(|| "-".into())))
+            .collect();
+        if targets.is_empty() {
+            self.set_status("No tunnels available to probe");
+            return;
+        }
+        let mut results = Vec::with_capacity(targets.len());
+        for (id, endpoint) in targets {
+            results.push(self.data_source.probe_tunnel(&id, &endpoint).await);
+        }
+        let ok_count = results.iter().filter(|r| r.ok).count();
+        let total = results.len();
+        self.probe_results = results;
+        self.probe_scroll = 0;
+        self.set_status(format!("Probed {} tunnels: {} OK", total, ok_count));
     }
 
     /// Update tunnel dataset and refresh filtered/sorted view.
@@ -388,10 +868,45 @@ impl TuiApp {
             }
     }
 
-    /// Fetch latest tunnel states from data source.
+    /// Fetch latest tunnel states (and active tab data + bandwidth samples) from data source.
     pub async fn refresh(&mut self) -> Result<(), String> {
         let list = self.data_source.fetch_tunnels().await?;
+        let total_rx: u64 = list.iter().map(|t| t.rx_bytes).sum();
+        let total_tx: u64 = list.iter().map(|t| t.tx_bytes).sum();
+        let now = Instant::now();
+        if let (Some(prev_rx), Some(prev_tx), Some(prev_at)) =
+            (self.prev_total_rx, self.prev_total_tx, self.last_sample_at)
+        {
+            let elapsed = now.duration_since(prev_at).as_secs_f64().max(0.05);
+            let rx_bps = (total_rx.saturating_sub(prev_rx) as f64 / elapsed) as u64;
+            let tx_bps = (total_tx.saturating_sub(prev_tx) as f64 / elapsed) as u64;
+            self.current_rx_bps = rx_bps;
+            self.current_tx_bps = tx_bps;
+            if self.rx_rates.len() >= 40 {
+                self.rx_rates.pop_front();
+            }
+            if self.tx_rates.len() >= 40 {
+                self.tx_rates.pop_front();
+            }
+            self.rx_rates.push_back(rx_bps);
+            self.tx_rates.push_back(tx_bps);
+        }
+        self.prev_total_rx = Some(total_rx);
+        self.prev_total_tx = Some(total_tx);
+        self.last_sample_at = Some(now);
         self.set_tunnels(list);
+
+        if self.active_tab == TuiTab::Listeners
+            && let Ok(listeners) = self.data_source.fetch_listeners().await
+        {
+            self.listeners = listeners;
+        }
+        if self.active_tab == TuiTab::Config
+            && self.config_snapshot.is_none()
+            && let Ok(cfg) = self.data_source.fetch_config().await
+        {
+            self.config_snapshot = Some(cfg);
+        }
         Ok(())
     }
 

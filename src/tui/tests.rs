@@ -284,3 +284,71 @@ fn test_render_dashboard_small_terminal_auto_resize() {
     assert!(with_status.contains("Search: wgcf"));
     assert!(with_status.contains(">>> Reloaded"));
 }
+
+#[test]
+fn test_multi_tab_switching_logs_and_rendering() {
+    use crate::config::toml_config::MainConfig;
+    use crate::config::ListenerType;
+    use crate::core::listener::ActiveListenerInfo;
+    use crate::tui::logs::TuiLogBuffer;
+    use crate::tui::ui::{parse_key_sequence, render_dashboard, TuiKey};
+    use crate::tui::TuiTab;
+
+    assert_eq!(parse_key_sequence(b"\x1b[C"), Some(TuiKey::Right));
+    assert_eq!(parse_key_sequence(b"\x1b[D"), Some(TuiKey::Left));
+
+    let log_buf = TuiLogBuffer::new(3);
+    log_buf.push_line("2026-11-15T10:00:00Z INFO wpmulti::core: tunnel-1 active".to_string());
+    log_buf.push_line("2026-11-15T10:00:01Z WARN wpmulti::health: slow probe".to_string());
+    log_buf.push_line("2026-11-15T10:00:02Z ERROR wpmulti::net: timeout".to_string());
+    log_buf.push_line("2026-11-15T10:00:03Z DEBUG wpmulti::dns: resolved".to_string());
+    // Bounded ring buffer keeps only last 3 lines
+    assert_eq!(log_buf.snapshot().len(), 3);
+
+    let mut app = TuiApp::new(
+        TuiDataSource::Remote {
+            admin_url: "http://127.0.0.1:9090".to_string(),
+            auth_token: None,
+        },
+        TuiSortField::Id,
+    )
+    .with_log_buffer(log_buf);
+    app.listeners = vec![ActiveListenerInfo {
+        name: "shared-socks5".to_string(),
+        address: "127.0.0.1:1080".parse().unwrap(),
+        listener_type: ListenerType::Socks5,
+        is_shared: true,
+        tunnel_id: None,
+    }];
+    app.config_snapshot = Some(MainConfig::default());
+
+    assert_eq!(app.active_tab, TuiTab::Tunnels);
+    app.next_tab();
+    assert_eq!(app.active_tab, TuiTab::Logs);
+    let logs_out = render_dashboard(&mut app, 90, 24);
+    assert!(logs_out.contains("2:Logs"));
+    assert!(logs_out.contains("slow probe"));
+
+    app.cycle_log_filter(); // ALL -> ERROR
+    assert_eq!(app.filtered_logs().len(), 1);
+    app.cycle_log_filter(); // ERROR -> WARN
+    assert_eq!(app.filtered_logs().len(), 1);
+
+    app.next_tab();
+    assert_eq!(app.active_tab, TuiTab::Listeners);
+    let listeners_out = render_dashboard(&mut app, 90, 24);
+    assert!(listeners_out.contains("127.0.0.1:1080"));
+
+    app.next_tab();
+    assert_eq!(app.active_tab, TuiTab::Config);
+    let config_out = render_dashboard(&mut app, 90, 24);
+    assert!(config_out.contains("global.dns_strategy"));
+
+    app.next_tab();
+    assert_eq!(app.active_tab, TuiTab::Probe);
+    let probe_out = render_dashboard(&mut app, 90, 24);
+    assert!(probe_out.contains("Probe"));
+
+    app.prev_tab();
+    assert_eq!(app.active_tab, TuiTab::Config);
+}

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::config::TuiSortField;
 use crate::core::{HealthStatus, TunnelState};
-use crate::tui::app::TuiApp;
+use crate::tui::app::{TuiApp, TuiTab, CONFIG_ROW_COUNT};
 
 // ANSI escape sequences
 pub const ANSI_CLEAR: &str = "\x1b[2J\x1b[H";
@@ -56,6 +56,23 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
     let mut out: String = s.chars().take(max_chars - 1).collect();
     out.push('…');
+    out
+}
+
+/// Render an ASCII/Unicode sparkline (`▁▂▃▄▅▆▇█`) from recent rate samples.
+fn render_sparkline(samples: &std::collections::VecDeque<u64>, max_cols: usize) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if max_cols == 0 || samples.is_empty() {
+        return "▁".repeat(max_cols.min(16));
+    }
+    let slice_len = samples.len().min(max_cols);
+    let start = samples.len() - slice_len;
+    let peak = samples.iter().skip(start).copied().max().unwrap_or(0).max(1);
+    let mut out = String::with_capacity(slice_len);
+    for &val in samples.iter().skip(start) {
+        let idx = ((val.saturating_mul(7)) / peak).min(7) as usize;
+        out.push(BARS[idx]);
+    }
     out
 }
 
@@ -146,19 +163,50 @@ pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String
         5
     };
 
+    // 1.5 Tab Bar (nyx-style multi-tab navigation)
+    for tab in TuiTab::ALL {
+        let label = format!(" [{}] ", tab.label());
+        if tab == app.active_tab {
+            let _ = write!(buf, "{}{}{}{}", ANSI_REVERSE, ANSI_CYAN, label, ANSI_RESET);
+        } else {
+            let _ = write!(buf, "{}{}{}", ANSI_DIM, label, ANSI_RESET);
+        }
+    }
+    let _ = writeln!(buf);
+
     // 2. Navigation / Key Hints Bar
-    let sort_name = match app.sort_field {
-        TuiSortField::Id => "ID",
-        TuiSortField::Status => "Status",
-        TuiSortField::Conns => "Conns",
-        TuiSortField::Rx => "RX",
-        TuiSortField::Tx => "TX",
+    let hints = match app.active_tab {
+        TuiTab::Tunnels => {
+            let sort_name = match app.sort_field {
+                TuiSortField::Id => "ID",
+                TuiSortField::Status => "Status",
+                TuiSortField::Conns => "Conns",
+                TuiSortField::Rx => "RX",
+                TuiSortField::Tx => "TX",
+            };
+            let dir = if app.sort_ascending { "▲" } else { "▼" };
+            format!(
+                " [1-5/←→] Tabs  [q] Quit  [r] Reload  [a] Activate  [s] Suspend  [/] Search  [Tab] Sort:{}{}",
+                sort_name, dir
+            )
+        }
+        TuiTab::Logs => {
+            let flt = app.log_level_filter.as_deref().unwrap_or("ALL");
+            format!(
+                " [1-5/←→] Tabs  [q] Quit  [f] Filter:{}  [c] Clear  [↑↓/jk] Scroll  [g/G] Top/End",
+                flt
+            )
+        }
+        TuiTab::Listeners => {
+            " [1-5/←→] Tabs  [q] Quit  [r] Reload  [↑↓/jk] Scroll".to_string()
+        }
+        TuiTab::Config => {
+            " [1-5/←→] Tabs  [q] Quit  [Enter] Edit/Toggle  [w] Save & Reload  [↑↓/jk] Select".to_string()
+        }
+        TuiTab::Probe => {
+            " [1-5/←→] Tabs  [q] Quit  [p] Probe Selected  [P] Probe All (<=16)  [↑↓/jk] Scroll".to_string()
+        }
     };
-    let dir = if app.sort_ascending { "▲" } else { "▼" };
-    let hints = format!(
-        " [q] Quit  [r] Reload  [a] Activate  [s] Suspend  [/] Search  [Tab] Sort:{}{}  [↑↓/jk] Move",
-        sort_name, dir
-    );
     let _ = writeln!(
         buf,
         "{}{}{}",
@@ -167,163 +215,364 @@ pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String
         ANSI_RESET
     );
 
-    // 3. Search Bar
-    if app.is_searching || !app.search_query.is_empty() {
-        let cursor_ch = if app.is_searching { "█" } else { "" };
-        let search_line = format!("Search: {}{}", app.search_query, cursor_ch);
-        let _ = writeln!(
-            buf,
-            "{}{}{}{}",
-            ANSI_BOLD,
-            ANSI_YELLOW,
-            truncate_chars(&search_line, width),
-            ANSI_RESET
-        );
-    } else {
-        let _ = writeln!(buf);
-    }
+    let tab_bar_lines = 1usize;
 
-    // 4. Adaptive Table Columns based on terminal width
-    // Layout modes: Full (>= 96), Medium (68..96), Compact (< 68)
-    let (show_port, show_tx, show_endpoint, state_w, id_w, port_w, conns_w, bytes_w, endp_w) =
-        if width >= 96 {
-            let fixed = 10 + 22 + 7 + 6 + 11 + 11 + 6; // columns + spaces
-            let ep_w = width.saturating_sub(fixed).max(12);
-            (true, true, true, 10, 22, 7, 6, 11, ep_w)
-        } else if width >= 68 {
-            let fixed = 10 + 7 + 5 + 10 + 10 + 5;
-            let id_w = width.saturating_sub(fixed).max(12);
-            (true, true, false, 10, id_w, 7, 5, 10, 0)
-        } else {
-            let state_w = 7;
-            let conns_w = 4;
-            let bytes_w = 8;
-            let fixed = state_w + conns_w + bytes_w + 3;
-            let id_w = width.saturating_sub(fixed).max(4);
-            (false, false, false, state_w, id_w, 0, conns_w, bytes_w, 0)
-        };
-
-    // Table Header
-    let mut hdr = format!(
-        "{:<state_w$} {:<id_w$}",
-        truncate_chars("STATE", state_w),
-        truncate_chars("TUNNEL ID", id_w),
-    );
-    if show_port {
-        let _ = write!(hdr, " {:<port_w$}", truncate_chars("PORT", port_w));
-    }
-    let _ = write!(hdr, " {:<conns_w$} {:<bytes_w$}", "CONNS", "RX");
-    if show_tx {
-        let _ = write!(hdr, " {:<bytes_w$}", "TX");
-    }
-    if show_endpoint {
-        let _ = write!(hdr, " {:<endp_w$}", truncate_chars("ENDPOINT", endp_w));
-    }
-    let _ = writeln!(
-        buf,
-        "{}{}{}{}",
-        ANSI_BOLD,
-        ANSI_BG_BLUE,
-        truncate_chars(&hdr, width),
-        ANSI_RESET
-    );
-
-    // 5. Table Rows
-    // Reserved: header_lines + hint (1) + search (1) + table header (1) + footer (2)
-    let reserved_lines = header_lines + 5;
-    let table_height = height.saturating_sub(reserved_lines).max(1);
-
-    app.update_scroll(table_height);
-
-    let start = app.scroll_offset;
-    let end = (start + table_height).min(app.filtered_indices.len());
-
-    if app.filtered_indices.is_empty() {
-        let msg = if app.search_query.is_empty() {
-            "  (No tunnels registered)"
-        } else {
-            "  (No tunnels match search query)"
-        };
-        let _ = writeln!(
-            buf,
-            "{}{}{}",
-            ANSI_DIM,
-            truncate_chars(msg, width),
-            ANSI_RESET
-        );
-    } else {
-        for row_pos in start..end {
-            let tunnel_idx = app.filtered_indices[row_pos];
-            let t = &app.tunnels[tunnel_idx];
-            let is_selected = row_pos == app.selected_index;
-
-            let (state_color, state_str) = match (t.health, t.state) {
-                (HealthStatus::Unhealthy, _) => (ANSI_RED, "Unhealthy"),
-                (HealthStatus::HalfOpen, _) => (ANSI_YELLOW, "HalfOpen"),
-                (HealthStatus::Healthy, TunnelState::Active) => (ANSI_GREEN, "Active"),
-                (HealthStatus::Healthy, TunnelState::Activating) => (ANSI_CYAN, "Activating"),
-                (HealthStatus::Healthy, TunnelState::Suspended) => (ANSI_MAGENTA, "Suspended"),
-                (HealthStatus::Healthy, TunnelState::Dormant) => (ANSI_DIM, "Dormant"),
-            };
-
-            let port_str = t
-                .assigned_port
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let endpoint_str = if t.health == HealthStatus::Unhealthy {
-                format!(
-                    "{} (fails:{}, {}s)",
-                    t.endpoint.as_deref().unwrap_or("-"),
-                    t.consecutive_failures,
-                    t.cooldown_remaining_secs
-                )
-            } else if t.health == HealthStatus::HalfOpen {
-                format!("{} (probe)", t.endpoint.as_deref().unwrap_or("-"))
-            } else {
-                t.endpoint.clone().unwrap_or_else(|| "-".to_string())
-            };
-
-            if is_selected {
-                let _ = write!(buf, "{}{}", ANSI_REVERSE, ANSI_BOLD);
-            }
-
-            let state_cell = truncate_chars(state_str, state_w);
-            let id_cell = truncate_chars(&t.id, id_w);
-            let mut tail = format!("{:<id_w$}", id_cell);
-            if show_port {
-                let _ = write!(tail, " {:<port_w$}", truncate_chars(&port_str, port_w));
-            }
-            let _ = write!(
-                tail,
-                " {:<conns_w$} {:<bytes_w$}",
-                t.active_conns,
-                truncate_chars(&format_bytes(t.rx_bytes), bytes_w),
-            );
-            if show_tx {
-                let _ = write!(
-                    tail,
-                    " {:<bytes_w$}",
-                    truncate_chars(&format_bytes(t.tx_bytes), bytes_w),
+    match app.active_tab {
+        TuiTab::Tunnels => {
+            // Optional bandwidth sparkline on standard+ terminals
+            let spark_lines = if !compact_height && width >= 68 {
+                let rx_spark = render_sparkline(&app.rx_rates, 16);
+                let tx_spark = render_sparkline(&app.tx_rates, 16);
+                let bw_line = format!(
+                    " BW Rate: RX {}/s [{}]  |  TX {}/s [{}]",
+                    format_bytes(app.current_rx_bps),
+                    rx_spark,
+                    format_bytes(app.current_tx_bps),
+                    tx_spark
                 );
-            }
-            if show_endpoint {
-                let _ = write!(tail, " {:<endp_w$}", truncate_chars(&endpoint_str, endp_w));
-            }
+                let _ = writeln!(
+                    buf,
+                    "{}{}{}",
+                    ANSI_CYAN,
+                    truncate_chars(&bw_line, width),
+                    ANSI_RESET
+                );
+                1
+            } else {
+                0
+            };
 
-            let tail_max = width.saturating_sub(state_w + 1);
-            let _ = write!(
-                buf,
-                "{}{:<state_w$}{} {}",
-                state_color,
-                state_cell,
-                if is_selected { "" } else { ANSI_RESET },
-                truncate_chars(&tail, tail_max),
-            );
-
-            if is_selected {
-                let _ = writeln!(buf, "{}", ANSI_RESET);
+            // 3. Search Bar
+            if app.is_searching || !app.search_query.is_empty() {
+                let cursor_ch = if app.is_searching { "█" } else { "" };
+                let search_line = format!("Search: {}{}", app.search_query, cursor_ch);
+                let _ = writeln!(
+                    buf,
+                    "{}{}{}{}",
+                    ANSI_BOLD,
+                    ANSI_YELLOW,
+                    truncate_chars(&search_line, width),
+                    ANSI_RESET
+                );
             } else {
                 let _ = writeln!(buf);
+            }
+
+            // 4. Adaptive Table Columns based on terminal width
+            let (show_port, show_tx, show_endpoint, state_w, id_w, port_w, conns_w, bytes_w, endp_w) =
+                if width >= 96 {
+                    let fixed = 10 + 22 + 7 + 6 + 11 + 11 + 6;
+                    let ep_w = width.saturating_sub(fixed).max(12);
+                    (true, true, true, 10, 22, 7, 6, 11, ep_w)
+                } else if width >= 68 {
+                    let fixed = 10 + 7 + 5 + 10 + 10 + 5;
+                    let id_w = width.saturating_sub(fixed).max(12);
+                    (true, true, false, 10, id_w, 7, 5, 10, 0)
+                } else {
+                    let state_w = 7;
+                    let conns_w = 4;
+                    let bytes_w = 8;
+                    let fixed = state_w + conns_w + bytes_w + 3;
+                    let id_w = width.saturating_sub(fixed).max(4);
+                    (false, false, false, state_w, id_w, 0, conns_w, bytes_w, 0)
+                };
+
+            let mut hdr = format!(
+                "{:<state_w$} {:<id_w$}",
+                truncate_chars("STATE", state_w),
+                truncate_chars("TUNNEL ID", id_w),
+            );
+            if show_port {
+                let _ = write!(hdr, " {:<port_w$}", truncate_chars("PORT", port_w));
+            }
+            let _ = write!(hdr, " {:<conns_w$} {:<bytes_w$}", "CONNS", "RX");
+            if show_tx {
+                let _ = write!(hdr, " {:<bytes_w$}", "TX");
+            }
+            if show_endpoint {
+                let _ = write!(hdr, " {:<endp_w$}", truncate_chars("ENDPOINT", endp_w));
+            }
+            let _ = writeln!(
+                buf,
+                "{}{}{}{}",
+                ANSI_BOLD,
+                ANSI_BG_BLUE,
+                truncate_chars(&hdr, width),
+                ANSI_RESET
+            );
+
+            let reserved_lines = header_lines + tab_bar_lines + spark_lines + 5;
+            let table_height = height.saturating_sub(reserved_lines).max(1);
+            app.update_scroll(table_height);
+
+            let start = app.scroll_offset;
+            let end = (start + table_height).min(app.filtered_indices.len());
+
+            if app.filtered_indices.is_empty() {
+                let msg = if app.search_query.is_empty() {
+                    "  (No tunnels registered)"
+                } else {
+                    "  (No tunnels match search query)"
+                };
+                let _ = writeln!(buf, "{}{}{}", ANSI_DIM, truncate_chars(msg, width), ANSI_RESET);
+            } else {
+                for row_pos in start..end {
+                    let tunnel_idx = app.filtered_indices[row_pos];
+                    let t = &app.tunnels[tunnel_idx];
+                    let is_selected = row_pos == app.selected_index;
+
+                    let (state_color, state_str) = match (t.health, t.state) {
+                        (HealthStatus::Unhealthy, _) => (ANSI_RED, "Unhealthy"),
+                        (HealthStatus::HalfOpen, _) => (ANSI_YELLOW, "HalfOpen"),
+                        (HealthStatus::Healthy, TunnelState::Active) => (ANSI_GREEN, "Active"),
+                        (HealthStatus::Healthy, TunnelState::Activating) => (ANSI_CYAN, "Activating"),
+                        (HealthStatus::Healthy, TunnelState::Suspended) => (ANSI_MAGENTA, "Suspended"),
+                        (HealthStatus::Healthy, TunnelState::Dormant) => (ANSI_DIM, "Dormant"),
+                    };
+
+                    let port_str = t
+                        .assigned_port
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let endpoint_str = if t.health == HealthStatus::Unhealthy {
+                        format!(
+                            "{} (fails:{}, {}s)",
+                            t.endpoint.as_deref().unwrap_or("-"),
+                            t.consecutive_failures,
+                            t.cooldown_remaining_secs
+                        )
+                    } else if t.health == HealthStatus::HalfOpen {
+                        format!("{} (probe)", t.endpoint.as_deref().unwrap_or("-"))
+                    } else {
+                        t.endpoint.clone().unwrap_or_else(|| "-".to_string())
+                    };
+
+                    if is_selected {
+                        let _ = write!(buf, "{}{}", ANSI_REVERSE, ANSI_BOLD);
+                    }
+
+                    let state_cell = truncate_chars(state_str, state_w);
+                    let id_cell = truncate_chars(&t.id, id_w);
+                    let mut tail = format!("{:<id_w$}", id_cell);
+                    if show_port {
+                        let _ = write!(tail, " {:<port_w$}", truncate_chars(&port_str, port_w));
+                    }
+                    let _ = write!(
+                        tail,
+                        " {:<conns_w$} {:<bytes_w$}",
+                        t.active_conns,
+                        truncate_chars(&format_bytes(t.rx_bytes), bytes_w),
+                    );
+                    if show_tx {
+                        let _ = write!(
+                            tail,
+                            " {:<bytes_w$}",
+                            truncate_chars(&format_bytes(t.tx_bytes), bytes_w),
+                        );
+                    }
+                    if show_endpoint {
+                        let _ = write!(tail, " {:<endp_w$}", truncate_chars(&endpoint_str, endp_w));
+                    }
+
+                    let tail_max = width.saturating_sub(state_w + 1);
+                    let _ = write!(
+                        buf,
+                        "{}{:<state_w$}{} {}",
+                        state_color,
+                        state_cell,
+                        if is_selected { "" } else { ANSI_RESET },
+                        truncate_chars(&tail, tail_max),
+                    );
+
+                    if is_selected {
+                        let _ = writeln!(buf, "{}", ANSI_RESET);
+                    } else {
+                        let _ = writeln!(buf);
+                    }
+                }
+            }
+        }
+
+        TuiTab::Logs => {
+            let hdr = format!(
+                "{:<width$}",
+                truncate_chars("LIVE DAEMON LOGS", width)
+            );
+            let _ = writeln!(buf, "{}{}{}{}", ANSI_BOLD, ANSI_BG_BLUE, hdr, ANSI_RESET);
+            let body_h = height.saturating_sub(header_lines + tab_bar_lines + 4).max(1);
+            let logs = app.filtered_logs();
+            if logs.is_empty() {
+                let msg = if app.log_buffer.is_some() {
+                    "  (No log entries matching filter)"
+                } else {
+                    "  (Live logs only available in `wpmulti run --tui` mode)"
+                };
+                let _ = writeln!(buf, "{}{}{}", ANSI_DIM, truncate_chars(msg, width), ANSI_RESET);
+            } else {
+                let max_scroll = logs.len().saturating_sub(body_h);
+                app.log_scroll = app.log_scroll.min(max_scroll);
+                let end = logs.len().saturating_sub(app.log_scroll);
+                let start = end.saturating_sub(body_h);
+                for line in &logs[start..end] {
+                    let color = if line.contains("ERROR") {
+                        ANSI_RED
+                    } else if line.contains("WARN") {
+                        ANSI_YELLOW
+                    } else if line.contains("DEBUG") || line.contains("TRACE") {
+                        ANSI_CYAN
+                    } else {
+                        ANSI_WHITE
+                    };
+                    let _ = writeln!(
+                        buf,
+                        "{}{}{}",
+                        color,
+                        truncate_chars(line, width),
+                        ANSI_RESET
+                    );
+                }
+            }
+        }
+
+        TuiTab::Listeners => {
+            let hdr = format!(
+                "{:<24} {:<8} {:<10} {:<22} {}",
+                "NAME", "TYPE", "SCOPE", "BIND ADDRESS", "TUNNEL ID"
+            );
+            let _ = writeln!(
+                buf,
+                "{}{}{}{}",
+                ANSI_BOLD,
+                ANSI_BG_BLUE,
+                truncate_chars(&hdr, width),
+                ANSI_RESET
+            );
+            let body_h = height.saturating_sub(header_lines + tab_bar_lines + 4).max(1);
+            if app.listeners.is_empty() {
+                let _ = writeln!(
+                    buf,
+                    "{}  (No active listeners loaded yet){}",
+                    ANSI_DIM, ANSI_RESET
+                );
+            } else {
+                let max_scroll = app.listeners.len().saturating_sub(body_h);
+                app.listener_scroll = app.listener_scroll.min(max_scroll);
+                let end = (app.listener_scroll + body_h).min(app.listeners.len());
+                for l in &app.listeners[app.listener_scroll..end] {
+                    let scope = if l.is_shared { "Shared" } else { "Dedicated" };
+                    let row = format!(
+                        "{:<24} {:<8} {:<10} {:<22} {}",
+                        truncate_chars(&l.name, 24),
+                        format!("{:?}", l.listener_type),
+                        scope,
+                        l.address,
+                        l.tunnel_id.as_deref().unwrap_or("-")
+                    );
+                    let _ = writeln!(buf, "{}", truncate_chars(&row, width));
+                }
+            }
+        }
+
+        TuiTab::Config => {
+            let hdr = format!("{:<30} {:<24} {}", "SETTING", "VALUE", "ACTION");
+            let _ = writeln!(
+                buf,
+                "{}{}{}{}",
+                ANSI_BOLD,
+                ANSI_BG_BLUE,
+                truncate_chars(&hdr, width),
+                ANSI_RESET
+            );
+            if let Some(cfg) = &app.config_snapshot {
+                for idx in 0..CONFIG_ROW_COUNT {
+                    let (key, val, is_toggle) = TuiApp::config_row_display(cfg, idx);
+                    let is_sel = idx == app.config_selected;
+                    let display_val = if is_sel && let Some(editing) = &app.config_editing {
+                        format!("{}█", editing)
+                    } else {
+                        val
+                    };
+                    let action_hint = if is_toggle {
+                        "[Enter] cycle"
+                    } else {
+                        "[Enter] edit"
+                    };
+                    let row = format!("{:<30} {:<24} {}", key, display_val, action_hint);
+                    if is_sel {
+                        let _ = writeln!(
+                            buf,
+                            "{}{}{}{}",
+                            ANSI_REVERSE,
+                            ANSI_YELLOW,
+                            truncate_chars(&row, width),
+                            ANSI_RESET
+                        );
+                    } else {
+                        let _ = writeln!(buf, "{}", truncate_chars(&row, width));
+                    }
+                }
+                if let Some(path) = &app.config_path {
+                    let path_line = format!("  Config file: {}", path.display());
+                    let _ = writeln!(
+                        buf,
+                        "{}{}{}",
+                        ANSI_DIM,
+                        truncate_chars(&path_line, width),
+                        ANSI_RESET
+                    );
+                }
+            } else {
+                let _ = writeln!(
+                    buf,
+                    "{}  (Loading configuration...){}",
+                    ANSI_DIM, ANSI_RESET
+                );
+            }
+        }
+
+        TuiTab::Probe => {
+            let hdr = format!(
+                "{:<22} {:<8} {:<10} {:<22} {}",
+                "TUNNEL ID", "RESULT", "RTT", "ENDPOINT", "DETAIL"
+            );
+            let _ = writeln!(
+                buf,
+                "{}{}{}{}",
+                ANSI_BOLD,
+                ANSI_BG_BLUE,
+                truncate_chars(&hdr, width),
+                ANSI_RESET
+            );
+            let body_h = height.saturating_sub(header_lines + tab_bar_lines + 4).max(1);
+            if app.probe_results.is_empty() {
+                let _ = writeln!(
+                    buf,
+                    "{}  Press [p] to probe selected tunnel or [P] to probe all (<=16){}",
+                    ANSI_DIM, ANSI_RESET
+                );
+            } else {
+                let max_scroll = app.probe_results.len().saturating_sub(body_h);
+                app.probe_scroll = app.probe_scroll.min(max_scroll);
+                let end = (app.probe_scroll + body_h).min(app.probe_results.len());
+                for r in &app.probe_results[app.probe_scroll..end] {
+                    let status_str = if r.ok { "OK" } else { "FAIL" };
+                    let color = if r.ok { ANSI_GREEN } else { ANSI_RED };
+                    let rtt = r
+                        .rtt_ms
+                        .map(|ms| format!("{} ms", ms))
+                        .unwrap_or_else(|| "-".into());
+                    let row = format!(
+                        "{:<22} {}{:<8}{} {:<10} {:<22} {}",
+                        truncate_chars(&r.id, 22),
+                        color,
+                        status_str,
+                        ANSI_RESET,
+                        rtt,
+                        truncate_chars(&r.endpoint, 22),
+                        r.message
+                    );
+                    let _ = writeln!(buf, "{}", row);
+                }
             }
         }
     }
@@ -369,6 +618,8 @@ pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String
 pub enum TuiKey {
     Up,
     Down,
+    Left,
+    Right,
     PageUp,
     PageDown,
     Home,
@@ -394,6 +645,8 @@ pub fn parse_next_key(bytes: &[u8]) -> (Option<TuiKey>, usize) {
             match bytes[2] {
                 b'A' => return (Some(TuiKey::Up), 3),
                 b'B' => return (Some(TuiKey::Down), 3),
+                b'C' => return (Some(TuiKey::Right), 3),
+                b'D' => return (Some(TuiKey::Left), 3),
                 b'H' => return (Some(TuiKey::Home), 3),
                 b'F' => return (Some(TuiKey::End), 3),
                 b'1' | b'4' | b'5' | b'6' | b'7' | b'8' => {
@@ -654,79 +907,202 @@ pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> Result<(
                 let (w, h) = get_terminal_size();
                 let reserved = if h < 15 { 6 } else { 10 };
                 let page_size = h.saturating_sub(reserved).max(1);
+                let typing = app.is_searching || app.config_editing.is_some();
                 match key {
-                    TuiKey::Up => {
-                        app.select_prev();
+                    TuiKey::Left if !typing => {
+                        app.prev_tab();
+                        let _ = app.refresh().await;
                     }
-                    TuiKey::Down => {
-                        app.select_next();
+                    TuiKey::Right if !typing => {
+                        app.next_tab();
+                        let _ = app.refresh().await;
                     }
+                    TuiKey::Left | TuiKey::Right => {}
+                    TuiKey::Up => match app.active_tab {
+                        TuiTab::Tunnels => app.select_prev(),
+                        TuiTab::Logs => {
+                            app.log_scroll = app.log_scroll.saturating_add(1);
+                        }
+                        TuiTab::Listeners => {
+                            app.listener_scroll = app.listener_scroll.saturating_sub(1);
+                        }
+                        TuiTab::Config => {
+                            app.config_selected = app.config_selected.saturating_sub(1);
+                        }
+                        TuiTab::Probe => {
+                            app.probe_scroll = app.probe_scroll.saturating_sub(1);
+                        }
+                    },
+                    TuiKey::Down => match app.active_tab {
+                        TuiTab::Tunnels => app.select_next(),
+                        TuiTab::Logs => {
+                            app.log_scroll = app.log_scroll.saturating_sub(1);
+                        }
+                        TuiTab::Listeners => {
+                            if app.listener_scroll + 1 < app.listeners.len() {
+                                app.listener_scroll += 1;
+                            }
+                        }
+                        TuiTab::Config => {
+                            if app.config_selected + 1 < CONFIG_ROW_COUNT {
+                                app.config_selected += 1;
+                            }
+                        }
+                        TuiTab::Probe => {
+                            if app.probe_scroll + 1 < app.probe_results.len() {
+                                app.probe_scroll += 1;
+                            }
+                        }
+                    },
                     TuiKey::PageUp => {
-                        app.page_up(page_size);
+                        if app.active_tab == TuiTab::Tunnels {
+                            app.page_up(page_size);
+                        } else if app.active_tab == TuiTab::Logs {
+                            app.log_scroll = app.log_scroll.saturating_add(page_size);
+                        }
                     }
                     TuiKey::PageDown => {
-                        app.page_down(page_size);
+                        if app.active_tab == TuiTab::Tunnels {
+                            app.page_down(page_size);
+                        } else if app.active_tab == TuiTab::Logs {
+                            app.log_scroll = app.log_scroll.saturating_sub(page_size);
+                        }
                     }
                     TuiKey::Home => {
-                        app.scroll_to_top();
+                        if app.active_tab == TuiTab::Tunnels {
+                            app.scroll_to_top();
+                        } else if app.active_tab == TuiTab::Logs {
+                            app.log_scroll = usize::MAX;
+                        }
                     }
                     TuiKey::End => {
-                        app.scroll_to_bottom();
+                        if app.active_tab == TuiTab::Tunnels {
+                            app.scroll_to_bottom();
+                        } else if app.active_tab == TuiTab::Logs {
+                            app.log_scroll = 0;
+                        }
                     }
                     TuiKey::Esc => {
                         app.is_searching = false;
-                        app.search_query.clear();
-                        app.apply_filter_and_sort();
+                        app.config_editing = None;
+                        if app.active_tab == TuiTab::Tunnels {
+                            app.search_query.clear();
+                            app.apply_filter_and_sort();
+                        }
                     }
                     TuiKey::Char(ch) => match ch {
                         '\x03' => {
                             app.running = false;
                         }
-                        'q' | 'Q' if !app.is_searching => {
+                        'q' | 'Q' if !typing => {
                             app.running = false;
                         }
-                        '/' if !app.is_searching => {
+                        '1' if !typing => {
+                            app.set_tab(TuiTab::Tunnels);
+                            let _ = app.refresh().await;
+                        }
+                        '2' if !typing => {
+                            app.set_tab(TuiTab::Logs);
+                        }
+                        '3' if !typing => {
+                            app.set_tab(TuiTab::Listeners);
+                            let _ = app.refresh().await;
+                        }
+                        '4' if !typing => {
+                            app.set_tab(TuiTab::Config);
+                            let _ = app.refresh().await;
+                        }
+                        '5' if !typing => {
+                            app.set_tab(TuiTab::Probe);
+                        }
+                        '/' if !typing && app.active_tab == TuiTab::Tunnels => {
                             app.is_searching = true;
                             app.search_query.clear();
                             app.apply_filter_and_sort();
                         }
                         '\n' | '\r' => {
-                            app.is_searching = false;
+                            if app.is_searching {
+                                app.is_searching = false;
+                            } else if app.config_editing.is_some() {
+                                if let Err(e) = app.commit_config_edit().await {
+                                    app.set_status(format!("Config error: {}", e));
+                                }
+                            } else if app.active_tab == TuiTab::Config
+                                && let Err(e) = app.activate_config_row().await
+                            {
+                                app.set_status(format!("Config error: {}", e));
+                            }
                         }
                         '\x08' | '\x7f' => {
                             if app.is_searching {
                                 app.search_query.pop();
                                 app.apply_filter_and_sort();
+                            } else if let Some(ed) = &mut app.config_editing {
+                                ed.pop();
                             }
                         }
-                        'a' | 'A' if !app.is_searching => {
+                        'a' | 'A' if !typing && app.active_tab == TuiTab::Tunnels => {
                             let _ = app.activate_selected().await;
                         }
-                        's' | 'S' if !app.is_searching => {
+                        's' | 'S' if !typing && app.active_tab == TuiTab::Tunnels => {
                             let _ = app.suspend_selected().await;
                         }
-                        'r' | 'R' if !app.is_searching => {
+                        'r' | 'R' if !typing => {
                             let _ = app.trigger_reload().await;
                         }
-                        '\t' if !app.is_searching => {
+                        '\t' if !typing && app.active_tab == TuiTab::Tunnels => {
                             app.cycle_sort();
                         }
-                        'j' if !app.is_searching => {
-                            app.select_next();
+                        'f' | 'F' if !typing && app.active_tab == TuiTab::Logs => {
+                            app.cycle_log_filter();
                         }
-                        'k' if !app.is_searching => {
-                            app.select_prev();
+                        'c' | 'C' if !typing && app.active_tab == TuiTab::Logs => {
+                            if let Some(buf) = &app.log_buffer {
+                                buf.clear();
+                            }
+                            app.log_scroll = 0;
                         }
-                        'g' if !app.is_searching => {
+                        'w' | 'W' if !typing && app.active_tab == TuiTab::Config => {
+                            if let Err(e) = app.save_config_and_reload().await {
+                                app.set_status(format!("Save error: {}", e));
+                            }
+                        }
+                        'p' if !typing && app.active_tab == TuiTab::Probe => {
+                            app.probe_selected_tunnel().await;
+                        }
+                        'P' if !typing && app.active_tab == TuiTab::Probe => {
+                            app.probe_all_tunnels().await;
+                        }
+                        'j' if !typing => match app.active_tab {
+                            TuiTab::Tunnels => app.select_next(),
+                            TuiTab::Logs => app.log_scroll = app.log_scroll.saturating_sub(1),
+                            TuiTab::Config if app.config_selected + 1 < CONFIG_ROW_COUNT => {
+                                app.config_selected += 1;
+                            }
+                            _ => {}
+                        },
+                        'k' if !typing => match app.active_tab {
+                            TuiTab::Tunnels => app.select_prev(),
+                            TuiTab::Logs => app.log_scroll = app.log_scroll.saturating_add(1),
+                            TuiTab::Config => {
+                                app.config_selected = app.config_selected.saturating_sub(1);
+                            }
+                            _ => {}
+                        },
+                        'g' if !typing && app.active_tab == TuiTab::Tunnels => {
                             app.scroll_to_top();
                         }
-                        'G' if !app.is_searching => {
+                        'G' if !typing && app.active_tab == TuiTab::Tunnels => {
                             app.scroll_to_bottom();
                         }
                         other => {
                             if app.is_searching && !other.is_control() {
                                 app.search_query.push(other);
                                 app.apply_filter_and_sort();
+                            } else if let Some(ed) = &mut app.config_editing
+                                && !other.is_control()
+                            {
+                                ed.push(other);
                             }
                         }
                     },

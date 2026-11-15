@@ -296,6 +296,29 @@ pub async fn handle_admin_request(
             HttpResponse::ok_json(&tunnels)
         }
 
+        // GET /listeners
+        ("GET", "/listeners") => {
+            let listeners = manager.listeners().list_listeners();
+            HttpResponse::ok_json(&listeners)
+        }
+
+        // GET /config
+        ("GET", "/config") => {
+            let cfg = manager.config_snapshot();
+            HttpResponse::ok_json(&cfg)
+        }
+
+        // POST /config
+        ("POST", "/config") => {
+            match serde_json::from_slice::<crate::config::MainConfig>(&req.body) {
+                Ok(new_cfg) => match manager.update_runtime_config(new_cfg) {
+                    Ok(()) => HttpResponse::ok_json(&json!({ "status": "updated" })),
+                    Err(e) => HttpResponse::bad_request(&format!("Invalid config: {}", e)),
+                },
+                Err(e) => HttpResponse::bad_request(&format!("Invalid JSON config: {}", e)),
+            }
+        }
+
         // POST /reload
         ("POST", "/reload") => {
             match manager.reload().await {

@@ -138,6 +138,28 @@ impl TunnelManager {
         &self.prober
     }
 
+    /// Return a cloned snapshot of the current [`MainConfig`].
+    pub fn config_snapshot(&self) -> MainConfig {
+        self.config.read().clone()
+    }
+
+    /// Validate and apply updated runtime settings to the manager and lifecycle controller.
+    pub fn update_runtime_config(&self, new_cfg: MainConfig) -> Result<(), CoreError> {
+        new_cfg.validate()?;
+        self.lifecycle.set_prefer_ipv6(
+            new_cfg.global.dns_preference == crate::config::toml_config::DnsPreference::Ipv6First,
+        );
+        self.lifecycle.set_ip_mode(new_cfg.global.ip_mode);
+        self.lifecycle
+            .set_handshake_timeout(new_cfg.lifecycle.handshake_timeout);
+        self.lifecycle
+            .set_max_active_tunnels(new_cfg.global.max_active_tunnels);
+        self.lifecycle.set_dns_fallback(new_cfg.global.dns_fallback);
+        self.lifecycle.set_dns_strategy(new_cfg.global.dns_strategy);
+        *self.config.write() = new_cfg;
+        Ok(())
+    }
+
     /// Start the tunnel manager: launches lifecycle idle teardown, boots eager tunnels,
     /// starts active prober, and starts all configured listeners.
     pub async fn start(&self) -> Result<(), CoreError> {

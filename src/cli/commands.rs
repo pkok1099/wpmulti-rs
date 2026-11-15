@@ -23,6 +23,7 @@ pub async fn cmd_run(
     dir_path: Option<PathBuf>,
     tui_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let saved_config_path = config_path.clone();
     let mut config = if let Some(path) = config_path {
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
@@ -43,16 +44,20 @@ pub async fn cmd_run(
         crate::config::LogLevel::Warn => tracing::Level::WARN,
         crate::config::LogLevel::Error => tracing::Level::ERROR,
     };
-    if tui_mode {
+    let tui_log_buffer = if tui_mode {
+        let buf = crate::tui::TuiLogBuffer::new(500);
         let _ = tracing_subscriber::fmt()
             .with_max_level(max_level)
-            .with_writer(std::io::sink)
+            .with_ansi(false)
+            .with_writer(buf.clone())
             .try_init();
+        Some(buf)
     } else {
         let _ = tracing_subscriber::fmt()
             .with_max_level(max_level)
             .try_init();
-    }
+        None
+    };
 
     let tunnels = if config.global.config_dir.exists() {
         load_tunnel_configs_from_dir(&config.global.config_dir)
@@ -94,10 +99,16 @@ pub async fn cmd_run(
     );
 
     if tui_mode {
-        let app = TuiApp::new(
+        let mut app = TuiApp::new(
             TuiDataSource::InProcess(Arc::clone(&manager)),
             config.tui.default_sort,
         );
+        if let Some(buf) = tui_log_buffer {
+            app = app.with_log_buffer(buf);
+        }
+        if let Some(path) = saved_config_path {
+            app = app.with_config_path(path);
+        }
         let _ = run_terminal_tui(app, config.tui.refresh_rate_ms).await;
 
         tracing::info!("TUI exited. Stopping daemon...");

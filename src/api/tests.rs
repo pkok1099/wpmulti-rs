@@ -65,7 +65,7 @@ async fn test_health_endpoint() {
 
     let json_val: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
     assert_eq!(json_val["status"], "ok");
-    assert_eq!(json_val["version"], "0.1.0");
+    assert_eq!(json_val["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(json_val["uptime_secs"], 42);
 }
 
@@ -381,4 +381,45 @@ async fn test_admin_server_content_length_limit() {
     assert!(resp_str.starts_with("HTTP/1.1 413 Payload Too Large"));
 
     server.stop().await;
+}
+
+#[tokio::test]
+async fn test_listeners_and_config_endpoints() {
+    let manager = create_test_manager();
+
+    let req_listeners = HttpRequest {
+        method: "GET".to_string(),
+        path: "/listeners".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let resp_listeners = handle_admin_request(&req_listeners, &manager, None, 10).await;
+    assert_eq!(resp_listeners.status, 200);
+    let listeners_json: serde_json::Value = serde_json::from_slice(&resp_listeners.body).unwrap();
+    assert!(listeners_json.is_array());
+
+    let req_get_cfg = HttpRequest {
+        method: "GET".to_string(),
+        path: "/config".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let resp_get_cfg = handle_admin_request(&req_get_cfg, &manager, None, 10).await;
+    assert_eq!(resp_get_cfg.status, 200);
+    let mut cfg: crate::config::toml_config::MainConfig =
+        serde_json::from_slice(&resp_get_cfg.body).unwrap();
+    cfg.global.max_active_tunnels = 42;
+
+    let req_post_cfg = HttpRequest {
+        method: "POST".to_string(),
+        path: "/config".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: serde_json::to_vec(&cfg).unwrap(),
+    };
+    let resp_post_cfg = handle_admin_request(&req_post_cfg, &manager, None, 10).await;
+    assert_eq!(resp_post_cfg.status, 200);
+    assert_eq!(manager.config_snapshot().global.max_active_tunnels, 42);
 }

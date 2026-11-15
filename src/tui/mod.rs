@@ -3,9 +3,11 @@
 //! Provides color-coded real-time tunnel visualization, search, sort, and lifecycle controls.
 
 pub mod app;
+pub mod logs;
 pub mod ui;
 #[cfg(test)]
 pub mod tests;
 
-pub use app::{TuiApp, TuiDataSource};
+pub use app::{TuiApp, TuiDataSource, TuiProbeResult, TuiTab};
+pub use logs::TuiLogBuffer;
 pub use ui::{format_bytes, render_dashboard, run_terminal_tui};
