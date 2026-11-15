@@ -69,21 +69,30 @@ pub fn parse_duration_str(s: &str) -> Result<Duration, String> {
             .trim()
             .parse()
             .map_err(|e| format!("Invalid m duration: {e}"))?;
-        return Ok(Duration::from_secs(v * 60));
+        let secs = v
+            .checked_mul(60)
+            .ok_or_else(|| format!("Duration overflow: '{s}'"))?;
+        return Ok(Duration::from_secs(secs));
     }
     if let Some(rest) = s.strip_suffix('h') {
         let v: u64 = rest
             .trim()
             .parse()
             .map_err(|e| format!("Invalid h duration: {e}"))?;
-        return Ok(Duration::from_secs(v * 3600));
+        let secs = v
+            .checked_mul(3600)
+            .ok_or_else(|| format!("Duration overflow: '{s}'"))?;
+        return Ok(Duration::from_secs(secs));
     }
     if let Some(rest) = s.strip_suffix('d') {
         let v: u64 = rest
             .trim()
             .parse()
             .map_err(|e| format!("Invalid d duration: {e}"))?;
-        return Ok(Duration::from_secs(v * 86400));
+        let secs = v
+            .checked_mul(86400)
+            .ok_or_else(|| format!("Duration overflow: '{s}'"))?;
+        return Ok(Duration::from_secs(secs));
     }
 
     Err(format!(

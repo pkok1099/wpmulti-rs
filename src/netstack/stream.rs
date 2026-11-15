@@ -114,7 +114,7 @@ impl AsyncRead for VirtualTcpStream {
         let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
 
         match socket.state() {
-            State::Established | State::CloseWait => {
+            State::Established | State::CloseWait | State::FinWait1 | State::FinWait2 => {
                 if socket.can_recv() {
                     let unfilled = buf.initialize_unfilled();
                     match socket.recv_slice(unfilled) {
@@ -138,12 +138,7 @@ impl AsyncRead for VirtualTcpStream {
                     Poll::Pending
                 }
             }
-            State::FinWait1
-            | State::FinWait2
-            | State::Closing
-            | State::TimeWait
-            | State::LastAck
-            | State::Closed => {
+            State::Closing | State::TimeWait | State::LastAck | State::Closed => {
                 if socket.can_recv() {
                     let unfilled = buf.initialize_unfilled();
                     if let Ok(n) = socket.recv_slice(unfilled) {

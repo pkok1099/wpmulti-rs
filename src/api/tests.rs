@@ -490,3 +490,71 @@ async fn test_batch_and_single_tunnel_disable_enable() {
     assert!(!manager.registry().get("wgcf-002").unwrap().is_disabled());
     assert!(manager.config_snapshot().disabled_tunnels.is_empty());
 }
+
+#[tokio::test]
+async fn test_config_endpoint_redacts_and_preserves_secrets_and_auth_rejects_empty_token() {
+    let mut cfg = MainConfig::default();
+    cfg.per_tunnel.enabled = false;
+    cfg.admin.auth_token = Some("super-secret-token".to_string());
+    if let Some(l) = cfg.shared_listeners.first_mut() {
+        l.global_password = Some("proxy-pass".to_string());
+    }
+
+    let manager = Arc::new(TunnelManager::new(cfg, Vec::new()).unwrap());
+
+    // Empty expected token must fail closed.
+    let empty_auth_req = HttpRequest {
+        method: "GET".to_string(),
+        path: "/status".to_string(),
+        query: None,
+        headers: HashMap::from([("authorization".to_string(), "Bearer ".to_string())]),
+        body: Vec::new(),
+    };
+    let resp_empty = handle_admin_request(&empty_auth_req, &manager, Some(""), 10).await;
+    assert_eq!(resp_empty.status, 401);
+
+    // Case-insensitive bearer scheme must be accepted.
+    let lowercase_bearer_req = HttpRequest {
+        method: "GET".to_string(),
+        path: "/config".to_string(),
+        query: None,
+        headers: HashMap::from([(
+            "authorization".to_string(),
+            "bearer super-secret-token".to_string(),
+        )]),
+        body: Vec::new(),
+    };
+    let resp_get = handle_admin_request(
+        &lowercase_bearer_req,
+        &manager,
+        Some("super-secret-token"),
+        10,
+    )
+    .await;
+    assert_eq!(resp_get.status, 200);
+
+    let returned_cfg: MainConfig = serde_json::from_slice(&resp_get.body).unwrap();
+    assert!(returned_cfg.admin.auth_token.is_none());
+    if let Some(l) = returned_cfg.shared_listeners.first() {
+        assert!(l.global_password.is_none());
+    }
+
+    // Posting the redacted config back must preserve existing secrets.
+    let post_req = HttpRequest {
+        method: "POST".to_string(),
+        path: "/config".to_string(),
+        query: None,
+        headers: HashMap::from([(
+            "authorization".to_string(),
+            "Bearer super-secret-token".to_string(),
+        )]),
+        body: resp_get.body,
+    };
+    let resp_post =
+        handle_admin_request(&post_req, &manager, Some("super-secret-token"), 10).await;
+    assert_eq!(resp_post.status, 200);
+    assert_eq!(
+        manager.config_snapshot().admin.auth_token.as_deref(),
+        Some("super-secret-token")
+    );
+}

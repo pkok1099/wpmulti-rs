@@ -203,11 +203,17 @@ fn is_authorized(req: &HttpRequest, auth_token: Option<&str>) -> bool {
     let Some(expected_token) = auth_token else {
         return true;
     };
+    if expected_token.is_empty() {
+        return false;
+    }
     let Some(h) = req.headers.get("authorization") else {
         return false;
     };
-    h.strip_prefix("Bearer ")
-        .is_some_and(|token| constant_time_eq(token.trim().as_bytes(), expected_token.as_bytes()))
+    let Some((scheme, token)) = h.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer")
+        && constant_time_eq(token.trim().as_bytes(), expected_token.as_bytes())
 }
 
 fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> HttpResponse {
@@ -404,13 +410,16 @@ pub async fn handle_admin_request(
         ("GET", "/tunnels") => handle_list_tunnels_request(req, manager),
         ("GET", "/logs") => HttpResponse::ok_json(&manager.log_buffer().snapshot()),
         ("GET", "/listeners") => HttpResponse::ok_json(&manager.listeners().list_listeners()),
-        ("GET", "/config") => HttpResponse::ok_json(&manager.config_snapshot()),
+        ("GET", "/config") => HttpResponse::ok_json(&redact_config_secrets(manager.config_snapshot())),
         ("POST", "/config") => match serde_json::from_slice::<crate::config::MainConfig>(&req.body)
         {
-            Ok(new_cfg) => match manager.update_runtime_config(new_cfg) {
-                Ok(()) => HttpResponse::ok_json(&json!({ "status": "updated" })),
-                Err(e) => HttpResponse::bad_request(&format!("Invalid config: {e}")),
-            },
+            Ok(mut new_cfg) => {
+                preserve_config_secrets(&mut new_cfg, &manager.config_snapshot());
+                match manager.update_runtime_config(new_cfg) {
+                    Ok(()) => HttpResponse::ok_json(&json!({ "status": "updated" })),
+                    Err(e) => HttpResponse::bad_request(&format!("Invalid config: {e}")),
+                }
+            }
             Err(e) => HttpResponse::bad_request(&format!("Invalid JSON config: {e}")),
         },
         ("POST", "/reload") => match manager.reload().await {
@@ -433,9 +442,52 @@ pub async fn handle_admin_request(
         ("POST", "/tunnels/batch/disable" | "/tunnels/batch/enable") => {
             handle_batch_toggle(path, &req.body, manager).await
         }
-        _ if path.starts_with("/tunnels/") => {
-            handle_tunnel_subroute(method, &path["/tunnels/".len()..], manager).await
+        _ => {
+            if let Some(subpath) = path.strip_prefix("/tunnels/") {
+                handle_tunnel_subroute(method, subpath, manager).await
+            } else {
+                HttpResponse::not_found("Not found")
+            }
         }
-        _ => HttpResponse::not_found("Not found"),
+    }
+}
+
+fn redact_config_secrets(mut cfg: crate::config::MainConfig) -> crate::config::MainConfig {
+    cfg.admin.auth_token = None;
+    for l in &mut cfg.shared_listeners {
+        l.global_password = None;
+    }
+    for o in cfg.per_tunnel.overrides.values_mut() {
+        o.password = None;
+    }
+    cfg
+}
+
+fn preserve_config_secrets(
+    new_cfg: &mut crate::config::MainConfig,
+    existing: &crate::config::MainConfig,
+) {
+    if new_cfg.admin.auth_token.is_none() {
+        new_cfg
+            .admin
+            .auth_token
+            .clone_from(&existing.admin.auth_token);
+    }
+    for l in &mut new_cfg.shared_listeners {
+        if l.global_password.is_none()
+            && let Some(prev) = existing
+                .shared_listeners
+                .iter()
+                .find(|p| p.bind == l.bind && p.name == l.name)
+        {
+            l.global_password.clone_from(&prev.global_password);
+        }
+    }
+    for (k, o) in &mut new_cfg.per_tunnel.overrides {
+        if o.password.is_none()
+            && let Some(prev) = existing.per_tunnel.overrides.get(k)
+        {
+            o.password.clone_from(&prev.password);
+        }
     }
 }

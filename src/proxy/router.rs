@@ -354,12 +354,12 @@ impl SingleTunnelRouter {
 pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let max_len = a.len().max(b.len());
+    let mut diff = usize::from(a.len() != b.len());
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
     }
     diff == 0
 }

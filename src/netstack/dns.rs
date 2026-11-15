@@ -531,7 +531,16 @@ impl InTunnelDnsResolver {
             }
         }
 
+        let is_transport_err = matches!(
+            last_err.kind(),
+            io::ErrorKind::TimedOut
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::HostUnreachable
+        );
         if strategy == crate::config::toml_config::DnsStrategy::TunnelFirst
+            && is_transport_err
             && let Ok(ips) = self.resolve_via_host(trimmed, mode, prefer_v6).await
         {
             self.cache.insert(&cache_key, ips.clone(), 60);

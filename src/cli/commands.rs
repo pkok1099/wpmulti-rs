@@ -533,8 +533,9 @@ fn print_probe_table(results: &[ProbeResult]) {
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}…", &s[..max_len.saturating_sub(1)])
+    if s.chars().count() > max_len {
+        let prefix: String = s.chars().take(max_len.saturating_sub(1)).collect();
+        format!("{prefix}…")
     } else {
         s.to_string()
     }

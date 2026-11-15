@@ -315,6 +315,11 @@ impl VirtualNetworkStack {
                 .map_err(|e| io::Error::other(format!("tcp connect failed: {e:?}")))?;
             (inner.sockets.add(socket), port)
         };
+        let mut guard = ConnectSocketGuard {
+            inner: Arc::clone(&self.inner),
+            notify: Arc::clone(&self.notify),
+            handle: Some(handle),
+        };
         let local_addr = SocketAddr::new(local_ip, local_port);
 
         // Wake reactor to transmit SYN packet
@@ -352,40 +357,21 @@ impl VirtualNetworkStack {
         });
 
         match tokio::time::timeout(self.connect_timeout, connect_fut).await {
-            Ok(Ok(())) => Ok(VirtualTcpStream::new(
-                handle,
-                Arc::clone(&self.inner),
-                Arc::clone(&self.notify),
-                local_addr,
-                dst,
-            )),
-            Ok(Err(e)) => {
-                {
-                    let mut inner = self.inner.lock();
-                    let exists = inner.sockets.iter().any(|(h, _)| h == handle);
-                    if exists {
-                        inner.sockets.remove(handle);
-                    }
-                }
-                self.notify.notify_one();
-                Err(e)
-            }
-            Err(_) => {
-                {
-                    let mut inner = self.inner.lock();
-                    let exists = inner.sockets.iter().any(|(h, _)| h == handle);
-                    if exists {
-                        let sock = inner.sockets.get_mut::<TcpSocket<'_>>(handle);
-                        sock.abort();
-                        inner.sockets.remove(handle);
-                    }
-                }
-                self.notify.notify_one();
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "connection timed out",
+            Ok(Ok(())) => {
+                guard.handle = None;
+                Ok(VirtualTcpStream::new(
+                    handle,
+                    Arc::clone(&self.inner),
+                    Arc::clone(&self.notify),
+                    local_addr,
+                    dst,
                 ))
             }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection timed out",
+            )),
         }
     }
 
@@ -537,4 +523,27 @@ async fn run_reactor(
     }
 
     tracing::debug!("smoltcp reactor loop stopped");
+}
+
+struct ConnectSocketGuard {
+    inner: Arc<Mutex<StackInner>>,
+    notify: Arc<Notify>,
+    handle: Option<smoltcp::iface::SocketHandle>,
+}
+
+impl Drop for ConnectSocketGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            {
+                let mut inner = self.inner.lock();
+                let exists = inner.sockets.iter().any(|(existing, _)| existing == h);
+                if exists {
+                    let sock = inner.sockets.get_mut::<TcpSocket<'_>>(h);
+                    sock.abort();
+                    inner.sockets.remove(h);
+                }
+            }
+            self.notify.notify_one();
+        }
+    }
 }

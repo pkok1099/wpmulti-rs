@@ -39,16 +39,22 @@ impl std::fmt::Display for HealthStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HealthState {
+    status: HealthStatus,
+    cooldown_until: Option<Instant>,
+    trial_in_flight: bool,
+}
+
 /// Thread-safe tracker maintaining circuit breaker health status and failure counts.
 ///
 /// Designed to guarantee 0% idle CPU and 0 socket allocations for dormant lazy tunnels
 /// by evaluating cooldown expiration lazily upon query.
 #[derive(Debug)]
 pub struct TunnelHealthTracker {
-    status: RwLock<HealthStatus>,
+    state: RwLock<HealthState>,
     consecutive_failures: AtomicUsize,
     last_failure_at: AtomicU64,
-    cooldown_until: RwLock<Option<Instant>>,
 }
 
 impl Default for TunnelHealthTracker {
@@ -61,10 +67,13 @@ impl TunnelHealthTracker {
     /// Construct a new tracker initialized to Healthy.
     pub const fn new() -> Self {
         Self {
-            status: RwLock::new(HealthStatus::Healthy),
+            state: RwLock::new(HealthState {
+                status: HealthStatus::Healthy,
+                cooldown_until: None,
+                trial_in_flight: false,
+            }),
             consecutive_failures: AtomicUsize::new(0),
             last_failure_at: AtomicU64::new(0),
-            cooldown_until: RwLock::new(None),
         }
     }
 
@@ -73,21 +82,38 @@ impl TunnelHealthTracker {
     /// If in `Unhealthy` state and cooldown timer has elapsed, lazily transitions
     /// the state to `HalfOpen` and returns `true` (allowing 1 trial attempt).
     pub fn is_routable(&self) -> bool {
-        let mut status = self.status.write();
-        match *status {
-            HealthStatus::Healthy | HealthStatus::HalfOpen => true,
+        {
+            let state = self.state.read();
+            match state.status {
+                HealthStatus::Healthy => return true,
+                HealthStatus::HalfOpen if state.trial_in_flight => return false,
+                HealthStatus::HalfOpen | HealthStatus::Unhealthy => {}
+            }
+        }
+
+        let mut state = self.state.write();
+        match state.status {
+            HealthStatus::Healthy => true,
+            HealthStatus::HalfOpen => {
+                if state.trial_in_flight {
+                    false
+                } else {
+                    state.trial_in_flight = true;
+                    true
+                }
+            }
             HealthStatus::Unhealthy => {
-                let cooldown = self.cooldown_until.read();
-                if let Some(until) = *cooldown {
+                if let Some(until) = state.cooldown_until {
                     if Instant::now() >= until {
-                        drop(cooldown);
-                        *status = HealthStatus::HalfOpen;
+                        state.status = HealthStatus::HalfOpen;
+                        state.trial_in_flight = true;
                         true
                     } else {
                         false
                     }
                 } else {
-                    *status = HealthStatus::Healthy;
+                    state.status = HealthStatus::Healthy;
+                    state.trial_in_flight = false;
                     true
                 }
             }
@@ -96,22 +122,31 @@ impl TunnelHealthTracker {
 
     /// Query current health status, lazily advancing from Unhealthy to HalfOpen if cooldown elapsed.
     pub fn current_status(&self) -> HealthStatus {
-        let mut status = self.status.write();
-        if *status == HealthStatus::Unhealthy
-            && let Some(until) = *self.cooldown_until.read()
+        {
+            let state = self.state.read();
+            if state.status != HealthStatus::Unhealthy {
+                return state.status;
+            }
+        }
+        let mut state = self.state.write();
+        if state.status == HealthStatus::Unhealthy
+            && let Some(until) = state.cooldown_until
             && Instant::now() >= until
         {
-            *status = HealthStatus::HalfOpen;
+            state.status = HealthStatus::HalfOpen;
+            state.trial_in_flight = false;
         }
-        *status
+        state.status
     }
 
     /// Record a successful connection, handshake, or probe attempt.
     /// Resets consecutive failures to 0 and restores Healthy status.
     pub fn record_success(&self) {
+        let mut state = self.state.write();
         self.consecutive_failures.store(0, Ordering::Relaxed);
-        *self.cooldown_until.write() = None;
-        *self.status.write() = HealthStatus::Healthy;
+        state.cooldown_until = None;
+        state.status = HealthStatus::Healthy;
+        state.trial_in_flight = false;
     }
 
     /// Record a failed connection, handshake, or probe attempt.
@@ -126,16 +161,20 @@ impl TunnelHealthTracker {
             .as_secs();
         self.last_failure_at.store(now_secs, Ordering::Relaxed);
 
-        if failures >= threshold {
-            *self.cooldown_until.write() = Some(Instant::now() + cooldown);
-            *self.status.write() = HealthStatus::Unhealthy;
+        let mut state = self.state.write();
+        if state.status == HealthStatus::HalfOpen || failures >= threshold {
+            state.cooldown_until = Some(Instant::now() + cooldown);
+            state.status = HealthStatus::Unhealthy;
+            state.trial_in_flight = false;
         }
     }
 
     /// Directly mark the tunnel as Unhealthy with a given cooldown duration.
     pub fn mark_unhealthy(&self, cooldown: Duration) {
-        *self.cooldown_until.write() = Some(Instant::now() + cooldown);
-        *self.status.write() = HealthStatus::Unhealthy;
+        let mut state = self.state.write();
+        state.cooldown_until = Some(Instant::now() + cooldown);
+        state.status = HealthStatus::Unhealthy;
+        state.trial_in_flight = false;
     }
 
     /// Return the count of consecutive failures.
@@ -145,7 +184,7 @@ impl TunnelHealthTracker {
 
     /// Return the remaining cooldown in seconds, or 0 if not currently cooling down.
     pub fn cooldown_remaining_secs(&self) -> u64 {
-        let until = *self.cooldown_until.read();
+        let until = self.state.read().cooldown_until;
         until.map_or(0, |u| {
             let now = Instant::now();
             if u > now {
@@ -158,9 +197,11 @@ impl TunnelHealthTracker {
 
     /// Reset tracker back to initial Healthy state.
     pub fn reset(&self) {
+        let mut state = self.state.write();
         self.consecutive_failures.store(0, Ordering::Relaxed);
-        *self.cooldown_until.write() = None;
-        *self.status.write() = HealthStatus::Healthy;
+        state.cooldown_until = None;
+        state.status = HealthStatus::Healthy;
+        state.trial_in_flight = false;
     }
 }
 

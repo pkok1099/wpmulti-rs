@@ -59,5 +59,4 @@ bind = "127.0.0.1:9090"
 
 [tui]
 refresh_rate_ms = 1000
-sort_by = "id"
-sort_desc = false
+default_sort = "id"

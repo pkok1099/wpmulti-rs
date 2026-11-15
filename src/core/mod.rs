@@ -106,6 +106,7 @@ impl TunnelManager {
         lifecycle.set_max_active_tunnels(config.global.max_active_tunnels);
         lifecycle.set_dns_fallback(config.global.dns_fallback);
         lifecycle.set_dns_strategy(config.global.dns_strategy);
+        lifecycle.set_health_check(config.health_check.threshold, config.health_check.cooldown);
 
         let listeners = Arc::new(ListenerSupervisor::new());
         let prober = Arc::new(ActiveProber::new());
@@ -232,9 +233,13 @@ impl TunnelManager {
             if let Some(entry) = self.registry.get(id) {
                 entry.set_disabled(disabled);
                 if disabled {
-                    let _ = self.lifecycle.suspend_tunnel(id).await;
-                } else if entry.lifecycle_mode == LifecycleMode::Eager {
-                    let _ = self.lifecycle.activate_tunnel(id).await;
+                    if let Err(e) = self.lifecycle.suspend_tunnel(id).await {
+                        tracing::warn!("Failed to suspend disabled tunnel '{}': {}", id, e);
+                    }
+                } else if entry.lifecycle_mode == LifecycleMode::Eager
+                    && let Err(e) = self.lifecycle.activate_tunnel(id).await
+                {
+                    tracing::warn!("Failed to activate re-enabled tunnel '{}': {}", id, e);
                 }
             }
         }
@@ -254,10 +259,16 @@ impl TunnelManager {
             cfg.clone()
         };
 
-        if let Some(path) = self.config_path.read().clone()
+        let maybe_path = self.config_path.read().clone();
+        if let Some(path) = maybe_path
             && let Ok(toml_str) = toml::to_string_pretty(&cfg_snapshot)
+            && let Err(e) = tokio::fs::write(&path, toml_str).await
         {
-            let _ = std::fs::write(path, toml_str);
+            tracing::warn!(
+                "Failed to persist disabled_tunnels to '{}': {}",
+                path.display(),
+                e
+            );
         }
 
         Ok(targets)
@@ -276,7 +287,11 @@ impl TunnelManager {
         );
         self.lifecycle.set_ip_mode(new_cfg.global.ip_mode);
         self.lifecycle
+            .set_idle_timeout(new_cfg.lifecycle.idle_timeout);
+        self.lifecycle
             .set_handshake_timeout(new_cfg.lifecycle.handshake_timeout);
+        self.lifecycle
+            .set_health_check(new_cfg.health_check.threshold, new_cfg.health_check.cooldown);
         self.lifecycle
             .set_max_active_tunnels(new_cfg.global.max_active_tunnels);
         self.lifecycle.set_dns_fallback(new_cfg.global.dns_fallback);
@@ -296,7 +311,7 @@ impl TunnelManager {
             .registry
             .all_entries()
             .into_iter()
-            .filter(|e| e.lifecycle_mode == LifecycleMode::Eager)
+            .filter(|e| e.lifecycle_mode == LifecycleMode::Eager && !e.is_disabled())
             .map(|e| e.id.clone())
             .collect();
 
@@ -427,42 +442,25 @@ impl TunnelManager {
 
         for t_cfg in new_tunnels {
             if let Some(existing) = self.registry.get(&t_cfg.id) {
-                // If entire config (interface, addresses, keys, dns, peers, allowed_ips) changed, mark updated
-                let config_changed = {
-                    let cur = existing.config.read();
-                    *cur != t_cfg
-                };
-                if config_changed {
-                    if existing.stats.active_conns.load(Ordering::SeqCst) == 0 {
-                        // Cleanly close old device and reactor if running and no active connections
-                        let _ = self.lifecycle.close_tunnel(&t_cfg.id).await;
-
-                        let saved_port = *existing.assigned_port.read();
-                        *existing.config.write() = t_cfg.clone();
-
-                        let new_entry =
-                            TunnelEntry::new(t_cfg.id.clone(), t_cfg, existing.lifecycle_mode);
-                        if let Some(p) = saved_port {
-                            new_entry.set_assigned_port(p);
-                        }
-                        self.registry.replace(new_entry);
-                    } else {
-                        // Active connections exist: update config in-place without disrupting traffic
-                        *existing.config.write() = t_cfg;
-                    }
+                if self
+                    .reload_existing_tunnel(&existing, t_cfg, &cfg_snapshot)
+                    .await
+                {
                     report.updated += 1;
                 }
             } else {
-                // New tunnel added: respect eager_tunnels list
+                // New tunnel added: respect eager_tunnels and disabled_tunnels lists
                 let mode = if eager_tunnels.contains(&t_cfg.id) {
                     LifecycleMode::Eager
                 } else {
                     default_mode
                 };
                 let new_id = t_cfg.id.clone();
-                let entry =
-                    self.registry
-                        .register(TunnelEntry::new(new_id.clone(), t_cfg, mode))?;
+                let new_entry = TunnelEntry::new(new_id.clone(), t_cfg, mode);
+                if cfg_snapshot.disabled_tunnels.iter().any(|d| d == &new_id) {
+                    new_entry.set_disabled(true);
+                }
+                let entry = self.registry.register(new_entry)?;
 
                 if cfg_snapshot.per_tunnel.enabled
                     && self.listeners.is_started()
@@ -500,5 +498,47 @@ impl TunnelManager {
 
         report.total = self.tunnel_count();
         Ok(report)
+    }
+
+    async fn reload_existing_tunnel(
+        &self,
+        existing: &Arc<TunnelEntry>,
+        t_cfg: TunnelConfig,
+        cfg_snapshot: &MainConfig,
+    ) -> bool {
+        let config_changed = {
+            let cur = existing.config.read();
+            *cur != t_cfg
+        };
+        if !config_changed {
+            return false;
+        }
+
+        let _act_lock = existing.activation_lock.lock().await;
+        if existing.stats.active_conns.load(Ordering::SeqCst) == 0 {
+            let maybe_active = existing.active.write().take();
+            if let Some(active) = maybe_active {
+                active.device.suspend().await;
+                active.netstack.close().await;
+            }
+            *existing.state.write() = TunnelState::Dormant;
+
+            let saved_port = *existing.assigned_port.read();
+            let was_disabled = existing.is_disabled()
+                || cfg_snapshot.disabled_tunnels.iter().any(|d| d == &t_cfg.id);
+            *existing.config.write() = t_cfg.clone();
+
+            let new_entry = TunnelEntry::new(t_cfg.id.clone(), t_cfg, existing.lifecycle_mode);
+            if was_disabled {
+                new_entry.set_disabled(true);
+            }
+            if let Some(p) = saved_port {
+                new_entry.set_assigned_port(p);
+            }
+            self.registry.replace(new_entry);
+        } else {
+            *existing.config.write() = t_cfg;
+        }
+        true
     }
 }

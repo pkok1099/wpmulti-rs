@@ -1055,3 +1055,76 @@ fn test_per_tunnel_auth_override_and_global_fallback() {
             .is_err()
     );
 }
+
+#[test]
+fn test_health_tracker_half_open_single_trial_and_failure_rearms_cooldown() {
+    use crate::core::health::{HealthStatus, TunnelHealthTracker};
+    let tracker = TunnelHealthTracker::new();
+    tracker.record_failure(2, Duration::from_millis(20));
+    assert_eq!(tracker.current_status(), HealthStatus::Healthy);
+    assert!(tracker.is_routable());
+
+    tracker.record_failure(2, Duration::from_millis(20));
+    assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
+    assert!(!tracker.is_routable());
+
+    std::thread::sleep(Duration::from_millis(30));
+
+    // First caller gets the single HalfOpen trial slot; concurrent second caller is blocked.
+    assert!(tracker.is_routable());
+    assert!(!tracker.is_routable());
+    assert_eq!(tracker.current_status(), HealthStatus::HalfOpen);
+
+    // Failed trial immediately returns tracker to Unhealthy with a fresh cooldown.
+    tracker.record_failure(5, Duration::from_secs(30));
+    assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
+    assert!(!tracker.is_routable());
+
+    // Success restores Healthy.
+    tracker.record_success();
+    assert_eq!(tracker.current_status(), HealthStatus::Healthy);
+    assert!(tracker.is_routable());
+}
+
+#[tokio::test]
+async fn test_disabled_active_tunnel_is_suspended_and_eager_disabled_starts_cleanly() {
+    let mut config = MainConfig::default();
+    config.per_tunnel.enabled = false;
+    config.shared_listeners.clear();
+    config.lifecycle.mode = LifecycleMode::Eager;
+    config.disabled_tunnels = vec!["eager-disabled".to_string()];
+
+    let t1 = make_test_tunnel_config("eager-disabled");
+    let t2 = make_test_tunnel_config("lazy-active");
+    let manager = TunnelManager::new(config, vec![t1, t2]).unwrap();
+
+    // start() must skip disabled eager tunnels instead of failing.
+    manager.start().await.unwrap();
+    assert_eq!(
+        *manager
+            .registry()
+            .get("eager-disabled")
+            .unwrap()
+            .state
+            .read(),
+        TunnelState::Dormant
+    );
+
+    // Activate lazy-active, then disable it: it must transition to Suspended (not stay Active).
+    manager.activate_tunnel("lazy-active").await.unwrap();
+    assert_eq!(
+        *manager.registry().get("lazy-active").unwrap().state.read(),
+        TunnelState::Active
+    );
+    manager
+        .set_tunnels_disabled("lazy-active", true)
+        .await
+        .unwrap();
+    assert!(manager.registry().get("lazy-active").unwrap().is_disabled());
+    assert_eq!(
+        *manager.registry().get("lazy-active").unwrap().state.read(),
+        TunnelState::Suspended
+    );
+
+    manager.stop().await.unwrap();
+}

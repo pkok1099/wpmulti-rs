@@ -59,6 +59,8 @@ impl AdminServer {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         let task = tokio::spawn(async move {
+            const MAX_ADMIN_CONNS: usize = 64;
+            let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_ADMIN_CONNS));
             let mut client_tasks = tokio::task::JoinSet::new();
 
             loop {
@@ -76,9 +78,15 @@ impl AdminServer {
                     res = listener.accept() => {
                         match res {
                             Ok((stream, _peer_addr)) => {
+                                let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
+                                    tracing::warn!("Admin server connection limit ({}) reached; dropping connection", MAX_ADMIN_CONNS);
+                                    drop(stream);
+                                    continue;
+                                };
                                 let m = Arc::clone(&manager);
                                 let tok = auth_token.clone();
                                 client_tasks.spawn(async move {
+                                    let _permit = permit;
                                     handle_client_connection(stream, m, tok.as_deref(), start_time).await;
                                 });
                             }

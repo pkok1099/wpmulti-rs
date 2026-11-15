@@ -112,6 +112,36 @@ impl GuardedTunnelTarget {
     pub const fn tunnel(&self) -> &Arc<ActiveTunnel> {
         &self.tunnel
     }
+
+    /// Resolve a domain through the tunnel with an explicit [`IpMode`] while updating
+    /// handshake stats and circuit-breaker health.
+    pub fn resolve_in_tunnel_with_mode<'a>(
+        &'a self,
+        domain: &'a str,
+        ip_mode: crate::config::IpMode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<std::net::IpAddr>> + Send + 'a>> {
+        let tunnel = Arc::clone(&self.tunnel);
+        let health = self.health.clone();
+        let threshold = self.threshold;
+        let cooldown = self.cooldown;
+        Box::pin(async move {
+            match tunnel.resolve_in_tunnel_with_mode(domain, ip_mode).await {
+                Ok(ip) => {
+                    tunnel.stats.record_handshake(now_unix_secs());
+                    if let Some(h) = &health {
+                        h.record_success();
+                    }
+                    Ok(ip)
+                }
+                Err(e) => {
+                    if let Some(h) = &health {
+                        h.record_failure(threshold, cooldown);
+                    }
+                    Err(e)
+                }
+            }
+        })
+    }
 }
 
 fn now_unix_secs() -> u64 {
@@ -174,27 +204,7 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         &'a self,
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<std::net::IpAddr>> + Send + 'a>> {
-        let tunnel = Arc::clone(&self.tunnel);
-        let health = self.health.clone();
-        let threshold = self.threshold;
-        let cooldown = self.cooldown;
-        Box::pin(async move {
-            match tunnel.resolve_in_tunnel(domain).await {
-                Ok(ip) => {
-                    tunnel.stats.record_handshake(now_unix_secs());
-                    if let Some(h) = &health {
-                        h.record_success();
-                    }
-                    Ok(ip)
-                }
-                Err(e) => {
-                    if let Some(h) = &health {
-                        h.record_failure(threshold, cooldown);
-                    }
-                    Err(e)
-                }
-            }
-        })
+        self.resolve_in_tunnel_with_mode(domain, crate::config::IpMode::DualStack)
     }
 }
 
@@ -309,9 +319,11 @@ impl Drop for ActivatingGuard<'_> {
 #[derive(Debug)]
 pub struct LifecycleController {
     registry: Arc<TunnelRegistry>,
-    idle_timeout: Duration,
+    idle_timeout_ms: std::sync::atomic::AtomicU64,
     check_interval: Duration,
     handshake_timeout_ms: std::sync::atomic::AtomicU64,
+    health_threshold: std::sync::atomic::AtomicUsize,
+    health_cooldown_ms: std::sync::atomic::AtomicU64,
     max_active_tunnels: std::sync::atomic::AtomicUsize,
     dns_fallback: Mutex<SocketAddr>,
     dns_strategy: std::sync::atomic::AtomicU8,
@@ -330,11 +342,14 @@ impl LifecycleController {
         check_interval: Duration,
     ) -> Arc<Self> {
         let (shutdown_tx, _) = watch::channel(false);
+        let idle_ms = idle_timeout.as_millis().min(u128::from(u64::MAX)) as u64;
         Arc::new(Self {
             registry,
-            idle_timeout,
+            idle_timeout_ms: std::sync::atomic::AtomicU64::new(idle_ms),
             check_interval,
             handshake_timeout_ms: std::sync::atomic::AtomicU64::new(10_000),
+            health_threshold: std::sync::atomic::AtomicUsize::new(3),
+            health_cooldown_ms: std::sync::atomic::AtomicU64::new(30_000),
             max_active_tunnels: std::sync::atomic::AtomicUsize::new(usize::MAX),
             dns_fallback: Mutex::new(SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
@@ -347,6 +362,33 @@ impl LifecycleController {
             ip_mode: std::sync::atomic::AtomicU8::new(0),
             eviction_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Configure the idle timeout before inactive lazy tunnels are suspended.
+    pub fn set_idle_timeout(&self, timeout: Duration) {
+        let ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.idle_timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Return the configured idle timeout.
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.idle_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    /// Configure the circuit-breaker failure threshold and cooldown duration.
+    pub fn set_health_check(&self, threshold: usize, cooldown: Duration) {
+        self.health_threshold
+            .store(threshold.max(1), Ordering::Relaxed);
+        let ms = cooldown.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.health_cooldown_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Return the configured circuit-breaker `(threshold, cooldown)`.
+    pub fn health_check(&self) -> (usize, Duration) {
+        (
+            self.health_threshold.load(Ordering::Relaxed),
+            Duration::from_millis(self.health_cooldown_ms.load(Ordering::Relaxed)),
+        )
     }
 
     /// Configure the maximum number of concurrently active tunnels (`usize::MAX` = unlimited).
@@ -463,13 +505,6 @@ impl LifecycleController {
             .registry
             .get(id)
             .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
-
-        if entry.is_disabled() {
-            return Err(CoreError::ActivationFailed(
-                id.to_string(),
-                "tunnel is disabled".into(),
-            ));
-        }
 
         let _lock = entry.activation_lock.lock().await;
 
@@ -588,7 +623,8 @@ impl LifecycleController {
 
                 tracing::debug!("Resuming suspended tunnel '{}'", id);
                 if let Err(e) = active.device.resume().await {
-                    entry.health.record_failure(3, Duration::from_secs(30));
+                    let (threshold, cooldown) = self.health_check();
+                    entry.health.record_failure(threshold, cooldown);
                     return Err(CoreError::ActivationFailed(
                         id.to_string(),
                         format!("device resume error: {e:?}"),
@@ -622,7 +658,8 @@ impl LifecycleController {
                     }
                     Err(e) => {
                         drop(activating_guard);
-                        entry.health.record_failure(3, Duration::from_secs(30));
+                        let (threshold, cooldown) = self.health_check();
+                        entry.health.record_failure(threshold, cooldown);
                         Err(e)
                     }
                 }
@@ -669,6 +706,8 @@ impl LifecycleController {
 
                 tracing::debug!("Resuming suspended tunnel '{}'", id);
                 active.device.resume().await.map_err(|e| {
+                    let (threshold, cooldown) = self.health_check();
+                    entry.health.record_failure(threshold, cooldown);
                     CoreError::ActivationFailed(
                         id.to_string(),
                         format!("device resume error: {e:?}"),
@@ -705,6 +744,8 @@ impl LifecycleController {
                     }
                     Err(e) => {
                         drop(activating_guard);
+                        let (threshold, cooldown) = self.health_check();
+                        entry.health.record_failure(threshold, cooldown);
                         Err(e)
                     }
                 }
@@ -718,13 +759,6 @@ impl LifecycleController {
             .registry
             .get(id)
             .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
-
-        if entry.is_disabled() {
-            return Err(CoreError::ActivationFailed(
-                id.to_string(),
-                "tunnel is disabled".into(),
-            ));
-        }
 
         let _lock = entry.activation_lock.lock().await;
 
@@ -885,12 +919,13 @@ impl LifecycleController {
                     0
                 };
 
-                if idle_secs >= self.idle_timeout.as_secs() {
+                let idle_timeout_secs = self.idle_timeout().as_secs();
+                if idle_secs >= idle_timeout_secs {
                     tracing::info!(
                         "Tunnel '{}' idle for {}s (threshold: {}s); suspending to save resources",
                         entry.id,
                         idle_secs,
-                        self.idle_timeout.as_secs()
+                        idle_timeout_secs
                     );
                     let _ = self.suspend_tunnel(&entry.id).await;
                 }

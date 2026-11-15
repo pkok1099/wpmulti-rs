@@ -248,26 +248,24 @@ impl MultiTenantRouter {
                 })
             }
             PoolKeyword::Random | PoolKeyword::RoundRobin | PoolKeyword::Auto => {
-                let healthy_count = entries
+                let healthy: Vec<_> = entries
                     .iter()
                     .filter(|e| !e.is_disabled() && e.health.is_routable())
-                    .count();
-                if healthy_count == 0 {
+                    .collect();
+                if healthy.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "no healthy tunnels available in pool",
                     ));
                 }
                 let target_idx = match keyword {
-                    PoolKeyword::Random => (rand::random::<u32>() as usize) % healthy_count,
+                    PoolKeyword::Random => (rand::random::<u32>() as usize) % healthy.len(),
                     PoolKeyword::Auto | PoolKeyword::RoundRobin | PoolKeyword::LeastConn => {
-                        self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_count
+                        self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len()
                     }
                 };
-                entries
-                    .iter()
-                    .filter(|e| !e.is_disabled() && e.health.is_routable())
-                    .nth(target_idx)
+                healthy
+                    .get(target_idx)
                     .map(|e| e.id.clone())
                     .ok_or_else(|| {
                         io::Error::new(
@@ -411,16 +409,28 @@ fn resolve_selector(
                 || {
                     router
                         .registry
-                        .all_ids()
+                        .all_entries()
                         .into_iter()
-                        .find(|id| id.contains(tag))
+                        .find(|e| e.id.contains(tag) && !e.is_disabled() && e.health.is_routable())
+                        .map(|e| e.id.clone())
                 },
-                |allowed| allowed.iter().find(|id| id.contains(tag)).cloned(),
+                |allowed| {
+                    allowed
+                        .iter()
+                        .find(|id| {
+                            id.contains(tag)
+                                && router
+                                    .registry
+                                    .get(id)
+                                    .is_some_and(|e| !e.is_disabled() && e.health.is_routable())
+                        })
+                        .cloned()
+                },
             );
             matched.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("no tunnel found matching tag '{tag}'"),
+                    format!("no healthy tunnel found matching tag '{tag}'"),
                 )
             })
         }
@@ -509,9 +519,26 @@ impl TunnelRouter for MultiTenantRouter {
 
             let mut last_err = None;
             let mut chosen = None;
+            let mut failed_ids: Vec<String> = Vec::new();
 
             for attempt in 0..max_attempts {
-                let target_id = resolve_selector(self, selector, allowed_guard.as_deref())?;
+                let candidate_override: Option<Vec<String>> = if failed_ids.is_empty() {
+                    None
+                } else {
+                    let base: Vec<String> = allowed_guard
+                        .as_deref()
+                        .map_or_else(|| self.registry.all_ids(), ToOwned::to_owned);
+                    let remaining: Vec<String> = base
+                        .into_iter()
+                        .filter(|id| !failed_ids.contains(id))
+                        .collect();
+                    if remaining.is_empty() {
+                        break;
+                    }
+                    Some(remaining)
+                };
+                let effective_allowed = candidate_override.as_deref().or(allowed_guard.as_deref());
+                let target_id = resolve_selector(self, selector, effective_allowed)?;
 
                 match self.lifecycle.get_or_activate(&target_id).await {
                     Ok((active_tunnel, guard)) => {
@@ -526,6 +553,7 @@ impl TunnelRouter for MultiTenantRouter {
                             max_attempts,
                             e
                         );
+                        failed_ids.push(target_id);
                         last_err =
                             Some(io::Error::other(format!("tunnel activation failed: {e:?}")));
                         if attempt + 1 < max_attempts {
@@ -626,7 +654,8 @@ impl TunnelRouter for DedicatedTunnelRouter {
             let health = entry.as_ref().map(|e| Arc::clone(&e.health));
 
             let guarded = if let Some(h) = health {
-                GuardedTunnelTarget::new_with_health(active, guard, h, 3, Duration::from_secs(30))
+                let (threshold, cooldown) = self.lifecycle.health_check();
+                GuardedTunnelTarget::new_with_health(active, guard, h, threshold, cooldown)
             } else {
                 GuardedTunnelTarget::new(active, guard)
             };
@@ -688,7 +717,6 @@ impl ProxyTunnelTarget for IpFilteredTunnelTarget {
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
         self.inner
-            .tunnel()
             .resolve_in_tunnel_with_mode(domain, self.ip_mode)
     }
 }
