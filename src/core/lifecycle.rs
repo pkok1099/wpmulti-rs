@@ -113,6 +113,13 @@ impl GuardedTunnelTarget {
     }
 }
 
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl ProxyTunnelTarget for GuardedTunnelTarget {
     fn tcp_connect<'a>(
         &'a self,
@@ -126,6 +133,7 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         Box::pin(async move {
             match tunnel.tcp_connect(dst).await {
                 Ok(stream) => {
+                    tunnel.stats.record_handshake(now_unix_secs());
                     if let Some(h) = &health {
                         h.record_success();
                     }
@@ -172,6 +180,7 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         Box::pin(async move {
             match tunnel.resolve_in_tunnel(domain).await {
                 Ok(ip) => {
+                    tunnel.stats.record_handshake(now_unix_secs());
                     if let Some(h) = &health {
                         h.record_success();
                     }
@@ -296,6 +305,7 @@ pub struct LifecycleController {
     teardown_handle: Mutex<Option<JoinHandle<()>>>,
     prefer_ipv6: std::sync::atomic::AtomicBool,
     ip_mode: std::sync::atomic::AtomicU8,
+    eviction_lock: tokio::sync::Mutex<()>,
 }
 
 impl LifecycleController {
@@ -318,6 +328,7 @@ impl LifecycleController {
             teardown_handle: Mutex::new(None),
             prefer_ipv6: std::sync::atomic::AtomicBool::new(false),
             ip_mode: std::sync::atomic::AtomicU8::new(0),
+            eviction_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -449,6 +460,7 @@ impl LifecycleController {
 
     /// Ensure active tunnel count is below `max_active_tunnels`, evicting oldest idle lazy tunnels if needed.
     async fn enforce_max_active_tunnels(&self, target_id: &str) -> Result<(), CoreError> {
+        let _evict_guard = self.eviction_lock.lock().await;
         let max_active = self.max_active_tunnels.load(Ordering::Relaxed);
         if max_active == usize::MAX || self.registry.active_count() < max_active {
             return Ok(());
@@ -497,14 +509,14 @@ impl LifecycleController {
             .get(id)
             .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
 
-        if *entry.state.read() != TunnelState::Active {
-            self.enforce_max_active_tunnels(id).await?;
-        }
-
         let _lock = entry.activation_lock.lock().await;
 
         // Check if already active or suspended
         let current_state = *entry.state.read();
+        if current_state != TunnelState::Active {
+            self.enforce_max_active_tunnels(id).await?;
+        }
+
         match current_state {
             TunnelState::Active => {
                 let active = entry
@@ -571,13 +583,13 @@ impl LifecycleController {
             .get(id)
             .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
 
-        if *entry.state.read() != TunnelState::Active {
-            self.enforce_max_active_tunnels(id).await?;
-        }
-
         let _lock = entry.activation_lock.lock().await;
 
         let current_state = *entry.state.read();
+        if current_state != TunnelState::Active {
+            self.enforce_max_active_tunnels(id).await?;
+        }
+
         match current_state {
             TunnelState::Active => {
                 let now = std::time::SystemTime::now()
@@ -740,6 +752,7 @@ impl LifecycleController {
             prefer_ipv6,
             dns_fallback,
             dns_strategy,
+            handshake_timeout,
         )
         .await
         {

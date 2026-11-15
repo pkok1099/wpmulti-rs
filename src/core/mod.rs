@@ -261,9 +261,23 @@ impl TunnelManager {
         let default_mode = cfg_snapshot.lifecycle.mode;
         let eager_tunnels = &cfg_snapshot.lifecycle.eager_tunnels;
 
-        let mut incoming_ids = std::collections::HashSet::new();
+        let incoming_ids: std::collections::HashSet<String> =
+            new_tunnels.iter().map(|t| t.id.clone()).collect();
+
+        // Detect and remove deleted tunnels first so freed dedicated ports are available to additions
+        let existing_ids = self.registry.all_ids();
+        for id in existing_ids {
+            if !incoming_ids.contains(&id) {
+                if self.listeners.is_started() {
+                    self.listeners.stop_dedicated_for_tunnel(&id).await;
+                }
+                let _ = self.lifecycle.close_tunnel(&id).await;
+                self.registry.remove(&id);
+                report.removed += 1;
+            }
+        }
+
         for t_cfg in new_tunnels {
-            incoming_ids.insert(t_cfg.id.clone());
             if let Some(existing) = self.registry.get(&t_cfg.id) {
                 // If entire config (interface, addresses, keys, dns, peers, allowed_ips) changed, mark updated
                 let config_changed = {
@@ -318,19 +332,6 @@ impl TunnelManager {
                 }
 
                 report.added += 1;
-            }
-        }
-
-        // Detect removed tunnels
-        let existing_ids = self.registry.all_ids();
-        for id in existing_ids {
-            if !incoming_ids.contains(&id) {
-                if self.listeners.is_started() {
-                    self.listeners.stop_dedicated_for_tunnel(&id).await;
-                }
-                let _ = self.lifecycle.close_tunnel(&id).await;
-                self.registry.remove(&id);
-                report.removed += 1;
             }
         }
 

@@ -329,17 +329,34 @@ impl ListenerSupervisor {
         lifecycle: &Arc<LifecycleController>,
     ) -> Result<Vec<ActiveListenerInfo>, CoreError> {
         let mut started = Vec::new();
-        let next_port_offset = {
+        let mut used_ports: std::collections::HashSet<u16> = {
             let handles = self.handles.lock();
-            handles.iter().filter(|h| !h.info.is_shared).count() as u16
+            handles.iter().map(|h| h.info.address.port()).collect()
+        };
+
+        let pick_free_port = |base: u16, used: &mut std::collections::HashSet<u16>| -> u16 {
+            for offset in 0..=u16::MAX {
+                let candidate = base.wrapping_add(offset);
+                if !used.contains(&candidate) {
+                    used.insert(candidate);
+                    return candidate;
+                }
+            }
+            base
         };
 
         if let Some(base_socks5) = per_tunnel.base_socks5_port {
-            let port = per_tunnel
+            let port = match per_tunnel
                 .overrides
                 .get(&entry.id)
                 .and_then(|o| o.socks5_port)
-                .unwrap_or_else(|| base_socks5.wrapping_add(next_port_offset));
+            {
+                Some(p) => {
+                    used_ports.insert(p);
+                    p
+                }
+                None => pick_free_port(base_socks5, &mut used_ports),
+            };
 
             let bind_addr = SocketAddr::new(bind_address, port);
             let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
@@ -376,11 +393,17 @@ impl ListenerSupervisor {
         }
 
         if let Some(base_http) = per_tunnel.base_http_port {
-            let port = per_tunnel
+            let port = match per_tunnel
                 .overrides
                 .get(&entry.id)
                 .and_then(|o| o.http_port)
-                .unwrap_or_else(|| base_http.wrapping_add(next_port_offset));
+            {
+                Some(p) => {
+                    used_ports.insert(p);
+                    p
+                }
+                None => pick_free_port(base_http, &mut used_ports),
+            };
 
             let bind_addr = SocketAddr::new(bind_address, port);
             let listener = TcpListener::bind(bind_addr).await.map_err(|e| {

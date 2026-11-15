@@ -50,6 +50,7 @@ pub struct VirtualNetworkStack {
     local_v6: Option<Ipv6Addr>,
     next_ephemeral_port: AtomicU16,
     dns_resolver: InTunnelDnsResolver,
+    connect_timeout: StdDuration,
 }
 
 impl VirtualNetworkStack {
@@ -62,9 +63,32 @@ impl VirtualNetworkStack {
     /// Construct a new virtual network stack with an explicit [`IpMode`] and IPv6 DNS preference.
     pub async fn new_with_mode(
         config: &WgInterfaceConfig,
+        bridge: VirtualTunBridge,
+        ip_mode: crate::config::IpMode,
+        prefer_ipv6: bool,
+    ) -> Result<Self, io::Error> {
+        Self::new_with_options(
+            config,
+            bridge,
+            ip_mode,
+            prefer_ipv6,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+            crate::config::toml_config::DnsStrategy::TunnelOnly,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Construct a new [`VirtualNetworkStack`] with explicit IP mode, DNS fallback, DNS strategy,
+    /// and connection timeout.
+    pub async fn new_with_options(
+        config: &WgInterfaceConfig,
         mut bridge: VirtualTunBridge,
         ip_mode: crate::config::IpMode,
         prefer_ipv6: bool,
+        dns_fallback: SocketAddr,
+        dns_strategy: crate::config::toml_config::DnsStrategy,
+        connect_timeout: StdDuration,
     ) -> Result<Self, io::Error> {
         let notify = bridge.notify_handle();
 
@@ -157,9 +181,10 @@ impl VirtualNetworkStack {
         });
 
         let initial_port = 49152 + (rand::random::<u16>() % 1000);
-        let resolver = InTunnelDnsResolver::new(&config.dns);
+        let resolver = InTunnelDnsResolver::with_fallback(&config.dns, dns_fallback);
         resolver.set_ip_mode(ip_mode);
         resolver.set_prefer_ipv6(prefer_ipv6);
+        resolver.set_dns_strategy(dns_strategy);
 
         Ok(Self {
             inner,
@@ -170,6 +195,7 @@ impl VirtualNetworkStack {
             local_v6,
             next_ephemeral_port: AtomicU16::new(initial_port),
             dns_resolver: resolver,
+            connect_timeout,
         })
     }
 
@@ -186,24 +212,6 @@ impl VirtualNetworkStack {
     /// Configure the DNS resolution strategy (`TunnelOnly`, `TunnelFirst`, `Host`).
     pub fn set_dns_strategy(&self, strategy: crate::config::toml_config::DnsStrategy) {
         self.dns_resolver.set_dns_strategy(strategy);
-    }
-
-    /// Construct a new [`VirtualNetworkStack`] with explicit IP mode, DNS fallback, and DNS strategy.
-    pub async fn new_with_options(
-        config: &WgInterfaceConfig,
-        bridge: VirtualTunBridge,
-        ip_mode: crate::config::IpMode,
-        prefer_ipv6: bool,
-        dns_fallback: SocketAddr,
-        dns_strategy: crate::config::toml_config::DnsStrategy,
-    ) -> Result<Self, io::Error> {
-        let mut stack = Self::new_with_mode(config, bridge, ip_mode, prefer_ipv6).await?;
-        let resolver = InTunnelDnsResolver::with_fallback(&config.dns, dns_fallback);
-        resolver.set_ip_mode(ip_mode);
-        resolver.set_prefer_ipv6(prefer_ipv6);
-        resolver.set_dns_strategy(dns_strategy);
-        stack.dns_resolver = resolver;
-        Ok(stack)
     }
 
     /// Access the wakeup notification handle.
@@ -319,7 +327,7 @@ impl VirtualNetworkStack {
             }
         });
 
-        match tokio::time::timeout(DEFAULT_CONNECT_TIMEOUT, connect_fut).await {
+        match tokio::time::timeout(self.connect_timeout, connect_fut).await {
             Ok(Ok(())) => Ok(VirtualTcpStream::new(handle, Arc::clone(&self.inner), Arc::clone(&self.notify), local_addr, dst)),
             Ok(Err(e)) => {
                 let mut inner = self.inner.lock();
