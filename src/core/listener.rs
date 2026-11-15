@@ -140,8 +140,21 @@ impl ListenerSupervisor {
             ListenerType::Http => "http",
         };
         let mut started = Vec::with_capacity(entries.len());
+        let mut used_ports: std::collections::HashSet<u16> = entries
+            .iter()
+            .filter_map(|e| {
+                per_tunnel
+                    .overrides
+                    .get(&e.id)
+                    .and_then(|o| match listener_type {
+                        ListenerType::Socks5 => o.socks5_port,
+                        ListenerType::Http => o.http_port,
+                    })
+            })
+            .collect();
+        let mut next_port = base_port;
 
-        for (idx, entry) in entries.iter().enumerate() {
+        for entry in entries {
             let override_port =
                 per_tunnel
                     .overrides
@@ -150,15 +163,27 @@ impl ListenerSupervisor {
                         ListenerType::Socks5 => o.socks5_port,
                         ListenerType::Http => o.http_port,
                     });
-            let port = override_port.unwrap_or_else(|| base_port.wrapping_add(idx as u16));
+            let port = override_port.unwrap_or_else(|| {
+                while used_ports.contains(&next_port) {
+                    next_port = next_port.wrapping_add(1);
+                }
+                let p = next_port;
+                used_ports.insert(p);
+                next_port = next_port.wrapping_add(1);
+                p
+            });
 
             let bind_addr = SocketAddr::new(bind_address, port);
-            let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
-                CoreError::ListenerError(format!(
-                    "failed to bind dedicated {proto_label} listener for tunnel '{}' on {bind_addr}: {e:?}",
-                    entry.id
-                ))
-            })?;
+            let listener = match TcpListener::bind(bind_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    self.rollback_started_listeners(&started);
+                    return Err(CoreError::ListenerError(format!(
+                        "failed to bind dedicated {proto_label} listener for tunnel '{}' on {bind_addr}: {e:?}",
+                        entry.id
+                    )));
+                }
+            };
 
             if listener_type == ListenerType::Socks5 || entry.assigned_port.read().is_none() {
                 entry.set_assigned_port(port);
@@ -200,6 +225,30 @@ impl ListenerSupervisor {
         }
 
         Ok(started)
+    }
+
+    fn rollback_started_listeners(&self, started: &[ActiveListenerInfo]) {
+        let rollback_names: std::collections::HashSet<&str> =
+            started.iter().map(|i| i.name.as_str()).collect();
+        let mut removed = Vec::new();
+        {
+            let mut handles = self.handles.lock();
+            let mut idx = 0;
+            while idx < handles.len() {
+                if handles
+                    .get(idx)
+                    .is_some_and(|h| rollback_names.contains(h.info.name.as_str()))
+                {
+                    removed.push(handles.swap_remove(idx));
+                } else {
+                    idx += 1;
+                }
+            }
+            drop(handles);
+        }
+        for h in removed {
+            h.task.abort();
+        }
     }
 
     /// Start dedicated per-tunnel listeners for all registered tunnels.

@@ -1065,6 +1065,8 @@ fn handle_logs_tab_key(app: &mut TuiApp, key: TuiKey) {
         TuiKey::Char('c') => {
             if let Some(buf) = &app.log_buffer {
                 buf.clear();
+            } else {
+                app.remote_logs.clear();
             }
             app.log_scroll = 0;
             app.set_status("Logs cleared");

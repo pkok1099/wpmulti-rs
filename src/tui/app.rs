@@ -829,15 +829,23 @@ impl TuiApp {
 
     /// Persist `config_snapshot` to `config_path` (if set) and trigger `reload()`.
     pub async fn save_config_and_reload(&mut self) -> Result<(), String> {
-        if let (Some(cfg), Some(path)) = (&self.config_snapshot, &self.config_path) {
+        let saved_to_disk = if let (Some(cfg), Some(path)) = (&self.config_snapshot, &self.config_path) {
             let serialized = toml::to_string_pretty(cfg)
                 .map_err(|e| format!("Failed to serialize TOML: {e}"))?;
             std::fs::write(path, serialized)
                 .map_err(|e| format!("Failed to write '{}': {}", path.display(), e))?;
-        }
+            true
+        } else {
+            false
+        };
         let rep = self.data_source.reload().await?;
+        let prefix = if saved_to_disk {
+            "Saved & reloaded"
+        } else {
+            "Reloaded (disk save only in local --tui mode)"
+        };
         self.set_status(format!(
-            "Saved & reloaded: +{} -{} ~{} ({} total)",
+            "{prefix}: +{} -{} ~{} ({} total)",
             rep.added, rep.removed, rep.updated, rep.total
         ));
         Ok(())

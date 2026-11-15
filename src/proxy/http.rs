@@ -18,15 +18,25 @@ const MAX_HEADER_SIZE: usize = 16384;
 /// Parses authority-form string `host:port` or `[ipv6]:port`.
 pub fn parse_authority(authority: &str) -> Option<(String, u16)> {
     let auth = authority.trim();
-    if auth.starts_with('[') {
-        let close = auth.find(']')?;
-        let host = auth[1..close].to_string();
-        let colon = auth[close..].find(':')? + close;
-        let port: u16 = auth[colon + 1..].parse().ok()?;
-        Some((host, port))
+    if let Some(rest) = auth.strip_prefix('[') {
+        let (host, port_str) = rest.split_once("]:")?;
+        if host.is_empty() || host.parse::<std::net::Ipv6Addr>().is_err() {
+            return None;
+        }
+        let port: u16 = port_str.parse().ok()?;
+        if port == 0 {
+            return None;
+        }
+        Some((host.to_string(), port))
     } else {
         let (host, port_str) = auth.split_once(':')?;
+        if host.is_empty() || host.contains('[') || host.contains(']') {
+            return None;
+        }
         let port: u16 = port_str.parse().ok()?;
+        if port == 0 {
+            return None;
+        }
         Some((host.to_string(), port))
     }
 }
@@ -113,8 +123,22 @@ fn parse_header_bytes(header_bytes: &[u8]) -> io::Result<ParsedHttpHeaders> {
         if line.is_empty() {
             break;
         }
+        if line.contains('\r') || line.contains('\n') || line.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid control character in header",
+            ));
+        }
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let name = k.trim().to_ascii_lowercase();
+            let val = v.trim().to_string();
+            if name.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "empty header name",
+                ));
+            }
+            headers.insert(name, val);
         }
     }
 
@@ -286,30 +310,57 @@ struct ForwardRequest {
 }
 
 fn parse_forward_uri(uri: &str) -> io::Result<(String, u16, String)> {
-    let rest = uri
+    let (default_port, rest) = uri
         .strip_prefix("http://")
-        .or_else(|| uri.strip_prefix("https://"))
+        .map(|r| (80u16, r))
+        .or_else(|| uri.strip_prefix("https://").map(|r| (443u16, r)))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid absolute URI"))?;
 
-    let (authority, path) = match rest.split_once('/') {
-        Some((auth, p)) => (auth, format!("/{p}")),
-        None => (rest, "/".to_string()),
-    };
+    let (authority, path) = rest
+        .find(['/', '?', '#'])
+        .map_or_else(|| (rest, "/".to_string()), |idx| {
+            let auth = rest.get(..idx).unwrap_or(rest);
+            let suffix = rest.get(idx..).unwrap_or("");
+            let path = if suffix.starts_with('/') {
+                suffix.to_string()
+            } else if suffix.starts_with('?') {
+                format!("/{suffix}")
+            } else {
+                "/".to_string()
+            };
+            (auth, path)
+        });
 
-    let (host, port) = if authority.starts_with('[') {
-        if authority.ends_with(']') {
-            (authority[1..authority.len() - 1].to_string(), 80)
-        } else {
-            parse_authority(authority)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid authority"))?
+    let (host, port) = if let Some(inner) = authority
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        if inner.is_empty() || inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid IPv6 host",
+            ));
         }
+        (inner.to_string(), default_port)
+    } else if authority.starts_with('[') {
+        parse_authority(authority)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid authority"))?
     } else if let Some((h, p_str)) = authority.split_once(':') {
         let p = p_str.parse::<u16>().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid port in authority")
         })?;
+        if h.is_empty() || p == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid host or port in authority",
+            ));
+        }
         (h.to_string(), p)
     } else {
-        (authority.to_string(), 80)
+        if authority.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty host"));
+        }
+        (authority.to_string(), default_port)
     };
 
     Ok((host, port, path))
@@ -381,12 +432,30 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     // Rewrite request line with relative path, filter hop-by-hop headers, and inject Connection: close
+    let conn_tokens: Vec<String> = req
+        .headers
+        .get("connection")
+        .map(|v| {
+            v.split(',')
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut req_buf = format!("{} {} {}\r\n", req.method, path, req.version);
     for (k, v) in &req.headers {
-        if k == "proxy-authorization"
-            || k == "proxy-connection"
-            || k == "proxy-authenticate"
-            || k == "connection"
+        if matches!(
+            k.as_str(),
+            "proxy-authorization"
+                | "proxy-connection"
+                | "proxy-authenticate"
+                | "connection"
+                | "keep-alive"
+                | "te"
+                | "upgrade"
+                | "trailer"
+        ) || conn_tokens.iter().any(|t| t == k)
         {
             continue;
         }
