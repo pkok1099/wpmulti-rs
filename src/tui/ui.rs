@@ -463,7 +463,15 @@ fn draw_config_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows: Vec<Row> = (0..11)
+    let visible = (area.height.saturating_sub(3) as usize).max(1);
+    let total = TuiApp::CONFIG_ROW_COUNT;
+    let start = app
+        .config_selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(total.saturating_sub(visible));
+
+    let rows: Vec<Row> = (start..total)
+        .take(visible)
         .map(|idx| {
             let (label, val, is_cycle) = TuiApp::config_row_display(cfg, idx);
             let display_val = if idx == app.config_selected {
@@ -517,6 +525,20 @@ fn draw_config_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
 }
 
 fn draw_probe_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+    if app.probe_results.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Handshake Probe (0) ");
+        f.render_widget(
+            Paragraph::new(
+                "No probe results yet. Press 'p' to probe selected tunnel or 'P' to probe all tunnels.",
+            )
+            .block(block),
+            area,
+        );
+        return;
+    }
+
     let header = Row::new(vec!["TUNNEL", "ENDPOINT", "STATUS", "RTT", "MESSAGE"]).style(
         Style::default()
             .fg(Color::Cyan)
@@ -798,7 +820,7 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
                     app.config_selected = app.config_selected.saturating_sub(1);
                 }
                 TuiKey::Down | TuiKey::Char('j') => {
-                    if app.config_selected < 10 {
+                    if app.config_selected + 1 < TuiApp::CONFIG_ROW_COUNT {
                         app.config_selected += 1;
                     }
                 }

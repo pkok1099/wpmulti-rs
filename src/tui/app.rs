@@ -557,17 +557,27 @@ impl TuiApp {
         }
     }
 
+    /// Total number of configuration rows displayed in the Config tab.
+    pub const CONFIG_ROW_COUNT: usize = 15;
+
     /// Return `(label, current_value, is_cycle_toggle)` for a Config tab row.
     pub fn config_row_display(cfg: &MainConfig, idx: usize) -> (&'static str, String, bool) {
         match idx {
             0 => ("global.log_level", format!("{:?}", cfg.global.log_level).to_lowercase(), true),
             1 => ("global.ip_mode", format!("{:?}", cfg.global.ip_mode).to_lowercase(), true),
             2 => ("global.dns_strategy", format!("{:?}", cfg.global.dns_strategy).to_lowercase(), true),
-            3 => ("global.max_active_tunnels", cfg.global.max_active_tunnels.to_string(), false),
-            4 => ("lifecycle.mode", format!("{:?}", cfg.lifecycle.mode).to_lowercase(), true),
-            5 => ("lifecycle.idle_timeout", format!("{}s", cfg.lifecycle.idle_timeout.as_secs()), false),
-            6 => ("lifecycle.handshake_timeout", format!("{}s", cfg.lifecycle.handshake_timeout.as_secs()), false),
-            _ => ("per_tunnel.enabled", cfg.per_tunnel.enabled.to_string(), true),
+            3 => ("global.dns_preference", format!("{:?}", cfg.global.dns_preference).to_lowercase(), true),
+            4 => ("global.dns_fallback", cfg.global.dns_fallback.to_string(), false),
+            5 => ("global.max_active_tunnels", cfg.global.max_active_tunnels.to_string(), false),
+            6 => ("lifecycle.mode", format!("{:?}", cfg.lifecycle.mode).to_lowercase(), true),
+            7 => ("lifecycle.idle_timeout", format!("{}s", cfg.lifecycle.idle_timeout.as_secs()), false),
+            8 => ("lifecycle.handshake_timeout", format!("{}s", cfg.lifecycle.handshake_timeout.as_secs()), false),
+            9 => ("health_check.probe_interval", format!("{}s", cfg.health_check.probe_interval.as_secs()), false),
+            10 => ("health_check.probe_timeout", format!("{}s", cfg.health_check.probe_timeout.as_secs()), false),
+            11 => ("health_check.threshold", cfg.health_check.threshold.to_string(), false),
+            12 => ("health_check.cooldown", format!("{}s", cfg.health_check.cooldown.as_secs()), false),
+            13 => ("per_tunnel.enabled", cfg.per_tunnel.enabled.to_string(), true),
+            _ => ("tui.refresh_rate_ms", cfg.tui.refresh_rate_ms.to_string(), false),
         }
     }
 
@@ -602,13 +612,23 @@ impl TuiApp {
                     DnsStrategy::Host => DnsStrategy::TunnelOnly,
                 };
             }
-            4 => {
+            3 => {
+                cfg.global.dns_preference = match cfg.global.dns_preference {
+                    crate::config::toml_config::DnsPreference::Ipv4First => {
+                        crate::config::toml_config::DnsPreference::Ipv6First
+                    }
+                    crate::config::toml_config::DnsPreference::Ipv6First => {
+                        crate::config::toml_config::DnsPreference::Ipv4First
+                    }
+                };
+            }
+            6 => {
                 cfg.lifecycle.mode = match cfg.lifecycle.mode {
                     LifecycleMode::Lazy => LifecycleMode::Eager,
                     LifecycleMode::Eager => LifecycleMode::Lazy,
                 };
             }
-            7 => {
+            13 => {
                 cfg.per_tunnel.enabled = !cfg.per_tunnel.enabled;
             }
             _ => {
@@ -633,19 +653,44 @@ impl TuiApp {
         };
         let trimmed = raw.trim();
         match self.config_selected {
-            3 => {
+            4 => {
+                let addr: std::net::SocketAddr = trimmed
+                    .parse()
+                    .map_err(|_| format!("Invalid socket address '{}'", trimmed))?;
+                cfg.global.dns_fallback = addr;
+            }
+            5 => {
                 let n: usize = trimmed
                     .parse()
                     .map_err(|_| format!("Invalid integer '{}'", trimmed))?;
                 cfg.global.max_active_tunnels = n;
             }
-            5 => {
-                let dur = parse_duration_str(trimmed).map_err(|e| e.to_string())?;
-                cfg.lifecycle.idle_timeout = dur;
+            7 => {
+                cfg.lifecycle.idle_timeout = parse_duration_str(trimmed)?;
             }
-            6 => {
-                let dur = parse_duration_str(trimmed).map_err(|e| e.to_string())?;
-                cfg.lifecycle.handshake_timeout = dur;
+            8 => {
+                cfg.lifecycle.handshake_timeout = parse_duration_str(trimmed)?;
+            }
+            9 => {
+                cfg.health_check.probe_interval = parse_duration_str(trimmed)?;
+            }
+            10 => {
+                cfg.health_check.probe_timeout = parse_duration_str(trimmed)?;
+            }
+            11 => {
+                let n: usize = trimmed
+                    .parse()
+                    .map_err(|_| format!("Invalid integer '{}'", trimmed))?;
+                cfg.health_check.threshold = n;
+            }
+            12 => {
+                cfg.health_check.cooldown = parse_duration_str(trimmed)?;
+            }
+            14 => {
+                let ms: u64 = trimmed
+                    .parse()
+                    .map_err(|_| format!("Invalid integer '{}'", trimmed))?;
+                cfg.tui.refresh_rate_ms = ms;
             }
             _ => {}
         }
