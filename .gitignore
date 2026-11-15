@@ -2,3 +2,7 @@
 **/*.rs.bk
 *.log
 *.profraw
+*.conf
+wpmulti.toml
+.env
+.DS_Store
