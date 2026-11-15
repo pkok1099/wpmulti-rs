@@ -758,6 +758,7 @@ fn test_f9_bnd_partial_port_override() {
         wpmulti::config::TunnelPortOverride {
             socks5_port: Some(12345),
             http_port: None,
+            password: None,
         },
     );
 

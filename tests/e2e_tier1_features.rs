@@ -915,6 +915,7 @@ fn test_f9_port_override_takes_precedence() {
         wpmulti::config::TunnelPortOverride {
             socks5_port: Some(19999),
             http_port: None,
+            password: None,
         },
     );
 

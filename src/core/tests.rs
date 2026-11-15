@@ -298,6 +298,7 @@ async fn test_dedicated_and_shared_listeners() {
         TunnelPortOverride {
             socks5_port: Some(port1),
             http_port: None,
+            password: None,
         },
     );
 
@@ -839,4 +840,63 @@ fn test_router_all_unhealthy_fails() {
     let candidates = vec!["t1".to_string(), "t2".to_string()];
     let healthy = router.filter_healthy_candidates(&candidates);
     assert!(healthy.is_empty());
+}
+
+#[test]
+fn test_per_tunnel_auth_override_and_global_fallback() {
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new("tun-vip", make_test_tunnel_config("tun-vip"), LifecycleMode::Lazy))
+        .unwrap();
+    registry
+        .register(TunnelEntry::new("tun-std", make_test_tunnel_config("tun-std"), LifecycleMode::Lazy))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let mut passwords = std::collections::HashMap::new();
+    passwords.insert("tun-vip".to_string(), "vip-secret".to_string());
+
+    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::RoundRobin, false)
+        .with_auth(AuthMode::PerTunnel, Some("global-secret".to_string()))
+        .with_per_tunnel_passwords(passwords);
+
+    // 1. Tunnel with override password requires its own password and rejects global password
+    assert_eq!(
+        router.authenticate(Some(("tun-vip", "vip-secret"))).unwrap(),
+        TunnelSelector::ById("tun-vip".to_string())
+    );
+    assert!(router.authenticate(Some(("tun-vip", "global-secret"))).is_err());
+
+    // 2. Tunnel without override password falls back to global_password
+    assert_eq!(
+        router.authenticate(Some(("tun-std", "global-secret"))).unwrap(),
+        TunnelSelector::ById("tun-std".to_string())
+    );
+    assert!(router.authenticate(Some(("tun-std", "vip-secret"))).is_err());
+
+    // 3. Pool keyword falls back to global_password
+    assert_eq!(
+        router.authenticate(Some(("auto", "global-secret"))).unwrap(),
+        TunnelSelector::ByKeyword(PoolKeyword::Auto)
+    );
+    assert!(router.authenticate(Some(("auto", "vip-secret"))).is_err());
+
+    // 4. When global_password is None in PerTunnel mode, un-overridden tunnels are rejected (fail-closed)
+    let mut passwords2 = std::collections::HashMap::new();
+    passwords2.insert("tun-vip".to_string(), "vip-secret".to_string());
+    let router_strict = MultiTenantRouter::new(
+        LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1)),
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        false,
+    )
+    .with_auth(AuthMode::PerTunnel, None)
+    .with_per_tunnel_passwords(passwords2);
+
+    assert_eq!(
+        router_strict.authenticate(Some(("tun-vip", "vip-secret"))).unwrap(),
+        TunnelSelector::ById("tun-vip".to_string())
+    );
+    assert!(router_strict.authenticate(Some(("tun-std", "any-pass"))).is_err());
+    assert!(router_strict.authenticate(Some(("auto", "any-pass"))).is_err());
 }

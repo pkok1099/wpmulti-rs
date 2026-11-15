@@ -347,6 +347,20 @@ impl SingleTunnelRouter {
     }
 }
 
+/// Constant-time byte comparison to prevent timing side-channel attacks on proxy credentials.
+pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 impl TunnelRouter for SingleTunnelRouter {
     fn authenticate(
         &self,
@@ -354,7 +368,10 @@ impl TunnelRouter for SingleTunnelRouter {
     ) -> Result<TunnelSelector, ProxyAuthError> {
         if let Some((expected_user, expected_pass)) = &self.auth {
             match credentials {
-                Some((u, p)) if u == expected_user && p == expected_pass => {
+                Some((u, p))
+                    if constant_time_eq_str(u, expected_user)
+                        && constant_time_eq_str(p, expected_pass) =>
+                {
                     Ok(TunnelSelector::ById(self.tunnel_id.clone()))
                 }
                 Some(_) => Err(ProxyAuthError::InvalidCredentials),
@@ -385,6 +402,7 @@ pub struct PoolRouter {
     strategy: PoolStrategy,
     auth_mode: AuthMode,
     global_password: Option<String>,
+    per_tunnel_passwords: RwLock<HashMap<String, String>>,
     allow_anonymous: bool,
     rr_counter: AtomicUsize,
 }
@@ -400,6 +418,7 @@ impl PoolRouter {
             strategy,
             auth_mode: AuthMode::None,
             global_password: None,
+            per_tunnel_passwords: RwLock::new(HashMap::new()),
             allow_anonymous,
             rr_counter: AtomicUsize::new(0),
         }
@@ -410,6 +429,19 @@ impl PoolRouter {
         self.auth_mode = auth_mode;
         self.global_password = global_password;
         self
+    }
+
+    /// Configure per-tunnel override passwords used when `AuthMode::PerTunnel` is active.
+    pub fn with_per_tunnel_passwords(self, passwords: HashMap<String, String>) -> Self {
+        *self.per_tunnel_passwords.write() = passwords;
+        self
+    }
+
+    /// Register or update a per-tunnel password override.
+    pub fn set_tunnel_password(&self, id: impl Into<String>, password: impl Into<String>) {
+        self.per_tunnel_passwords
+            .write()
+            .insert(id.into(), password.into());
     }
 
     /// Register a tunnel target in this pool.
@@ -464,42 +496,48 @@ impl TunnelRouter for PoolRouter {
                     Ok(TunnelSelector::DefaultPool)
                 }
             }
-            AuthMode::Global => {
-                match credentials {
-                    None => {
-                        if self.allow_anonymous {
-                            Ok(TunnelSelector::DefaultPool)
-                        } else {
-                            Err(ProxyAuthError::AuthRequired)
-                        }
-                    }
-                    Some((user, pass)) => {
-                        if let Some(expected_pass) = &self.global_password
-                            && pass != expected_pass {
-                                return Err(ProxyAuthError::InvalidCredentials);
-                            }
-                        Ok(TunnelSelector::parse(user))
+            AuthMode::Global => match credentials {
+                None => {
+                    if self.allow_anonymous {
+                        Ok(TunnelSelector::DefaultPool)
+                    } else {
+                        Err(ProxyAuthError::AuthRequired)
                     }
                 }
-            }
-            AuthMode::PerTunnel => {
-                match credentials {
-                    None => {
-                        if self.allow_anonymous {
-                            Ok(TunnelSelector::DefaultPool)
-                        } else {
-                            Err(ProxyAuthError::AuthRequired)
-                        }
-                    }
-                    Some((user, pass)) => {
-                        if let Some(expected_pass) = &self.global_password
-                            && pass != expected_pass {
-                                return Err(ProxyAuthError::InvalidCredentials);
-                            }
+                Some((user, pass)) => match &self.global_password {
+                    Some(expected_pass) if constant_time_eq_str(pass, expected_pass) => {
                         Ok(TunnelSelector::parse(user))
                     }
+                    _ => Err(ProxyAuthError::InvalidCredentials),
+                },
+            },
+            AuthMode::PerTunnel => match credentials {
+                None => {
+                    if self.allow_anonymous {
+                        Ok(TunnelSelector::DefaultPool)
+                    } else {
+                        Err(ProxyAuthError::AuthRequired)
+                    }
                 }
-            }
+                Some((user, pass)) => {
+                    let selector = TunnelSelector::parse(user);
+                    if let TunnelSelector::ById(ref id) = selector
+                        && let Some(tunnel_pass) = self.per_tunnel_passwords.read().get(id)
+                    {
+                        return if constant_time_eq_str(pass, tunnel_pass) {
+                            Ok(selector)
+                        } else {
+                            Err(ProxyAuthError::InvalidCredentials)
+                        };
+                    }
+                    match &self.global_password {
+                        Some(expected_pass) if constant_time_eq_str(pass, expected_pass) => {
+                            Ok(selector)
+                        }
+                        _ => Err(ProxyAuthError::InvalidCredentials),
+                    }
+                }
+            },
         }
     }
 

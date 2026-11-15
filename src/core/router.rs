@@ -31,6 +31,7 @@ pub struct MultiTenantRouter {
     default_strategy: PoolStrategy,
     auth_mode: AuthMode,
     global_password: Option<String>,
+    per_tunnel_passwords: RwLock<std::collections::HashMap<String, String>>,
     allow_anonymous: bool,
     ip_mode: IpMode,
     rr_counter: AtomicUsize,
@@ -76,6 +77,7 @@ impl MultiTenantRouter {
             default_strategy: settings.default_strategy,
             auth_mode: settings.auth_mode,
             global_password: settings.global_password.clone(),
+            per_tunnel_passwords: RwLock::new(std::collections::HashMap::new()),
             allow_anonymous: settings.allow_anonymous,
             ip_mode,
             rr_counter: AtomicUsize::new(0),
@@ -99,6 +101,7 @@ impl MultiTenantRouter {
             default_strategy,
             auth_mode: AuthMode::None,
             global_password: None,
+            per_tunnel_passwords: RwLock::new(std::collections::HashMap::new()),
             allow_anonymous,
             ip_mode,
             rr_counter: AtomicUsize::new(0),
@@ -131,6 +134,20 @@ impl MultiTenantRouter {
         Arc::new(router)
     }
 
+    /// Configure per-tunnel override passwords used when `AuthMode::PerTunnel` is active.
+    pub fn with_per_tunnel_passwords(
+        self: Arc<Self>,
+        passwords: std::collections::HashMap<String, String>,
+    ) -> Arc<Self> {
+        *self.per_tunnel_passwords.write() = passwords;
+        self
+    }
+
+    /// Update per-tunnel override passwords under lock.
+    pub fn set_per_tunnel_passwords(&self, passwords: std::collections::HashMap<String, String>) {
+        *self.per_tunnel_passwords.write() = passwords;
+    }
+
     /// Update the allowed tunnel pool IDs under lock.
     pub fn set_allowed_tunnels(&self, list: Option<Vec<String>>) {
         let mut allowed = self.allowed_tunnels.write();
@@ -145,6 +162,7 @@ impl MultiTenantRouter {
             default_strategy: self.default_strategy,
             auth_mode: self.auth_mode,
             global_password: self.global_password.clone(),
+            per_tunnel_passwords: RwLock::new(self.per_tunnel_passwords.read().clone()),
             allow_anonymous: self.allow_anonymous,
             ip_mode: self.ip_mode,
             rr_counter: AtomicUsize::new(self.rr_counter.load(Ordering::Relaxed)),
@@ -313,24 +331,52 @@ impl TunnelRouter for MultiTenantRouter {
                     Err(ProxyAuthError::AuthRequired)
                 }
             }
-            AuthMode::Global | AuthMode::PerTunnel => {
-                match credentials {
-                    None => {
-                        if self.allow_anonymous {
-                            Ok(TunnelSelector::DefaultPool)
-                        } else {
-                            Err(ProxyAuthError::AuthRequired)
-                        }
-                    }
-                    Some((user, pass)) => {
-                        if let Some(expected_pass) = &self.global_password
-                            && pass != expected_pass {
-                                return Err(ProxyAuthError::InvalidCredentials);
-                            }
-                        Ok(TunnelSelector::parse(user))
+            AuthMode::Global => match credentials {
+                None => {
+                    if self.allow_anonymous {
+                        Ok(TunnelSelector::DefaultPool)
+                    } else {
+                        Err(ProxyAuthError::AuthRequired)
                     }
                 }
-            }
+                Some((user, pass)) => match &self.global_password {
+                    Some(expected_pass)
+                        if crate::proxy::router::constant_time_eq_str(pass, expected_pass) =>
+                    {
+                        Ok(TunnelSelector::parse(user))
+                    }
+                    _ => Err(ProxyAuthError::InvalidCredentials),
+                },
+            },
+            AuthMode::PerTunnel => match credentials {
+                None => {
+                    if self.allow_anonymous {
+                        Ok(TunnelSelector::DefaultPool)
+                    } else {
+                        Err(ProxyAuthError::AuthRequired)
+                    }
+                }
+                Some((user, pass)) => {
+                    let selector = TunnelSelector::parse(user);
+                    if let TunnelSelector::ById(ref id) = selector
+                        && let Some(tunnel_pass) = self.per_tunnel_passwords.read().get(id)
+                    {
+                        return if crate::proxy::router::constant_time_eq_str(pass, tunnel_pass) {
+                            Ok(selector)
+                        } else {
+                            Err(ProxyAuthError::InvalidCredentials)
+                        };
+                    }
+                    match &self.global_password {
+                        Some(expected_pass)
+                            if crate::proxy::router::constant_time_eq_str(pass, expected_pass) =>
+                        {
+                            Ok(selector)
+                        }
+                        _ => Err(ProxyAuthError::InvalidCredentials),
+                    }
+                }
+            },
         }
     }
 
@@ -458,7 +504,10 @@ impl TunnelRouter for DedicatedTunnelRouter {
     ) -> Result<TunnelSelector, ProxyAuthError> {
         if let Some((expected_user, expected_pass)) = &self.auth {
             match credentials {
-                Some((u, p)) if u == expected_user && p == expected_pass => {
+                Some((u, p))
+                    if crate::proxy::router::constant_time_eq_str(u, expected_user)
+                        && crate::proxy::router::constant_time_eq_str(p, expected_pass) =>
+                {
                     Ok(TunnelSelector::ById(self.tunnel_id.clone()))
                 }
                 Some(_) => Err(ProxyAuthError::InvalidCredentials),

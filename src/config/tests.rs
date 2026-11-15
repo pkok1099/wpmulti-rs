@@ -257,7 +257,8 @@ fn test_toml_config_full_schema() {
         cfg.per_tunnel.overrides.get("wg-gateway"),
         Some(&TunnelPortOverride {
             socks5_port: Some(1080),
-            http_port: Some(8080)
+            http_port: Some(8080),
+            password: None,
         })
     );
 

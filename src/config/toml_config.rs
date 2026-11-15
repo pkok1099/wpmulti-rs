@@ -409,7 +409,7 @@ impl Default for LifecycleSettings {
     }
 }
 
-/// Explicit port overrides for specific tunnel IDs.
+/// Explicit port and credential overrides for specific tunnel IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TunnelPortOverride {
     #[serde(default)]
@@ -417,6 +417,9 @@ pub struct TunnelPortOverride {
 
     #[serde(default)]
     pub http_port: Option<u16>,
+
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 /// Per-tunnel dedicated port configuration `[per_tunnel]`.
@@ -684,6 +687,41 @@ impl MainConfig {
                         )));
                     }
                 }
+            }
+            if listener.auth_mode == AuthMode::PerTunnel {
+                if let Some(pwd) = &listener.global_password
+                    && pwd.is_empty()
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "shared_listener '{}' specifies empty global_password",
+                        listener.name
+                    )));
+                }
+                let has_global = listener
+                    .global_password
+                    .as_ref()
+                    .is_some_and(|p| !p.is_empty());
+                let has_override = self
+                    .per_tunnel
+                    .overrides
+                    .values()
+                    .any(|o| o.password.as_ref().is_some_and(|p| !p.is_empty()));
+                if !has_global && !has_override && !listener.allow_anonymous {
+                    return Err(ConfigError::Validation(format!(
+                        "shared_listener '{}' specifies auth_mode = 'per-tunnel' but neither global_password nor any per_tunnel.overrides.<id>.password is configured",
+                        listener.name
+                    )));
+                }
+            }
+        }
+
+        for (id, override_cfg) in &self.per_tunnel.overrides {
+            if let Some(pwd) = &override_cfg.password
+                && pwd.is_empty()
+            {
+                return Err(ConfigError::Validation(format!(
+                    "Override password for tunnel '{id}' cannot be empty"
+                )));
             }
         }
 
