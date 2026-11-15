@@ -68,6 +68,7 @@ pub struct ReloadReport {
 /// Central multi-tunnel coordinator managing lifecycle, routing, and listeners.
 pub struct TunnelManager {
     config: RwLock<MainConfig>,
+    config_path: RwLock<Option<std::path::PathBuf>>,
     registry: Arc<TunnelRegistry>,
     lifecycle: Arc<LifecycleController>,
     listeners: Arc<ListenerSupervisor>,
@@ -88,6 +89,9 @@ impl TunnelManager {
                 default_mode
             };
             let entry = TunnelEntry::new(t_cfg.id.clone(), t_cfg, mode);
+            if config.disabled_tunnels.iter().any(|d| d == &entry.id) {
+                entry.set_disabled(true);
+            }
             registry.register(entry)?;
         }
 
@@ -112,6 +116,7 @@ impl TunnelManager {
 
         Ok(Self {
             config: RwLock::new(config),
+            config_path: RwLock::new(None),
             registry,
             lifecycle,
             listeners,
@@ -143,6 +148,123 @@ impl TunnelManager {
     /// Access the daemon's bounded [`crate::tui::TuiLogBuffer`].
     pub fn log_buffer(&self) -> &crate::tui::TuiLogBuffer {
         &self.log_buffer
+    }
+
+    /// Associate a configuration file path so `disabled_tunnels` updates persist to disk.
+    pub fn set_config_path(&self, path: std::path::PathBuf) {
+        *self.config_path.write() = Some(path);
+    }
+
+    /// Resolve a flexible tunnel target expression (`A`, `1`, `1-200`, `all`, or comma-separated)
+    /// against alphabetically sorted tunnel IDs.
+    pub fn resolve_tunnel_targets(&self, spec: &str) -> Result<Vec<String>, CoreError> {
+        let mut sorted_ids = self.registry.all_ids();
+        sorted_ids.sort();
+        let mut selected = Vec::new();
+
+        for raw_token in spec.split(',') {
+            let tok = raw_token.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            if tok.eq_ignore_ascii_case("all") || tok == "*" {
+                for id in &sorted_ids {
+                    if !selected.contains(id) {
+                        selected.push(id.clone());
+                    }
+                }
+                continue;
+            }
+            if let Some((a_str, b_str)) = tok.split_once('-')
+                && let (Ok(a), Ok(b)) = (a_str.trim().parse::<usize>(), b_str.trim().parse::<usize>())
+            {
+                if a == 0 || b == 0 || a > b {
+                    return Err(CoreError::ActivationFailed(
+                        tok.to_string(),
+                        "invalid 1-based range".into(),
+                    ));
+                }
+                let start = a - 1;
+                let end = b.min(sorted_ids.len());
+                if start < end {
+                    for id in &sorted_ids[start..end] {
+                        if !selected.contains(id) {
+                            selected.push(id.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Ok(idx) = tok.parse::<usize>() {
+                if idx == 0 || idx > sorted_ids.len() {
+                    return Err(CoreError::TunnelNotFound(format!(
+                        "tunnel index {} out of range (1..={})",
+                        idx,
+                        sorted_ids.len()
+                    )));
+                }
+                let id = &sorted_ids[idx - 1];
+                if !selected.contains(id) {
+                    selected.push(id.clone());
+                }
+                continue;
+            }
+            if self.registry.get(tok).is_none() {
+                return Err(CoreError::TunnelNotFound(tok.to_string()));
+            }
+            let id = tok.to_string();
+            if !selected.contains(&id) {
+                selected.push(id);
+            }
+        }
+
+        if selected.is_empty() {
+            return Err(CoreError::TunnelNotFound(spec.to_string()));
+        }
+        Ok(selected)
+    }
+
+    /// Enable or disable one or more tunnels (`A`, `1`, `1-200`, `all`) in runtime and persist
+    /// `disabled_tunnels` to `wpmulti.toml` if a config path is configured.
+    pub async fn set_tunnels_disabled(
+        &self,
+        spec: &str,
+        disabled: bool,
+    ) -> Result<Vec<String>, CoreError> {
+        let targets = self.resolve_tunnel_targets(spec)?;
+        for id in &targets {
+            if let Some(entry) = self.registry.get(id) {
+                entry.set_disabled(disabled);
+                if disabled {
+                    let _ = self.lifecycle.suspend_tunnel(id).await;
+                } else if entry.lifecycle_mode == LifecycleMode::Eager {
+                    let _ = self.lifecycle.activate_tunnel(id).await;
+                }
+            }
+        }
+
+        let cfg_snapshot = {
+            let mut cfg = self.config.write();
+            if disabled {
+                for id in &targets {
+                    if !cfg.disabled_tunnels.contains(id) {
+                        cfg.disabled_tunnels.push(id.clone());
+                    }
+                }
+            } else {
+                cfg.disabled_tunnels.retain(|id| !targets.contains(id));
+            }
+            cfg.disabled_tunnels.sort();
+            cfg.clone()
+        };
+
+        if let Some(path) = self.config_path.read().clone()
+            && let Ok(toml_str) = toml::to_string_pretty(&cfg_snapshot)
+        {
+            let _ = std::fs::write(path, toml_str);
+        }
+
+        Ok(targets)
     }
 
     /// Return a cloned snapshot of the current [`MainConfig`].

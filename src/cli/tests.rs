@@ -196,3 +196,18 @@ AllowedIPs = 0.0.0.0/0
     assert!(!results[0].healthy);
     assert!(results[0].error.is_some());
 }
+
+#[test]
+fn test_cli_parse_disable_enable() {
+    let cli_disable = Cli::try_parse_from(["wpmulti", "disable", "1-200"]).expect("parse disable");
+    match cli_disable.command {
+        Commands::Disable { target, .. } => assert_eq!(target, "1-200"),
+        other => panic!("expected Disable, got {:?}", other),
+    }
+
+    let cli_enable = Cli::try_parse_from(["wpmulti", "enable", "wgcf-001"]).expect("parse enable");
+    match cli_enable.command {
+        Commands::Enable { target, .. } => assert_eq!(target, "wgcf-001"),
+        other => panic!("expected Enable, got {:?}", other),
+    }
+}

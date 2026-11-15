@@ -349,6 +349,29 @@ pub async fn handle_admin_request(
             )
         }
 
+        // POST /tunnels/batch/disable and POST /tunnels/batch/enable
+        ("POST", "/tunnels/batch/disable") | ("POST", "/tunnels/batch/enable") => {
+            let disabled = path.ends_with("/disable");
+            #[derive(serde::Deserialize)]
+            struct BatchReq {
+                target: String,
+            }
+            match serde_json::from_slice::<BatchReq>(&req.body) {
+                Ok(payload) => match manager.set_tunnels_disabled(&payload.target, disabled).await {
+                    Ok(updated) => HttpResponse::ok_json(&json!({
+                        "status": if disabled { "disabled" } else { "enabled" },
+                        "count": updated.len(),
+                        "tunnels": updated
+                    })),
+                    Err(CoreError::TunnelNotFound(msg)) => {
+                        HttpResponse::not_found(&format!("Tunnel target not found: {}", msg))
+                    }
+                    Err(e) => HttpResponse::bad_request(&format!("Invalid target: {}", e)),
+                },
+                Err(e) => HttpResponse::bad_request(&format!("Invalid JSON body: {}", e)),
+            }
+        }
+
         // Parameterized routes /tunnels/:id and /tunnels/:id/action
         _ if path.starts_with("/tunnels/") => {
             let sub = &path["/tunnels/".len()..];
@@ -385,6 +408,40 @@ pub async fn handle_admin_request(
                             }
                             Err(e) => {
                                 HttpResponse::internal_error(&format!("Suspend error: {}", e))
+                            }
+                        }
+                    }
+                    ("POST", "disable") => {
+                        match manager.set_tunnels_disabled(id, true).await {
+                            Ok(_) => {
+                                let summary = manager.registry().get(id).map(|e| e.summary());
+                                HttpResponse::ok_json(&json!({
+                                    "status": "disabled",
+                                    "tunnel": summary
+                                }))
+                            }
+                            Err(CoreError::TunnelNotFound(_)) => {
+                                HttpResponse::not_found(&format!("Tunnel '{}' not found", id))
+                            }
+                            Err(e) => {
+                                HttpResponse::internal_error(&format!("Disable error: {}", e))
+                            }
+                        }
+                    }
+                    ("POST", "enable") => {
+                        match manager.set_tunnels_disabled(id, false).await {
+                            Ok(_) => {
+                                let summary = manager.registry().get(id).map(|e| e.summary());
+                                HttpResponse::ok_json(&json!({
+                                    "status": "enabled",
+                                    "tunnel": summary
+                                }))
+                            }
+                            Err(CoreError::TunnelNotFound(_)) => {
+                                HttpResponse::not_found(&format!("Tunnel '{}' not found", id))
+                            }
+                            Err(e) => {
+                                HttpResponse::internal_error(&format!("Enable error: {}", e))
                             }
                         }
                     }

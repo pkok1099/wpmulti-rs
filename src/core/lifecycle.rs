@@ -446,6 +446,13 @@ impl LifecycleController {
             .get(id)
             .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
 
+        if entry.is_disabled() {
+            return Err(CoreError::ActivationFailed(
+                id.to_string(),
+                "tunnel is disabled".into(),
+            ));
+        }
+
         let _lock = entry.activation_lock.lock().await;
 
         let maybe_active = entry.active.write().take();
@@ -532,6 +539,13 @@ impl LifecycleController {
             .get(id)
             .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
 
+        if entry.is_disabled() {
+            return Err(CoreError::ActivationFailed(
+                id.to_string(),
+                "tunnel is disabled".into(),
+            ));
+        }
+
         let _lock = entry.activation_lock.lock().await;
 
         // Check if already active or suspended
@@ -605,6 +619,13 @@ impl LifecycleController {
             .registry
             .get(id)
             .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
+
+        if entry.is_disabled() {
+            return Err(CoreError::ActivationFailed(
+                id.to_string(),
+                "tunnel is disabled".into(),
+            ));
+        }
 
         let _lock = entry.activation_lock.lock().await;
 
@@ -683,6 +704,13 @@ impl LifecycleController {
             .registry
             .get(id)
             .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
+
+        if entry.is_disabled() {
+            return Err(CoreError::ActivationFailed(
+                id.to_string(),
+                "tunnel is disabled".into(),
+            ));
+        }
 
         let _lock = entry.activation_lock.lock().await;
 

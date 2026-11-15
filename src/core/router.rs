@@ -187,7 +187,7 @@ impl MultiTenantRouter {
             .iter()
             .filter(|id| {
                 if let Some(entry) = self.registry.get(id) {
-                    entry.health.is_routable()
+                    !entry.is_disabled() && entry.health.is_routable()
                 } else {
                     false
                 }
@@ -233,7 +233,7 @@ impl MultiTenantRouter {
                 let mut best_id: Option<&str> = None;
                 let mut min_conns = usize::MAX;
                 for entry in &entries {
-                    if entry.health.is_routable() {
+                    if !entry.is_disabled() && entry.health.is_routable() {
                         let conns = entry.stats.active_conns.load(Ordering::Relaxed);
                         if conns < min_conns {
                             min_conns = conns;
@@ -249,7 +249,10 @@ impl MultiTenantRouter {
                 })
             }
             PoolKeyword::Random | PoolKeyword::RoundRobin | PoolKeyword::Auto => {
-                let healthy_count = entries.iter().filter(|e| e.health.is_routable()).count();
+                let healthy_count = entries
+                    .iter()
+                    .filter(|e| !e.is_disabled() && e.health.is_routable())
+                    .count();
                 if healthy_count == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::NotConnected,
@@ -262,7 +265,7 @@ impl MultiTenantRouter {
                 };
                 entries
                     .iter()
-                    .filter(|e| e.health.is_routable())
+                    .filter(|e| !e.is_disabled() && e.health.is_routable())
                     .nth(target_idx)
                     .map(|e| e.id.clone())
                     .ok_or_else(|| {
@@ -324,6 +327,7 @@ impl MultiTenantRouter {
                 // True priority fallback: select first routable candidate in sequence
                 for id in candidates {
                     if let Some(entry) = self.registry.get(id)
+                        && !entry.is_disabled()
                         && entry.health.is_routable()
                     {
                         return Ok(id.clone());

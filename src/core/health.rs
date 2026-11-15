@@ -235,8 +235,8 @@ impl ActiveProber {
         let mut set = tokio::task::JoinSet::new();
 
         for entry in registry.all_entries() {
-            // STRICTLY SKIP LAZY TUNNELS to guarantee 0% idle CPU and 0 sockets
-            if entry.lifecycle_mode != LifecycleMode::Eager {
+            // STRICTLY SKIP LAZY OR DISABLED TUNNELS to guarantee 0% idle CPU and 0 sockets
+            if entry.lifecycle_mode != LifecycleMode::Eager || entry.is_disabled() {
                 continue;
             }
 

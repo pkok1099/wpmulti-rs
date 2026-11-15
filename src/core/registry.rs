@@ -324,6 +324,8 @@ pub struct TunnelEntry {
     pub assigned_port: RwLock<Option<u16>>,
     /// Mutual exclusion lock ensuring serialized activation/boot per tunnel.
     pub activation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Whether this tunnel is administratively disabled (`true` = off).
+    pub disabled: std::sync::atomic::AtomicBool,
 }
 
 impl TunnelEntry {
@@ -340,6 +342,7 @@ impl TunnelEntry {
             active: RwLock::new(None),
             assigned_port: RwLock::new(None),
             activation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            disabled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -357,6 +360,16 @@ impl TunnelEntry {
     /// Check if the tunnel is currently in the active state.
     pub fn is_active(&self) -> bool {
         *self.state.read() == TunnelState::Active
+    }
+
+    /// Check if the tunnel is administratively disabled.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Relaxed)
+    }
+
+    /// Set whether the tunnel is administratively disabled.
+    pub fn set_disabled(&self, disabled: bool) {
+        self.disabled.store(disabled, Ordering::Relaxed);
     }
 
     /// Generate a summary snapshot for status APIs and TUI dashboards.
@@ -389,6 +402,7 @@ impl TunnelEntry {
             health: self.health.current_status(),
             consecutive_failures: self.health.consecutive_failures(),
             cooldown_remaining_secs: self.health.cooldown_remaining_secs(),
+            disabled: self.is_disabled(),
         }
     }
 }
@@ -427,6 +441,9 @@ pub struct TunnelSummary {
     /// Remaining circuit breaker cooldown in seconds.
     #[serde(default)]
     pub cooldown_remaining_secs: u64,
+    /// Whether the tunnel is administratively disabled.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 struct RegistryInner {

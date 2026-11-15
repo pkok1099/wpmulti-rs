@@ -45,6 +45,7 @@ fn make_dummy_summary(id: &str, state: TunnelState, conns: usize, rx: u64, tx: u
         health: HealthStatus::Healthy,
         consecutive_failures: 0,
         cooldown_remaining_secs: 0,
+        disabled: false,
     }
 }
 
@@ -354,4 +355,23 @@ fn test_multi_tab_switching_logs_and_rendering() {
 
     app.prev_tab();
     assert_eq!(app.active_tab, TuiTab::Config);
+}
+
+#[test]
+fn test_tui_disabled_badge_renders() {
+    let mut app = TuiApp::new(
+        TuiDataSource::Remote {
+            admin_url: "http://127.0.0.1:9090".to_string(),
+            auth_token: None,
+        },
+        TuiSortField::Id,
+    );
+    let mut summary = make_dummy_summary("wgcf-001", TunnelState::Dormant, 0, 0, 0);
+    summary.disabled = true;
+    app.set_tunnels(vec![summary]);
+
+    let out = render_dashboard(&mut app, 90, 24);
+    assert!(out.contains("Disabled"));
+    assert!(out.contains("x:Toggle"));
+    assert!(out.contains("X:Batch"));
 }

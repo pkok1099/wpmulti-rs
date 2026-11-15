@@ -423,3 +423,68 @@ async fn test_listeners_and_config_endpoints() {
     assert_eq!(resp_post_cfg.status, 200);
     assert_eq!(manager.config_snapshot().global.max_active_tunnels, 42);
 }
+
+#[tokio::test]
+async fn test_batch_and_single_tunnel_disable_enable() {
+    let manager = create_test_manager();
+
+    // Alphabetical order: 1 = vpn-backup, 2 = wgcf-001, 3 = wgcf-002
+    assert_eq!(
+        manager.resolve_tunnel_targets("1").unwrap(),
+        vec!["vpn-backup"]
+    );
+    assert_eq!(
+        manager.resolve_tunnel_targets("1-2").unwrap(),
+        vec!["vpn-backup", "wgcf-001"]
+    );
+    assert_eq!(
+        manager.resolve_tunnel_targets("wgcf-002").unwrap(),
+        vec!["wgcf-002"]
+    );
+    assert_eq!(
+        manager.resolve_tunnel_targets("all").unwrap(),
+        vec!["vpn-backup", "wgcf-001", "wgcf-002"]
+    );
+
+    let req_batch_disable = HttpRequest {
+        method: "POST".to_string(),
+        path: "/tunnels/batch/disable".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: br#"{"target":"1-2"}"#.to_vec(),
+    };
+    let resp = handle_admin_request(&req_batch_disable, &manager, None, 10).await;
+    assert_eq!(resp.status, 200);
+    assert!(manager.registry().get("vpn-backup").unwrap().is_disabled());
+    assert!(manager.registry().get("wgcf-001").unwrap().is_disabled());
+    assert!(!manager.registry().get("wgcf-002").unwrap().is_disabled());
+    assert_eq!(
+        manager.config_snapshot().disabled_tunnels,
+        vec!["vpn-backup".to_string(), "wgcf-001".to_string()]
+    );
+
+    let req_single_disable = HttpRequest {
+        method: "POST".to_string(),
+        path: "/tunnels/wgcf-002/disable".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let resp2 = handle_admin_request(&req_single_disable, &manager, None, 10).await;
+    assert_eq!(resp2.status, 200);
+    assert!(manager.registry().get("wgcf-002").unwrap().is_disabled());
+
+    let req_batch_enable = HttpRequest {
+        method: "POST".to_string(),
+        path: "/tunnels/batch/enable".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: br#"{"target":"all"}"#.to_vec(),
+    };
+    let resp3 = handle_admin_request(&req_batch_enable, &manager, None, 10).await;
+    assert_eq!(resp3.status, 200);
+    assert!(!manager.registry().get("vpn-backup").unwrap().is_disabled());
+    assert!(!manager.registry().get("wgcf-001").unwrap().is_disabled());
+    assert!(!manager.registry().get("wgcf-002").unwrap().is_disabled());
+    assert!(manager.config_snapshot().disabled_tunnels.is_empty());
+}

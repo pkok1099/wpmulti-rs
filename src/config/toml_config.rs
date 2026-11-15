@@ -610,6 +610,10 @@ pub struct MainConfig {
 
     #[serde(default)]
     pub health_check: HealthCheckSettings,
+
+    /// Persisted list of disabled tunnel IDs (excluded from routing and probing).
+    #[serde(default)]
+    pub disabled_tunnels: Vec<String>,
 }
 
 impl MainConfig {

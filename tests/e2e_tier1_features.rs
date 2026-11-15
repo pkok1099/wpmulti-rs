@@ -1355,6 +1355,7 @@ fn test_f13_tui_app_navigation_key_events() {
             health: wpmulti::core::HealthStatus::Healthy,
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
+            disabled: false,
         },
         wpmulti::core::TunnelSummary {
             id: "wgcf-002".to_string(),
@@ -1371,6 +1372,7 @@ fn test_f13_tui_app_navigation_key_events() {
             health: wpmulti::core::HealthStatus::Healthy,
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
+            disabled: false,
         },
     ];
     app.set_tunnels(list);
@@ -1406,6 +1408,7 @@ fn test_f13_tui_app_search_filtering() {
             health: wpmulti::core::HealthStatus::Healthy,
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
+            disabled: false,
         },
         wpmulti::core::TunnelSummary {
             id: "staging-eu-west".to_string(),
@@ -1422,6 +1425,7 @@ fn test_f13_tui_app_search_filtering() {
             health: wpmulti::core::HealthStatus::Healthy,
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
+            disabled: false,
         },
     ];
     app.set_tunnels(list);
@@ -1457,6 +1461,7 @@ fn test_f13_tui_app_column_sorting() {
             health: wpmulti::core::HealthStatus::Healthy,
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
+            disabled: false,
         },
         wpmulti::core::TunnelSummary {
             id: "tun-a".to_string(),
@@ -1473,6 +1478,7 @@ fn test_f13_tui_app_column_sorting() {
             health: wpmulti::core::HealthStatus::Healthy,
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
+            disabled: false,
         },
     ];
     app.set_tunnels(list);
@@ -1511,6 +1517,7 @@ fn test_f13_tui_render_dashboard_output() {
         health: wpmulti::core::HealthStatus::Healthy,
         consecutive_failures: 0,
         cooldown_remaining_secs: 0,
+        disabled: false,
     }];
     app.set_tunnels(list);
 

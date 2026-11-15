@@ -269,6 +269,40 @@ impl TuiDataSource {
     }
 
     /// Trigger configuration reload.
+    /// Enable or disable one or more tunnels (`A`, `1`, `1-200`, `all`).
+    pub async fn set_tunnels_disabled(&self, target: &str, disabled: bool) -> Result<usize, String> {
+        match self {
+            TuiDataSource::InProcess(mgr) => mgr
+                .set_tunnels_disabled(target, disabled)
+                .await
+                .map(|v| v.len())
+                .map_err(|e| format!("{:?}", e)),
+            TuiDataSource::Remote {
+                admin_url,
+                auth_token,
+            } => {
+                let path = if disabled {
+                    "/tunnels/batch/disable"
+                } else {
+                    "/tunnels/batch/enable"
+                };
+                let body = serde_json::to_vec(&serde_json::json!({ "target": target }))
+                    .map_err(|e| e.to_string())?;
+                let resp = admin_http_request_with_body(
+                    admin_url,
+                    "POST",
+                    path,
+                    auth_token.as_deref(),
+                    Some(&body),
+                )
+                .await?;
+                let val: serde_json::Value =
+                    serde_json::from_slice(&resp).map_err(|e| e.to_string())?;
+                Ok(val["count"].as_u64().unwrap_or(0) as usize)
+            }
+        }
+    }
+
     pub async fn reload(&self) -> Result<ReloadReport, String> {
         match self {
             TuiDataSource::InProcess(mgr) => mgr
@@ -484,6 +518,8 @@ pub struct TuiApp {
     pub probe_scroll: usize,
     // Animation tick counter (incremented every 100ms UI frame)
     pub anim_tick: u64,
+    // Inline batch enable/disable prompt buffer (`-1-200`, `+1-200`, `A`, `all`)
+    pub batch_prompt: Option<String>,
 }
 
 impl TuiApp {
@@ -522,6 +558,7 @@ impl TuiApp {
             probe_results: Vec::new(),
             probe_scroll: 0,
             anim_tick: 0,
+            batch_prompt: None,
         }
     }
 
@@ -1021,6 +1058,47 @@ impl TuiApp {
     }
 
     /// Trigger hot-reload of configurations.
+    /// Toggle enable/disable on the currently selected tunnel.
+    pub async fn toggle_selected_disabled(&mut self) -> Result<(), String> {
+        let Some(t) = self.selected_tunnel().cloned() else {
+            return Ok(());
+        };
+        let next_disabled = !t.disabled;
+        self.data_source
+            .set_tunnels_disabled(&t.id, next_disabled)
+            .await?;
+        let action = if next_disabled { "Disabled" } else { "Enabled" };
+        self.set_status(format!("{} '{}'", action, t.id));
+        let _ = self.refresh().await;
+        Ok(())
+    }
+
+    /// Commit inline batch enable/disable prompt (`+target` enables, `-target` or plain `target` disables).
+    pub async fn commit_batch_toggle(&mut self) -> Result<(), String> {
+        let Some(raw) = self.batch_prompt.take() else {
+            return Ok(());
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let (disabled, target) = if let Some(rest) = trimmed.strip_prefix('+') {
+            (false, rest.trim())
+        } else if let Some(rest) = trimmed.strip_prefix('-') {
+            (true, rest.trim())
+        } else {
+            (true, trimmed)
+        };
+        let count = self
+            .data_source
+            .set_tunnels_disabled(target, disabled)
+            .await?;
+        let action = if disabled { "Disabled" } else { "Enabled" };
+        self.set_status(format!("{} {} tunnel(s) ({})", action, count, target));
+        let _ = self.refresh().await;
+        Ok(())
+    }
+
     pub async fn trigger_reload(&mut self) -> Result<ReloadReport, String> {
         let rep = self.data_source.reload().await?;
         self.set_status(format!(

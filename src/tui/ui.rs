@@ -392,7 +392,11 @@ fn draw_tunnels_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         .take(visible_rows.max(1))
         .map(|(vis_idx, &orig_idx)| {
             let t = &app.tunnels[orig_idx];
-            let state_str = format!("{:?}", t.state);
+            let (state_str, st_style) = if t.disabled {
+                ("Disabled".to_string(), Style::default().fg(Color::Rgb(255, 85, 85)))
+            } else {
+                (format!("{:?}", t.state), state_style(t.state))
+            };
             let health_str = match t.health {
                 HealthStatus::Healthy => "Healthy",
                 HealthStatus::HalfOpen => "HalfOpen",
@@ -400,7 +404,7 @@ fn draw_tunnels_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             };
             let mut cells = vec![
                 Cell::from(t.id.clone()),
-                Cell::from(state_str).style(state_style(t.state)),
+                Cell::from(state_str).style(st_style),
                 Cell::from(health_str).style(health_style(t.health)),
                 Cell::from(t.active_conns.to_string()),
                 Cell::from(format_bytes(t.rx_bytes)),
@@ -707,7 +711,7 @@ fn draw_probe_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
     let help = match app.active_tab {
         TuiTab::Tunnels => {
-            "1-5/Tab:Tabs  j/k:Nav  /:Search  s:Sort  a:Activate  d:Suspend  r:Reload  q:Quit"
+            "1-5/Tab:Tabs  j/k:Nav  /:Search  s:Sort  a:Activate  d:Suspend  x:Toggle  X:Batch  r:Reload  q:Quit"
         }
         TuiTab::Logs => "1-5/Tab:Tabs  j/k:Scroll  f:Filter Level  c:Clear  q:Quit",
         TuiTab::Listeners => "1-5/Tab:Tabs  j/k:Scroll  q:Quit",
@@ -716,7 +720,12 @@ fn draw_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
     };
 
     let mut lines = Vec::new();
-    if app.is_searching {
+    if let Some(buf) = &app.batch_prompt {
+        lines.push(Line::from(Span::styled(
+            format!("Batch [+/-]target (e.g. -1-200, +1-50, A, all): {}_", buf),
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if app.is_searching {
         lines.push(Line::from(Span::styled(
             format!("Search: {}_", app.search_query),
             Style::default().fg(Color::Yellow),
@@ -863,6 +872,29 @@ fn map_crossterm_key(code: KeyCode) -> Option<TuiKey> {
 }
 
 async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
+    if app.batch_prompt.is_some() {
+        match key {
+            TuiKey::Esc => app.batch_prompt = None,
+            TuiKey::Enter => {
+                if let Err(e) = app.commit_batch_toggle().await {
+                    app.set_status(format!("Batch error: {}", e));
+                }
+            }
+            TuiKey::Backspace => {
+                if let Some(buf) = &mut app.batch_prompt {
+                    buf.pop();
+                }
+            }
+            TuiKey::Char(c) => {
+                if let Some(buf) = &mut app.batch_prompt {
+                    buf.push(c);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     if app.is_searching {
         match key {
             TuiKey::Esc | TuiKey::Enter => app.is_searching = false,
@@ -930,6 +962,14 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
                     if let Err(e) = app.suspend_selected().await {
                         app.set_status(format!("Suspend error: {}", e));
                     }
+                }
+                TuiKey::Char('x') => {
+                    if let Err(e) = app.toggle_selected_disabled().await {
+                        app.set_status(format!("Toggle error: {}", e));
+                    }
+                }
+                TuiKey::Char('X') => {
+                    app.batch_prompt = Some(String::new());
                 }
                 TuiKey::Char('r') => {
                     if let Err(e) = app.trigger_reload().await {

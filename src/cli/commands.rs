@@ -58,6 +58,9 @@ pub async fn cmd_run(
     );
 
     let tui_log_buffer = manager.log_buffer().clone();
+    if let Some(ref cfg_path) = saved_config_path {
+        manager.set_config_path(cfg_path.clone());
+    }
     if tui_mode {
         let _ = tracing_subscriber::fmt()
             .with_max_level(max_level)
@@ -193,6 +196,35 @@ pub async fn cmd_top(
     };
     let app = TuiApp::new(source, crate::config::TuiSortField::Id);
     run_terminal_tui(app, 500).await?;
+    Ok(())
+}
+
+/// Enable or disable tunnels (`A`, `1`, `1-200`, `all`) via Admin API.
+pub async fn cmd_toggle_tunnels(
+    target: String,
+    disabled: bool,
+    admin_url: String,
+    auth_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = if disabled {
+        "/tunnels/batch/disable"
+    } else {
+        "/tunnels/batch/enable"
+    };
+    let body = serde_json::to_vec(&serde_json::json!({ "target": target }))?;
+    let resp = crate::tui::app::admin_http_request_with_body(
+        &admin_url,
+        "POST",
+        path,
+        auth_token.as_deref(),
+        Some(&body),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach Admin API: {}", e))?;
+    let val: serde_json::Value = serde_json::from_slice(&resp)?;
+    let count = val["count"].as_u64().unwrap_or(0);
+    let action = if disabled { "Disabled" } else { "Enabled" };
+    println!("{} {} tunnel(s) matching '{}'.", action, count, target);
     Ok(())
 }
 

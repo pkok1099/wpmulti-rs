@@ -7,7 +7,10 @@ pub mod tests;
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
-pub use commands::{cmd_probe, cmd_run, cmd_status, cmd_top, cmd_validate, run_probe_single, ProbeResult};
+pub use commands::{
+    cmd_probe, cmd_run, cmd_status, cmd_toggle_tunnels, cmd_top, cmd_validate, run_probe_single,
+    ProbeResult,
+};
 
 /// Command line interface for `wpmulti`.
 #[derive(Parser, Debug, Clone, PartialEq, Eq)]
@@ -112,6 +115,42 @@ pub enum Commands {
         #[clap(long, default_value = "5s")]
         timeout: String,
     },
+    /// Disable one or more tunnels (`A`, `1`, `1-200`, `all`) via Admin API
+    #[clap(after_help = "EXAMPLES:\n  \
+                         wpmulti disable wgcf-001\n  \
+                         wpmulti disable 1\n  \
+                         wpmulti disable 1-200\n  \
+                         wpmulti disable all")]
+    Disable {
+        /// Target tunnel(s): name, 1-based index, range (1-200), comma list, or 'all'
+        target: String,
+
+        /// Admin API URL to connect to (e.g. http://127.0.0.1:9090)
+        #[clap(long, default_value = "http://127.0.0.1:9090")]
+        admin_url: String,
+
+        /// Bearer authentication token for protected Admin API
+        #[clap(long)]
+        auth_token: Option<String>,
+    },
+    /// Enable one or more disabled tunnels (`A`, `1`, `1-200`, `all`) via Admin API
+    #[clap(after_help = "EXAMPLES:\n  \
+                         wpmulti enable wgcf-001\n  \
+                         wpmulti enable 1\n  \
+                         wpmulti enable 1-200\n  \
+                         wpmulti enable all")]
+    Enable {
+        /// Target tunnel(s): name, 1-based index, range (1-200), comma list, or 'all'
+        target: String,
+
+        /// Admin API URL to connect to (e.g. http://127.0.0.1:9090)
+        #[clap(long, default_value = "http://127.0.0.1:9090")]
+        admin_url: String,
+
+        /// Bearer authentication token for protected Admin API
+        #[clap(long)]
+        auth_token: Option<String>,
+    },
 }
 
 /// Parse arguments and execute the selected subcommand.
@@ -137,6 +176,16 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                     cmd_probe(config, dir, json, timeout).await?;
                     Ok(())
                 }
+                Commands::Disable {
+                    target,
+                    admin_url,
+                    auth_token,
+                } => cmd_toggle_tunnels(target, true, admin_url, auth_token).await,
+                Commands::Enable {
+                    target,
+                    admin_url,
+                    auth_token,
+                } => cmd_toggle_tunnels(target, false, admin_url, auth_token).await,
                 Commands::Run { .. } => unreachable!(),
             }
         }
