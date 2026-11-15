@@ -410,7 +410,9 @@ pub async fn handle_admin_request(
         ("GET", "/tunnels") => handle_list_tunnels_request(req, manager),
         ("GET", "/logs") => HttpResponse::ok_json(&manager.log_buffer().snapshot()),
         ("GET", "/listeners") => HttpResponse::ok_json(&manager.listeners().list_listeners()),
-        ("GET", "/config") => HttpResponse::ok_json(&redact_config_secrets(manager.config_snapshot())),
+        ("GET", "/config") => {
+            HttpResponse::ok_json(&redact_config_secrets(manager.config_snapshot()))
+        }
         ("POST", "/config") => match serde_json::from_slice::<crate::config::MainConfig>(&req.body)
         {
             Ok(mut new_cfg) => {

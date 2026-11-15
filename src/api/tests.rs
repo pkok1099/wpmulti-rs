@@ -550,8 +550,7 @@ async fn test_config_endpoint_redacts_and_preserves_secrets_and_auth_rejects_emp
         )]),
         body: resp_get.body,
     };
-    let resp_post =
-        handle_admin_request(&post_req, &manager, Some("super-secret-token"), 10).await;
+    let resp_post = handle_admin_request(&post_req, &manager, Some("super-secret-token"), 10).await;
     assert_eq!(resp_post.status, 200);
     assert_eq!(
         manager.config_snapshot().admin.auth_token.as_deref(),

@@ -316,9 +316,9 @@ fn parse_forward_uri(uri: &str) -> io::Result<(String, u16, String)> {
         .or_else(|| uri.strip_prefix("https://").map(|r| (443u16, r)))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid absolute URI"))?;
 
-    let (authority, path) = rest
-        .find(['/', '?', '#'])
-        .map_or_else(|| (rest, "/".to_string()), |idx| {
+    let (authority, path) = rest.find(['/', '?', '#']).map_or_else(
+        || (rest, "/".to_string()),
+        |idx| {
             let auth = rest.get(..idx).unwrap_or(rest);
             let suffix = rest.get(idx..).unwrap_or("");
             let path = if suffix.starts_with('/') {
@@ -329,7 +329,8 @@ fn parse_forward_uri(uri: &str) -> io::Result<(String, u16, String)> {
                 "/".to_string()
             };
             (auth, path)
-        });
+        },
+    );
 
     let (host, port) = if let Some(inner) = authority
         .strip_prefix('[')

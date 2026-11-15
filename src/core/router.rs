@@ -716,8 +716,7 @@ impl ProxyTunnelTarget for IpFilteredTunnelTarget {
         &'a self,
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
-        self.inner
-            .resolve_in_tunnel_with_mode(domain, self.ip_mode)
+        self.inner.resolve_in_tunnel_with_mode(domain, self.ip_mode)
     }
 }
 

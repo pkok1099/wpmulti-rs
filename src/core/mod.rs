@@ -290,8 +290,10 @@ impl TunnelManager {
             .set_idle_timeout(new_cfg.lifecycle.idle_timeout);
         self.lifecycle
             .set_handshake_timeout(new_cfg.lifecycle.handshake_timeout);
-        self.lifecycle
-            .set_health_check(new_cfg.health_check.threshold, new_cfg.health_check.cooldown);
+        self.lifecycle.set_health_check(
+            new_cfg.health_check.threshold,
+            new_cfg.health_check.cooldown,
+        );
         self.lifecycle
             .set_max_active_tunnels(new_cfg.global.max_active_tunnels);
         self.lifecycle.set_dns_fallback(new_cfg.global.dns_fallback);
