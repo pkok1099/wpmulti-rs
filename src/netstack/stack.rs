@@ -67,15 +67,12 @@ pub struct VirtualNetworkStack {
 impl VirtualNetworkStack {
     /// Construct a new virtual network stack from WireGuard interface configuration
     /// and a [`VirtualTunBridge`] in `DualStack` mode.
-    pub async fn new(
-        config: &WgInterfaceConfig,
-        bridge: VirtualTunBridge,
-    ) -> Result<Self, io::Error> {
-        Self::new_with_mode(config, bridge, crate::config::IpMode::DualStack, false).await
+    pub fn new(config: &WgInterfaceConfig, bridge: VirtualTunBridge) -> Result<Self, io::Error> {
+        Self::new_with_mode(config, bridge, crate::config::IpMode::DualStack, false)
     }
 
     /// Construct a new virtual network stack with an explicit [`IpMode`] and IPv6 DNS preference.
-    pub async fn new_with_mode(
+    pub fn new_with_mode(
         config: &WgInterfaceConfig,
         bridge: VirtualTunBridge,
         ip_mode: crate::config::IpMode,
@@ -92,13 +89,11 @@ impl VirtualNetworkStack {
             ),
             DEFAULT_CONNECT_TIMEOUT,
         )
-        .await
     }
 
     /// Construct a new [`VirtualNetworkStack`] with explicit IP mode, DNS fallback/strategy,
     /// and connection timeout.
-    #[allow(clippy::unused_async)]
-    pub async fn new_with_options(
+    pub fn new_with_options(
         config: &WgInterfaceConfig,
         mut bridge: VirtualTunBridge,
         ip_mode: crate::config::IpMode,
@@ -260,17 +255,13 @@ impl VirtualNetworkStack {
     }
 
     /// Check if `port` is currently bound or in use by any socket in `sockets`.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        clippy::match_wildcard_for_single_variants
-    )]
     fn is_port_in_use(sockets: &SocketSet<'_>, port: u16) -> bool {
         sockets.iter().any(|(_, sock)| match sock {
             smoltcp::socket::Socket::Tcp(tcp_sock) => {
                 tcp_sock.local_endpoint().is_some_and(|ep| ep.port == port)
             }
             smoltcp::socket::Socket::Udp(udp_sock) => udp_sock.endpoint().port == port,
-            _ => false,
+            smoltcp::socket::Socket::Dns(_) => false,
         })
     }
 
@@ -399,8 +390,7 @@ impl VirtualNetworkStack {
     }
 
     /// Bind a virtual UDP socket to the specified local port with custom buffer sizing.
-    #[allow(clippy::unused_async)]
-    pub async fn udp_bind_with_size(
+    pub fn udp_bind_with_size(
         &self,
         local_port: u16,
         rx_buf_size: usize,
@@ -440,14 +430,13 @@ impl VirtualNetworkStack {
     }
 
     /// Bind a virtual UDP socket to the specified local port using default buffer sizes.
-    pub async fn udp_bind(&self, local_port: u16) -> Result<VirtualUdpSocket, io::Error> {
+    pub fn udp_bind(&self, local_port: u16) -> Result<VirtualUdpSocket, io::Error> {
         self.udp_bind_with_size(
             local_port,
             UDP_PAYLOAD_BUF_SIZE,
             UDP_PAYLOAD_BUF_SIZE,
             UDP_PACKET_QUEUE_CAPACITY,
         )
-        .await
     }
 
     /// Resolve a domain name inside the WireGuard tunnel.

@@ -83,15 +83,13 @@ impl VirtualTcpStream {
     }
 
     /// Returns the local address of this stream.
-    #[allow(clippy::unnecessary_wraps)]
-    pub const fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local_addr)
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 
     /// Returns the remote peer address of this stream.
-    #[allow(clippy::unnecessary_wraps)]
-    pub const fn peer_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.peer_addr)
+    pub const fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
     }
 }
 

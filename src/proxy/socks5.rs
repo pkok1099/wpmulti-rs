@@ -430,6 +430,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let mut tunnel_stream: DynStream = match target_tunnel.tcp_connect(dst_addr).await {
         Ok(s) => s,
         Err(e) => {
+            // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; map all others to general failure.
             #[allow(clippy::wildcard_enum_match_arm)]
             let rep = match e.kind() {
                 io::ErrorKind::ConnectionRefused => REP_CONN_REFUSED,

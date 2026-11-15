@@ -35,6 +35,7 @@ pub enum DnsError {
     InvalidDomain(&'static str),
 }
 
+// Standard RFC 1035 / RFC 3596 DNS record type acronyms (`A`, `AAAA`).
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryType {
@@ -612,7 +613,7 @@ impl InTunnelDnsResolver {
         qtype: QueryType,
     ) -> Result<(Vec<IpAddr>, u32), io::Error> {
         tokio::time::timeout(self.timeout, async {
-            let socket = stack.udp_bind_with_size(0, 4096, 4096, 2).await?;
+            let socket = stack.udp_bind_with_size(0, 4096, 4096, 2)?;
             let tx_id = rand::random::<u16>();
 
             let query = build_query(domain, qtype, tx_id)

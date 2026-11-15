@@ -355,7 +355,7 @@ async fn test_adv_dns_leak_prevention_and_cache_churn() {
         listen_port: None,
         mtu: 1420,
     };
-    let stack = VirtualNetworkStack::new(&iface_cfg, bridge).await.unwrap();
+    let stack = VirtualNetworkStack::new(&iface_cfg, bridge).unwrap();
 
     // Query non-existent domain to unroutable DNS
     let start = std::time::Instant::now();

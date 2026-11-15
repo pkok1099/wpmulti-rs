@@ -395,7 +395,7 @@ async fn test_stack_dual_stack_addressing() {
     let config = make_test_config("10.2.0.2/32", Some("fd00::2/128"));
     let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
 
-    let stack = VirtualNetworkStack::new(&config, bridge).await.unwrap();
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
 
     assert_eq!(stack.local_v4(), Some(Ipv4Addr::new(10, 2, 0, 2)));
     assert_eq!(
@@ -410,7 +410,7 @@ async fn test_stack_dual_stack_addressing() {
 async fn test_stack_ephemeral_port_cycling() {
     let config = make_test_config("10.2.0.2/32", None);
     let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
-    let stack = VirtualNetworkStack::new(&config, bridge).await.unwrap();
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
 
     let mut prev = stack.alloc_ephemeral_port();
     assert!(prev >= 49152);
@@ -429,7 +429,7 @@ async fn test_stack_ephemeral_port_cycling() {
 async fn test_stack_clean_shutdown() {
     let config = make_test_config("172.16.0.2/32", None);
     let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
-    let stack = VirtualNetworkStack::new(&config, bridge).await.unwrap();
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
 
     // Close and ensure background task terminates without hanging
     tokio::time::timeout(Duration::from_millis(500), stack.close())
@@ -445,14 +445,14 @@ async fn test_stack_clean_shutdown() {
 async fn test_udp_socket_bind_and_port() {
     let config = make_test_config("10.2.0.2/32", None);
     let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
-    let stack = VirtualNetworkStack::new(&config, bridge).await.unwrap();
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
 
     // Ephemeral port binding (0)
-    let sock_ephemeral = stack.udp_bind(0).await.unwrap();
+    let sock_ephemeral = stack.udp_bind(0).unwrap();
     assert!(sock_ephemeral.local_port() >= 49152);
 
     // Explicit port binding
-    let sock_explicit = stack.udp_bind(5353).await.unwrap();
+    let sock_explicit = stack.udp_bind(5353).unwrap();
     assert_eq!(sock_explicit.local_port(), 5353);
 
     stack.close().await;
@@ -462,9 +462,9 @@ async fn test_udp_socket_bind_and_port() {
 async fn test_udp_socket_send_and_recv_loopback() {
     let config = make_test_config("10.2.0.2/32", None);
     let (bridge, mut ip_send, mut ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
-    let stack = VirtualNetworkStack::new(&config, bridge).await.unwrap();
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
 
-    let udp = stack.udp_bind(12345).await.unwrap();
+    let udp = stack.udp_bind(12345).unwrap();
     let target = SocketAddr::from(([1, 1, 1, 1], 53));
 
     // 1. Send datagram from virtual socket
@@ -524,7 +524,7 @@ async fn test_udp_socket_send_and_recv_loopback() {
 async fn test_in_tunnel_dns_ip_literal_fast_path() {
     let config = make_test_config("10.2.0.2/32", Some("fd00::2/128"));
     let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
-    let stack = VirtualNetworkStack::new(&config, bridge).await.unwrap();
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
 
     // IPv4 literal fast-path
     let ip4 = stack.resolve_in_tunnel("93.184.216.34").await.unwrap();
@@ -544,7 +544,7 @@ async fn test_in_tunnel_dns_ip_literal_fast_path() {
 async fn test_in_tunnel_dns_resolution_and_cache() {
     let config = make_test_config("10.2.0.2/32", None);
     let (bridge, mut ip_send, mut ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
-    let stack = VirtualNetworkStack::new(&config, bridge).await.unwrap();
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
 
     let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
 
@@ -622,7 +622,7 @@ async fn test_in_tunnel_dns_resolution_and_cache() {
 async fn test_tcp_stream_connect_unaddressable() {
     let config = make_test_config("10.2.0.2/32", None); // IPv4 only
     let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
-    let stack = VirtualNetworkStack::new(&config, bridge).await.unwrap();
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
 
     // Attempting to connect to IPv6 when only IPv4 configured must fail
     let dst = SocketAddr::from(([0x26, 0x06, 0, 0, 0, 0, 0, 1], 80));
@@ -640,7 +640,7 @@ async fn test_tcp_stream_connect_unaddressable() {
 async fn test_tcp_stream_handshake_and_exchange() {
     let config = make_test_config("10.2.0.2/32", None);
     let (bridge, mut ip_send, mut ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
-    let stack = VirtualNetworkStack::new(&config, bridge).await.unwrap();
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
 
     let dst = SocketAddr::from(([93, 184, 216, 34], 80));
 
@@ -760,7 +760,7 @@ async fn test_tcp_stream_handshake_and_exchange() {
         .tcp_connect(dst)
         .await
         .expect("tcp_connect must succeed");
-    assert_eq!(stream.peer_addr().unwrap(), dst);
+    assert_eq!(stream.peer_addr(), dst);
 
     // Write data
     stream
@@ -800,7 +800,6 @@ async fn test_stack_ipv4_only_isolation() {
 
     let stack =
         VirtualNetworkStack::new_with_mode(&config, bridge, crate::config::IpMode::Ipv4Only, false)
-            .await
             .unwrap();
 
     assert_eq!(stack.local_v4(), Some(Ipv4Addr::new(10, 2, 0, 2)));
@@ -812,7 +811,7 @@ async fn test_stack_ipv4_only_isolation() {
     assert_eq!(tcp_err.kind(), std::io::ErrorKind::AddrNotAvailable);
 
     // IPv6 UDP send_to must be blocked immediately
-    let udp = stack.udp_bind(0).await.unwrap();
+    let udp = stack.udp_bind(0).unwrap();
     let udp_err = udp.send_to(b"hello", v6_dst).await.unwrap_err();
     assert_eq!(udp_err.kind(), std::io::ErrorKind::AddrNotAvailable);
 
@@ -835,7 +834,6 @@ async fn test_stack_ipv6_only_isolation() {
 
     let stack =
         VirtualNetworkStack::new_with_mode(&config, bridge, crate::config::IpMode::Ipv6Only, false)
-            .await
             .unwrap();
 
     assert_eq!(stack.local_v4(), None);
@@ -850,7 +848,7 @@ async fn test_stack_ipv6_only_isolation() {
     assert_eq!(tcp_err.kind(), std::io::ErrorKind::AddrNotAvailable);
 
     // IPv4 UDP send_to must be blocked immediately
-    let udp = stack.udp_bind(0).await.unwrap();
+    let udp = stack.udp_bind(0).unwrap();
     let udp_err = udp.send_to(b"hello", v4_dst).await.unwrap_err();
     assert_eq!(udp_err.kind(), std::io::ErrorKind::AddrNotAvailable);
 

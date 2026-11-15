@@ -831,9 +831,7 @@ impl LifecycleController {
             prefer_ipv6,
             (dns_fallback, dns_strategy),
             handshake_timeout,
-        )
-        .await
-        {
+        ) {
             Ok(ns) => ns,
             Err(e) => {
                 let () = device.suspend().await;

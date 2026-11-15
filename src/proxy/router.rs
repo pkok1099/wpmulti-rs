@@ -146,10 +146,11 @@ impl ProxyTunnelTarget for VirtualNetworkStack {
         &'a self,
         local_port: u16,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
-        Box::pin(async move {
-            let sock: Box<dyn ProxyUdpSocket> = Box::new(self.udp_bind(local_port).await?);
-            Ok(sock)
-        })
+        let res = self.udp_bind(local_port).map(|sock| {
+            let boxed: Box<dyn ProxyUdpSocket> = Box::new(sock);
+            boxed
+        });
+        Box::pin(std::future::ready(res))
     }
 
     fn resolve_in_tunnel<'a>(

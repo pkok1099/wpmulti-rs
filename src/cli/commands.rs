@@ -356,9 +356,7 @@ pub async fn run_probe_single(
         bridge,
         IpMode::DualStack,
         false,
-    )
-    .await
-    {
+    ) {
         Ok(ns) => ns,
         Err(e) => {
             let () = device.suspend().await;

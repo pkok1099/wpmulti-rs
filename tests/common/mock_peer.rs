@@ -52,11 +52,8 @@ pub struct MockPeerControls {
 struct PeerSession {
     tunn: Tunn,
     peer_addr: SocketAddr,
-    #[allow(dead_code)]
     peer_pub: [u8; 32],
-    #[allow(dead_code)]
     peer_idx: u32,
-    #[allow(dead_code)]
     last_seen: Instant,
 }
 
@@ -339,7 +336,6 @@ async fn run_mock_peer_loop(
 
 struct TcpConnState {
     server_seq: u32,
-    #[allow(dead_code)]
     client_seq: u32,
 }
 
@@ -551,7 +547,6 @@ impl MockIpEngine {
         Some(resp)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_tcp(
         &self,
         src_ip: IpAddr,

@@ -36,16 +36,10 @@ impl std::str::FromStr for WgConfig {
 }
 
 impl WgConfig {
-    /// Parse configuration from a string slice.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(content: &str) -> Result<Self, WgConfError> {
-        <Self as std::str::FromStr>::from_str(content)
-    }
-
     /// Parse configuration from a filesystem path.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, WgConfError> {
         let content = std::fs::read_to_string(path)?;
-        Self::from_str(&content)
+        content.parse()
     }
 }
 

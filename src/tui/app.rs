@@ -1072,11 +1072,13 @@ impl TuiApp {
         if let (Some(prev_rx), Some(prev_tx), Some(prev_at)) =
             (self.prev_total_rx, self.prev_total_tx, self.last_sample_at)
         {
-            let elapsed = now.duration_since(prev_at).as_secs_f64().max(0.05);
-            #[allow(clippy::cast_sign_loss)]
-            let rx_bps = (total_rx.saturating_sub(prev_rx) as f64 / elapsed).max(0.0) as u64;
-            #[allow(clippy::cast_sign_loss)]
-            let tx_bps = (total_tx.saturating_sub(prev_tx) as f64 / elapsed).max(0.0) as u64;
+            let elapsed_ms = now.duration_since(prev_at).as_millis().max(50);
+            let rx_bps =
+                u64::try_from(u128::from(total_rx.saturating_sub(prev_rx)) * 1000 / elapsed_ms)
+                    .unwrap_or(u64::MAX);
+            let tx_bps =
+                u64::try_from(u128::from(total_tx.saturating_sub(prev_tx)) * 1000 / elapsed_ms)
+                    .unwrap_or(u64::MAX);
             self.current_rx_bps = rx_bps;
             self.current_tx_bps = tx_bps;
             if self.rx_rates.len() >= 40 {

@@ -852,20 +852,21 @@ pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Resu
                         handle_tui_key(&mut app, tui_key).await;
                     }
                 }
-                Event::Mouse(mouse) =>
-                {
-                    #[allow(clippy::wildcard_enum_match_arm)]
-                    match mouse.kind {
-                        MouseEventKind::ScrollDown => handle_tui_key(&mut app, TuiKey::Down).await,
-                        MouseEventKind::ScrollUp => handle_tui_key(&mut app, TuiKey::Up).await,
-                        MouseEventKind::Down(MouseButton::Left) if mouse.row == 1 => {
-                            if let Some(tab) = tab_at_column(mouse.column as usize) {
-                                app.set_tab(tab);
-                            }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollDown => handle_tui_key(&mut app, TuiKey::Down).await,
+                    MouseEventKind::ScrollUp => handle_tui_key(&mut app, TuiKey::Up).await,
+                    MouseEventKind::Down(MouseButton::Left) if mouse.row == 1 => {
+                        if let Some(tab) = tab_at_column(mouse.column as usize) {
+                            app.set_tab(tab);
                         }
-                        _ => {}
                     }
-                }
+                    MouseEventKind::Down(_)
+                    | MouseEventKind::Up(_)
+                    | MouseEventKind::Drag(_)
+                    | MouseEventKind::Moved
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight => {}
+                },
                 Event::Key(_)
                 | Event::FocusGained
                 | Event::FocusLost
@@ -900,6 +901,7 @@ fn tab_at_column(col: usize) -> Option<TuiTab> {
     None
 }
 
+// `crossterm::event::KeyCode` is a large external input enum; unmapped keys return `None`.
 #[allow(clippy::wildcard_enum_match_arm)]
 const fn map_crossterm_key(code: KeyCode) -> Option<TuiKey> {
     match code {
@@ -920,7 +922,6 @@ const fn map_crossterm_key(code: KeyCode) -> Option<TuiKey> {
     }
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
 async fn handle_prompt_key(app: &mut TuiApp, key: TuiKey) -> bool {
     if app.batch_prompt.is_some() {
         match key {
@@ -940,7 +941,15 @@ async fn handle_prompt_key(app: &mut TuiApp, key: TuiKey) -> bool {
                     buf.push(c);
                 }
             }
-            _ => {}
+            TuiKey::Up
+            | TuiKey::Down
+            | TuiKey::Left
+            | TuiKey::Right
+            | TuiKey::PageUp
+            | TuiKey::PageDown
+            | TuiKey::Home
+            | TuiKey::End
+            | TuiKey::Tab => {}
         }
         return true;
     }
@@ -956,7 +965,15 @@ async fn handle_prompt_key(app: &mut TuiApp, key: TuiKey) -> bool {
                 app.search_query.push(c);
                 app.apply_filter_and_sort();
             }
-            _ => {}
+            TuiKey::Up
+            | TuiKey::Down
+            | TuiKey::Left
+            | TuiKey::Right
+            | TuiKey::PageUp
+            | TuiKey::PageDown
+            | TuiKey::Home
+            | TuiKey::End
+            | TuiKey::Tab => {}
         }
         return true;
     }
@@ -979,7 +996,15 @@ async fn handle_prompt_key(app: &mut TuiApp, key: TuiKey) -> bool {
                     buf.push(c);
                 }
             }
-            _ => {}
+            TuiKey::Up
+            | TuiKey::Down
+            | TuiKey::Left
+            | TuiKey::Right
+            | TuiKey::PageUp
+            | TuiKey::PageDown
+            | TuiKey::Home
+            | TuiKey::End
+            | TuiKey::Tab => {}
         }
         return true;
     }
@@ -987,7 +1012,6 @@ async fn handle_prompt_key(app: &mut TuiApp, key: TuiKey) -> bool {
     false
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
 async fn handle_tunnels_tab_key(app: &mut TuiApp, key: TuiKey) {
     match key {
         TuiKey::Up | TuiKey::Char('k') => app.select_prev(),
@@ -1021,11 +1045,124 @@ async fn handle_tunnels_tab_key(app: &mut TuiApp, key: TuiKey) {
                 app.set_status(format!("Reload error: {e}"));
             }
         }
-        _ => {}
+        TuiKey::Char(_)
+        | TuiKey::Left
+        | TuiKey::Right
+        | TuiKey::Enter
+        | TuiKey::Backspace
+        | TuiKey::Tab
+        | TuiKey::Esc => {}
     }
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
+fn handle_logs_tab_key(app: &mut TuiApp, key: TuiKey) {
+    match key {
+        TuiKey::Up | TuiKey::Char('k') => app.log_scroll = app.log_scroll.saturating_add(1),
+        TuiKey::Down | TuiKey::Char('j') => {
+            app.log_scroll = app.log_scroll.saturating_sub(1);
+        }
+        TuiKey::Char('f') => app.cycle_log_filter(),
+        TuiKey::Char('c') => {
+            if let Some(buf) = &app.log_buffer {
+                buf.clear();
+            }
+            app.log_scroll = 0;
+            app.set_status("Logs cleared");
+        }
+        TuiKey::Char(_)
+        | TuiKey::Left
+        | TuiKey::Right
+        | TuiKey::PageUp
+        | TuiKey::PageDown
+        | TuiKey::Home
+        | TuiKey::End
+        | TuiKey::Enter
+        | TuiKey::Backspace
+        | TuiKey::Tab
+        | TuiKey::Esc => {}
+    }
+}
+
+const fn handle_listeners_tab_key(app: &mut TuiApp, key: TuiKey) {
+    match key {
+        TuiKey::Up | TuiKey::Char('k') => {
+            app.listener_scroll = app.listener_scroll.saturating_sub(1);
+        }
+        TuiKey::Down | TuiKey::Char('j') if app.listener_scroll + 1 < app.listeners.len() => {
+            app.listener_scroll += 1;
+        }
+        TuiKey::Char(_)
+        | TuiKey::Down
+        | TuiKey::Left
+        | TuiKey::Right
+        | TuiKey::PageUp
+        | TuiKey::PageDown
+        | TuiKey::Home
+        | TuiKey::End
+        | TuiKey::Enter
+        | TuiKey::Backspace
+        | TuiKey::Tab
+        | TuiKey::Esc => {}
+    }
+}
+
+async fn handle_config_tab_key(app: &mut TuiApp, key: TuiKey) {
+    match key {
+        TuiKey::Up | TuiKey::Char('k') => {
+            app.config_selected = app.config_selected.saturating_sub(1);
+        }
+        TuiKey::Down | TuiKey::Char('j') if app.config_selected + 1 < TuiApp::CONFIG_ROW_COUNT => {
+            app.config_selected += 1;
+        }
+        TuiKey::Enter | TuiKey::Char(' ') => {
+            if let Err(e) = app.activate_config_row().await {
+                app.set_status(format!("Config error: {e}"));
+            }
+        }
+        TuiKey::Char('w') => {
+            if let Err(e) = app.save_config_and_reload().await {
+                app.set_status(format!("Save error: {e}"));
+            }
+        }
+        TuiKey::Char(_)
+        | TuiKey::Down
+        | TuiKey::Left
+        | TuiKey::Right
+        | TuiKey::PageUp
+        | TuiKey::PageDown
+        | TuiKey::Home
+        | TuiKey::End
+        | TuiKey::Backspace
+        | TuiKey::Tab
+        | TuiKey::Esc => {}
+    }
+}
+
+async fn handle_probe_tab_key(app: &mut TuiApp, key: TuiKey) {
+    match key {
+        TuiKey::Up | TuiKey::Char('k') => {
+            app.probe_scroll = app.probe_scroll.saturating_sub(1);
+        }
+        TuiKey::Down | TuiKey::Char('j') if app.probe_scroll + 1 < app.probe_results.len() => {
+            app.probe_scroll += 1;
+        }
+        TuiKey::Char('p') => app.probe_selected_tunnel().await,
+        TuiKey::Char('P') => app.probe_all_tunnels().await,
+        TuiKey::Char(_)
+        | TuiKey::Down
+        | TuiKey::Left
+        | TuiKey::Right
+        | TuiKey::PageUp
+        | TuiKey::PageDown
+        | TuiKey::Home
+        | TuiKey::End
+        | TuiKey::Enter
+        | TuiKey::Backspace
+        | TuiKey::Tab
+        | TuiKey::Esc => {}
+    }
+}
+
 async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
     if handle_prompt_key(app, key).await {
         return;
@@ -1040,68 +1177,21 @@ async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
         TuiKey::Char('5') => app.set_tab(TuiTab::Probe),
         TuiKey::Tab | TuiKey::Right => app.next_tab(),
         TuiKey::Left => app.prev_tab(),
-        _ => match app.active_tab {
+        TuiKey::Char(_)
+        | TuiKey::Up
+        | TuiKey::Down
+        | TuiKey::PageUp
+        | TuiKey::PageDown
+        | TuiKey::Home
+        | TuiKey::End
+        | TuiKey::Enter
+        | TuiKey::Backspace
+        | TuiKey::Esc => match app.active_tab {
             TuiTab::Tunnels => handle_tunnels_tab_key(app, key).await,
-            TuiTab::Logs => match key {
-                TuiKey::Up | TuiKey::Char('k') => app.log_scroll = app.log_scroll.saturating_add(1),
-                TuiKey::Down | TuiKey::Char('j') => {
-                    app.log_scroll = app.log_scroll.saturating_sub(1);
-                }
-                TuiKey::Char('f') => app.cycle_log_filter(),
-                TuiKey::Char('c') => {
-                    if let Some(buf) = &app.log_buffer {
-                        buf.clear();
-                    }
-                    app.log_scroll = 0;
-                    app.set_status("Logs cleared");
-                }
-                _ => {}
-            },
-            TuiTab::Listeners => match key {
-                TuiKey::Up | TuiKey::Char('k') => {
-                    app.listener_scroll = app.listener_scroll.saturating_sub(1);
-                }
-                TuiKey::Down | TuiKey::Char('j')
-                    if app.listener_scroll + 1 < app.listeners.len() =>
-                {
-                    app.listener_scroll += 1;
-                }
-                _ => {}
-            },
-            TuiTab::Config => match key {
-                TuiKey::Up | TuiKey::Char('k') => {
-                    app.config_selected = app.config_selected.saturating_sub(1);
-                }
-                TuiKey::Down | TuiKey::Char('j')
-                    if app.config_selected + 1 < TuiApp::CONFIG_ROW_COUNT =>
-                {
-                    app.config_selected += 1;
-                }
-                TuiKey::Enter | TuiKey::Char(' ') => {
-                    if let Err(e) = app.activate_config_row().await {
-                        app.set_status(format!("Config error: {e}"));
-                    }
-                }
-                TuiKey::Char('w') => {
-                    if let Err(e) = app.save_config_and_reload().await {
-                        app.set_status(format!("Save error: {e}"));
-                    }
-                }
-                _ => {}
-            },
-            TuiTab::Probe => match key {
-                TuiKey::Up | TuiKey::Char('k') => {
-                    app.probe_scroll = app.probe_scroll.saturating_sub(1);
-                }
-                TuiKey::Down | TuiKey::Char('j')
-                    if app.probe_scroll + 1 < app.probe_results.len() =>
-                {
-                    app.probe_scroll += 1;
-                }
-                TuiKey::Char('p') => app.probe_selected_tunnel().await,
-                TuiKey::Char('P') => app.probe_all_tunnels().await,
-                _ => {}
-            },
+            TuiTab::Logs => handle_logs_tab_key(app, key),
+            TuiTab::Listeners => handle_listeners_tab_key(app, key),
+            TuiTab::Config => handle_config_tab_key(app, key).await,
+            TuiTab::Probe => handle_probe_tab_key(app, key).await,
         },
     }
 }

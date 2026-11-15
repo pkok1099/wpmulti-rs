@@ -464,11 +464,13 @@ const fn default_true() -> bool {
     true
 }
 
+// `#[serde(default = "...")]` requires returning the exact `Option<u16>` field type.
 #[allow(clippy::unnecessary_wraps)]
 const fn default_base_socks5_port() -> Option<u16> {
     Some(10000)
 }
 
+// `#[serde(default = "...")]` requires returning the exact `Option<u16>` field type.
 #[allow(clippy::unnecessary_wraps)]
 const fn default_base_http_port() -> Option<u16> {
     Some(20000)
