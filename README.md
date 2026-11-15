@@ -1,6 +1,10 @@
 # wpmulti
 
-High-concurrency multi-tunnel WireGuard proxy daemon in Rust, built on top of [`gotatun`](https://github.com/mullvad/gotatun) and [`smoltcp`](https://github.com/smoltcp-rs/smoltcp).
+[![CI](https://github.com/pkok1099/wpmulti-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/pkok1099/wpmulti-rs/actions/workflows/ci.yml)
+[![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](LICENSE)
+[![Rust: 1.95+](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
+
+High-concurrency multi-tunnel WireGuard SOCKS5 & HTTP proxy daemon in Rust, built on top of [`gotatun`](https://github.com/mullvad/gotatun) and [`smoltcp`](https://github.com/smoltcp-rs/smoltcp).
 
 `wpmulti` runs hundreds or thousands of WireGuard `.conf` files simultaneously **entirely in userspace** (no root privileges or kernel `wg0`/TUN interfaces required) and exposes them as **SOCKS5** and **HTTP/HTTPS CONNECT** proxies.
 
