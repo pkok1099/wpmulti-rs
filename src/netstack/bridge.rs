@@ -64,7 +64,7 @@ impl VirtualTunBridge {
         let bridge = Self {
             mtu,
             rx_receiver,
-            tx_sender: tx_sender.clone(),
+            tx_sender,
             notify: Arc::clone(&notify),
             buf_pool: Arc::clone(&buf_pool),
         };

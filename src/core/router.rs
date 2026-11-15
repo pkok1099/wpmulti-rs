@@ -218,10 +218,61 @@ impl MultiTenantRouter {
         }
     }
 
-    /// Select a tunnel ID directly from the registry without candidate vector allocation.
+    /// Select a tunnel ID directly from the registry without candidate vector or HashMap lookups.
     fn select_by_keyword_registry(&self, keyword: PoolKeyword) -> io::Result<String> {
-        let candidates = self.registry.all_ids();
-        self.select_by_keyword_slice(keyword, &candidates)
+        let entries = self.registry.all_entries();
+        if entries.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no healthy tunnels available in pool",
+            ));
+        }
+
+        match keyword {
+            PoolKeyword::LeastConn => {
+                let mut best_id: Option<&str> = None;
+                let mut min_conns = usize::MAX;
+                for entry in &entries {
+                    if entry.health.is_routable() {
+                        let conns = entry.stats.active_conns.load(Ordering::Relaxed);
+                        if conns < min_conns {
+                            min_conns = conns;
+                            best_id = Some(entry.id.as_str());
+                        }
+                    }
+                }
+                best_id.map(str::to_string).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "no healthy tunnels available in pool",
+                    )
+                })
+            }
+            PoolKeyword::Random | PoolKeyword::RoundRobin | PoolKeyword::Auto => {
+                let healthy_count = entries.iter().filter(|e| e.health.is_routable()).count();
+                if healthy_count == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "no healthy tunnels available in pool",
+                    ));
+                }
+                let target_idx = match keyword {
+                    PoolKeyword::Random => (rand::random::<u32>() as usize) % healthy_count,
+                    _ => self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_count,
+                };
+                entries
+                    .iter()
+                    .filter(|e| e.health.is_routable())
+                    .nth(target_idx)
+                    .map(|e| e.id.clone())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "no healthy tunnels available in pool",
+                        )
+                    })
+            }
+        }
     }
 
     /// Select a candidate tunnel with lowest active connections among healthy candidates.
