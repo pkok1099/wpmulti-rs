@@ -1,14 +1,21 @@
 //! Command handlers for the `wpmulti` CLI.
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::api::AdminServer;
-use crate::config::{load_tunnel_configs_from_dir, MainConfig};
+use crate::config::{
+    load_tunnel_config_from_file, load_tunnel_configs_from_dir, parse_duration_str, IpMode,
+    MainConfig, TunnelConfig,
+};
 use crate::core::TunnelManager;
+use crate::netstack::{VirtualNetworkStack, VirtualTunBridge, DEFAULT_CHANNEL_CAPACITY};
 use crate::tui::{run_terminal_tui, TuiApp, TuiDataSource};
 
 /// Execute the `wpmulti run` command: starts multi-tunnel daemon and optional TUI.
@@ -172,4 +179,254 @@ pub async fn cmd_top(admin_url: String) -> Result<(), Box<dyn std::error::Error>
     let app = TuiApp::new(source, crate::config::TuiSortField::Id);
     run_terminal_tui(app, 500).await?;
     Ok(())
+}
+
+/// Diagnostic result of probing a single WireGuard configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeResult {
+    /// Tunnel ID.
+    pub id: String,
+    /// Path or name of configuration file.
+    pub config_file: String,
+    /// Peer endpoint address.
+    pub endpoint: String,
+    /// Whether handshake and connectivity probe succeeded.
+    pub healthy: bool,
+    /// Round-trip time in milliseconds, if handshake succeeded.
+    pub rtt_ms: Option<f64>,
+    /// In-tunnel exit IP address, if available.
+    pub exit_ip: Option<String>,
+    /// Error message, if probe failed.
+    pub error: Option<String>,
+}
+
+/// Run probe for a single tunnel config.
+pub async fn run_probe_single(
+    config: &TunnelConfig,
+    config_file: String,
+    timeout: Duration,
+) -> ProbeResult {
+    let endpoint = config
+        .peers
+        .first()
+        .map(|p| p.endpoint.clone())
+        .unwrap_or_else(|| "none".to_string());
+
+    let peer_pubkey = match config.peers.first().map(|p| p.public_key) {
+        Some(pk) => pk,
+        None => {
+            return ProbeResult {
+                id: config.id.clone(),
+                config_file,
+                endpoint,
+                healthy: false,
+                rtt_ms: None,
+                exit_ip: None,
+                error: Some("no peers configured in tunnel file".to_string()),
+            };
+        }
+    };
+
+    let (bridge, bridge_tx, bridge_rx) =
+        VirtualTunBridge::new(config.interface.mtu, DEFAULT_CHANNEL_CAPACITY);
+
+    let mut peers = Vec::with_capacity(config.peers.len());
+    for p_cfg in &config.peers {
+        let mut peer = gotatun::device::Peer::new(p_cfg.public_key);
+        if let Ok(addr) = p_cfg.endpoint.parse::<SocketAddr>() {
+            peer.endpoint = Some(addr);
+        } else if let Ok(mut addrs) = tokio::net::lookup_host(&p_cfg.endpoint).await {
+            peer.endpoint = addrs.next();
+        }
+        peer.allowed_ips = p_cfg.allowed_ips.clone();
+        peer.preshared_key = p_cfg.preshared_key;
+        peer.keepalive = p_cfg.persistent_keepalive;
+        peers.push(peer);
+    }
+
+    let mut builder = gotatun::device::DeviceBuilder::new()
+        .with_default_udp()
+        .with_ip_pair(bridge_tx, bridge_rx)
+        .with_private_key(config.interface.private_key.clone())
+        .with_peers(peers)
+        .suspended(false);
+
+    if let Some(port) = config.interface.listen_port {
+        builder = builder.with_listen_port(port);
+    }
+
+    let device = match builder.build().await {
+        Ok(d) => d,
+        Err(e) => {
+            return ProbeResult {
+                id: config.id.clone(),
+                config_file,
+                endpoint,
+                healthy: false,
+                rtt_ms: None,
+                exit_ip: None,
+                error: Some(format!("failed to build WireGuard device: {e}")),
+            };
+        }
+    };
+
+    let netstack = match VirtualNetworkStack::new_with_mode(
+        &config.interface,
+        bridge,
+        IpMode::DualStack,
+        false,
+    )
+    .await
+    {
+        Ok(ns) => ns,
+        Err(e) => {
+            let _ = device.suspend().await;
+            return ProbeResult {
+                id: config.id.clone(),
+                config_file,
+                endpoint,
+                healthy: false,
+                rtt_ms: None,
+                exit_ip: None,
+                error: Some(format!("failed to build network stack: {e}")),
+            };
+        }
+    };
+
+    let t0 = Instant::now();
+    let handshake_res = tokio::time::timeout(timeout, device.force_handshake(&peer_pubkey)).await;
+
+    let (healthy, rtt_ms, error) = match handshake_res {
+        Ok(Ok(())) => {
+            let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+            (true, Some(elapsed), None)
+        }
+        Ok(Err(e)) => (false, None, Some(format!("handshake failed: {e}"))),
+        Err(_) => (false, None, Some(format!("handshake timed out after {:?}", timeout))),
+    };
+
+    let exit_ip = if healthy {
+        config.interface.addresses.first().map(|net| net.ip().to_string())
+    } else {
+        None
+    };
+
+    let _ = device.suspend().await;
+    netstack.close().await;
+
+    ProbeResult {
+        id: config.id.clone(),
+        config_file,
+        endpoint,
+        healthy,
+        rtt_ms,
+        exit_ip,
+        error,
+    }
+}
+
+/// Execute the `wpmulti probe` command: probes one or more WireGuard configuration files.
+pub async fn cmd_probe(
+    config_path: Option<PathBuf>,
+    dir_path: Option<PathBuf>,
+    json_output: bool,
+    timeout_str: String,
+) -> Result<Vec<ProbeResult>, Box<dyn std::error::Error>> {
+    let timeout = parse_duration_str(&timeout_str)
+        .map_err(|e| format!("Invalid probe timeout '{}': {}", timeout_str, e))?;
+
+    let configs_with_path: Vec<(TunnelConfig, String)> = match (config_path, dir_path) {
+        (Some(file), None) => {
+            let t = load_tunnel_config_from_file(&file)
+                .map_err(|e| format!("Failed to load config '{}': {}", file.display(), e))?;
+            vec![(t, file.display().to_string())]
+        }
+        (None, Some(dir)) => {
+            let tunnels = load_tunnel_configs_from_dir(&dir)
+                .map_err(|e| format!("Failed to load configs from '{}': {}", dir.display(), e))?;
+            tunnels
+                .into_iter()
+                .map(|t| {
+                    let filename = format!("{}/{}.conf", dir.display(), t.id);
+                    (t, filename)
+                })
+                .collect()
+        }
+        (Some(_), Some(_)) => {
+            return Err("Cannot specify both -c/--config and -d/--dir simultaneously".into());
+        }
+        (None, None) => {
+            return Err("Must specify either -c/--config <FILE> or -d/--dir <DIR>".into());
+        }
+    };
+
+    if configs_with_path.is_empty() {
+        println!("No tunnel configurations found to probe.");
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::with_capacity(configs_with_path.len());
+    for (cfg, file) in configs_with_path {
+        let res = run_probe_single(&cfg, file, timeout).await;
+        results.push(res);
+    }
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        print_probe_table(&results);
+    }
+
+    Ok(results)
+}
+
+fn print_probe_table(results: &[ProbeResult]) {
+    println!("┌──────────┬──────────────────────┬─────────────┬────────────────┬────────────────────────┐");
+    println!("│ STATUS   │ CONFIG               │ RTT         │ EXIT IP        │ ENDPOINT               │");
+    println!("├──────────┼──────────────────────┼─────────────┼────────────────┼────────────────────────┤");
+
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for r in results {
+        let status = if r.healthy {
+            passed += 1;
+            "OK"
+        } else {
+            failed += 1;
+            "FAILED"
+        };
+
+        let rtt = match r.rtt_ms {
+            Some(ms) => format!("{:.1} ms", ms),
+            None => "-".to_string(),
+        };
+
+        let exit_ip = r.exit_ip.as_deref().unwrap_or("-");
+
+        println!(
+            "│ {:<8} │ {:<20} │ {:<11} │ {:<14} │ {:<22} │",
+            status,
+            truncate_str(&r.id, 20),
+            truncate_str(&rtt, 11),
+            truncate_str(exit_ip, 14),
+            truncate_str(&r.endpoint, 22),
+        );
+    }
+
+    println!("└──────────┴──────────────────────┴─────────────┴────────────────┴────────────────────────┘");
+    println!(
+        "Probe completed: {} passed, {} failed (total {}).",
+        passed,
+        failed,
+        results.len()
+    );
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() > max_len {
+        format!("{}…", &s[..max_len.saturating_sub(1)])
+    } else {
+        s.to_string()
+    }
 }

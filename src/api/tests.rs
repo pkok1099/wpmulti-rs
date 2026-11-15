@@ -88,6 +88,8 @@ async fn test_status_endpoint() {
     assert_eq!(json_val["total_tunnels"], 3);
     assert_eq!(json_val["active_tunnels"], 0);
     assert_eq!(json_val["dormant_tunnels"], 3);
+    assert_eq!(json_val["healthy_tunnels"], 3);
+    assert_eq!(json_val["unhealthy_tunnels"], 0);
     assert_eq!(json_val["total_connections"], 0);
     assert!(json_val["listeners"].is_array());
 }
@@ -276,10 +278,14 @@ async fn test_metrics_prometheus_exposition() {
 
     let body_str = String::from_utf8(resp.body).unwrap();
     assert!(body_str.contains("wpmulti_tunnels_total 3"));
+    assert!(body_str.contains("wpmulti_tunnels_healthy 3"));
+    assert!(body_str.contains("wpmulti_tunnels_unhealthy 0"));
     assert!(body_str.contains("wpmulti_connections_active_total 1"));
     assert!(body_str.contains("wpmulti_tunnel_rx_bytes{tunnel_id=\"wgcf-001\"} 1048576"));
     assert!(body_str.contains("wpmulti_tunnel_tx_bytes{tunnel_id=\"wgcf-001\"} 524288"));
     assert!(body_str.contains("wpmulti_tunnel_active_conns{tunnel_id=\"wgcf-001\"} 1"));
+    assert!(body_str.contains("wpmulti_tunnel_health{tunnel_id=\"wgcf-001\"} 1"));
+    assert!(body_str.contains("wpmulti_tunnel_consecutive_failures{tunnel_id=\"wgcf-001\"} 0"));
 }
 
 #[tokio::test]

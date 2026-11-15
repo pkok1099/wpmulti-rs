@@ -5,7 +5,7 @@ use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::config::{LifecycleMode, MainConfig, TuiSortField, TunnelConfig, WgInterfaceConfig, WgPeerConfig};
-use crate::core::{TunnelManager, TunnelState, TunnelSummary};
+use crate::core::{HealthStatus, TunnelManager, TunnelState, TunnelSummary};
 use crate::tui::app::{TuiApp, TuiDataSource};
 use crate::tui::ui::{format_bytes, render_dashboard};
 
@@ -42,6 +42,9 @@ fn make_dummy_summary(id: &str, state: TunnelState, conns: usize, rx: u64, tx: u
         last_active_at: None,
         assigned_port: Some(10000),
         endpoint: Some("198.51.100.1:51820".to_string()),
+        health: HealthStatus::Healthy,
+        consecutive_failures: 0,
+        cooldown_remaining_secs: 0,
     }
 }
 

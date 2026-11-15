@@ -11,6 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::RwLock;
 
@@ -33,6 +34,8 @@ pub struct MultiTenantRouter {
     allow_anonymous: bool,
     ip_mode: IpMode,
     rr_counter: AtomicUsize,
+    failure_threshold: usize,
+    cooldown_duration: Duration,
 }
 
 impl MultiTenantRouter {
@@ -41,6 +44,23 @@ impl MultiTenantRouter {
         settings: &SharedListenerSettings,
         lifecycle: Arc<LifecycleController>,
         registry: Arc<TunnelRegistry>,
+    ) -> Arc<Self> {
+        Self::from_settings_with_health(
+            settings,
+            lifecycle,
+            registry,
+            3,
+            Duration::from_secs(30),
+        )
+    }
+
+    /// Create a new multi-tenant router from shared listener configuration with health parameters.
+    pub fn from_settings_with_health(
+        settings: &SharedListenerSettings,
+        lifecycle: Arc<LifecycleController>,
+        registry: Arc<TunnelRegistry>,
+        failure_threshold: usize,
+        cooldown_duration: Duration,
     ) -> Arc<Self> {
         let allowed: Option<Arc<[String]>> = match &settings.pool {
             TunnelPoolSelection::All => None,
@@ -59,6 +79,8 @@ impl MultiTenantRouter {
             allow_anonymous: settings.allow_anonymous,
             ip_mode,
             rr_counter: AtomicUsize::new(0),
+            failure_threshold,
+            cooldown_duration,
         })
     }
 
@@ -80,7 +102,21 @@ impl MultiTenantRouter {
             allow_anonymous,
             ip_mode,
             rr_counter: AtomicUsize::new(0),
+            failure_threshold: 3,
+            cooldown_duration: Duration::from_secs(30),
         })
+    }
+
+    /// Configure health check parameters.
+    pub fn with_health_settings(
+        self: Arc<Self>,
+        failure_threshold: usize,
+        cooldown_duration: Duration,
+    ) -> Arc<Self> {
+        let mut router = Arc::try_unwrap(self).unwrap_or_else(|a| (*a).clone_shallow());
+        router.failure_threshold = failure_threshold;
+        router.cooldown_duration = cooldown_duration;
+        Arc::new(router)
     }
 
     /// Configure authentication mode and global password.
@@ -112,6 +148,8 @@ impl MultiTenantRouter {
             allow_anonymous: self.allow_anonymous,
             ip_mode: self.ip_mode,
             rr_counter: AtomicUsize::new(self.rr_counter.load(Ordering::Relaxed)),
+            failure_threshold: self.failure_threshold,
+            cooldown_duration: self.cooldown_duration,
         }
     }
 
@@ -125,63 +163,55 @@ impl MultiTenantRouter {
         }
     }
 
+    /// Filter candidates to only those whose health status is routable.
+    pub fn filter_healthy_candidates<'a>(&self, candidates: &'a [String]) -> Vec<&'a String> {
+        candidates
+            .iter()
+            .filter(|id| {
+                if let Some(entry) = self.registry.get(id) {
+                    entry.health.is_routable()
+                } else {
+                    false
+                }
+            })
+            .collect()
+    }
+
     /// Select a tunnel ID from slice based on keyword without cloning candidate lists.
     fn select_by_keyword_slice(&self, keyword: PoolKeyword, candidates: &[String]) -> io::Result<String> {
-        if candidates.is_empty() {
+        let healthy = self.filter_healthy_candidates(candidates);
+        if healthy.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
-                "no available tunnels in pool",
+                "no healthy tunnels available in pool",
             ));
         }
 
         match keyword {
             PoolKeyword::Random => {
-                let idx = (rand::random::<u32>() as usize) % candidates.len();
-                Ok(candidates[idx].clone())
+                let idx = (rand::random::<u32>() as usize) % healthy.len();
+                Ok((*healthy[idx]).clone())
             }
             PoolKeyword::RoundRobin | PoolKeyword::Auto => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % candidates.len();
-                Ok(candidates[idx].clone())
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len();
+                Ok((*healthy[idx]).clone())
             }
-            PoolKeyword::LeastConn => self.select_least_conn_slice(candidates),
+            PoolKeyword::LeastConn => self.select_least_conn_refs(&healthy),
         }
     }
 
     /// Select a tunnel ID directly from the registry without candidate vector allocation.
     fn select_by_keyword_registry(&self, keyword: PoolKeyword) -> io::Result<String> {
-        let total = self.registry.count();
-        if total == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "no available tunnels in registry",
-            ));
-        }
-
-        match keyword {
-            PoolKeyword::Random => {
-                let idx = (rand::random::<u32>() as usize) % total;
-                self.registry.id_by_index(idx).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotConnected, "failed to index tunnel")
-                })
-            }
-            PoolKeyword::RoundRobin | PoolKeyword::Auto => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % total;
-                self.registry.id_by_index(idx).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotConnected, "failed to index tunnel")
-                })
-            }
-            PoolKeyword::LeastConn => self.registry.least_conn_id().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "no candidate tunnels in registry")
-            }),
-        }
+        let candidates = self.registry.all_ids();
+        self.select_by_keyword_slice(keyword, &candidates)
     }
 
-    /// Select a candidate tunnel with lowest active connections from a slice.
-    fn select_least_conn_slice(&self, candidates: &[String]) -> io::Result<String> {
+    /// Select a candidate tunnel with lowest active connections among healthy candidates.
+    fn select_least_conn_refs(&self, healthy: &[&String]) -> io::Result<String> {
         let mut best_id = None;
         let mut min_conns = usize::MAX;
 
-        for id in candidates {
+        for &id in healthy {
             if let Some(entry) = self.registry.get(id) {
                 let conns = entry.stats.active_conns.load(Ordering::Relaxed);
                 if conns < min_conns {
@@ -199,6 +229,18 @@ impl MultiTenantRouter {
         })
     }
 
+    /// Select a candidate tunnel with lowest active connections from a slice.
+    fn select_least_conn_slice(&self, candidates: &[String]) -> io::Result<String> {
+        let healthy = self.filter_healthy_candidates(candidates);
+        if healthy.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no healthy tunnels available in pool",
+            ));
+        }
+        self.select_least_conn_refs(&healthy)
+    }
+
     /// Select a tunnel ID using default pool strategy from slice.
     fn select_default_pool_slice(&self, candidates: &[String]) -> io::Result<String> {
         if candidates.is_empty() {
@@ -209,13 +251,41 @@ impl MultiTenantRouter {
         }
 
         match self.default_strategy {
-            PoolStrategy::RoundRobin | PoolStrategy::Fallback => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % candidates.len();
-                Ok(candidates[idx].clone())
+            PoolStrategy::Fallback => {
+                // True priority fallback: select first routable candidate in sequence
+                for id in candidates {
+                    if let Some(entry) = self.registry.get(id)
+                        && entry.health.is_routable()
+                    {
+                        return Ok(id.clone());
+                    }
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "all tunnels in fallback pool are unhealthy",
+                ))
+            }
+            PoolStrategy::RoundRobin => {
+                let healthy = self.filter_healthy_candidates(candidates);
+                if healthy.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "no healthy tunnels available in pool",
+                    ));
+                }
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len();
+                Ok((*healthy[idx]).clone())
             }
             PoolStrategy::Random => {
-                let idx = (rand::random::<u32>() as usize) % candidates.len();
-                Ok(candidates[idx].clone())
+                let healthy = self.filter_healthy_candidates(candidates);
+                if healthy.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "no healthy tunnels available in pool",
+                    ));
+                }
+                let idx = (rand::random::<u32>() as usize) % healthy.len();
+                Ok((*healthy[idx]).clone())
             }
             PoolStrategy::LeastConn => self.select_least_conn_slice(candidates),
         }
@@ -223,13 +293,8 @@ impl MultiTenantRouter {
 
     /// Select a tunnel ID using default pool strategy from registry directly.
     fn select_default_pool_registry(&self) -> io::Result<String> {
-        match self.default_strategy {
-            PoolStrategy::RoundRobin | PoolStrategy::Fallback => {
-                self.select_by_keyword_registry(PoolKeyword::RoundRobin)
-            }
-            PoolStrategy::Random => self.select_by_keyword_registry(PoolKeyword::Random),
-            PoolStrategy::LeastConn => self.select_by_keyword_registry(PoolKeyword::LeastConn),
-        }
+        let candidates = self.registry.all_ids();
+        self.select_default_pool_slice(&candidates)
     }
 }
 
@@ -337,7 +402,21 @@ impl TunnelRouter for MultiTenantRouter {
                 .await
                 .map_err(|e| io::Error::other(format!("tunnel activation failed: {:?}", e)))?;
 
-            let guarded = GuardedTunnelTarget::new(active_tunnel, guard);
+            let entry = self.registry.get(&target_id);
+            let health = entry.as_ref().map(|e| Arc::clone(&e.health));
+
+            let guarded = if let Some(h) = health {
+                GuardedTunnelTarget::new_with_health(
+                    active_tunnel,
+                    guard,
+                    h,
+                    self.failure_threshold,
+                    self.cooldown_duration,
+                )
+            } else {
+                GuardedTunnelTarget::new(active_tunnel, guard)
+            };
+
             if self.ip_mode == IpMode::DualStack {
                 Ok(Arc::new(guarded) as Arc<dyn ProxyTunnelTarget>)
             } else {
@@ -401,7 +480,21 @@ impl TunnelRouter for DedicatedTunnelRouter {
                 .await
                 .map_err(|e| io::Error::other(format!("tunnel activation failed: {:?}", e)))?;
 
-            let guarded = GuardedTunnelTarget::new(active, guard);
+            let entry = self.lifecycle.registry().get(&self.tunnel_id);
+            let health = entry.as_ref().map(|e| Arc::clone(&e.health));
+
+            let guarded = if let Some(h) = health {
+                GuardedTunnelTarget::new_with_health(
+                    active,
+                    guard,
+                    h,
+                    3,
+                    Duration::from_secs(30),
+                )
+            } else {
+                GuardedTunnelTarget::new(active, guard)
+            };
+
             let ip_mode = self.lifecycle.ip_mode();
             if ip_mode == IpMode::DualStack {
                 Ok(Arc::new(guarded) as Arc<dyn ProxyTunnelTarget>)

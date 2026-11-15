@@ -1071,6 +1071,9 @@ fn test_f13_bnd_tui_search_query_no_matches() {
         last_active_at: None,
         assigned_port: None,
         endpoint: None,
+        health: wpmulti::core::HealthStatus::Healthy,
+        consecutive_failures: 0,
+        cooldown_remaining_secs: 0,
     }];
     app.set_tunnels(list);
 
@@ -1099,6 +1102,9 @@ fn test_f13_bnd_tui_scroll_past_bounds() {
         last_active_at: None,
         assigned_port: None,
         endpoint: None,
+        health: wpmulti::core::HealthStatus::Healthy,
+        consecutive_failures: 0,
+        cooldown_remaining_secs: 0,
     }];
     app.set_tunnels(list);
 

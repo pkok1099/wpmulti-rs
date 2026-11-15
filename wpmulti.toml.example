@@ -16,6 +16,12 @@ idle_timeout = "5m"                 # ms, s, m, h, d or integer seconds
 handshake_timeout = "10s"
 eager_tunnels = []                  # e.g. ["wgcf-001"]
 
+[health_check]
+threshold = 3                       # consecutive failures before marking unhealthy (circuit breaker)
+cooldown = "30s"                    # cooldown period before attempting half-open recovery
+probe_interval = "30s"              # active probe interval for eager tunnels (force_handshake)
+probe_timeout = "5s"                # active probe handshake timeout
+
 [per_tunnel]
 enabled = true
 base_socks5_port = 11000            # SOCKS5 ports: 11000 + index

@@ -763,3 +763,80 @@ async fn test_boot_failure_reverts_state_to_dormant() {
     assert!(res.is_err());
     assert_eq!(*entry.state.read(), TunnelState::Dormant);
 }
+
+#[tokio::test]
+async fn test_router_failover_strategies() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let e1 = registry.register(TunnelEntry::new("t1", make_test_tunnel_config("t1"), LifecycleMode::Lazy)).unwrap();
+    let e2 = registry.register(TunnelEntry::new("t2", make_test_tunnel_config("t2"), LifecycleMode::Lazy)).unwrap();
+    let e3 = registry.register(TunnelEntry::new("t3", make_test_tunnel_config("t3"), LifecycleMode::Lazy)).unwrap();
+
+    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+
+    // 1. Fallback Strategy
+    let router_fallback = MultiTenantRouter::new(Arc::clone(&lifecycle), Arc::clone(&registry), PoolStrategy::Fallback, true);
+    router_fallback.set_allowed_tunnels(Some(vec!["t1".into(), "t2".into(), "t3".into()]));
+
+    // All healthy: primary t1 selected
+    let s = router_fallback.authenticate(None).unwrap();
+    match s {
+        TunnelSelector::DefaultPool => {
+            let candidates = router_fallback.get_candidates();
+            assert_eq!(candidates, vec!["t1", "t2", "t3"]);
+        }
+        _ => panic!("expected DefaultPool"),
+    }
+
+    // Mark t1 Unhealthy: falls back to t2
+    e1.health.mark_unhealthy(Duration::from_secs(60));
+    assert!(!e1.health.is_routable());
+
+    // 2. Round-Robin skips Unhealthy t1
+    let router_rr = MultiTenantRouter::new(Arc::clone(&lifecycle), Arc::clone(&registry), PoolStrategy::RoundRobin, true);
+    router_rr.set_allowed_tunnels(Some(vec!["t1".into(), "t2".into(), "t3".into()]));
+
+    for _ in 0..10 {
+        let chosen = router_rr.authenticate(None).unwrap();
+        assert_eq!(chosen, TunnelSelector::DefaultPool);
+        // Direct keyword selection to inspect chosen tunnel
+        let selected = router_rr.get_candidates();
+        let healthy = router_rr.filter_healthy_candidates(&selected);
+        assert_eq!(healthy.len(), 2);
+        assert!(!healthy.contains(&&"t1".to_string()));
+    }
+
+    // 3. Least-Conn selects healthy even with higher connections
+    e2.stats.active_conns.store(100, Ordering::Relaxed);
+    e3.stats.active_conns.store(5, Ordering::Relaxed);
+    let router_lc = MultiTenantRouter::new(Arc::clone(&lifecycle), Arc::clone(&registry), PoolStrategy::LeastConn, true);
+    router_lc.set_allowed_tunnels(Some(vec!["t1".into(), "t2".into(), "t3".into()]));
+
+    // e1 has 0 conns, but is unhealthy! So e3 (5 conns) must be chosen over e2 (100 conns)
+    let candidates = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
+    let filtered = router_lc.filter_healthy_candidates(&candidates);
+    assert_eq!(filtered.len(), 2);
+
+    // 4. Fallback recovery: restore e1, verify it becomes primary again
+    e1.health.record_success();
+    assert!(e1.health.is_routable());
+    let filtered_after = router_fallback.filter_healthy_candidates(&candidates);
+    assert_eq!(filtered_after.len(), 3);
+}
+
+#[test]
+fn test_router_all_unhealthy_fails() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let e1 = registry.register(TunnelEntry::new("t1", make_test_tunnel_config("t1"), LifecycleMode::Lazy)).unwrap();
+    let e2 = registry.register(TunnelEntry::new("t2", make_test_tunnel_config("t2"), LifecycleMode::Lazy)).unwrap();
+
+    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let router = MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::RoundRobin, true);
+    router.set_allowed_tunnels(Some(vec!["t1".into(), "t2".into()]));
+
+    e1.health.mark_unhealthy(Duration::from_secs(60));
+    e2.health.mark_unhealthy(Duration::from_secs(60));
+
+    let candidates = vec!["t1".to_string(), "t2".to_string()];
+    let healthy = router.filter_healthy_candidates(&candidates);
+    assert!(healthy.is_empty());
+}

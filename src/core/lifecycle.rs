@@ -17,6 +17,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::LifecycleMode;
+use crate::core::health::TunnelHealthTracker;
 use crate::core::registry::{ActiveTunnel, TunnelEntry, TunnelRegistry, TunnelState, TunnelStats};
 use crate::core::CoreError;
 use crate::netstack::{VirtualNetworkStack, VirtualTunBridge, DEFAULT_CHANNEL_CAPACITY};
@@ -59,6 +60,9 @@ impl Drop for TunnelConnGuard {
 pub struct GuardedTunnelTarget {
     tunnel: Arc<ActiveTunnel>,
     guard: Arc<TunnelConnGuard>,
+    health: Option<Arc<TunnelHealthTracker>>,
+    threshold: usize,
+    cooldown: Duration,
 }
 
 impl GuardedTunnelTarget {
@@ -67,7 +71,40 @@ impl GuardedTunnelTarget {
         Self {
             tunnel,
             guard: Arc::new(guard),
+            health: None,
+            threshold: 3,
+            cooldown: Duration::from_secs(30),
         }
+    }
+
+    /// Wrap an active tunnel, connection guard, and health tracker into a guarded target.
+    pub fn new_with_health(
+        tunnel: Arc<ActiveTunnel>,
+        guard: TunnelConnGuard,
+        health: Arc<TunnelHealthTracker>,
+        threshold: usize,
+        cooldown: Duration,
+    ) -> Self {
+        Self {
+            tunnel,
+            guard: Arc::new(guard),
+            health: Some(health),
+            threshold,
+            cooldown,
+        }
+    }
+
+    /// Attach health tracker, failure threshold, and cooldown duration.
+    pub fn with_health(
+        mut self,
+        health: Arc<TunnelHealthTracker>,
+        threshold: usize,
+        cooldown: Duration,
+    ) -> Self {
+        self.health = Some(health);
+        self.threshold = threshold;
+        self.cooldown = cooldown;
+        self
     }
 
     /// Access the underlying active tunnel handle.
@@ -83,13 +120,28 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
     ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
         let tunnel = Arc::clone(&self.tunnel);
         let guard = Arc::clone(&self.guard);
+        let health = self.health.clone();
+        let threshold = self.threshold;
+        let cooldown = self.cooldown;
         Box::pin(async move {
-            let stream = tunnel.tcp_connect(dst).await?;
-            let guarded = GuardedStream {
-                inner: stream,
-                _guard: guard,
-            };
-            Ok(Box::new(guarded) as DynStream)
+            match tunnel.tcp_connect(dst).await {
+                Ok(stream) => {
+                    if let Some(h) = &health {
+                        h.record_success();
+                    }
+                    let guarded = GuardedStream {
+                        inner: stream,
+                        _guard: guard,
+                    };
+                    Ok(Box::new(guarded) as DynStream)
+                }
+                Err(e) => {
+                    if let Some(h) = &health {
+                        h.record_failure(threshold, cooldown);
+                    }
+                    Err(e)
+                }
+            }
         })
     }
 
@@ -113,7 +165,26 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         &'a self,
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<std::net::IpAddr>> + Send + 'a>> {
-        self.tunnel.resolve_in_tunnel(domain)
+        let tunnel = Arc::clone(&self.tunnel);
+        let health = self.health.clone();
+        let threshold = self.threshold;
+        let cooldown = self.cooldown;
+        Box::pin(async move {
+            match tunnel.resolve_in_tunnel(domain).await {
+                Ok(ip) => {
+                    if let Some(h) = &health {
+                        h.record_success();
+                    }
+                    Ok(ip)
+                }
+                Err(e) => {
+                    if let Some(h) = &health {
+                        h.record_failure(threshold, cooldown);
+                    }
+                    Err(e)
+                }
+            }
+        })
     }
 }
 
@@ -229,6 +300,11 @@ impl LifecycleController {
         crate::config::IpMode::from_u8(self.ip_mode.load(Ordering::Relaxed))
     }
 
+    /// Access the underlying [`TunnelRegistry`].
+    pub fn registry(&self) -> &Arc<TunnelRegistry> {
+        &self.registry
+    }
+
     /// Start the background debounced idle teardown task.
     pub fn start(self: &Arc<Self>) {
         let mut handle_lock = self.teardown_handle.lock();
@@ -330,11 +406,10 @@ impl LifecycleController {
                     .ok_or_else(|| CoreError::ActivationFailed(id.to_string(), "suspended handle missing".into()))?;
 
                 tracing::debug!("Resuming suspended tunnel '{}'", id);
-                active
-                    .device
-                    .resume()
-                    .await
-                    .map_err(|e| CoreError::ActivationFailed(id.to_string(), format!("device resume error: {:?}", e)))?;
+                if let Err(e) = active.device.resume().await {
+                    entry.health.record_failure(3, Duration::from_secs(30));
+                    return Err(CoreError::ActivationFailed(id.to_string(), format!("device resume error: {:?}", e)));
+                }
 
                 *entry.state.write() = TunnelState::Active;
                 let guard = TunnelConnGuard::new(id, Arc::clone(&entry.stats));
@@ -358,6 +433,7 @@ impl LifecycleController {
                     }
                     Err(e) => {
                         *entry.state.write() = TunnelState::Dormant;
+                        entry.health.record_failure(3, Duration::from_secs(30));
                         Err(e)
                     }
                 }

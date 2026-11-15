@@ -541,6 +541,49 @@ impl Default for TuiSettings {
     }
 }
 
+/// Health check configuration `[health_check]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCheckSettings {
+    #[serde(default = "default_failure_threshold")]
+    pub threshold: usize,
+
+    #[serde(default = "default_cooldown", with = "duration_str_serde")]
+    pub cooldown: Duration,
+
+    #[serde(default = "default_probe_interval", with = "duration_str_serde")]
+    pub probe_interval: Duration,
+
+    #[serde(default = "default_probe_timeout", with = "duration_str_serde")]
+    pub probe_timeout: Duration,
+}
+
+fn default_failure_threshold() -> usize {
+    3
+}
+
+fn default_cooldown() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_probe_interval() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_probe_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+impl Default for HealthCheckSettings {
+    fn default() -> Self {
+        Self {
+            threshold: default_failure_threshold(),
+            cooldown: default_cooldown(),
+            probe_interval: default_probe_interval(),
+            probe_timeout: default_probe_timeout(),
+        }
+    }
+}
+
 /// Main application configuration structure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MainConfig {
@@ -561,6 +604,9 @@ pub struct MainConfig {
 
     #[serde(default)]
     pub tui: TuiSettings,
+
+    #[serde(default)]
+    pub health_check: HealthCheckSettings,
 }
 
 impl MainConfig {
@@ -679,6 +725,27 @@ impl MainConfig {
         if self.tui.refresh_rate_ms < 50 {
             return Err(ConfigError::Validation(
                 "tui.refresh_rate_ms must be at least 50 ms".into(),
+            ));
+        }
+
+        if self.health_check.threshold == 0 {
+            return Err(ConfigError::Validation(
+                "health_check.threshold must be greater than 0".into(),
+            ));
+        }
+        if self.health_check.cooldown.is_zero() {
+            return Err(ConfigError::Validation(
+                "health_check.cooldown must be greater than 0".into(),
+            ));
+        }
+        if self.health_check.probe_interval.is_zero() {
+            return Err(ConfigError::Validation(
+                "health_check.probe_interval must be greater than 0".into(),
+            ));
+        }
+        if self.health_check.probe_timeout.is_zero() {
+            return Err(ConfigError::Validation(
+                "health_check.probe_timeout must be greater than 0".into(),
             ));
         }
 

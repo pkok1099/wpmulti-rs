@@ -6,6 +6,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -87,7 +88,13 @@ impl ListenerSupervisor {
         // 2. Start configured shared listeners
         for shared_cfg in &config.shared_listeners {
             let info = self
-                .start_shared_listener(shared_cfg, registry, lifecycle)
+                .start_shared_listener_with_health(
+                    shared_cfg,
+                    registry,
+                    lifecycle,
+                    config.health_check.threshold,
+                    config.health_check.cooldown,
+                )
                 .await?;
             started.push(info);
         }
@@ -216,6 +223,25 @@ impl ListenerSupervisor {
         registry: &Arc<TunnelRegistry>,
         lifecycle: &Arc<LifecycleController>,
     ) -> Result<ActiveListenerInfo, CoreError> {
+        self.start_shared_listener_with_health(
+            settings,
+            registry,
+            lifecycle,
+            3,
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
+    /// Start a single shared listener with specified health check parameters.
+    pub async fn start_shared_listener_with_health(
+        &self,
+        settings: &SharedListenerSettings,
+        registry: &Arc<TunnelRegistry>,
+        lifecycle: &Arc<LifecycleController>,
+        failure_threshold: usize,
+        cooldown_duration: Duration,
+    ) -> Result<ActiveListenerInfo, CoreError> {
         let bind_addr = settings.bind;
         let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
             CoreError::ListenerError(format!(
@@ -224,10 +250,12 @@ impl ListenerSupervisor {
             ))
         })?;
 
-        let router = MultiTenantRouter::from_settings(
+        let router = MultiTenantRouter::from_settings_with_health(
             settings,
             Arc::clone(lifecycle),
             Arc::clone(registry),
+            failure_threshold,
+            cooldown_duration,
         );
 
         let info = ActiveListenerInfo {

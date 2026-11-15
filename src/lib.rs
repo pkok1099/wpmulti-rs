@@ -14,21 +14,25 @@ pub use api::{
     generate_prometheus_metrics, handle_admin_request, parse_http_request, AdminServer,
     HttpRequest, HttpResponse,
 };
-pub use cli::{cmd_run, cmd_status, cmd_top, cmd_validate, run_cli, Cli, Commands};
+pub use cli::{
+    cmd_probe, cmd_run, cmd_status, cmd_top, cmd_validate, run_cli, run_probe_single, Cli,
+    Commands, ProbeResult,
+};
 pub use tui::{format_bytes, render_dashboard, run_terminal_tui, TuiApp, TuiDataSource};
 pub use core::{
-    ActiveListenerInfo, ActiveTunnel, CoreError, DedicatedTunnelRouter, GuardedStream,
-    GuardedTunnelTarget, LifecycleController, ListenerSupervisor, MeteredStream, MeteredUdpSocket,
-    MultiTenantRouter, ReloadReport, TunnelConnGuard, TunnelEntry, TunnelManager,
-    TunnelRegistry, TunnelState, TunnelStats, TunnelSummary, WgDevice,
+    ActiveListenerInfo, ActiveProber, ActiveTunnel, CoreError, DedicatedTunnelRouter, GuardedStream,
+    GuardedTunnelTarget, HealthStatus, LifecycleController, ListenerSupervisor, MeteredStream,
+    MeteredUdpSocket, MultiTenantRouter, ReloadReport, TunnelConnGuard, TunnelEntry,
+    TunnelHealthTracker, TunnelManager, TunnelRegistry, TunnelState, TunnelStats, TunnelSummary,
+    WgDevice,
 };
 pub use config::{
     load_tunnel_config_from_file, load_tunnel_config_from_str, load_tunnel_configs_from_dir,
     parse_duration_str, parse_wg_conf, parse_wg_conf_file, strip_comment, AdminSettings,
-    AuthMode, ConfigError, DnsPreference, DnsStrategy, GlobalSettings, IpMode, LifecycleMode,
-    LifecycleSettings, ListenerType, LogLevel, MainConfig, PerTunnelSettings, PoolStrategy,
-    SharedListenerSettings, TuiSettings, TuiSortField, TunnelConfig, TunnelPoolSelection,
-    TunnelPortOverride, WgConfig, WgConfError, WgInterfaceConfig, WgPeerConfig,
+    AuthMode, ConfigError, DnsPreference, DnsStrategy, GlobalSettings, HealthCheckSettings, IpMode,
+    LifecycleMode, LifecycleSettings, ListenerType, LogLevel, MainConfig, PerTunnelSettings,
+    PoolStrategy, SharedListenerSettings, TuiSettings, TuiSortField, TunnelConfig,
+    TunnelPoolSelection, TunnelPortOverride, WgConfig, WgConfError, WgInterfaceConfig, WgPeerConfig,
 };
 pub use netstack::{
     build_query, parse_response, to_smoltcp_endpoint, to_std_socket_addr, BridgeIpRecv,

@@ -4,6 +4,7 @@
 //! configurations in userspace, lazy on-demand lifecycle transitions, multi-tenant proxy routing,
 //! and listener supervision.
 
+pub mod health;
 pub mod lifecycle;
 pub mod listener;
 pub mod registry;
@@ -21,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{
     load_tunnel_configs_from_dir, LifecycleMode, MainConfig, TunnelConfig,
 };
+pub use health::{ActiveProber, HealthStatus, TunnelHealthTracker};
 pub use lifecycle::{GuardedStream, GuardedTunnelTarget, LifecycleController, TunnelConnGuard};
 pub use listener::{ActiveListenerInfo, ListenerSupervisor};
 pub use registry::{
@@ -69,6 +71,7 @@ pub struct TunnelManager {
     registry: Arc<TunnelRegistry>,
     lifecycle: Arc<LifecycleController>,
     listeners: Arc<ListenerSupervisor>,
+    prober: Arc<ActiveProber>,
 }
 
 impl TunnelManager {
@@ -100,12 +103,14 @@ impl TunnelManager {
         lifecycle.set_ip_mode(config.global.ip_mode);
 
         let listeners = Arc::new(ListenerSupervisor::new());
+        let prober = Arc::new(ActiveProber::new());
 
         Ok(Self {
             config: RwLock::new(config),
             registry,
             lifecycle,
             listeners,
+            prober,
         })
     }
 
@@ -124,8 +129,13 @@ impl TunnelManager {
         &self.listeners
     }
 
+    /// Access the underlying [`ActiveProber`].
+    pub fn prober(&self) -> &Arc<ActiveProber> {
+        &self.prober
+    }
+
     /// Start the tunnel manager: launches lifecycle idle teardown, boots eager tunnels,
-    /// and starts all configured listeners.
+    /// starts active prober, and starts all configured listeners.
     pub async fn start(&self) -> Result<(), CoreError> {
         // 1. Start lifecycle teardown background task
         self.lifecycle.start();
@@ -171,8 +181,11 @@ impl TunnelManager {
             }
         }
 
-        // 3. Start listeners
+        // 3. Start active prober for eager tunnels
         let cfg = self.config.read().clone();
+        self.prober.start(Arc::clone(&self.registry), cfg.health_check.clone());
+
+        // 4. Start listeners
         self.listeners
             .start_all(&cfg, &self.registry, &self.lifecycle)
             .await?;
@@ -180,13 +193,16 @@ impl TunnelManager {
         Ok(())
     }
 
-    /// Stop the tunnel manager: terminates listeners, stops idle teardown,
+    /// Stop the tunnel manager: terminates listeners, stops active prober, stops idle teardown,
     /// and cleanly closes all running and suspended tunnels.
     pub async fn stop(&self) -> Result<(), CoreError> {
         // 1. Stop all proxy listeners
         self.listeners.stop().await;
 
-        // 2. Stop lifecycle controller and cleanly shut down all tunnels
+        // 2. Stop active prober
+        self.prober.stop().await;
+
+        // 3. Stop lifecycle controller and cleanly shut down all tunnels
         self.lifecycle.stop().await;
 
         Ok(())

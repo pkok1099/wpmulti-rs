@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::{LifecycleMode, TunnelConfig};
+use crate::core::health::{HealthStatus, TunnelHealthTracker};
 use crate::core::CoreError;
 use crate::netstack::{BridgeIpRecv, BridgeIpSend, VirtualNetworkStack};
 use crate::proxy::{DynStream, ProxyTunnelTarget, ProxyUdpSocket};
@@ -29,9 +30,10 @@ pub type WgDevice = gotatun::device::Device<(
 )>;
 
 /// Operational state of a WireGuard tunnel in the registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TunnelState {
     /// Config loaded in memory; no running device, sockets, or background tasks.
+    #[default]
     Dormant,
     /// Currently transitioning from dormant to active.
     Activating,
@@ -314,6 +316,8 @@ pub struct TunnelEntry {
     pub state: RwLock<TunnelState>,
     /// Live statistical counters.
     pub stats: Arc<TunnelStats>,
+    /// Live health status and circuit breaker tracker.
+    pub health: Arc<TunnelHealthTracker>,
     /// Reference to the active device handle, if currently booted.
     pub active: RwLock<Option<Arc<ActiveTunnel>>>,
     /// Dedicated local port assigned to this tunnel, if any.
@@ -332,6 +336,7 @@ impl TunnelEntry {
             lifecycle_mode,
             state: RwLock::new(TunnelState::Dormant),
             stats: Arc::new(TunnelStats::new()),
+            health: Arc::new(TunnelHealthTracker::new()),
             active: RwLock::new(None),
             assigned_port: RwLock::new(None),
             activation_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -381,12 +386,15 @@ impl TunnelEntry {
             },
             assigned_port: *self.assigned_port.read(),
             endpoint,
+            health: self.health.current_status(),
+            consecutive_failures: self.health.consecutive_failures(),
+            cooldown_remaining_secs: self.health.cooldown_remaining_secs(),
         }
     }
 }
 
 /// Serializable snapshot of tunnel health and metrics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TunnelSummary {
     /// Unique tunnel ID.
     pub id: String,
@@ -410,6 +418,15 @@ pub struct TunnelSummary {
     pub assigned_port: Option<u16>,
     /// Primary WireGuard peer endpoint address.
     pub endpoint: Option<String>,
+    /// Health status of the tunnel.
+    #[serde(default)]
+    pub health: HealthStatus,
+    /// Consecutive connection or probe failures.
+    #[serde(default)]
+    pub consecutive_failures: usize,
+    /// Remaining circuit breaker cooldown in seconds.
+    #[serde(default)]
+    pub cooldown_remaining_secs: u64,
 }
 
 struct RegistryInner {
@@ -502,6 +519,23 @@ impl TunnelRegistry {
     pub fn all_ids(&self) -> Vec<String> {
         let inner = self.inner.read();
         inner.keys.clone()
+    }
+
+    /// Return registered tunnel IDs whose health status is routable.
+    pub fn healthy_ids(&self) -> Vec<String> {
+        let inner = self.inner.read();
+        inner
+            .keys
+            .iter()
+            .filter(|k| {
+                if let Some(entry) = inner.entries.get(*k) {
+                    entry.health.is_routable()
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect()
     }
 
     /// Return all registered tunnel entries.

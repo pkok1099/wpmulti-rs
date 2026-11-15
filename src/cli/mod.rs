@@ -7,7 +7,7 @@ pub mod tests;
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
-pub use commands::{cmd_run, cmd_status, cmd_top, cmd_validate};
+pub use commands::{cmd_probe, cmd_run, cmd_status, cmd_top, cmd_validate, run_probe_single, ProbeResult};
 
 /// Command line interface for `wpmulti`.
 #[derive(Parser, Debug, Clone, PartialEq, Eq)]
@@ -82,6 +82,28 @@ pub enum Commands {
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
     },
+    /// Probe WireGuard tunnel configs for connectivity, RTT latency, and exit IP
+    #[clap(after_help = "EXAMPLES:\n  \
+                         wpmulti probe -c ./wgcf-profile.conf\n  \
+                         wpmulti probe -d ./confs\n  \
+                         wpmulti probe -d ./confs --json")]
+    Probe {
+        /// Path to single WireGuard .conf file
+        #[clap(short, long)]
+        config: Option<PathBuf>,
+
+        /// Path to directory containing WireGuard .conf files
+        #[clap(short, long)]
+        dir: Option<PathBuf>,
+
+        /// Output results as JSON
+        #[clap(long)]
+        json: bool,
+
+        /// Probe timeout (e.g. 5s, 10s)
+        #[clap(long, default_value = "5s")]
+        timeout: String,
+    },
 }
 
 /// Parse arguments and execute the selected subcommand.
@@ -96,6 +118,10 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Status { admin_url } => {
             cmd_status(admin_url).await?;
+            Ok(())
+        }
+        Commands::Probe { config, dir, json, timeout } => {
+            cmd_probe(config, dir, json, timeout).await?;
             Ok(())
         }
     }

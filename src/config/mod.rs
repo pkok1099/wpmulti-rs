@@ -14,7 +14,7 @@ pub use wg_conf::{
 };
 pub use toml_config::{
     parse_duration_str, AdminSettings, AuthMode, ConfigError, DnsPreference, DnsStrategy,
-    GlobalSettings, IpMode, LifecycleMode, LifecycleSettings, ListenerType, LogLevel,
+    GlobalSettings, HealthCheckSettings, IpMode, LifecycleMode, LifecycleSettings, ListenerType, LogLevel,
     MainConfig, PerTunnelSettings, PoolStrategy, SharedListenerSettings,
     TuiSettings, TuiSortField, TunnelPoolSelection, TunnelPortOverride,
 };

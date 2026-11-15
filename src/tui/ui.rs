@@ -5,7 +5,7 @@ use std::io::{self, stdout, IsTerminal, Read, Write as IoWrite};
 use std::time::Duration;
 
 use crate::config::TuiSortField;
-use crate::core::TunnelState;
+use crate::core::{HealthStatus, TunnelState};
 use crate::tui::app::TuiApp;
 
 // ANSI escape sequences
@@ -16,6 +16,7 @@ pub const ANSI_RESET: &str = "\x1b[0m";
 pub const ANSI_BOLD: &str = "\x1b[1m";
 pub const ANSI_DIM: &str = "\x1b[2m";
 pub const ANSI_REVERSE: &str = "\x1b[7m";
+pub const ANSI_RED: &str = "\x1b[31m";
 pub const ANSI_GREEN: &str = "\x1b[32m";
 pub const ANSI_YELLOW: &str = "\x1b[33m";
 pub const ANSI_BLUE: &str = "\x1b[34m";
@@ -80,6 +81,8 @@ pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String
     let active = app.tunnels.iter().filter(|t| t.state == TunnelState::Active).count();
     let suspended = app.tunnels.iter().filter(|t| t.state == TunnelState::Suspended).count();
     let dormant = app.tunnels.iter().filter(|t| t.state == TunnelState::Dormant).count();
+    let healthy = app.tunnels.iter().filter(|t| t.health == HealthStatus::Healthy).count();
+    let unhealthy = app.tunnels.iter().filter(|t| t.health == HealthStatus::Unhealthy).count();
     let total_conns: usize = app.tunnels.iter().map(|t| t.active_conns).sum();
     let total_rx: u64 = app.tunnels.iter().map(|t| t.rx_bytes).sum();
     let total_tx: u64 = app.tunnels.iter().map(|t| t.tx_bytes).sum();
@@ -89,12 +92,12 @@ pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String
     // 1. Header Box (or compact 1-line header on very short terminals)
     let header_lines = if compact_height {
         let summary = format!(
-            " wpmulti v{} | T:{} A:{} S:{} D:{} | RX:{} TX:{} | C:{}",
+            " wpmulti v{} | T:{} A:{} H:{} U:{} | RX:{} TX:{} | C:{}",
             env!("CARGO_PKG_VERSION"),
             total,
             active,
-            suspended,
-            dormant,
+            healthy,
+            unhealthy,
             format_bytes(total_rx),
             format_bytes(total_tx),
             total_conns
@@ -118,14 +121,14 @@ pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String
         write_box_line(&mut buf, &title, title.chars().count(), width);
 
         let stats_raw = format!(
-            "  Tunnels: Total: {} | Active: {} | Suspended: {} | Dormant: {}",
-            total, active, suspended, dormant
+            "  Tunnels: Total: {} | Active: {} | Healthy: {} | Unhealthy: {} | Suspended: {} | Dormant: {}",
+            total, active, healthy, unhealthy, suspended, dormant
         );
         let stats_raw_len = stats_raw.chars().count();
         if stats_raw_len <= inner_w {
             let stats_colored = format!(
-                "  Tunnels: Total: {} | Active: {}{}{} | Suspended: {}{}{} | Dormant: {}",
-                total, ANSI_GREEN, active, ANSI_CYAN, ANSI_MAGENTA, suspended, ANSI_CYAN, dormant
+                "  Tunnels: Total: {} | Active: {}{}{} | Healthy: {}{}{} | Unhealthy: {}{}{} | Suspended: {}{}{} | Dormant: {}",
+                total, ANSI_GREEN, active, ANSI_CYAN, ANSI_GREEN, healthy, ANSI_CYAN, ANSI_RED, unhealthy, ANSI_CYAN, ANSI_MAGENTA, suspended, ANSI_CYAN, dormant
             );
             write_box_line(&mut buf, &stats_colored, stats_raw_len, width);
         } else {
@@ -254,18 +257,31 @@ pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String
             let t = &app.tunnels[tunnel_idx];
             let is_selected = row_pos == app.selected_index;
 
-            let (state_color, state_str) = match t.state {
-                TunnelState::Active => (ANSI_GREEN, "Active"),
-                TunnelState::Activating => (ANSI_CYAN, "Activating"),
-                TunnelState::Suspended => (ANSI_MAGENTA, "Suspended"),
-                TunnelState::Dormant => (ANSI_DIM, "Dormant"),
+            let (state_color, state_str) = match (t.health, t.state) {
+                (HealthStatus::Unhealthy, _) => (ANSI_RED, "Unhealthy"),
+                (HealthStatus::HalfOpen, _) => (ANSI_YELLOW, "HalfOpen"),
+                (HealthStatus::Healthy, TunnelState::Active) => (ANSI_GREEN, "Active"),
+                (HealthStatus::Healthy, TunnelState::Activating) => (ANSI_CYAN, "Activating"),
+                (HealthStatus::Healthy, TunnelState::Suspended) => (ANSI_MAGENTA, "Suspended"),
+                (HealthStatus::Healthy, TunnelState::Dormant) => (ANSI_DIM, "Dormant"),
             };
 
             let port_str = t
                 .assigned_port
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let endpoint_str = t.endpoint.as_deref().unwrap_or("-");
+            let endpoint_str = if t.health == HealthStatus::Unhealthy {
+                format!(
+                    "{} (fails:{}, {}s)",
+                    t.endpoint.as_deref().unwrap_or("-"),
+                    t.consecutive_failures,
+                    t.cooldown_remaining_secs
+                )
+            } else if t.health == HealthStatus::HalfOpen {
+                format!("{} (probe)", t.endpoint.as_deref().unwrap_or("-"))
+            } else {
+                t.endpoint.clone().unwrap_or_else(|| "-".to_string())
+            };
 
             if is_selected {
                 let _ = write!(buf, "{}{}", ANSI_REVERSE, ANSI_BOLD);
@@ -291,7 +307,7 @@ pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String
                 );
             }
             if show_endpoint {
-                let _ = write!(tail, " {:<endp_w$}", truncate_chars(endpoint_str, endp_w));
+                let _ = write!(tail, " {:<endp_w$}", truncate_chars(&endpoint_str, endp_w));
             }
 
             let tail_max = width.saturating_sub(state_w + 1);

@@ -1422,6 +1422,9 @@ fn test_f13_tui_app_navigation_key_events() {
             last_active_at: None,
             assigned_port: Some(10000),
             endpoint: Some("127.0.0.1:51820".to_string()),
+            health: wpmulti::core::HealthStatus::Healthy,
+            consecutive_failures: 0,
+            cooldown_remaining_secs: 0,
         },
         wpmulti::core::TunnelSummary {
             id: "wgcf-002".to_string(),
@@ -1435,6 +1438,9 @@ fn test_f13_tui_app_navigation_key_events() {
             last_active_at: None,
             assigned_port: Some(10001),
             endpoint: Some("127.0.0.1:51820".to_string()),
+            health: wpmulti::core::HealthStatus::Healthy,
+            consecutive_failures: 0,
+            cooldown_remaining_secs: 0,
         },
     ];
     app.set_tunnels(list);
@@ -1467,6 +1473,9 @@ fn test_f13_tui_app_search_filtering() {
             last_active_at: None,
             assigned_port: None,
             endpoint: None,
+            health: wpmulti::core::HealthStatus::Healthy,
+            consecutive_failures: 0,
+            cooldown_remaining_secs: 0,
         },
         wpmulti::core::TunnelSummary {
             id: "staging-eu-west".to_string(),
@@ -1480,6 +1489,9 @@ fn test_f13_tui_app_search_filtering() {
             last_active_at: None,
             assigned_port: None,
             endpoint: None,
+            health: wpmulti::core::HealthStatus::Healthy,
+            consecutive_failures: 0,
+            cooldown_remaining_secs: 0,
         },
     ];
     app.set_tunnels(list);
@@ -1512,6 +1524,9 @@ fn test_f13_tui_app_column_sorting() {
             last_active_at: None,
             assigned_port: None,
             endpoint: None,
+            health: wpmulti::core::HealthStatus::Healthy,
+            consecutive_failures: 0,
+            cooldown_remaining_secs: 0,
         },
         wpmulti::core::TunnelSummary {
             id: "tun-a".to_string(),
@@ -1525,6 +1540,9 @@ fn test_f13_tui_app_column_sorting() {
             last_active_at: None,
             assigned_port: None,
             endpoint: None,
+            health: wpmulti::core::HealthStatus::Healthy,
+            consecutive_failures: 0,
+            cooldown_remaining_secs: 0,
         },
     ];
     app.set_tunnels(list);
@@ -1560,6 +1578,9 @@ fn test_f13_tui_render_dashboard_output() {
         last_active_at: None,
         assigned_port: Some(10080),
         endpoint: Some("127.0.0.1:51820".to_string()),
+        health: wpmulti::core::HealthStatus::Healthy,
+        consecutive_failures: 0,
+        cooldown_remaining_secs: 0,
     }];
     app.set_tunnels(list);
 

@@ -232,6 +232,12 @@ fn test_toml_config_full_schema() {
         [tui]
         refresh_rate_ms = 250
         default_sort = "conns"
+
+        [health_check]
+        threshold = 5
+        cooldown = "45s"
+        probe_interval = "1m"
+        probe_timeout = "10s"
     "#;
 
     let cfg = MainConfig::from_toml_str(toml_str).expect("parse full toml");
@@ -275,6 +281,11 @@ fn test_toml_config_full_schema() {
 
     assert_eq!(cfg.tui.refresh_rate_ms, 250);
     assert_eq!(cfg.tui.default_sort, TuiSortField::Conns);
+
+    assert_eq!(cfg.health_check.threshold, 5);
+    assert_eq!(cfg.health_check.cooldown, Duration::from_secs(45));
+    assert_eq!(cfg.health_check.probe_interval, Duration::from_secs(60));
+    assert_eq!(cfg.health_check.probe_timeout, Duration::from_secs(10));
 }
 
 // =========================================================================
@@ -287,6 +298,10 @@ fn test_toml_config_minimal_and_defaults() {
 
     assert_eq!(cfg.global.bind_address, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
     assert_eq!(cfg.global.log_level, LogLevel::Info);
+    assert_eq!(cfg.health_check.threshold, 3);
+    assert_eq!(cfg.health_check.cooldown, Duration::from_secs(30));
+    assert_eq!(cfg.health_check.probe_interval, Duration::from_secs(30));
+    assert_eq!(cfg.health_check.probe_timeout, Duration::from_secs(5));
     assert_eq!(cfg.global.max_active_tunnels, 1000);
     assert_eq!(cfg.global.dns_strategy, DnsStrategy::TunnelOnly);
     assert_eq!(cfg.lifecycle.mode, LifecycleMode::Lazy);
@@ -518,4 +533,29 @@ fn test_ip_mode_listener_validation() {
     "#;
     let cfg: MainConfig = toml::from_str(loosen_toml).unwrap();
     assert!(cfg.validate().is_err(), "loosening global ip_mode must fail validation");
+}
+
+#[test]
+fn test_health_check_settings_and_validation() {
+    let mut cfg = MainConfig::default();
+    assert_eq!(cfg.health_check.threshold, 3);
+    assert_eq!(cfg.health_check.cooldown, Duration::from_secs(30));
+    assert_eq!(cfg.health_check.probe_interval, Duration::from_secs(30));
+    assert_eq!(cfg.health_check.probe_timeout, Duration::from_secs(5));
+    assert!(cfg.validate().is_ok());
+
+    cfg.health_check.threshold = 0;
+    assert!(cfg.validate().is_err());
+
+    cfg.health_check.threshold = 3;
+    cfg.health_check.cooldown = Duration::ZERO;
+    assert!(cfg.validate().is_err());
+
+    cfg.health_check.cooldown = Duration::from_secs(10);
+    cfg.health_check.probe_interval = Duration::ZERO;
+    assert!(cfg.validate().is_err());
+
+    cfg.health_check.probe_interval = Duration::from_secs(10);
+    cfg.health_check.probe_timeout = Duration::ZERO;
+    assert!(cfg.validate().is_err());
 }

@@ -236,6 +236,8 @@ pub async fn handle_admin_request(
             let active_tunnels = stats.iter().filter(|s| s.state == TunnelState::Active).count();
             let suspended_tunnels = stats.iter().filter(|s| s.state == TunnelState::Suspended).count();
             let dormant_tunnels = stats.iter().filter(|s| s.state == TunnelState::Dormant).count();
+            let healthy_tunnels = stats.iter().filter(|s| s.health == crate::core::HealthStatus::Healthy).count();
+            let unhealthy_tunnels = stats.iter().filter(|s| s.health == crate::core::HealthStatus::Unhealthy).count();
             let total_connections: u64 = stats.iter().map(|s| s.total_conns).sum();
             let active_connections: usize = stats.iter().map(|s| s.active_conns).sum();
             let rx_bytes: u64 = stats.iter().map(|s| s.rx_bytes).sum();
@@ -250,6 +252,8 @@ pub async fn handle_admin_request(
                 "active_tunnels": active_tunnels,
                 "suspended_tunnels": suspended_tunnels,
                 "dormant_tunnels": dormant_tunnels,
+                "healthy_tunnels": healthy_tunnels,
+                "unhealthy_tunnels": unhealthy_tunnels,
                 "total_connections": total_connections,
                 "active_connections": active_connections,
                 "rx_bytes": rx_bytes,

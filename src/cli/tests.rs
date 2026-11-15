@@ -115,3 +115,81 @@ AllowedIPs = 0.0.0.0/0
     let count = cmd_validate(None, Some(dir.path().to_path_buf())).expect("cmd_validate");
     assert_eq!(count, 1);
 }
+
+#[test]
+fn test_cli_parse_probe_options() {
+    let args = vec![
+        "wpmulti",
+        "probe",
+        "-c",
+        "profile.conf",
+        "--json",
+        "--timeout",
+        "10s",
+    ];
+    let cli = Cli::try_parse_from(args).expect("parse probe");
+    assert_eq!(
+        cli.command,
+        Commands::Probe {
+            config: Some(PathBuf::from("profile.conf")),
+            dir: None,
+            json: true,
+            timeout: "10s".to_string(),
+        }
+    );
+
+    let args_dir = vec![
+        "wpmulti",
+        "probe",
+        "-d",
+        "/etc/wireguard",
+    ];
+    let cli_dir = Cli::try_parse_from(args_dir).expect("parse probe dir");
+    assert_eq!(
+        cli_dir.command,
+        Commands::Probe {
+            config: None,
+            dir: Some(PathBuf::from("/etc/wireguard")),
+            json: false,
+            timeout: "5s".to_string(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_cli_probe_command_execution() {
+    use crate::cli::cmd_probe;
+
+    let dir = tempdir().expect("tempdir");
+    let conf_path = dir.path().join("probe-01.conf");
+    fs::write(
+        &conf_path,
+        r#"
+[Interface]
+PrivateKey = 0OaUaQd4uJq5m8eN8uJq5m8eN8uJq5m8eN8uJq5m8eM=
+Address = 172.16.0.2/32
+
+[Peer]
+PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+Endpoint = 192.0.2.1:51820
+AllowedIPs = 0.0.0.0/0
+"#,
+    )
+    .expect("write wg conf");
+
+    // Probe single with short timeout (unreachable test endpoint will fail/timeout without panicking)
+    let results = cmd_probe(
+        Some(conf_path),
+        None,
+        true,
+        "100ms".to_string(),
+    )
+    .await
+    .expect("cmd_probe");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "probe-01");
+    assert_eq!(results[0].endpoint, "192.0.2.1:51820");
+    assert!(!results[0].healthy);
+    assert!(results[0].error.is_some());
+}
