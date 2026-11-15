@@ -3,6 +3,6 @@
 *.log
 *.profraw
 *.conf
-wpmulti.toml
+/wpmulti.toml
 .env
 .DS_Store
