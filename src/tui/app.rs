@@ -239,15 +239,14 @@ impl TuiApp {
         self.apply_filter_and_sort();
 
         // Restore selection by ID if possible
-        if let Some(id) = prev_selected_id {
-            if let Some(pos) = self
+        if let Some(id) = prev_selected_id
+            && let Some(pos) = self
                 .filtered_indices
                 .iter()
                 .position(|&idx| self.tunnels[idx].id == id)
             {
                 self.selected_index = pos;
             }
-        }
     }
 
     /// Re-filter and sort active indices based on search query and sort criteria.
@@ -382,11 +381,10 @@ impl TuiApp {
 
     /// Clear status message if it has been displayed longer than `max_age`.
     pub fn clear_status_if_expired(&mut self, max_age: Duration) {
-        if let Some((_, ts)) = &self.status_message {
-            if ts.elapsed() > max_age {
+        if let Some((_, ts)) = &self.status_message
+            && ts.elapsed() > max_age {
                 self.status_message = None;
             }
-        }
     }
 
     /// Fetch latest tunnel states from data source.

@@ -20,7 +20,7 @@ pub async fn cmd_run(
     let mut config = if let Some(path) = config_path {
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
-        toml::from_str(&content)
+        MainConfig::from_toml_str(&content)
             .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?
     } else {
         MainConfig::default()
@@ -103,7 +103,7 @@ pub fn cmd_validate(
     let mut config = if let Some(path) = config_path {
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
-        toml::from_str::<MainConfig>(&content)
+        MainConfig::from_toml_str(&content)
             .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?
     } else {
         MainConfig::default()

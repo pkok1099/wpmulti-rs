@@ -16,6 +16,10 @@ path = "src/lib.rs"
 name = "wpmulti"
 path = "src/main.rs"
 
+[[bench]]
+name = "performance"
+harness = false
+
 [dependencies]
 gotatun = { git = "https://github.com/mullvad/gotatun", rev = "e95ba9693c15c9063a8c0293d9cbc67aef15eb1d", features = ["device"], default-features = false }
 gotatun-crypto = { git = "https://github.com/mullvad/gotatun", rev = "e95ba9693c15c9063a8c0293d9cbc67aef15eb1d" }

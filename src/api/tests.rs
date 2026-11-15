@@ -351,3 +351,28 @@ async fn test_admin_server_e2e_tcp() {
 
     server.stop().await;
 }
+
+#[tokio::test]
+async fn test_admin_server_content_length_limit() {
+    let manager = create_test_manager();
+    let server = AdminServer::new(
+        "127.0.0.1:0".parse().unwrap(),
+        manager,
+        None,
+    );
+    let bound_addr = server.start().await.expect("server started");
+
+    let mut client = TcpStream::connect(bound_addr).await.expect("connect");
+    let req = format!(
+        "POST /api/v1/reload HTTP/1.1\r\nHost: {}\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n",
+        bound_addr
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    let mut resp_buf = Vec::new();
+    client.read_to_end(&mut resp_buf).await.unwrap();
+    let resp_str = String::from_utf8_lossy(&resp_buf);
+    assert!(resp_str.starts_with("HTTP/1.1 413 Payload Too Large"));
+
+    server.stop().await;
+}

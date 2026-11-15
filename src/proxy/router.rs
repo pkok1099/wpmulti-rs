@@ -42,6 +42,18 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncReadWrite for T {}
 /// Dynamically dispatched asynchronous bidirectional byte stream.
 pub type DynStream = Box<dyn AsyncReadWrite>;
 
+/// Future returned by [`ProxyUdpSocket::recv_from`].
+pub type RecvFromFut<'a> =
+    Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>>;
+
+/// Future returned by [`ProxyTunnelTarget::udp_bind`].
+pub type UdpBindFut<'a> =
+    Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>>;
+
+/// Future returned by [`TunnelRouter::select_tunnel`].
+pub type SelectTunnelFut<'a> =
+    Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>>;
+
 /// Trait abstracting a virtual or physical UDP socket used by proxy relays.
 pub trait ProxyUdpSocket: Send + Sync {
     /// Send a UDP datagram to the specified destination.
@@ -55,7 +67,7 @@ pub trait ProxyUdpSocket: Send + Sync {
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>>;
+    ) -> RecvFromFut<'a>;
 
     /// Returns the bound local port of this UDP socket.
     fn local_port(&self) -> u16;
@@ -116,7 +128,7 @@ pub trait ProxyTunnelTarget: Send + Sync {
     fn udp_bind<'a>(
         &'a self,
         local_port: u16,
-    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>>;
+    ) -> UdpBindFut<'a>;
 
     /// Resolve a domain name inside the tunnel.
     fn resolve_in_tunnel<'a>(
@@ -294,7 +306,7 @@ pub trait TunnelRouter: Send + Sync {
     fn select_tunnel<'a>(
         &'a self,
         selector: &'a TunnelSelector,
-    ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>>;
+    ) -> SelectTunnelFut<'a>;
 }
 
 impl<T: TunnelRouter + ?Sized> TunnelRouter for Arc<T> {
@@ -461,11 +473,10 @@ impl TunnelRouter for PoolRouter {
                         }
                     }
                     Some((user, pass)) => {
-                        if let Some(expected_pass) = &self.global_password {
-                            if pass != expected_pass {
+                        if let Some(expected_pass) = &self.global_password
+                            && pass != expected_pass {
                                 return Err(ProxyAuthError::InvalidCredentials);
                             }
-                        }
                         Ok(TunnelSelector::parse(user))
                     }
                 }
@@ -480,11 +491,10 @@ impl TunnelRouter for PoolRouter {
                         }
                     }
                     Some((user, pass)) => {
-                        if let Some(expected_pass) = &self.global_password {
-                            if pass != expected_pass {
+                        if let Some(expected_pass) = &self.global_password
+                            && pass != expected_pass {
                                 return Err(ProxyAuthError::InvalidCredentials);
                             }
-                        }
                         Ok(TunnelSelector::parse(user))
                     }
                 }

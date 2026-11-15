@@ -60,11 +60,9 @@ async fn test_pairwise_f1_wg_conf_and_f9_per_tunnel_dedicated_port() {
     let base_s5 = 31100u16;
     let base_http = 32100u16;
 
-    let confs = vec![
-        make_test_conf("tunnel-a", "198.51.100.1:51820"),
+    let confs = [make_test_conf("tunnel-a", "198.51.100.1:51820"),
         make_test_conf("tunnel-b", "198.51.100.2:51820"),
-        make_test_conf("tunnel-c", "198.51.100.3:51820"),
-    ];
+        make_test_conf("tunnel-c", "198.51.100.3:51820")];
 
     let registry = Arc::new(TunnelRegistry::new());
     for (idx, conf) in confs.iter().enumerate() {

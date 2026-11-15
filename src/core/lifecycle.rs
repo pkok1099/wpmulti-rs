@@ -97,7 +97,16 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         &'a self,
         local_port: u16,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
-        self.tunnel.udp_bind(local_port)
+        let tunnel = Arc::clone(&self.tunnel);
+        let guard = Arc::clone(&self.guard);
+        Box::pin(async move {
+            let socket = tunnel.udp_bind(local_port).await?;
+            let guarded = GuardedUdpSocket {
+                inner: socket,
+                _guard: guard,
+            };
+            Ok(Box::new(guarded) as Box<dyn ProxyUdpSocket>)
+        })
     }
 
     fn resolve_in_tunnel<'a>(
@@ -105,6 +114,33 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<std::net::IpAddr>> + Send + 'a>> {
         self.tunnel.resolve_in_tunnel(domain)
+    }
+}
+
+/// A wrapper around a [`ProxyUdpSocket`] that keeps a [`TunnelConnGuard`] alive until dropped.
+pub struct GuardedUdpSocket {
+    inner: Box<dyn ProxyUdpSocket>,
+    _guard: Arc<TunnelConnGuard>,
+}
+
+impl ProxyUdpSocket for GuardedUdpSocket {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        self.inner.send_to(buf, target)
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
+        self.inner.recv_from(buf)
+    }
+
+    fn local_port(&self) -> u16 {
+        self.inner.local_port()
     }
 }
 
@@ -226,13 +262,37 @@ impl LifecycleController {
         *handle_lock = Some(handle);
     }
 
-    /// Stop the background idle teardown task.
+    /// Stop the background idle teardown task and cleanly close all tunnels.
     pub async fn stop(&self) {
         let _ = self.shutdown_tx.send(true);
         let handle = self.teardown_handle.lock().take();
         if let Some(h) = handle {
             let _ = h.await;
         }
+
+        // Cleanly close all tunnels and terminate their netstack reactors
+        for entry in self.registry.all_entries() {
+            let _ = self.close_tunnel(&entry.id).await;
+        }
+    }
+
+    /// Cleanly close a tunnel: terminates its smoltcp reactor task and suspends its WireGuard device.
+    pub async fn close_tunnel(&self, id: &str) -> Result<(), CoreError> {
+        let entry = self
+            .registry
+            .get(id)
+            .ok_or_else(|| CoreError::TunnelNotFound(id.to_string()))?;
+
+        let _lock = entry.activation_lock.lock().await;
+
+        let maybe_active = entry.active.write().take();
+        if let Some(active) = maybe_active {
+            tracing::debug!("Closing and shutting down netstack for tunnel '{}'", id);
+            let _ = active.device.suspend().await;
+            active.netstack.close().await;
+        }
+        *entry.state.write() = TunnelState::Dormant;
+        Ok(())
     }
 
     /// Get an active tunnel handle or dynamically boot/resume it on demand.
@@ -282,17 +342,25 @@ impl LifecycleController {
             }
             TunnelState::Dormant | TunnelState::Activating => {
                 *entry.state.write() = TunnelState::Activating;
-                let active = Self::boot_tunnel(
-            &entry,
-            self.ip_mode(),
-            self.prefer_ipv6.load(Ordering::Relaxed),
-        )
-        .await?;
-                *entry.active.write() = Some(Arc::clone(&active));
-                *entry.state.write() = TunnelState::Active;
+                match Self::boot_tunnel(
+                    &entry,
+                    self.ip_mode(),
+                    self.prefer_ipv6.load(Ordering::Relaxed),
+                )
+                .await
+                {
+                    Ok(active) => {
+                        *entry.active.write() = Some(Arc::clone(&active));
+                        *entry.state.write() = TunnelState::Active;
 
-                let guard = TunnelConnGuard::new(id, Arc::clone(&entry.stats));
-                Ok((active, guard))
+                        let guard = TunnelConnGuard::new(id, Arc::clone(&entry.stats));
+                        Ok((active, guard))
+                    }
+                    Err(e) => {
+                        *entry.state.write() = TunnelState::Dormant;
+                        Err(e)
+                    }
+                }
             }
         }
     }
@@ -345,15 +413,23 @@ impl LifecycleController {
             }
             TunnelState::Dormant | TunnelState::Activating => {
                 *entry.state.write() = TunnelState::Activating;
-                let active = Self::boot_tunnel(
-            &entry,
-            self.ip_mode(),
-            self.prefer_ipv6.load(Ordering::Relaxed),
-        )
-        .await?;
-                *entry.active.write() = Some(Arc::clone(&active));
-                *entry.state.write() = TunnelState::Active;
-                Ok(active)
+                match Self::boot_tunnel(
+                    &entry,
+                    self.ip_mode(),
+                    self.prefer_ipv6.load(Ordering::Relaxed),
+                )
+                .await
+                {
+                    Ok(active) => {
+                        *entry.active.write() = Some(Arc::clone(&active));
+                        *entry.state.write() = TunnelState::Active;
+                        Ok(active)
+                    }
+                    Err(e) => {
+                        *entry.state.write() = TunnelState::Dormant;
+                        Err(e)
+                    }
+                }
             }
         }
     }
@@ -380,6 +456,7 @@ impl LifecycleController {
         if let Some(active) = maybe_active {
             tracing::debug!("Suspending active tunnel '{}'", id);
             active.device.suspend().await;
+            active.netstack.notify().notify_one();
             *entry.state.write() = TunnelState::Suspended;
         }
 
@@ -432,11 +509,13 @@ impl LifecycleController {
         })?;
 
         // Build smoltcp VirtualNetworkStack
-        let netstack = VirtualNetworkStack::new_with_mode(&config_interface, bridge, ip_mode, prefer_ipv6)
-            .await
-            .map_err(|e| {
-                CoreError::ActivationFailed(entry.id.clone(), format!("failed to build netstack: {:?}", e))
-            })?;
+        let netstack = match VirtualNetworkStack::new_with_mode(&config_interface, bridge, ip_mode, prefer_ipv6).await {
+            Ok(ns) => ns,
+            Err(e) => {
+                let _ = device.suspend().await;
+                return Err(CoreError::ActivationFailed(entry.id.clone(), format!("failed to build netstack: {:?}", e)));
+            }
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

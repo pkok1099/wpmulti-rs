@@ -61,6 +61,17 @@ impl HttpResponse {
         }
     }
 
+    /// Construct a 413 Payload Too Large response.
+    pub fn payload_too_large(msg: &str) -> Self {
+        let body = serde_json::to_vec(&json!({ "error": msg })).unwrap_or_default();
+        Self {
+            status: 413,
+            reason: "Payload Too Large",
+            content_type: "application/json",
+            body,
+        }
+    }
+
     /// Construct a 401 Unauthorized response.
     pub fn unauthorized() -> Self {
         let body = serde_json::to_vec(&json!({ "error": "unauthorized" })).unwrap_or_default();

@@ -72,14 +72,12 @@ pub async fn read_http_headers<R: tokio::io::AsyncRead + Unpin>(
 
     // Read remaining body if Content-Length specified
     let mut body = Vec::new();
-    if let Some(len_str) = headers.get("content-length") {
-        if let Ok(content_len) = len_str.parse::<usize>() {
-            if content_len > 0 {
+    if let Some(len_str) = headers.get("content-length")
+        && let Ok(content_len) = len_str.parse::<usize>()
+            && content_len > 0 {
                 body.resize(content_len, 0);
                 reader.read_exact(&mut body).await?;
             }
-        }
-    }
 
     Ok((status_code, reason, headers, body))
 }

@@ -68,15 +68,54 @@ pub fn encode_target_addr(target: &TargetAddr, buf: &mut Vec<u8>) {
     }
 }
 
+/// Encodes a [`TargetAddr`] into a pre-allocated slice in SOCKS5 format, returning the number of bytes written.
+pub fn encode_target_addr_slice(target: &TargetAddr, buf: &mut [u8]) -> usize {
+    match target {
+        TargetAddr::Ip(SocketAddr::V4(v4)) => {
+            buf[0] = ATYP_IPV4;
+            buf[1..5].copy_from_slice(&v4.ip().octets());
+            buf[5..7].copy_from_slice(&v4.port().to_be_bytes());
+            7
+        }
+        TargetAddr::Ip(SocketAddr::V6(v6)) => {
+            buf[0] = ATYP_IPV6;
+            buf[1..17].copy_from_slice(&v6.ip().octets());
+            buf[17..19].copy_from_slice(&v6.port().to_be_bytes());
+            19
+        }
+        TargetAddr::Domain(domain, port) => {
+            buf[0] = ATYP_DOMAIN;
+            let bytes = domain.as_bytes();
+            let len = bytes.len().min(255);
+            buf[1] = len as u8;
+            buf[2..2 + len].copy_from_slice(&bytes[..len]);
+            buf[2 + len..4 + len].copy_from_slice(&port.to_be_bytes());
+            4 + len
+        }
+    }
+}
+
+/// Writes RFC 1928 SOCKS5 UDP header `[RSV 2B, FRAG 1B, ATYP, ADDR, PORT]` into a pre-allocated slice.
+pub fn write_socks5_udp_header(target: &TargetAddr, out: &mut [u8]) -> usize {
+    out[0] = 0x00;
+    out[1] = 0x00;
+    out[2] = 0x00;
+    let addr_len = encode_target_addr_slice(target, &mut out[3..]);
+    3 + addr_len
+}
+
 /// Sends a formatted SOCKS5 reply `[VER, REP, RSV, ATYP, BND.ADDR, BND.PORT]`.
 pub async fn send_socks5_reply<W: AsyncWrite + Unpin>(
     writer: &mut W,
     rep: u8,
     bnd_addr: SocketAddr,
 ) -> io::Result<()> {
-    let mut reply = vec![SOCKS5_VERSION, rep, 0x00];
-    encode_target_addr(&TargetAddr::Ip(bnd_addr), &mut reply);
-    writer.write_all(&reply).await?;
+    let mut reply = [0u8; 32];
+    reply[0] = SOCKS5_VERSION;
+    reply[1] = rep;
+    reply[2] = 0x00;
+    let len = encode_target_addr_slice(&TargetAddr::Ip(bnd_addr), &mut reply[3..]);
+    writer.write_all(&reply[..3 + len]).await?;
     writer.flush().await
 }
 
@@ -451,6 +490,7 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
 
     let mut relay_buf = vec![0u8; 65536];
     let mut virtual_buf = vec![0u8; 65536];
+    let mut out_pkt_buf = vec![0u8; 65536 + 32];
 
     loop {
         tokio::select! {
@@ -513,8 +553,9 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
                 match virtual_res {
                     Ok((n, peer_addr)) => {
                         if let Some(c_addr) = client_udp_addr {
-                            let out_pkt = build_socks5_udp_packet(&TargetAddr::Ip(peer_addr), &virtual_buf[..n]);
-                            let _ = relay_socket.send_to(&out_pkt, c_addr).await;
+                            let hdr_len = write_socks5_udp_header(&TargetAddr::Ip(peer_addr), &mut out_pkt_buf);
+                            out_pkt_buf[hdr_len..hdr_len + n].copy_from_slice(&virtual_buf[..n]);
+                            let _ = relay_socket.send_to(&out_pkt_buf[..hdr_len + n], c_addr).await;
                         }
                     }
                     Err(e) => {

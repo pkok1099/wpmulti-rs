@@ -3,17 +3,25 @@
 //! Exposes daemon-wide and per-tunnel statistical counters and gauges in Prometheus text format.
 
 use std::fmt::Write;
+use std::sync::atomic::Ordering;
 
 use crate::core::TunnelManager;
 
 /// Generate Prometheus / OpenMetrics exposition format text for the given [`TunnelManager`].
 pub fn generate_prometheus_metrics(manager: &TunnelManager) -> String {
-    let mut out = String::with_capacity(4096);
+    let entries = manager.registry().all_entries();
+    let total_tunnels = entries.len();
+    let mut active_tunnels = 0;
+    let mut active_conns_total = 0;
 
-    let stats = manager.get_tunnel_stats();
-    let total_tunnels = stats.len();
-    let active_tunnels = stats.iter().filter(|s| s.state == crate::core::TunnelState::Active).count();
-    let active_conns_total: usize = stats.iter().map(|s| s.active_conns).sum();
+    for entry in &entries {
+        if entry.is_active() {
+            active_tunnels += 1;
+        }
+        active_conns_total += entry.stats.active_conns.load(Ordering::Relaxed);
+    }
+
+    let mut out = String::with_capacity(total_tunnels * 160 + 512);
 
     // 1. Daemon-wide gauges
     let _ = writeln!(out, "# HELP wpmulti_tunnels_total Total number of registered tunnels");
@@ -34,22 +42,25 @@ pub fn generate_prometheus_metrics(manager: &TunnelManager) -> String {
     // 2. Per-tunnel counters: RX bytes
     let _ = writeln!(out, "# HELP wpmulti_tunnel_rx_bytes Total received bytes per tunnel");
     let _ = writeln!(out, "# TYPE wpmulti_tunnel_rx_bytes counter");
-    for s in &stats {
-        let _ = writeln!(out, "wpmulti_tunnel_rx_bytes{{tunnel_id=\"{}\"}} {}", s.id, s.rx_bytes);
+    for entry in &entries {
+        let rx = entry.stats.rx_bytes.load(Ordering::Relaxed);
+        let _ = writeln!(out, "wpmulti_tunnel_rx_bytes{{tunnel_id=\"{}\"}} {}", entry.id, rx);
     }
 
     // 3. Per-tunnel counters: TX bytes
     let _ = writeln!(out, "# HELP wpmulti_tunnel_tx_bytes Total transmitted bytes per tunnel");
     let _ = writeln!(out, "# TYPE wpmulti_tunnel_tx_bytes counter");
-    for s in &stats {
-        let _ = writeln!(out, "wpmulti_tunnel_tx_bytes{{tunnel_id=\"{}\"}} {}", s.id, s.tx_bytes);
+    for entry in &entries {
+        let tx = entry.stats.tx_bytes.load(Ordering::Relaxed);
+        let _ = writeln!(out, "wpmulti_tunnel_tx_bytes{{tunnel_id=\"{}\"}} {}", entry.id, tx);
     }
 
     // 4. Per-tunnel gauges: Active connections
     let _ = writeln!(out, "# HELP wpmulti_tunnel_active_conns Active connections per tunnel");
     let _ = writeln!(out, "# TYPE wpmulti_tunnel_active_conns gauge");
-    for s in &stats {
-        let _ = writeln!(out, "wpmulti_tunnel_active_conns{{tunnel_id=\"{}\"}} {}", s.id, s.active_conns);
+    for entry in &entries {
+        let conns = entry.stats.active_conns.load(Ordering::Relaxed);
+        let _ = writeln!(out, "wpmulti_tunnel_active_conns{{tunnel_id=\"{}\"}} {}", entry.id, conns);
     }
 
     out

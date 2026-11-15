@@ -26,11 +26,20 @@ impl std::fmt::Debug for WgConfig {
     }
 }
 
-impl WgConfig {
-    /// Parse configuration from a string slice.
-    pub fn from_str(content: &str) -> Result<Self, WgConfError> {
+impl std::str::FromStr for WgConfig {
+    type Err = WgConfError;
+
+    fn from_str(content: &str) -> Result<Self, Self::Err> {
         let (interface, peers) = parse_wg_conf(content)?;
         Ok(Self { interface, peers })
+    }
+}
+
+impl WgConfig {
+    /// Parse configuration from a string slice.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(content: &str) -> Result<Self, WgConfError> {
+        <Self as std::str::FromStr>::from_str(content)
     }
 
     /// Parse configuration from a filesystem path.
@@ -363,15 +372,14 @@ fn validate_endpoint(endpoint: &str, line_number: usize) -> Result<(), WgConfErr
                 reason: "host portion is empty",
             });
         }
-        if host.parse::<std::net::Ipv4Addr>().is_err() {
-            if !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+        if host.parse::<std::net::Ipv4Addr>().is_err()
+            && !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
                 return Err(WgConfError::InvalidEndpoint {
                     line_number,
                     value: endpoint.to_string(),
                     reason: "hostname contains invalid characters",
                 });
             }
-        }
         (host, port_str)
     };
 
@@ -414,8 +422,10 @@ pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConf
                 iface_builder = Some(InterfaceBuilder::default());
                 current_section = CurrentSection::Interface;
             } else if header.eq_ignore_ascii_case("peer") {
-                let mut pb = PeerBuilder::default();
-                pb.line_number = line_number;
+                let pb = PeerBuilder {
+                    line_number,
+                    ..Default::default()
+                };
                 peer_builders.push(pb);
                 current_section = CurrentSection::Peer(peer_builders.len() - 1);
             } else {

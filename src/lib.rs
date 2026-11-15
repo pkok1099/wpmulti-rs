@@ -38,13 +38,14 @@ pub use netstack::{
     TCP_RX_BUF_SIZE, TCP_TX_BUF_SIZE, UDP_PACKET_QUEUE_CAPACITY, UDP_PAYLOAD_BUF_SIZE,
 };
 pub use proxy::{
-    build_socks5_udp_packet, encode_target_addr, extract_basic_auth, handle_http, handle_socks5,
-    parse_authority, parse_socks5_udp_packet, read_http_request_headers, run_http_listener,
-    run_socks5_listener, send_socks5_reply, AsyncReadWrite, DirectTunnelTarget, DynStream,
-    PoolKeyword, PoolRouter, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket, SingleTunnelRouter,
-    TargetAddr, TunnelRouter, TunnelSelector, ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, CMD_BIND,
-    CMD_CONNECT, CMD_UDP_ASSOCIATE, METHOD_GSSAPI, METHOD_NO_ACCEPTABLE, METHOD_NO_AUTH,
-    METHOD_USER_PASS, REP_ADDR_NOT_SUPPORTED, REP_CMD_NOT_SUPPORTED, REP_CONN_NOT_ALLOWED,
-    REP_CONN_REFUSED, REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE, REP_NETWORK_UNREACHABLE,
-    REP_SUCCESS, REP_TTL_EXPIRED, RFC1929_VERSION, SOCKS5_VERSION,
+    build_socks5_udp_packet, encode_target_addr, encode_target_addr_slice, extract_basic_auth,
+    handle_http, handle_socks5, parse_authority, parse_socks5_udp_packet, read_http_request_headers,
+    read_http_request_headers_buffered, run_http_listener, run_socks5_listener, send_socks5_reply,
+    write_socks5_udp_header, AsyncReadWrite, DirectTunnelTarget, DynStream, PoolKeyword, PoolRouter,
+    ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket, SingleTunnelRouter, TargetAddr, TunnelRouter,
+    TunnelSelector, ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, CMD_BIND, CMD_CONNECT, CMD_UDP_ASSOCIATE,
+    METHOD_GSSAPI, METHOD_NO_ACCEPTABLE, METHOD_NO_AUTH, METHOD_USER_PASS, REP_ADDR_NOT_SUPPORTED,
+    REP_CMD_NOT_SUPPORTED, REP_CONN_NOT_ALLOWED, REP_CONN_REFUSED, REP_GENERAL_FAILURE,
+    REP_HOST_UNREACHABLE, REP_NETWORK_UNREACHABLE, REP_SUCCESS, REP_TTL_EXPIRED, RFC1929_VERSION,
+    SOCKS5_VERSION,
 };

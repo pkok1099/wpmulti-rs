@@ -97,14 +97,31 @@ impl TunnelStats {
     }
 
     /// Record an active connection decrement. If active conns hit 0, records `last_active_at`.
+    /// Guarded against underflow if called when active_conns is already 0.
     pub fn dec_conns(&self) {
-        let prev = self.active_conns.fetch_sub(1, Ordering::SeqCst);
-        if prev <= 1 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            self.last_active_at.store(now, Ordering::Relaxed);
+        let mut current = self.active_conns.load(Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.active_conns.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(prev) => {
+                    if prev == 1 {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        self.last_active_at.store(now, Ordering::Relaxed);
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
         }
     }
 }
@@ -226,11 +243,10 @@ impl AsyncWrite for MeteredStream {
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         let res = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let std::task::Poll::Ready(Ok(n)) = res {
-            if n > 0 {
+        if let std::task::Poll::Ready(Ok(n)) = res
+            && n > 0 {
                 self.stats.add_tx(n as u64);
             }
-        }
         res
     }
 
@@ -459,6 +475,27 @@ impl TunnelRegistry {
     pub fn get_by_index(&self, index: usize) -> Option<Arc<TunnelEntry>> {
         let inner = self.inner.read();
         inner.keys.get(index).and_then(|id| inner.entries.get(id)).cloned()
+    }
+
+    /// Look up a tunnel ID by its registered sequential index without cloning all IDs.
+    pub fn id_by_index(&self, index: usize) -> Option<String> {
+        let inner = self.inner.read();
+        inner.keys.get(index).cloned()
+    }
+
+    /// Find the tunnel ID with the least active connections in a single scan.
+    pub fn least_conn_id(&self) -> Option<String> {
+        let inner = self.inner.read();
+        let mut min_conns = usize::MAX;
+        let mut chosen = None;
+        for (id, entry) in &inner.entries {
+            let conns = entry.stats.active_conns.load(Ordering::Relaxed);
+            if conns < min_conns {
+                min_conns = conns;
+                chosen = Some(id.clone());
+            }
+        }
+        chosen
     }
 
     /// Return all registered tunnel IDs in insertion order.

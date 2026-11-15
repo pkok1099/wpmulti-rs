@@ -58,7 +58,13 @@ impl AdminServer {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         let task = tokio::spawn(async move {
+            let mut client_tasks = tokio::task::JoinSet::new();
+
             loop {
+                while let Some(res) = client_tasks.try_join_next() {
+                    let _ = res;
+                }
+
                 tokio::select! {
                     biased;
                     _ = shutdown_rx.changed() => {
@@ -71,18 +77,32 @@ impl AdminServer {
                             Ok((stream, _peer_addr)) => {
                                 let m = Arc::clone(&manager);
                                 let tok = auth_token.clone();
-                                tokio::spawn(async move {
+                                client_tasks.spawn(async move {
                                     handle_client_connection(stream, m, tok.as_deref(), start_time).await;
                                 });
                             }
                             Err(e) => {
-                                tracing::debug!("Admin HTTP accept error: {:?}", e);
-                                break;
+                                let is_transient = matches!(
+                                    e.raw_os_error(),
+                                    Some(libc::EMFILE | libc::ENFILE | libc::ECONNABORTED | libc::EINTR)
+                                ) || e.kind() == std::io::ErrorKind::ConnectionAborted
+                                    || e.kind() == std::io::ErrorKind::Interrupted;
+
+                                if is_transient {
+                                    tracing::warn!("Transient Admin HTTP accept error: {:?}; backing off", e);
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                } else {
+                                    tracing::debug!("Admin HTTP accept error: {:?}", e);
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
+
+            client_tasks.abort_all();
+            while client_tasks.join_next().await.is_some() {}
         });
 
         *self.task_handle.lock() = Some(task);
@@ -124,14 +144,25 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             let header_str = String::from_utf8_lossy(&buf[..pos]);
             let mut content_len = 0;
             for line in header_str.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    if k.trim().eq_ignore_ascii_case("content-length") {
-                        content_len = v.trim().parse::<usize>().unwrap_or(0);
-                    }
+                if let Some((k, v)) = line.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("content-length") {
+                    content_len = v.trim().parse::<usize>().unwrap_or(0);
                 }
             }
 
+            if content_len > 65536 {
+                let resp = HttpResponse::payload_too_large("Request body too large (max 64 KiB)");
+                let _ = stream.write_all(&resp.to_bytes()).await;
+                return;
+            }
+
             let required_total = pos + 4 + content_len;
+            if required_total > 131072 {
+                let resp = HttpResponse::payload_too_large("Request too large");
+                let _ = stream.write_all(&resp.to_bytes()).await;
+                return;
+            }
+
             while buf.len() < required_total {
                 let n = match stream.read(&mut temp).await {
                     Ok(0) => break,
@@ -139,6 +170,9 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                     Err(_) => return,
                 };
                 buf.extend_from_slice(&temp[..n]);
+                if buf.len() > required_total {
+                    break;
+                }
             }
             break;
         }

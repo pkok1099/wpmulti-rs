@@ -342,7 +342,7 @@ pub fn generate_245_cloned_wgcf_configs(
         "172.16.0.2/32".to_string(),
         "2606:4700:110:8524:5b27:35a3:e0e7:4816/128".to_string(),
     ];
-    let dns = vec!["1.1.1.1".to_string()];
+    let dns = ["1.1.1.1".to_string()];
 
     let mut tunnel_ids = Vec::with_capacity(245);
     let mut file_paths = Vec::with_capacity(245);

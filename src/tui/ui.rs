@@ -411,11 +411,10 @@ pub fn parse_next_key(bytes: &[u8]) -> (Option<TuiKey>, usize) {
         // Find valid UTF-8 prefix or drop invalid byte
         let len = bytes.len().min(4);
         for end in 1..=len {
-            if let Ok(s) = std::str::from_utf8(&bytes[..end]) {
-                if let Some(ch) = s.chars().next() {
+            if let Ok(s) = std::str::from_utf8(&bytes[..end])
+                && let Some(ch) = s.chars().next() {
                     return (Some(TuiKey::Char(ch)), ch.len_utf8());
                 }
-            }
         }
         if bytes.len() < 4 && (bytes[0] & 0xC0) == 0xC0 {
             return (None, 0);
@@ -579,13 +578,11 @@ pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> Result<(
                     pending.extend_from_slice(&buf[..n]);
                     // If a lone ESC arrived, wait briefly (50ms) to distinguish Esc vs split CSI sequence
                     #[cfg(unix)]
-                    if pending == [0x1b] && poll_stdin(50) {
-                        if let Ok(m) = stdin.read(&mut buf) {
-                            if m > 0 {
+                    if pending == [0x1b] && poll_stdin(50)
+                        && let Ok(m) = stdin.read(&mut buf)
+                            && m > 0 {
                                 pending.extend_from_slice(&buf[..m]);
                             }
-                        }
-                    }
 
                     let mut offset = 0;
                     while offset < pending.len() {
@@ -593,11 +590,10 @@ pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> Result<(
                         if consumed == 0 {
                             break;
                         }
-                        if let Some(k) = key {
-                            if key_tx.blocking_send(k).is_err() {
+                        if let Some(k) = key
+                            && key_tx.blocking_send(k).is_err() {
                                 return;
                             }
-                        }
                         offset += consumed;
                     }
                     if offset > 0 {

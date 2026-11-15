@@ -14,7 +14,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::config::{AuthMode, PoolStrategy};
-use crate::proxy::http::{extract_basic_auth, handle_http, parse_authority, read_http_request_headers};
+use crate::proxy::http::{
+    extract_basic_auth, handle_http, parse_authority, read_http_request_headers_buffered,
+};
 use crate::proxy::router::{
     DirectTunnelTarget, DynStream, PoolKeyword, PoolRouter, ProxyTunnelTarget, ProxyUdpSocket,
     SingleTunnelRouter, TargetAddr, TunnelRouter, TunnelSelector,
@@ -648,17 +650,13 @@ async fn test_read_http_request_headers_unit() {
         server.write_all(raw).await.unwrap();
     });
 
-    let (method, uri, version, headers) = read_http_request_headers(&mut client).await.unwrap();
+    let (method, uri, version, headers, leftover) = read_http_request_headers_buffered(&mut client).await.unwrap();
     assert_eq!(method, "GET");
     assert_eq!(uri, "http://example.com/index.html");
     assert_eq!(version, "HTTP/1.1");
     assert_eq!(headers.get("host").unwrap(), "example.com");
     assert_eq!(headers.get("user-agent").unwrap(), "test");
-
-    // Verify unread body remains intact in stream
-    let mut body = [0u8; 4];
-    client.read_exact(&mut body).await.unwrap();
-    assert_eq!(&body, b"body");
+    assert_eq!(&leftover, b"body");
 }
 
 #[tokio::test]
@@ -780,6 +778,37 @@ async fn test_http_forward_proxy() {
 }
 
 #[tokio::test]
+async fn test_http_forward_proxy_ipv6_bracket() {
+    let mock_server_addr = spawn_mock_http_server("ipv6_bracket_ok").await;
+    // mock_server_addr is IPv4 127.0.0.1:port. Now test IPv6 mock server if IPv6 available
+    if let Some(v6_addr) = spawn_echo_tcp_server_ipv6().await {
+        let (host, port) = match parse_authority(&format!("[::1]:{}", v6_addr.port())) {
+            Some(hp) => hp,
+            None => panic!("failed to parse [::1]:port"),
+        };
+        assert_eq!(host, "::1");
+        assert_eq!(port, v6_addr.port());
+    }
+
+    let target = Arc::new(DirectTunnelTarget);
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("fwd-tunnel-v6", target, None));
+    let (mut client, server) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let _ = handle_http(server, router).await;
+    });
+
+    let req = format!(
+        "GET http://{}/test/api HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
+        mock_server_addr, mock_server_addr
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    let (status, _, _, body) = read_http_headers_helper(&mut client).await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8_lossy(&body), "ipv6_bracket_ok");
+}
+
+#[tokio::test]
 async fn test_http_bad_request_handling() {
     let target = Arc::new(DirectTunnelTarget);
     let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("test", target, None));
@@ -884,14 +913,12 @@ async fn read_http_headers_helper<R: AsyncReadExt + Unpin>(
     }
 
     let mut body = Vec::new();
-    if let Some(len_str) = headers.get("content-length") {
-        if let Ok(len) = len_str.parse::<usize>() {
-            if len > 0 {
+    if let Some(len_str) = headers.get("content-length")
+        && let Ok(len) = len_str.parse::<usize>()
+            && len > 0 {
                 body.resize(len, 0);
                 reader.read_exact(&mut body).await?;
             }
-        }
-    }
 
     Ok((status_code, reason, headers, body))
 }

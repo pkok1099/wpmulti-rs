@@ -6,6 +6,7 @@
 
 use std::io;
 use std::sync::Arc;
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, Notify};
 
 use gotatun::packet::{Ip, Packet, PacketBufPool};
@@ -29,6 +30,7 @@ pub struct VirtualTunBridge {
     rx_receiver: mpsc::Receiver<Packet<Ip>>,
     tx_sender: mpsc::Sender<Vec<u8>>,
     notify: Arc<Notify>,
+    buf_pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 /// Inbound handle passed to `gotatun` (`ip_tx`) implementing [`gotatun::tun::IpSend`].
@@ -43,6 +45,7 @@ pub struct BridgeIpRecv {
     tx_receiver: mpsc::Receiver<Vec<u8>>,
     mtu: MtuWatcher,
     notify: Arc<Notify>,
+    buf_pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl VirtualTunBridge {
@@ -56,12 +59,14 @@ impl VirtualTunBridge {
         let (rx_sender, rx_receiver) = mpsc::channel(channel_capacity);
         let (tx_sender, tx_receiver) = mpsc::channel(channel_capacity);
         let notify = Arc::new(Notify::new());
+        let buf_pool = Arc::new(Mutex::new(Vec::with_capacity(64)));
 
         let bridge = Self {
             mtu,
             rx_receiver,
             tx_sender: tx_sender.clone(),
             notify: Arc::clone(&notify),
+            buf_pool: Arc::clone(&buf_pool),
         };
 
         let ip_send = BridgeIpSend {
@@ -73,6 +78,7 @@ impl VirtualTunBridge {
             tx_receiver,
             mtu: MtuWatcher::new(mtu),
             notify,
+            buf_pool,
         };
 
         (bridge, ip_send, ip_recv)
@@ -115,6 +121,7 @@ impl Device for VirtualTunBridge {
                 let rx = VirtualTunRxToken { packet };
                 let tx = VirtualTunTxToken {
                     tx_sender: &self.tx_sender,
+                    buf_pool: &self.buf_pool,
                 };
                 Some((rx, tx))
             }
@@ -130,6 +137,7 @@ impl Device for VirtualTunBridge {
         if self.tx_sender.capacity() > 0 {
             Some(VirtualTunTxToken {
                 tx_sender: &self.tx_sender,
+                buf_pool: &self.buf_pool,
             })
         } else {
             // Infallible token rule in smoltcp 0.14: return None to retain socket TX queue
@@ -150,13 +158,14 @@ impl RxToken for VirtualTunRxToken {
     {
         // Zero-copy: self.packet implements Deref<Target = Ip>.
         // Ip implements IntoBytes via zerocopy, providing &[u8] directly.
-        f((&*self.packet).as_bytes())
+        f((*self.packet).as_bytes())
     }
 }
 
 /// Token representing an outgoing transmission slot from smoltcp to WireGuard.
 pub struct VirtualTunTxToken<'a> {
     tx_sender: &'a mpsc::Sender<Vec<u8>>,
+    buf_pool: &'a Mutex<Vec<Vec<u8>>>,
 }
 
 impl<'a> TxToken for VirtualTunTxToken<'a> {
@@ -164,7 +173,12 @@ impl<'a> TxToken for VirtualTunTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
+        let mut buffer = self
+            .buf_pool
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(len.max(1500)));
+        buffer.resize(len, 0);
         let result = f(&mut buffer);
         if let Err(e) = self.tx_sender.try_send(buffer) {
             tracing::warn!("VirtualTunBridge TX channel full or closed: {e}");
@@ -214,12 +228,12 @@ impl IpRecv for BridgeIpRecv {
         })?;
 
         let mut packets = Vec::with_capacity(MAX_DRAIN_BATCH_SIZE);
-        packets.push(Self::to_packet(first, pool)?);
+        packets.push(Self::to_packet_and_recycle(first, pool, &self.buf_pool)?);
 
         // Opportunistic batch draining up to MAX_DRAIN_BATCH_SIZE
         while packets.len() < MAX_DRAIN_BATCH_SIZE {
             match self.tx_receiver.try_recv() {
-                Ok(next) => packets.push(Self::to_packet(next, pool)?),
+                Ok(next) => packets.push(Self::to_packet_and_recycle(next, pool, &self.buf_pool)?),
                 Err(_) => break,
             }
         }
@@ -240,6 +254,29 @@ impl BridgeIpRecv {
     #[inline]
     pub fn to_packet_pub(raw: Vec<u8>, pool: &mut PacketBufPool) -> io::Result<Packet<Ip>> {
         Self::to_packet(raw, pool)
+    }
+
+    #[inline]
+    fn to_packet_and_recycle(
+        mut raw: Vec<u8>,
+        pool: &mut PacketBufPool,
+        buf_pool: &Arc<Mutex<Vec<Vec<u8>>>>,
+    ) -> io::Result<Packet<Ip>> {
+        let mut pkt = pool.get();
+        pkt.truncate(raw.len());
+        pkt.copy_from_slice(&raw);
+        raw.clear();
+        let mut p = buf_pool.lock();
+        if p.len() < 64 {
+            p.push(raw);
+        }
+        drop(p);
+        pkt.try_into_ip().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Malformed IP packet from smoltcp: {e}"),
+            )
+        })
     }
 
     #[inline]

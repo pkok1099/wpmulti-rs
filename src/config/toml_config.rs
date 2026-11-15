@@ -102,9 +102,9 @@ pub mod duration_str_serde {
         let secs = duration.as_secs();
         if duration.subsec_millis() > 0 {
             serializer.serialize_str(&format!("{}ms", duration.as_millis()))
-        } else if secs % 3600 == 0 && secs > 0 {
+        } else if secs.is_multiple_of(3600) && secs > 0 {
             serializer.serialize_str(&format!("{}h", secs / 3600))
-        } else if secs % 60 == 0 && secs > 0 {
+        } else if secs.is_multiple_of(60) && secs > 0 {
             serializer.serialize_str(&format!("{}m", secs / 60))
         } else {
             serializer.serialize_str(&format!("{secs}s"))
@@ -270,16 +270,13 @@ pub enum TuiSortField {
 
 /// Selection of tunnels participating in a shared listener pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum TunnelPoolSelection {
+    #[default]
     All,
     Selected(Vec<String>),
 }
 
-impl Default for TunnelPoolSelection {
-    fn default() -> Self {
-        TunnelPoolSelection::All
-    }
-}
 
 impl<'de> Deserialize<'de> for TunnelPoolSelection {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -645,42 +642,37 @@ impl MainConfig {
         }
 
         if self.per_tunnel.enabled {
-            if let Some(s5) = self.per_tunnel.base_socks5_port {
-                if s5 == 0 {
+            if let Some(s5) = self.per_tunnel.base_socks5_port
+                && s5 == 0 {
                     return Err(ConfigError::Validation(
                         "per_tunnel.base_socks5_port cannot be 0".into(),
                     ));
                 }
-            }
-            if let Some(http) = self.per_tunnel.base_http_port {
-                if http == 0 {
+            if let Some(http) = self.per_tunnel.base_http_port
+                && http == 0 {
                     return Err(ConfigError::Validation(
                         "per_tunnel.base_http_port cannot be 0".into(),
                     ));
                 }
-            }
-            if let (Some(s5), Some(http)) = (self.per_tunnel.base_socks5_port, self.per_tunnel.base_http_port) {
-                if s5 == http {
+            if let (Some(s5), Some(http)) = (self.per_tunnel.base_socks5_port, self.per_tunnel.base_http_port)
+                && s5 == http {
                     return Err(ConfigError::Validation(
                         "per_tunnel.base_socks5_port and base_http_port cannot be identical".into(),
                     ));
                 }
-            }
             for (id, override_port) in &self.per_tunnel.overrides {
-                if let Some(p) = override_port.socks5_port {
-                    if p == 0 {
+                if let Some(p) = override_port.socks5_port
+                    && p == 0 {
                         return Err(ConfigError::Validation(format!(
                             "Override socks5_port for tunnel '{id}' cannot be 0"
                         )));
                     }
-                }
-                if let Some(p) = override_port.http_port {
-                    if p == 0 {
+                if let Some(p) = override_port.http_port
+                    && p == 0 {
                         return Err(ConfigError::Validation(format!(
                             "Override http_port for tunnel '{id}' cannot be 0"
                         )));
                     }
-                }
             }
         }
 

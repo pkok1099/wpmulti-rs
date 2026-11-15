@@ -91,13 +91,11 @@ pub fn load_tunnel_configs_from_dir<P: AsRef<Path>>(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                if ext.eq_ignore_ascii_case("conf") {
+        if path.is_file()
+            && let Some(ext) = path.extension().and_then(|s| s.to_str())
+                && ext.eq_ignore_ascii_case("conf") {
                     entries.push(path);
                 }
-            }
-        }
     }
 
     // Sort paths alphabetically to ensure deterministic ordering

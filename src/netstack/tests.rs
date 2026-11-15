@@ -1,8 +1,6 @@
 //! Milestone 2 comprehensive unit test suite for virtual networking stack.
 
-#[cfg(test)]
-mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::time::Duration;
     use etherparse::PacketBuilder;
     use gotatun::tun::IpSend;
@@ -166,6 +164,14 @@ mod tests {
         assert!(matches!(parse_response(&loop_pkt, 0x1234), Err(DnsError::PointerLoop)));
     }
 
+    #[test]
+    fn test_dns_compression_pointer_out_of_bounds() {
+        let mut oob_pkt = Vec::new();
+        oob_pkt.extend_from_slice(&[0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        oob_pkt.extend_from_slice(&[0xC0, 0xFF]); // Pointer points beyond buffer length
+        assert!(matches!(parse_response(&oob_pkt, 0x1234), Err(DnsError::PacketTooShort)));
+    }
+
     // =========================================================================
     // 2. TTL-Aware LRU Cache Tests
     // =========================================================================
@@ -216,6 +222,27 @@ mod tests {
         cache.clear();
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_dns_cache_concurrent_access_no_deadlock() {
+        use std::sync::Arc;
+        let cache = Arc::new(DnsLruCache::new(50));
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let c = Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                let ip: IpAddr = format!("10.0.0.{}", i).parse().unwrap();
+                for j in 0..100 {
+                    let domain = format!("test-{}.com", j % 20);
+                    c.insert(&domain, vec![ip], 60);
+                    let _ = c.get(&domain);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     // =========================================================================
@@ -279,7 +306,7 @@ mod tests {
         let pkt = packets.next().expect("packet must be received");
 
         use zerocopy::IntoBytes;
-        assert_eq!((&*pkt).as_bytes(), &raw[..]);
+        assert_eq!((*pkt).as_bytes(), &raw[..]);
     }
 
     #[test]
@@ -418,7 +445,7 @@ mod tests {
 
         let pkt = packets.next().expect("packet present");
         use zerocopy::IntoBytes;
-        let raw_out = (&*pkt).as_bytes();
+        let raw_out = (*pkt).as_bytes();
 
         // Verify it is an IPv4 UDP packet
         let parsed = etherparse::SlicedPacket::from_ip(raw_out).unwrap();
@@ -486,7 +513,7 @@ mod tests {
 
             let mut packets = ip_recv.recv(&mut pool).await.unwrap();
             let pkt = packets.next().unwrap();
-            let raw = (&*pkt).as_bytes();
+            let raw = (*pkt).as_bytes();
 
             let parsed = etherparse::SlicedPacket::from_ip(raw).unwrap();
             let dns_query = parsed.payload;
@@ -582,7 +609,7 @@ mod tests {
             // 1. Receive SYN packet
             let mut packets = ip_recv.recv(&mut pool).await.unwrap();
             let pkt = packets.next().unwrap();
-            let raw = (&*pkt).as_bytes().to_vec();
+            let raw = (*pkt).as_bytes().to_vec();
             drop(packets);
 
             let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
@@ -622,7 +649,7 @@ mod tests {
             // 3. Receive ACK (completes handshake)
             let mut packets = ip_recv.recv(&mut pool).await.unwrap();
             let pkt = packets.next().unwrap();
-            let raw = (&*pkt).as_bytes().to_vec();
+            let raw = (*pkt).as_bytes().to_vec();
             drop(packets);
 
             let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
@@ -635,7 +662,7 @@ mod tests {
             // 4. Receive client data (b"PING_DATA")
             let mut packets = ip_recv.recv(&mut pool).await.unwrap();
             let pkt = packets.next().unwrap();
-            let raw = (&*pkt).as_bytes().to_vec();
+            let raw = (*pkt).as_bytes().to_vec();
             drop(packets);
 
             let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
@@ -785,4 +812,3 @@ mod tests {
 
         stack.close().await;
     }
-}

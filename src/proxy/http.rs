@@ -43,19 +43,19 @@ pub fn extract_basic_auth(headers: &HashMap<String, String>) -> Option<(String, 
     Some((user.to_string(), pass.to_string()))
 }
 
-/// Reads HTTP request line and headers byte-by-byte up to `\r\n\r\n`.
+/// Reads HTTP request line and headers using buffered chunked reads.
 ///
-/// Guaranteed not to read past `\r\n\r\n`, leaving following stream bytes untouched.
-pub async fn read_http_request_headers<R: AsyncRead + Unpin>(
+/// Returns `(method, uri, version, headers, leftover_bytes)`.
+pub async fn read_http_request_headers_buffered<R: AsyncRead + Unpin>(
     reader: &mut R,
-) -> io::Result<(String, String, String, HashMap<String, String>)> {
-    let mut header_bytes = Vec::with_capacity(512);
-    let mut byte_buf = [0u8; 1];
+) -> io::Result<(String, String, String, HashMap<String, String>, Vec<u8>)> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
 
-    while header_bytes.len() < MAX_HEADER_SIZE {
-        let n = reader.read(&mut byte_buf).await?;
+    while buf.len() < MAX_HEADER_SIZE {
+        let n = reader.read(&mut chunk).await?;
         if n == 0 {
-            if header_bytes.is_empty() {
+            if buf.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "connection closed before request",
@@ -66,20 +66,25 @@ pub async fn read_http_request_headers<R: AsyncRead + Unpin>(
                 "request truncated",
             ));
         }
-        header_bytes.push(byte_buf[0]);
-        if header_bytes.ends_with(b"\r\n\r\n") {
-            break;
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_bytes = &buf[..pos + 4];
+            let (method, uri, version, headers) = parse_header_bytes(header_bytes)?;
+            let leftover = buf[pos + 4..].to_vec();
+            return Ok((method, uri, version, headers, leftover));
         }
     }
 
-    if !header_bytes.ends_with(b"\r\n\r\n") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "HTTP request headers too large",
-        ));
-    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "HTTP request headers too large",
+    ))
+}
 
-    let header_str = String::from_utf8_lossy(&header_bytes);
+fn parse_header_bytes(
+    header_bytes: &[u8],
+) -> io::Result<(String, String, String, HashMap<String, String>)> {
+    let header_str = String::from_utf8_lossy(header_bytes);
     let mut lines = header_str.split("\r\n");
 
     let req_line = lines.next().ok_or_else(|| {
@@ -111,6 +116,14 @@ pub async fn read_http_request_headers<R: AsyncRead + Unpin>(
     Ok((method, uri, version, headers))
 }
 
+/// Reads HTTP request line and headers using buffered chunked reads up to `\r\n\r\n`.
+pub async fn read_http_request_headers<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<(String, String, String, HashMap<String, String>)> {
+    let (method, uri, version, headers, _) = read_http_request_headers_buffered(reader).await?;
+    Ok((method, uri, version, headers))
+}
+
 /// Core HTTP proxy connection handler.
 ///
 /// Handles `CONNECT` tunneling (RFC 9110 Section 9.3.6), Basic Authentication challenges (RFC 7617),
@@ -119,8 +132,8 @@ pub async fn handle_http<S>(mut stream: S, router: Arc<dyn TunnelRouter>) -> io:
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // 1. Read HTTP request line and headers
-    let (method, uri, version, headers) = match read_http_request_headers(&mut stream).await {
+    // 1. Read HTTP request line and headers using buffered chunked reads
+    let (method, uri, version, headers, leftover) = match read_http_request_headers_buffered(&mut stream).await {
         Ok(res) => res,
         Err(e) => {
             if e.kind() == io::ErrorKind::UnexpectedEof && e.to_string().contains("before request") {
@@ -149,9 +162,15 @@ where
 
     // 3. Dispatch based on HTTP method and URI form
     if method.eq_ignore_ascii_case("CONNECT") {
-        handle_http_connect(stream, router, &selector, &uri).await
+        handle_http_connect(stream, router, &selector, &uri, leftover).await
     } else if uri.starts_with("http://") || uri.starts_with("https://") {
-        handle_http_forward(stream, router, &selector, &method, &uri, &version, headers).await
+        let req = ForwardRequest {
+            method,
+            uri,
+            version,
+            headers,
+        };
+        handle_http_forward(stream, router, &selector, req, leftover).await
     } else {
         // Non-CONNECT origin-form requests received on forward proxy port
         send_response(&mut stream, "400 Bad Request", "text/plain", b"Invalid Request").await?;
@@ -168,6 +187,7 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
     router: Arc<dyn TunnelRouter>,
     selector: &TunnelSelector,
     authority: &str,
+    leftover: Vec<u8>,
 ) -> io::Result<()> {
     let (host, port) = match parse_authority(authority) {
         Some(hp) => hp,
@@ -220,10 +240,23 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
     stream.flush().await?;
 
+    // Forward any pipelined leftover bytes
+    if !leftover.is_empty() {
+        tunnel_stream.write_all(&leftover).await?;
+        tunnel_stream.flush().await?;
+    }
+
     // Bidirectional byte streaming
     tokio::io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
 
     Ok(())
+}
+
+struct ForwardRequest {
+    method: String,
+    uri: String,
+    version: String,
+    headers: HashMap<String, String>,
 }
 
 /// Executes RFC 9110 Forward Proxy request forwarding for absolute URIs.
@@ -231,18 +264,16 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     router: Arc<dyn TunnelRouter>,
     selector: &TunnelSelector,
-    method: &str,
-    uri: &str,
-    version: &str,
-    headers: HashMap<String, String>,
+    req: ForwardRequest,
+    leftover: Vec<u8>,
 ) -> io::Result<()> {
     // Parse absolute URI: "http://host[:port]/path"
-    let (authority, path) = if let Some(rest) = uri.strip_prefix("http://") {
+    let (authority, path) = if let Some(rest) = req.uri.strip_prefix("http://") {
         match rest.split_once('/') {
             Some((auth, p)) => (auth, format!("/{}", p)),
             None => (rest, "/".to_string()),
         }
-    } else if let Some(rest) = uri.strip_prefix("https://") {
+    } else if let Some(rest) = req.uri.strip_prefix("https://") {
         match rest.split_once('/') {
             Some((auth, p)) => (auth, format!("/{}", p)),
             None => (rest, "/".to_string()),
@@ -252,10 +283,19 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid absolute URI"));
     };
 
-    let (host, port) = if authority.contains(':') {
-        parse_authority(authority).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid authority")
-        })?
+    let (host, port) = if authority.starts_with('[') {
+        if authority.ends_with(']') {
+            (authority[1..authority.len() - 1].to_string(), 80)
+        } else {
+            parse_authority(authority).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid authority")
+            })?
+        }
+    } else if let Some((h, p_str)) = authority.split_once(':') {
+        let p = p_str.parse::<u16>().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid port in authority")
+        })?;
+        (h.to_string(), p)
     } else {
         (authority.to_string(), 80)
     };
@@ -291,18 +331,25 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
-    // Rewrite request line with relative path and filter hop-by-hop headers
-    let mut req_buf = format!("{} {} {}\r\n", method, path, version);
-    for (k, v) in &headers {
-        if k == "proxy-authorization" || k == "proxy-connection" || k == "proxy-authenticate" {
+    // Rewrite request line with relative path, filter hop-by-hop headers, and inject Connection: close
+    let mut req_buf = format!("{} {} {}\r\n", req.method, path, req.version);
+    for (k, v) in &req.headers {
+        if k == "proxy-authorization"
+            || k == "proxy-connection"
+            || k == "proxy-authenticate"
+            || k == "connection"
+        {
             continue;
         }
         req_buf.push_str(&format!("{}: {}\r\n", k, v));
     }
-    req_buf.push_str("\r\n");
+    req_buf.push_str("connection: close\r\n\r\n");
 
     // Forward request line and headers to destination server
     tunnel_stream.write_all(req_buf.as_bytes()).await?;
+    if !leftover.is_empty() {
+        tunnel_stream.write_all(&leftover).await?;
+    }
     tunnel_stream.flush().await?;
 
     // Bidirectional copy: streams any request payload (e.g. POST) and response back to client

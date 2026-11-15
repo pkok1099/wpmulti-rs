@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -187,6 +188,9 @@ fn skip_name(buf: &[u8], offset: usize) -> Result<usize, DnsError> {
                 end_offset = Some(curr + 2);
             }
             let ptr = (((len & 0x3F) as usize) << 8) | (buf[curr + 1] as usize);
+            if ptr >= buf.len() {
+                return Err(DnsError::PacketTooShort);
+            }
             curr = ptr;
             hops += 1;
             if hops > 16 {
@@ -216,7 +220,7 @@ struct DnsCacheEntry {
 pub struct DnsLruCache {
     entries: Mutex<HashMap<String, DnsCacheEntry>>,
     capacity: usize,
-    access_counter: Mutex<u64>,
+    access_counter: AtomicU64,
     min_ttl: Duration,
     max_ttl: Duration,
 }
@@ -226,7 +230,7 @@ impl DnsLruCache {
         Self {
             entries: Mutex::new(HashMap::with_capacity(capacity)),
             capacity,
-            access_counter: Mutex::new(0),
+            access_counter: AtomicU64::new(0),
             min_ttl: Duration::from_secs(5),     // Clamped min TTL
             max_ttl: Duration::from_secs(86400), // Clamped max TTL (24h)
         }
@@ -239,9 +243,8 @@ impl DnsLruCache {
 
         if let Some(entry) = entries.get_mut(&key) {
             if now < entry.expires_at {
-                let mut counter = self.access_counter.lock();
-                *counter += 1;
-                entry.last_accessed = *counter;
+                let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                entry.last_accessed = access_time;
                 return Some(entry.ips.clone());
             } else {
                 entries.remove(&key);
@@ -258,9 +261,7 @@ impl DnsLruCache {
         let ttl = Duration::from_secs(ttl_secs as u64).clamp(self.min_ttl, self.max_ttl);
         let expires_at = Instant::now() + ttl;
 
-        let mut counter = self.access_counter.lock();
-        *counter += 1;
-        let access_time = *counter;
+        let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
         let mut entries = self.entries.lock();
 
@@ -268,15 +269,14 @@ impl DnsLruCache {
             let now = Instant::now();
             entries.retain(|_, v| now < v.expires_at);
 
-            if entries.len() >= self.capacity {
-                if let Some(lru_key) = entries
+            if entries.len() >= self.capacity
+                && let Some(lru_key) = entries
                     .iter()
                     .min_by_key(|(_, v)| v.last_accessed)
                     .map(|(k, _)| k.clone())
                 {
                     entries.remove(&lru_key);
                 }
-            }
         }
 
         entries.insert(
@@ -499,7 +499,7 @@ impl InTunnelDnsResolver {
         qtype: QueryType,
     ) -> Result<(Vec<IpAddr>, u32), io::Error> {
         tokio::time::timeout(self.timeout, async {
-            let socket = stack.udp_bind(0).await?;
+            let socket = stack.udp_bind_with_size(0, 4096, 4096, 2).await?;
             let tx_id = rand::random::<u16>();
 
             let query = build_query(domain, qtype, tx_id)
@@ -517,7 +517,7 @@ impl InTunnelDnsResolver {
             }
 
             let (ips, ttl) = parse_response(&buf[..len], tx_id)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
 
             Ok((ips, ttl))
         })

@@ -26,7 +26,7 @@ use crate::proxy::{
 pub struct MultiTenantRouter {
     lifecycle: Arc<LifecycleController>,
     registry: Arc<TunnelRegistry>,
-    allowed_tunnels: RwLock<Option<Vec<String>>>,
+    allowed_tunnels: RwLock<Option<Arc<[String]>>>,
     default_strategy: PoolStrategy,
     auth_mode: AuthMode,
     global_password: Option<String>,
@@ -42,9 +42,9 @@ impl MultiTenantRouter {
         lifecycle: Arc<LifecycleController>,
         registry: Arc<TunnelRegistry>,
     ) -> Arc<Self> {
-        let allowed = match &settings.pool {
+        let allowed: Option<Arc<[String]>> = match &settings.pool {
             TunnelPoolSelection::All => None,
-            TunnelPoolSelection::Selected(list) => Some(list.clone()),
+            TunnelPoolSelection::Selected(list) => Some(list.as_slice().into()),
         };
         let ip_mode = IpMode::effective_with_global(settings.ip_mode, lifecycle.ip_mode())
             .unwrap_or(lifecycle.ip_mode());
@@ -98,7 +98,7 @@ impl MultiTenantRouter {
     /// Update the allowed tunnel pool IDs under lock.
     pub fn set_allowed_tunnels(&self, list: Option<Vec<String>>) {
         let mut allowed = self.allowed_tunnels.write();
-        *allowed = list;
+        *allowed = list.map(|l| l.into_boxed_slice().into());
     }
 
     fn clone_shallow(&self) -> Self {
@@ -116,17 +116,17 @@ impl MultiTenantRouter {
     }
 
     /// Collect candidate tunnel IDs allowed for this pool.
-    fn get_candidates(&self) -> Vec<String> {
+    pub fn get_candidates(&self) -> Vec<String> {
         let allowed = self.allowed_tunnels.read().clone();
         if let Some(list) = allowed {
-            list
+            list.to_vec()
         } else {
             self.registry.all_ids()
         }
     }
 
-    /// Select a tunnel ID based on a pool keyword strategy.
-    fn select_by_keyword(&self, keyword: PoolKeyword, candidates: &[String]) -> io::Result<String> {
+    /// Select a tunnel ID from slice based on keyword without cloning candidate lists.
+    fn select_by_keyword_slice(&self, keyword: PoolKeyword, candidates: &[String]) -> io::Result<String> {
         if candidates.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -143,14 +143,41 @@ impl MultiTenantRouter {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % candidates.len();
                 Ok(candidates[idx].clone())
             }
-            PoolKeyword::LeastConn => {
-                self.select_least_conn(candidates)
-            }
+            PoolKeyword::LeastConn => self.select_least_conn_slice(candidates),
         }
     }
 
-    /// Select a candidate tunnel with the lowest number of active connections.
-    fn select_least_conn(&self, candidates: &[String]) -> io::Result<String> {
+    /// Select a tunnel ID directly from the registry without candidate vector allocation.
+    fn select_by_keyword_registry(&self, keyword: PoolKeyword) -> io::Result<String> {
+        let total = self.registry.count();
+        if total == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no available tunnels in registry",
+            ));
+        }
+
+        match keyword {
+            PoolKeyword::Random => {
+                let idx = (rand::random::<u32>() as usize) % total;
+                self.registry.id_by_index(idx).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "failed to index tunnel")
+                })
+            }
+            PoolKeyword::RoundRobin | PoolKeyword::Auto => {
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % total;
+                self.registry.id_by_index(idx).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "failed to index tunnel")
+                })
+            }
+            PoolKeyword::LeastConn => self.registry.least_conn_id().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "no candidate tunnels in registry")
+            }),
+        }
+    }
+
+    /// Select a candidate tunnel with lowest active connections from a slice.
+    fn select_least_conn_slice(&self, candidates: &[String]) -> io::Result<String> {
         let mut best_id = None;
         let mut min_conns = usize::MAX;
 
@@ -172,8 +199,8 @@ impl MultiTenantRouter {
         })
     }
 
-    /// Select a tunnel ID using the default pool strategy.
-    fn select_default_pool(&self, candidates: &[String]) -> io::Result<String> {
+    /// Select a tunnel ID using default pool strategy from slice.
+    fn select_default_pool_slice(&self, candidates: &[String]) -> io::Result<String> {
         if candidates.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -190,7 +217,18 @@ impl MultiTenantRouter {
                 let idx = (rand::random::<u32>() as usize) % candidates.len();
                 Ok(candidates[idx].clone())
             }
-            PoolStrategy::LeastConn => self.select_least_conn(candidates),
+            PoolStrategy::LeastConn => self.select_least_conn_slice(candidates),
+        }
+    }
+
+    /// Select a tunnel ID using default pool strategy from registry directly.
+    fn select_default_pool_registry(&self) -> io::Result<String> {
+        match self.default_strategy {
+            PoolStrategy::RoundRobin | PoolStrategy::Fallback => {
+                self.select_by_keyword_registry(PoolKeyword::RoundRobin)
+            }
+            PoolStrategy::Random => self.select_by_keyword_registry(PoolKeyword::Random),
+            PoolStrategy::LeastConn => self.select_by_keyword_registry(PoolKeyword::LeastConn),
         }
     }
 }
@@ -220,11 +258,10 @@ impl TunnelRouter for MultiTenantRouter {
                         }
                     }
                     Some((user, pass)) => {
-                        if let Some(expected_pass) = &self.global_password {
-                            if pass != expected_pass {
+                        if let Some(expected_pass) = &self.global_password
+                            && pass != expected_pass {
                                 return Err(ProxyAuthError::InvalidCredentials);
                             }
-                        }
                         Ok(TunnelSelector::parse(user))
                     }
                 }
@@ -237,17 +274,18 @@ impl TunnelRouter for MultiTenantRouter {
         selector: &'a TunnelSelector,
     ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>> {
         Box::pin(async move {
-            let candidates = self.get_candidates();
+            let allowed_guard = self.allowed_tunnels.read().clone();
 
             let target_id = match selector {
                 TunnelSelector::ById(id) => {
                     // Check if tunnel ID is recognized and allowed
-                    if !candidates.is_empty() && !candidates.contains(id) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("tunnel '{}' not allowed in this pool", id),
-                        ));
-                    }
+                    if let Some(ref allowed) = allowed_guard
+                        && !allowed.is_empty() && !allowed.iter().any(|s| s == id) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("tunnel '{}' not allowed in this pool", id),
+                            ));
+                        }
                     if self.registry.get(id).is_none() {
                         return Err(io::Error::new(
                             io::ErrorKind::NotFound,
@@ -257,24 +295,38 @@ impl TunnelRouter for MultiTenantRouter {
                     id.clone()
                 }
                 TunnelSelector::ByKeyword(keyword) => {
-                    self.select_by_keyword(*keyword, &candidates)?
+                    if let Some(ref allowed) = allowed_guard {
+                        self.select_by_keyword_slice(*keyword, allowed)?
+                    } else {
+                        self.select_by_keyword_registry(*keyword)?
+                    }
                 }
                 TunnelSelector::ByTag(tag) => {
-                    // Match prefix or substring among candidates
-                    let matched = candidates
-                        .iter()
-                        .find(|id| id.contains(tag))
-                        .cloned();
-
-                    matched.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("no tunnel found matching tag '{}'", tag),
-                        )
-                    })?
+                    if let Some(ref allowed) = allowed_guard {
+                        let matched = allowed.iter().find(|id| id.contains(tag)).cloned();
+                        matched.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("no tunnel found matching tag '{}'", tag),
+                            )
+                        })?
+                    } else {
+                        let all = self.registry.all_ids();
+                        let matched = all.into_iter().find(|id| id.contains(tag));
+                        matched.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("no tunnel found matching tag '{}'", tag),
+                            )
+                        })?
+                    }
                 }
                 TunnelSelector::DefaultPool => {
-                    self.select_default_pool(&candidates)?
+                    if let Some(ref allowed) = allowed_guard {
+                        self.select_default_pool_slice(allowed)?
+                    } else {
+                        self.select_default_pool_registry()?
+                    }
                 }
             };
 
@@ -283,7 +335,7 @@ impl TunnelRouter for MultiTenantRouter {
                 .lifecycle
                 .get_or_activate(&target_id)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tunnel activation failed: {:?}", e)))?;
+                .map_err(|e| io::Error::other(format!("tunnel activation failed: {:?}", e)))?;
 
             let guarded = GuardedTunnelTarget::new(active_tunnel, guard);
             if self.ip_mode == IpMode::DualStack {
@@ -347,7 +399,7 @@ impl TunnelRouter for DedicatedTunnelRouter {
                 .lifecycle
                 .get_or_activate(&self.tunnel_id)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tunnel activation failed: {:?}", e)))?;
+                .map_err(|e| io::Error::other(format!("tunnel activation failed: {:?}", e)))?;
 
             let guarded = GuardedTunnelTarget::new(active, guard);
             let ip_mode = self.lifecycle.ip_mode();

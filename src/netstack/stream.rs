@@ -104,6 +104,12 @@ impl AsyncRead for VirtualTcpStream {
         }
 
         let mut inner = self.inner.lock();
+        if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "tcp socket handle not found in socket set",
+            )));
+        }
         let socket = inner.sockets.get_mut::<tcp::Socket>(self.handle);
 
         match socket.state() {
@@ -179,6 +185,12 @@ impl AsyncWrite for VirtualTcpStream {
         }
 
         let mut inner = self.inner.lock();
+        if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "tcp socket handle not found in socket set",
+            )));
+        }
         let socket = inner.sockets.get_mut::<tcp::Socket>(self.handle);
 
         match socket.state() {
@@ -237,6 +249,12 @@ impl AsyncWrite for VirtualTcpStream {
         }
 
         let mut inner = self.inner.lock();
+        if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "tcp socket handle not found in socket set",
+            )));
+        }
         let socket = inner.sockets.get_mut::<tcp::Socket>(self.handle);
 
         match socket.state() {
@@ -265,16 +283,20 @@ impl AsyncWrite for VirtualTcpStream {
         }
 
         let mut inner = self.inner.lock();
+        if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "tcp socket handle not found in socket set",
+            )));
+        }
         let socket = inner.sockets.get_mut::<tcp::Socket>(self.handle);
 
         match socket.state() {
             State::Established | State::CloseWait => {
                 socket.close();
+                socket.register_send_waker(cx.waker());
                 drop(inner);
                 self.notify.notify_one();
-                let mut inner2 = self.inner.lock();
-                let socket2 = inner2.sockets.get_mut::<tcp::Socket>(self.handle);
-                socket2.register_send_waker(cx.waker());
                 Poll::Pending
             }
             State::FinWait1 | State::FinWait2 | State::Closing | State::LastAck => {
@@ -344,6 +366,12 @@ impl VirtualUdpSocket {
         let endpoint = to_smoltcp_endpoint(target);
         std::future::poll_fn(|cx| {
             let mut inner = self.inner.lock();
+            if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "udp socket handle not found in socket set",
+                )));
+            }
             let socket = inner.sockets.get_mut::<udp::Socket>(self.handle);
 
             if socket.can_send() {
@@ -376,6 +404,12 @@ impl VirtualUdpSocket {
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), io::Error> {
         std::future::poll_fn(|cx| {
             let mut inner = self.inner.lock();
+            if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "udp socket handle not found in socket set",
+                )));
+            }
             let socket = inner.sockets.get_mut::<udp::Socket>(self.handle);
 
             if socket.can_recv() {

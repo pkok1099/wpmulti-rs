@@ -11,6 +11,7 @@ pub mod router;
 #[cfg(test)]
 pub mod tests;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -180,26 +181,13 @@ impl TunnelManager {
     }
 
     /// Stop the tunnel manager: terminates listeners, stops idle teardown,
-    /// and suspends all running tunnels.
+    /// and cleanly closes all running and suspended tunnels.
     pub async fn stop(&self) -> Result<(), CoreError> {
         // 1. Stop all proxy listeners
         self.listeners.stop().await;
 
-        // 2. Stop lifecycle controller
+        // 2. Stop lifecycle controller and cleanly shut down all tunnels
         self.lifecycle.stop().await;
-
-        // 3. Suspend all currently active tunnels in parallel
-        let mut set = tokio::task::JoinSet::new();
-        for entry in self.registry.all_entries() {
-            if entry.is_active() {
-                let lifecycle = Arc::clone(&self.lifecycle);
-                let id = entry.id.clone();
-                set.spawn(async move {
-                    let _ = lifecycle.suspend_tunnel(&id).await;
-                });
-            }
-        }
-        while set.join_next().await.is_some() {}
 
         Ok(())
     }
@@ -255,28 +243,28 @@ impl TunnelManager {
         for t_cfg in new_tunnels {
             incoming_ids.insert(t_cfg.id.clone());
             if let Some(existing) = self.registry.get(&t_cfg.id) {
-                // If keys or peers changed, mark updated
-                let (keys_changed, peers_changed) = {
+                // If entire config (interface, addresses, keys, dns, peers, allowed_ips) changed, mark updated
+                let config_changed = {
                     let cur = existing.config.read();
-                    (
-                        cur.interface.private_key.to_bytes() != t_cfg.interface.private_key.to_bytes(),
-                        cur.peers.len() != t_cfg.peers.len(),
-                    )
+                    *cur != t_cfg
                 };
-                if keys_changed || peers_changed {
-                    // Suspend old device if running
-                    let _ = self.lifecycle.suspend_tunnel(&t_cfg.id).await;
-                    *existing.active.write() = None;
-                    *existing.state.write() = TunnelState::Dormant;
+                if config_changed {
+                    if existing.stats.active_conns.load(Ordering::SeqCst) == 0 {
+                        // Cleanly close old device and reactor if running and no active connections
+                        let _ = self.lifecycle.close_tunnel(&t_cfg.id).await;
 
-                    let saved_port = *existing.assigned_port.read();
-                    *existing.config.write() = t_cfg.clone();
+                        let saved_port = *existing.assigned_port.read();
+                        *existing.config.write() = t_cfg.clone();
 
-                    let new_entry = TunnelEntry::new(t_cfg.id.clone(), t_cfg, existing.lifecycle_mode);
-                    if let Some(p) = saved_port {
-                        new_entry.set_assigned_port(p);
+                        let new_entry = TunnelEntry::new(t_cfg.id.clone(), t_cfg, existing.lifecycle_mode);
+                        if let Some(p) = saved_port {
+                            new_entry.set_assigned_port(p);
+                        }
+                        self.registry.replace(new_entry);
+                    } else {
+                        // Active connections exist: update config in-place without disrupting traffic
+                        *existing.config.write() = t_cfg;
                     }
-                    self.registry.replace(new_entry);
                     report.updated += 1;
                 }
             } else {
@@ -291,7 +279,7 @@ impl TunnelManager {
         let existing_ids = self.registry.all_ids();
         for id in existing_ids {
             if !incoming_ids.contains(&id) {
-                let _ = self.lifecycle.suspend_tunnel(&id).await;
+                let _ = self.lifecycle.close_tunnel(&id).await;
                 self.registry.remove(&id);
                 report.removed += 1;
             }

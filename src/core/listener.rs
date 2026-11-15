@@ -3,6 +3,7 @@
 //! Handles automatic port assignment, socket binding, protocol dispatch (SOCKS5 and HTTP),
 //! and coordinated graceful shutdown.
 
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -281,7 +282,13 @@ async fn run_listener_loop(
     listener_type: ListenerType,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let mut client_tasks = tokio::task::JoinSet::new();
+
     loop {
+        while let Some(res) = client_tasks.try_join_next() {
+            let _ = res;
+        }
+
         tokio::select! {
             biased;
             _ = shutdown_rx.changed() => {
@@ -293,7 +300,7 @@ async fn run_listener_loop(
                 match res {
                     Ok((stream, _peer_addr)) => {
                         let r = Arc::clone(&router);
-                        tokio::spawn(async move {
+                        client_tasks.spawn(async move {
                             match listener_type {
                                 ListenerType::Socks5 => {
                                     let _ = handle_socks5(stream, r).await;
@@ -305,11 +312,25 @@ async fn run_listener_loop(
                         });
                     }
                     Err(e) => {
-                        tracing::debug!("TCP listener accept stopped: {:?}", e);
-                        break;
+                        let is_transient = matches!(
+                            e.raw_os_error(),
+                            Some(libc::EMFILE | libc::ENFILE | libc::ECONNABORTED | libc::EINTR)
+                        ) || e.kind() == io::ErrorKind::ConnectionAborted
+                            || e.kind() == io::ErrorKind::Interrupted;
+
+                        if is_transient {
+                            tracing::warn!("Transient TCP accept error: {:?}; backing off", e);
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        } else {
+                            tracing::debug!("TCP listener accept stopped: {:?}", e);
+                            break;
+                        }
                     }
                 }
             }
         }
     }
+
+    client_tasks.abort_all();
+    while client_tasks.join_next().await.is_some() {}
 }

@@ -502,6 +502,7 @@ impl MockIpEngine {
         Some(resp)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_tcp(
         &self,
         src_ip: IpAddr,

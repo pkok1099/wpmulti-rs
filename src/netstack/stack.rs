@@ -91,7 +91,7 @@ impl VirtualNetworkStack {
                     ipnetwork::IpNetwork::V4(v4) if ip_mode != crate::config::IpMode::Ipv6Only => {
                         let smol_addr = v4.ip();
                         let cidr = IpCidr::Ipv4(Ipv4Cidr::new(smol_addr, v4.prefix()));
-                        if let Err(_) = ip_addrs.push(cidr) {
+                        if ip_addrs.push(cidr).is_err() {
                             tracing::warn!("Failed to add IPv4 address {}: interface address list full", v4);
                         } else if local_v4.is_none() {
                             local_v4 = Some(v4.ip());
@@ -100,7 +100,7 @@ impl VirtualNetworkStack {
                     ipnetwork::IpNetwork::V6(v6) if ip_mode != crate::config::IpMode::Ipv4Only => {
                         let smol_addr = v6.ip();
                         let cidr = IpCidr::Ipv6(Ipv6Cidr::new(smol_addr, v6.prefix()));
-                        if let Err(_) = ip_addrs.push(cidr) {
+                        if ip_addrs.push(cidr).is_err() {
                             tracing::warn!("Failed to add IPv6 address {}: interface address list full", v6);
                         } else if local_v6.is_none() {
                             local_v6 = Some(v6.ip());
@@ -128,14 +128,14 @@ impl VirtualNetworkStack {
             };
             iface.routes_mut()
                 .add_default_ipv4_route(gateway)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("add default ipv4 route failed: {:?}", e)))?;
+                .map_err(|e| io::Error::other(format!("add default ipv4 route failed: {:?}", e)))?;
         }
 
         if local_v6.is_some() {
             let gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
             iface.routes_mut()
                 .add_default_ipv6_route(gateway)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("add default ipv6 route failed: {:?}", e)))?;
+                .map_err(|e| io::Error::other(format!("add default ipv6 route failed: {:?}", e)))?;
         }
 
         // 4. Initialize SocketSet with owned storage
@@ -243,7 +243,7 @@ impl VirtualNetworkStack {
             let cx = inner.iface.context();
             socket
                 .connect(cx, remote_endpoint, local_port)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tcp connect failed: {:?}", e)))?;
+                .map_err(|e| io::Error::other(format!("tcp connect failed: {:?}", e)))?;
             inner.sockets.add(socket)
         };
 
@@ -301,18 +301,24 @@ impl VirtualNetworkStack {
         }
     }
 
-    /// Bind a virtual UDP socket to the specified local port.
-    pub async fn udp_bind(&self, local_port: u16) -> Result<VirtualUdpSocket, io::Error> {
+    /// Bind a virtual UDP socket to the specified local port with custom buffer sizing.
+    pub async fn udp_bind_with_size(
+        &self,
+        local_port: u16,
+        rx_buf_size: usize,
+        tx_buf_size: usize,
+        queue_capacity: usize,
+    ) -> Result<VirtualUdpSocket, io::Error> {
         let port = if local_port == 0 {
             self.alloc_ephemeral_port()
         } else {
             local_port
         };
 
-        let rx_meta = vec![UdpPacketMetadata::EMPTY; UDP_PACKET_QUEUE_CAPACITY];
-        let rx_buf = vec![0u8; UDP_PAYLOAD_BUF_SIZE];
-        let tx_meta = vec![UdpPacketMetadata::EMPTY; UDP_PACKET_QUEUE_CAPACITY];
-        let tx_buf = vec![0u8; UDP_PAYLOAD_BUF_SIZE];
+        let rx_meta = vec![UdpPacketMetadata::EMPTY; queue_capacity];
+        let rx_buf = vec![0u8; rx_buf_size];
+        let tx_meta = vec![UdpPacketMetadata::EMPTY; queue_capacity];
+        let tx_buf = vec![0u8; tx_buf_size];
 
         let rx_buffer = UdpPacketBuffer::new(rx_meta, rx_buf);
         let tx_buffer = UdpPacketBuffer::new(tx_meta, tx_buf);
@@ -335,6 +341,17 @@ impl VirtualNetworkStack {
             port,
             self.dns_resolver.ip_mode(),
         ))
+    }
+
+    /// Bind a virtual UDP socket to the specified local port using default buffer sizes.
+    pub async fn udp_bind(&self, local_port: u16) -> Result<VirtualUdpSocket, io::Error> {
+        self.udp_bind_with_size(
+            local_port,
+            UDP_PAYLOAD_BUF_SIZE,
+            UDP_PAYLOAD_BUF_SIZE,
+            UDP_PACKET_QUEUE_CAPACITY,
+        )
+        .await
     }
 
     /// Resolve a domain name inside the WireGuard tunnel.
@@ -395,13 +412,24 @@ async fn run_reactor(
 
         // 2. Determine sleep or wait action
         match delay {
-            Some(smol_dur) if smol_dur.total_millis() == 0 => {
-                // Immediate re-poll requested by protocol timer (e.g. pending ACK/retransmit)
-                tokio::task::yield_now().await;
-                continue;
-            }
             Some(smol_dur) => {
-                let wait_ms = smol_dur.total_millis().max(1).min(10);
+                let micros = smol_dur.total_micros();
+                if micros == 0 {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::task::yield_now() => {}
+                    }
+                    continue;
+                }
+
+                // Sleep until smoltcp timer expires or external event arrives.
+                // Cap sleep at 500ms ceiling to ensure liveness, with a minimum of 1ms.
+                let wait_ms = smol_dur.total_millis().clamp(1, 500);
                 let sleep_dur = StdDuration::from_millis(wait_ms);
 
                 tokio::select! {

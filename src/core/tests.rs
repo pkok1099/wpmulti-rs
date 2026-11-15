@@ -14,7 +14,7 @@ use crate::config::{
 };
 use crate::core::lifecycle::{LifecycleController, TunnelConnGuard};
 use crate::core::listener::ListenerSupervisor;
-use crate::core::registry::{TunnelEntry, TunnelRegistry, TunnelState};
+use crate::core::registry::{TunnelEntry, TunnelRegistry, TunnelState, TunnelStats};
 use crate::core::router::MultiTenantRouter;
 use crate::core::TunnelManager;
 use crate::proxy::{PoolKeyword, ProxyAuthError, TunnelRouter, TunnelSelector};
@@ -287,12 +287,6 @@ async fn test_dedicated_and_shared_listeners() {
     let supervisor = ListenerSupervisor::new();
 
     // Use loopback with ephemeral ports
-    // PerTunnel dedicated configuration:
-    let mut per_tunnel = PerTunnelSettings::default();
-    per_tunnel.enabled = true;
-    per_tunnel.base_socks5_port = None; // Disable default sequential base
-    per_tunnel.base_http_port = None;
-
     // Pick an available ephemeral port for tunnel 1
     let temp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port1 = temp_listener.local_addr().unwrap().port();
@@ -306,8 +300,14 @@ async fn test_dedicated_and_shared_listeners() {
             http_port: None,
         },
     );
-    per_tunnel.overrides = overrides;
-    per_tunnel.base_socks5_port = Some(port1);
+
+    // PerTunnel dedicated configuration:
+    let per_tunnel = PerTunnelSettings {
+        enabled: true,
+        base_socks5_port: Some(port1),
+        base_http_port: None,
+        overrides,
+    };
 
     let started = supervisor
         .start_dedicated_listeners(
@@ -635,9 +635,11 @@ async fn test_assigned_port_reflected_in_summary() {
     let port = temp.local_addr().unwrap().port();
     drop(temp);
 
-    let mut per_tunnel = PerTunnelSettings::default();
-    per_tunnel.enabled = true;
-    per_tunnel.base_socks5_port = Some(port);
+    let per_tunnel = PerTunnelSettings {
+        enabled: true,
+        base_socks5_port: Some(port),
+        ..Default::default()
+    };
 
     supervisor
         .start_dedicated_listeners(
@@ -661,4 +663,103 @@ async fn test_assigned_port_reflected_in_summary() {
     assert_eq!(target_summary.assigned_port, Some(port));
 
     supervisor.stop().await;
+}
+
+#[test]
+fn test_active_conns_underflow_protection() {
+    let stats = TunnelStats::default();
+    assert_eq!(stats.active_conns.load(Ordering::SeqCst), 0);
+
+    // Decrementing when already 0 must NOT underflow to usize::MAX
+    stats.dec_conns();
+    assert_eq!(stats.active_conns.load(Ordering::SeqCst), 0);
+    stats.dec_conns();
+    assert_eq!(stats.active_conns.load(Ordering::SeqCst), 0);
+
+    // Normal increment and decrement
+    stats.inc_conns();
+    assert_eq!(stats.active_conns.load(Ordering::SeqCst), 1);
+    stats.dec_conns();
+    assert_eq!(stats.active_conns.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn test_registry_indexing_and_least_conn() {
+    let registry = TunnelRegistry::new();
+    let e1 = TunnelEntry::new("t1", make_test_tunnel_config("t1"), LifecycleMode::Lazy);
+    let e2 = TunnelEntry::new("t2", make_test_tunnel_config("t2"), LifecycleMode::Lazy);
+    e1.stats.active_conns.store(5, Ordering::Relaxed);
+    e2.stats.active_conns.store(2, Ordering::Relaxed);
+    registry.register(e1).unwrap();
+    registry.register(e2).unwrap();
+
+    assert_eq!(registry.id_by_index(0), Some("t1".to_string()));
+    assert_eq!(registry.id_by_index(1), Some("t2".to_string()));
+    assert_eq!(registry.id_by_index(2), None);
+
+    assert_eq!(registry.least_conn_id(), Some("t2".to_string()));
+}
+
+#[tokio::test]
+async fn test_reload_detects_peer_endpoint_change() {
+    let mut initial_cfg = make_test_tunnel_config("tun-reload-diff");
+    let manager = TunnelManager::new(MainConfig::default(), vec![initial_cfg.clone()]).unwrap();
+
+    // Modify peer endpoint IP without changing peer count or keys
+    initial_cfg.peers[0].endpoint = "203.0.113.50:51820".to_string();
+    let report = manager.reload_with_tunnels(vec![initial_cfg.clone()]).await.unwrap();
+    assert_eq!(report.updated, 1);
+    assert_eq!(report.added, 0);
+    assert_eq!(report.removed, 0);
+
+    let current = manager.registry().get("tun-reload-diff").unwrap();
+    assert_eq!(current.config.read().peers[0].endpoint, "203.0.113.50:51820");
+}
+
+#[tokio::test]
+async fn test_guarded_udp_socket_preserves_active_conns() {
+    use crate::proxy::ProxyTunnelTarget;
+
+    let registry = Arc::new(TunnelRegistry::new());
+    let cfg = make_test_tunnel_config("tun-udp-guard");
+    let entry = registry
+        .register(TunnelEntry::new("tun-udp-guard", cfg, LifecycleMode::Lazy))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let (target, guard) = lifecycle.get_or_activate("tun-udp-guard").await.unwrap();
+    assert_eq!(entry.stats.active_conns.load(Ordering::SeqCst), 1);
+
+    // Create a GuardedTunnelTarget and bind UDP socket
+    let guarded_target = crate::core::lifecycle::GuardedTunnelTarget::new(
+        target,
+        guard,
+    );
+
+    let socket = guarded_target.udp_bind(0).await.unwrap();
+    assert_eq!(entry.stats.active_conns.load(Ordering::SeqCst), 1);
+
+    drop(guarded_target);
+    // Connection guard is still held by socket!
+    assert_eq!(entry.stats.active_conns.load(Ordering::SeqCst), 1);
+
+    drop(socket);
+    // Dropping socket releases the guard!
+    assert_eq!(entry.stats.active_conns.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_boot_failure_reverts_state_to_dormant() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let mut cfg = make_test_tunnel_config("tun-boot-fail");
+    // Empty addresses will fail inside VirtualNetworkStack::new_with_mode after gotatun device is built
+    cfg.interface.addresses.clear();
+    let entry = registry
+        .register(TunnelEntry::new("tun-boot-fail", cfg, LifecycleMode::Lazy))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(Arc::clone(&registry), Duration::from_secs(60), Duration::from_secs(1));
+    let res = lifecycle.get_or_activate("tun-boot-fail").await;
+    assert!(res.is_err());
+    assert_eq!(*entry.state.read(), TunnelState::Dormant);
 }
