@@ -72,6 +72,7 @@ pub struct TunnelManager {
     lifecycle: Arc<LifecycleController>,
     listeners: Arc<ListenerSupervisor>,
     prober: Arc<ActiveProber>,
+    log_buffer: crate::tui::TuiLogBuffer,
 }
 
 impl TunnelManager {
@@ -115,6 +116,7 @@ impl TunnelManager {
             lifecycle,
             listeners,
             prober,
+            log_buffer: crate::tui::TuiLogBuffer::new(500),
         })
     }
 
@@ -136,6 +138,11 @@ impl TunnelManager {
     /// Access the underlying [`ActiveProber`].
     pub fn prober(&self) -> &Arc<ActiveProber> {
         &self.prober
+    }
+
+    /// Access the daemon's bounded [`crate::tui::TuiLogBuffer`].
+    pub fn log_buffer(&self) -> &crate::tui::TuiLogBuffer {
+        &self.log_buffer
     }
 
     /// Return a cloned snapshot of the current [`MainConfig`].

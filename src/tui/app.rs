@@ -292,6 +292,22 @@ impl TuiDataSource {
         }
     }
 
+    /// Fetch daemon log lines (in-process buffer or `GET /logs`).
+    pub async fn fetch_logs(&self) -> Result<Vec<String>, String> {
+        match self {
+            TuiDataSource::InProcess(mgr) => Ok(mgr.log_buffer().snapshot()),
+            TuiDataSource::Remote {
+                admin_url,
+                auth_token,
+            } => {
+                let body =
+                    admin_http_request(admin_url, "GET", "/logs", auth_token.as_deref()).await?;
+                serde_json::from_slice::<Vec<String>>(&body)
+                    .map_err(|e| format!("Invalid /logs JSON: {}", e))
+            }
+        }
+    }
+
     /// Retrieve active listeners from the data source.
     pub async fn fetch_listeners(&self) -> Result<Vec<ActiveListenerInfo>, String> {
         match self {
@@ -452,6 +468,7 @@ pub struct TuiApp {
     pub last_sample_at: Option<Instant>,
     // Live Logs tab state
     pub log_buffer: Option<TuiLogBuffer>,
+    pub remote_logs: Vec<String>,
     pub log_scroll: usize,
     pub log_level_filter: Option<String>,
     // Listeners tab state
@@ -491,6 +508,7 @@ impl TuiApp {
             prev_total_tx: None,
             last_sample_at: None,
             log_buffer: None,
+            remote_logs: Vec::new(),
             log_scroll: 0,
             log_level_filter: None,
             listeners: Vec::new(),
@@ -545,12 +563,12 @@ impl TuiApp {
         self.log_scroll = 0;
     }
 
-    /// Return filtered log lines from `log_buffer` (oldest to newest).
+    /// Return filtered log lines from `log_buffer` or `remote_logs` (oldest to newest).
     pub fn filtered_logs(&self) -> Vec<String> {
-        let Some(buf) = &self.log_buffer else {
-            return Vec::new();
+        let all = match &self.log_buffer {
+            Some(buf) => buf.snapshot(),
+            None => self.remote_logs.clone(),
         };
-        let all = buf.snapshot();
         match &self.log_level_filter {
             None => all,
             Some(lvl) => all.into_iter().filter(|l| l.contains(lvl)).collect(),
@@ -941,6 +959,12 @@ impl TuiApp {
         self.last_sample_at = Some(now);
         self.set_tunnels(list);
 
+        if self.active_tab == TuiTab::Logs
+            && self.log_buffer.is_none()
+            && let Ok(logs) = self.data_source.fetch_logs().await
+        {
+            self.remote_logs = logs;
+        }
         if self.active_tab == TuiTab::Listeners
             && let Ok(listeners) = self.data_source.fetch_listeners().await
         {

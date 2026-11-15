@@ -297,6 +297,10 @@ pub async fn handle_admin_request(
         }
 
         // GET /listeners
+        ("GET", "/logs") => {
+            let logs = manager.log_buffer().snapshot();
+            HttpResponse::ok_json(&logs)
+        }
         ("GET", "/listeners") => {
             let listeners = manager.listeners().list_listeners();
             HttpResponse::ok_json(&listeners)

@@ -44,29 +44,10 @@ pub async fn cmd_run(
         crate::config::LogLevel::Warn => tracing::Level::WARN,
         crate::config::LogLevel::Error => tracing::Level::ERROR,
     };
-    let tui_log_buffer = if tui_mode {
-        let buf = crate::tui::TuiLogBuffer::new(500);
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(max_level)
-            .with_ansi(false)
-            .with_writer(buf.clone())
-            .try_init();
-        Some(buf)
-    } else {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(max_level)
-            .try_init();
-        None
-    };
-
     let tunnels = if config.global.config_dir.exists() {
         load_tunnel_configs_from_dir(&config.global.config_dir)
             .map_err(|e| format!("Failed to load tunnels: {}", e))?
     } else {
-        tracing::warn!(
-            "Config directory '{}' not found; starting with 0 tunnels",
-            config.global.config_dir.display()
-        );
         Vec::new()
     };
 
@@ -75,6 +56,22 @@ pub async fn cmd_run(
         TunnelManager::new(config.clone(), tunnels)
             .map_err(|e| format!("Failed to initialize TunnelManager: {}", e))?,
     );
+
+    let tui_log_buffer = manager.log_buffer().clone();
+    if tui_mode {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .with_ansi(false)
+            .with_writer(tui_log_buffer.clone())
+            .try_init();
+    } else {
+        use tracing_subscriber::fmt::writer::MakeWriterExt;
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .with_writer(tui_log_buffer.clone().and(std::io::stdout))
+            .try_init();
+    }
+    let tui_log_buffer = Some(tui_log_buffer);
 
     let admin_server = if config.admin.enabled {
         let srv = AdminServer::new(
