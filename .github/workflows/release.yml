@@ -11,6 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build:
@@ -47,6 +48,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
+          cache-on-failure: true
+          cache-all-crates: true
 
       - name: Install cross-compiler
         if: matrix.apt_pkg != ''
