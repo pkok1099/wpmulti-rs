@@ -242,14 +242,11 @@ impl DnsLruCache {
 
         {
             let entries = self.entries.read();
-            if let Some(entry) = entries.get(&key) {
-                if now < entry.expires_at {
-                    let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    entry.last_accessed.store(access_time, Ordering::Relaxed);
-                    return Some(entry.ips.clone());
-                }
-            } else {
-                return None;
+            let entry = entries.get(&key)?;
+            if now < entry.expires_at {
+                let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                entry.last_accessed.store(access_time, Ordering::Relaxed);
+                return Some(entry.ips.clone());
             }
         }
 
