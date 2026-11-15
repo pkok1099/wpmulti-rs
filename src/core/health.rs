@@ -230,7 +230,7 @@ impl ActiveProber {
         registry: &Arc<TunnelRegistry>,
         settings: &HealthCheckSettings,
     ) {
-        const MAX_CONCURRENT_PROBES: usize = 64;
+        const MAX_CONCURRENT_PROBES: usize = 12;
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES));
         let mut set = tokio::task::JoinSet::new();
 
@@ -262,24 +262,48 @@ impl ActiveProber {
                     let Ok(_permit) = sem_clone.acquire_owned().await else {
                         return;
                     };
-                    let probe_res = tokio::time::timeout(timeout, active_clone.device.force_handshake(&peer_pubkey)).await;
-                    match probe_res {
-                        Ok(Ok(())) => {
-                            health.record_success();
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            stats.record_handshake(now);
+                    let mut succeeded = false;
+                    const MAX_PROBE_ATTEMPTS: usize = 3;
+                    for attempt in 0..MAX_PROBE_ATTEMPTS {
+                        let probe_res = tokio::time::timeout(
+                            timeout,
+                            active_clone.device.force_handshake(&peer_pubkey),
+                        )
+                        .await;
+                        match probe_res {
+                            Ok(Ok(())) => {
+                                health.record_success();
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                stats.record_handshake(now);
+                                succeeded = true;
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                tracing::debug!(
+                                    "Active probe handshake failed (attempt {}/{}): {}",
+                                    attempt + 1,
+                                    MAX_PROBE_ATTEMPTS,
+                                    e
+                                );
+                            }
+                            Err(_) => {
+                                tracing::debug!(
+                                    "Active probe handshake timed out (attempt {}/{})",
+                                    attempt + 1,
+                                    MAX_PROBE_ATTEMPTS
+                                );
+                            }
                         }
-                        Ok(Err(e)) => {
-                            tracing::debug!("Active probe handshake failed for eager tunnel: {}", e);
-                            health.record_failure(threshold, cooldown);
+                        if attempt + 1 < MAX_PROBE_ATTEMPTS {
+                            let backoff_ms = 200u64 << attempt; // 200ms, 400ms
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         }
-                        Err(_) => {
-                            tracing::debug!("Active probe handshake timed out for eager tunnel");
-                            health.record_failure(threshold, cooldown);
-                        }
+                    }
+                    if !succeeded {
+                        health.record_failure(threshold, cooldown);
                     }
                 });
             }

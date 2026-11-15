@@ -438,66 +438,105 @@ impl TunnelRouter for MultiTenantRouter {
         Box::pin(async move {
             let allowed_guard = self.allowed_tunnels.read().clone();
 
-            let target_id = match selector {
-                TunnelSelector::ById(id) => {
-                    // Check if tunnel ID is recognized and allowed
-                    if let Some(ref allowed) = allowed_guard
-                        && !allowed.is_empty() && !allowed.iter().any(|s| s == id) {
+            let max_attempts = match selector {
+                TunnelSelector::ByKeyword(_) | TunnelSelector::DefaultPool => 3,
+                _ => 1,
+            };
+
+            let mut last_err = None;
+            let mut chosen: Option<(String, Arc<crate::core::registry::ActiveTunnel>, crate::core::lifecycle::TunnelConnGuard)> = None;
+
+            for attempt in 0..max_attempts {
+                let target_id = match selector {
+                    TunnelSelector::ById(id) => {
+                        // Check if tunnel ID is recognized and allowed
+                        if let Some(ref allowed) = allowed_guard
+                            && !allowed.is_empty()
+                            && !allowed.iter().any(|s| s == id)
+                        {
                             return Err(io::Error::new(
                                 io::ErrorKind::NotFound,
                                 format!("tunnel '{}' not allowed in this pool", id),
                             ));
                         }
-                    if self.registry.get(id).is_none() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("tunnel '{}' not found in registry", id),
-                        ));
-                    }
-                    id.clone()
-                }
-                TunnelSelector::ByKeyword(keyword) => {
-                    if let Some(ref allowed) = allowed_guard {
-                        self.select_by_keyword_slice(*keyword, allowed)?
-                    } else {
-                        self.select_by_keyword_registry(*keyword)?
-                    }
-                }
-                TunnelSelector::ByTag(tag) => {
-                    if let Some(ref allowed) = allowed_guard {
-                        let matched = allowed.iter().find(|id| id.contains(tag)).cloned();
-                        matched.ok_or_else(|| {
-                            io::Error::new(
+                        if self.registry.get(id).is_none() {
+                            return Err(io::Error::new(
                                 io::ErrorKind::NotFound,
-                                format!("no tunnel found matching tag '{}'", tag),
-                            )
-                        })?
-                    } else {
-                        let all = self.registry.all_ids();
-                        let matched = all.into_iter().find(|id| id.contains(tag));
-                        matched.ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!("no tunnel found matching tag '{}'", tag),
-                            )
-                        })?
+                                format!("tunnel '{}' not found in registry", id),
+                            ));
+                        }
+                        id.clone()
+                    }
+                    TunnelSelector::ByKeyword(keyword) => {
+                        if let Some(ref allowed) = allowed_guard {
+                            self.select_by_keyword_slice(*keyword, allowed)?
+                        } else {
+                            self.select_by_keyword_registry(*keyword)?
+                        }
+                    }
+                    TunnelSelector::ByTag(tag) => {
+                        if let Some(ref allowed) = allowed_guard {
+                            let matched = allowed.iter().find(|id| id.contains(tag)).cloned();
+                            matched.ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    format!("no tunnel found matching tag '{}'", tag),
+                                )
+                            })?
+                        } else {
+                            let all = self.registry.all_ids();
+                            let matched = all.into_iter().find(|id| id.contains(tag));
+                            matched.ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    format!("no tunnel found matching tag '{}'", tag),
+                                )
+                            })?
+                        }
+                    }
+                    TunnelSelector::DefaultPool => {
+                        if let Some(ref allowed) = allowed_guard {
+                            self.select_default_pool_slice(allowed)?
+                        } else {
+                            self.select_default_pool_registry()?
+                        }
+                    }
+                };
+
+                // Dynamically activate or resume on demand with RAII connection guard
+                match self.lifecycle.get_or_activate(&target_id).await {
+                    Ok((active_tunnel, guard)) => {
+                        chosen = Some((target_id, active_tunnel, guard));
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Tunnel '{}' activation failed (attempt {}/{}): {:?}",
+                            target_id,
+                            attempt + 1,
+                            max_attempts,
+                            e
+                        );
+                        last_err = Some(io::Error::other(format!(
+                            "tunnel activation failed: {:?}",
+                            e
+                        )));
+                        if attempt + 1 < max_attempts {
+                            let backoff_ms = 100u64 << attempt; // 100ms, 200ms
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        }
                     }
                 }
-                TunnelSelector::DefaultPool => {
-                    if let Some(ref allowed) = allowed_guard {
-                        self.select_default_pool_slice(allowed)?
-                    } else {
-                        self.select_default_pool_registry()?
-                    }
+            }
+
+            let (target_id, active_tunnel, guard) = match chosen {
+                Some(pair) => pair,
+                None => {
+                    return Err(last_err.unwrap_or_else(|| {
+                        io::Error::other("tunnel activation failed after retries")
+                    }));
                 }
             };
-
-            // Dynamically activate or resume on demand with RAII connection guard
-            let (active_tunnel, guard) = self
-                .lifecycle
-                .get_or_activate(&target_id)
-                .await
-                .map_err(|e| io::Error::other(format!("tunnel activation failed: {:?}", e)))?;
 
             let entry = self.registry.get(&target_id);
             let health = entry.as_ref().map(|e| Arc::clone(&e.health));
