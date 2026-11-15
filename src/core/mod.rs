@@ -1,0 +1,260 @@
+//! Multi-tunnel manager, registry, and lifecycle coordinator.
+//!
+//! Provides [`TunnelManager`], the central coordinator managing thousands of WireGuard
+//! configurations in userspace, lazy on-demand lifecycle transitions, multi-tenant proxy routing,
+//! and listener supervision.
+
+pub mod lifecycle;
+pub mod listener;
+pub mod registry;
+pub mod router;
+#[cfg(test)]
+pub mod tests;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+
+use crate::config::{
+    load_tunnel_configs_from_dir, LifecycleMode, MainConfig, TunnelConfig,
+};
+pub use lifecycle::{GuardedStream, GuardedTunnelTarget, LifecycleController, TunnelConnGuard};
+pub use listener::{ActiveListenerInfo, ListenerSupervisor};
+pub use registry::{
+    ActiveTunnel, MeteredStream, MeteredUdpSocket, TunnelEntry, TunnelRegistry, TunnelState,
+    TunnelStats, TunnelSummary, WgDevice,
+};
+pub use router::{DedicatedTunnelRouter, MultiTenantRouter};
+
+/// Core error types originating in multi-tunnel management.
+#[derive(Debug, thiserror::Error)]
+pub enum CoreError {
+    #[error("Tunnel with ID '{0}' not found")]
+    TunnelNotFound(String),
+    #[error("Tunnel with ID '{0}' already exists")]
+    DuplicateTunnel(String),
+    #[error("Failed to activate tunnel '{0}': {1}")]
+    ActivationFailed(String, String),
+    #[error("Failed to suspend tunnel '{0}': {1}")]
+    SuspendFailed(String, String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Configuration error: {0}")]
+    Config(#[from] crate::config::ConfigError),
+    #[error("Listener supervisor error: {0}")]
+    ListenerError(String),
+    #[error("Core error: {0}")]
+    Other(String),
+}
+
+/// Summary report returned upon configuration reload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadReport {
+    /// Number of new tunnels registered.
+    pub added: usize,
+    /// Number of tunnels removed and suspended.
+    pub removed: usize,
+    /// Number of existing tunnels whose configurations were updated.
+    pub updated: usize,
+    /// Total count of tunnels active in the registry following reload.
+    pub total: usize,
+}
+
+/// Central multi-tunnel coordinator managing lifecycle, routing, and listeners.
+pub struct TunnelManager {
+    config: RwLock<MainConfig>,
+    registry: Arc<TunnelRegistry>,
+    lifecycle: Arc<LifecycleController>,
+    listeners: Arc<ListenerSupervisor>,
+}
+
+impl TunnelManager {
+    /// Construct a new [`TunnelManager`] from [`MainConfig`] and an initial set of [`TunnelConfig`]s.
+    pub fn new(config: MainConfig, tunnels: Vec<TunnelConfig>) -> Result<Self, CoreError> {
+        let registry = Arc::new(TunnelRegistry::new());
+
+        let default_mode = config.lifecycle.mode;
+        for t_cfg in tunnels {
+            let mode = if config.lifecycle.eager_tunnels.contains(&t_cfg.id) {
+                LifecycleMode::Eager
+            } else {
+                default_mode
+            };
+            let entry = TunnelEntry::new(t_cfg.id.clone(), t_cfg, mode);
+            registry.register(entry)?;
+        }
+
+        let idle_timeout = config.lifecycle.idle_timeout;
+        let check_interval = Duration::from_secs(1);
+        let lifecycle = LifecycleController::new(
+            Arc::clone(&registry),
+            idle_timeout,
+            check_interval,
+        );
+
+        let listeners = Arc::new(ListenerSupervisor::new());
+
+        Ok(Self {
+            config: RwLock::new(config),
+            registry,
+            lifecycle,
+            listeners,
+        })
+    }
+
+    /// Access the underlying [`TunnelRegistry`].
+    pub fn registry(&self) -> &Arc<TunnelRegistry> {
+        &self.registry
+    }
+
+    /// Access the underlying [`LifecycleController`].
+    pub fn lifecycle(&self) -> &Arc<LifecycleController> {
+        &self.lifecycle
+    }
+
+    /// Access the underlying [`ListenerSupervisor`].
+    pub fn listeners(&self) -> &Arc<ListenerSupervisor> {
+        &self.listeners
+    }
+
+    /// Start the tunnel manager: launches lifecycle idle teardown, boots eager tunnels,
+    /// and starts all configured listeners.
+    pub async fn start(&self) -> Result<(), CoreError> {
+        // 1. Start lifecycle teardown background task
+        self.lifecycle.start();
+
+        // 2. Eagerly activate Eager tunnels
+        for entry in self.registry.all_entries() {
+            if entry.lifecycle_mode == LifecycleMode::Eager {
+                tracing::info!("Eagerly booting Eager tunnel '{}'", entry.id);
+                self.lifecycle.activate_tunnel(&entry.id).await?;
+            }
+        }
+
+        // 3. Start listeners
+        let cfg = self.config.read().clone();
+        self.listeners
+            .start_all(&cfg, &self.registry, &self.lifecycle)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Stop the tunnel manager: terminates listeners, stops idle teardown,
+    /// and suspends all running tunnels.
+    pub async fn stop(&self) -> Result<(), CoreError> {
+        // 1. Stop all proxy listeners
+        self.listeners.stop().await;
+
+        // 2. Stop lifecycle controller
+        self.lifecycle.stop().await;
+
+        // 3. Suspend all currently active tunnels
+        for entry in self.registry.all_entries() {
+            if entry.is_active() {
+                let _ = self.lifecycle.suspend_tunnel(&entry.id).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the total number of tunnels registered in memory.
+    pub fn tunnel_count(&self) -> usize {
+        self.registry.count()
+    }
+
+    /// Returns the number of currently active tunnels.
+    pub fn active_tunnel_count(&self) -> usize {
+        self.registry.active_count()
+    }
+
+    /// Retrieve summary snapshots for all tunnels.
+    pub fn get_tunnel_stats(&self) -> Vec<TunnelSummary> {
+        self.registry.get_stats()
+    }
+
+    /// Manually activate a tunnel by its ID.
+    pub async fn activate_tunnel(&self, id: &str) -> Result<Arc<ActiveTunnel>, CoreError> {
+        self.lifecycle.activate_tunnel(id).await
+    }
+
+    /// Manually suspend a tunnel by its ID.
+    pub async fn suspend_tunnel(&self, id: &str) -> Result<(), CoreError> {
+        self.lifecycle.suspend_tunnel(id).await
+    }
+
+    /// Reload tunnel configurations from the configured `config_dir`.
+    pub async fn reload(&self) -> Result<ReloadReport, CoreError> {
+        let dir = self.config.read().global.config_dir.clone();
+        if !dir.exists() {
+            return Err(CoreError::Other(format!(
+                "tunnels directory '{}' does not exist",
+                dir.display()
+            )));
+        }
+
+        let new_tunnels = load_tunnel_configs_from_dir(&dir)?;
+        self.reload_with_tunnels(new_tunnels).await
+    }
+
+    /// Reload the registry with an updated set of tunnel configurations.
+    pub async fn reload_with_tunnels(
+        &self,
+        new_tunnels: Vec<TunnelConfig>,
+    ) -> Result<ReloadReport, CoreError> {
+        let mut report = ReloadReport::default();
+        let default_mode = self.config.read().lifecycle.mode;
+
+        let mut incoming_ids = std::collections::HashSet::new();
+        for t_cfg in new_tunnels {
+            incoming_ids.insert(t_cfg.id.clone());
+            if let Some(existing) = self.registry.get(&t_cfg.id) {
+                // If keys or peers changed, mark updated
+                let (keys_changed, peers_changed) = {
+                    let cur = existing.config.read();
+                    (
+                        cur.interface.private_key.to_bytes() != t_cfg.interface.private_key.to_bytes(),
+                        cur.peers.len() != t_cfg.peers.len(),
+                    )
+                };
+                if keys_changed || peers_changed {
+                    // Suspend old device if running
+                    let _ = self.lifecycle.suspend_tunnel(&t_cfg.id).await;
+                    *existing.active.write() = None;
+                    *existing.state.write() = TunnelState::Dormant;
+
+                    let saved_port = *existing.assigned_port.read();
+                    *existing.config.write() = t_cfg.clone();
+
+                    let new_entry = TunnelEntry::new(t_cfg.id.clone(), t_cfg, existing.lifecycle_mode);
+                    if let Some(p) = saved_port {
+                        new_entry.set_assigned_port(p);
+                    }
+                    self.registry.replace(new_entry);
+                    report.updated += 1;
+                }
+            } else {
+                // New tunnel added
+                let entry = TunnelEntry::new(t_cfg.id.clone(), t_cfg, default_mode);
+                self.registry.register(entry)?;
+                report.added += 1;
+            }
+        }
+
+        // Detect removed tunnels
+        let existing_ids = self.registry.all_ids();
+        for id in existing_ids {
+            if !incoming_ids.contains(&id) {
+                let _ = self.lifecycle.suspend_tunnel(&id).await;
+                self.registry.remove(&id);
+                report.removed += 1;
+            }
+        }
+
+        report.total = self.tunnel_count();
+        Ok(report)
+    }
+}
