@@ -1039,7 +1039,7 @@ fn test_f13_bnd_tui_empty_tunnel_list_no_panic() {
     assert_eq!(app.selected_index, 0);
 
     let rendered = render_dashboard(&mut app, 80, 24);
-    assert!(rendered.contains("Total: 0"));
+    assert!(rendered.contains("Tunnels: 0"));
 }
 
 #[test]

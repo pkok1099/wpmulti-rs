@@ -180,11 +180,11 @@ fn test_tui_render_dashboard_ansi() {
 
     let output = render_dashboard(&mut app, 100, 30);
     assert!(output.contains("wpmulti v"));
-    assert!(output.contains("Tunnels: Total: 2"));
-    assert!(output.contains("Active:"));
+    assert!(output.contains("Tunnels: 2"));
+    assert!(output.contains("1 active"));
     assert!(output.contains("wgcf-001"));
     assert!(output.contains("wgcf-002"));
-    assert!(output.contains("Active Conns: 3"));
+    assert!(output.contains("Conns: 3"));
 }
 
 #[tokio::test]
@@ -279,9 +279,12 @@ fn test_render_dashboard_small_terminal_auto_resize() {
     // Active search & status banner render cleanly
     app.is_searching = true;
     app.search_query = "wgcf".to_string();
+    let with_search = render_dashboard(&mut app, 80, 20);
+    assert!(with_search.contains("Search: wgcf"));
+
+    app.is_searching = false;
     app.status_message = Some(("Reloaded".to_string(), std::time::Instant::now()));
     let with_status = render_dashboard(&mut app, 80, 20);
-    assert!(with_status.contains("Search: wgcf"));
     assert!(with_status.contains(">>> Reloaded"));
 }
 

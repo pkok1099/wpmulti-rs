@@ -1,36 +1,29 @@
-//! Terminal UI rendering and ANSI formatting.
+//! Ratatui + Crossterm terminal UI renderer and interactive event loop for `wpmulti`.
 
-use std::fmt::Write;
-use std::io::{self, stdout, IsTerminal, Read, Write as IoWrite};
-use std::time::Duration;
+use std::io;
+use std::time::{Duration, Instant};
 
-use crate::config::TuiSortField;
-use crate::core::{HealthStatus, TunnelState};
-use crate::tui::app::{TuiApp, TuiTab, CONFIG_ROW_COUNT};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::{CrosstermBackend, TestBackend};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, Tabs};
+use ratatui::{Frame, Terminal};
 
-// ANSI escape sequences
-pub const ANSI_CLEAR: &str = "\x1b[2J\x1b[H";
-pub const ANSI_HIDE_CURSOR: &str = "\x1b[?25l";
-pub const ANSI_SHOW_CURSOR: &str = "\x1b[?25h";
-pub const ANSI_RESET: &str = "\x1b[0m";
-pub const ANSI_BOLD: &str = "\x1b[1m";
-pub const ANSI_DIM: &str = "\x1b[2m";
-pub const ANSI_REVERSE: &str = "\x1b[7m";
-pub const ANSI_RED: &str = "\x1b[31m";
-pub const ANSI_GREEN: &str = "\x1b[32m";
-pub const ANSI_YELLOW: &str = "\x1b[33m";
-pub const ANSI_BLUE: &str = "\x1b[34m";
-pub const ANSI_MAGENTA: &str = "\x1b[35m";
-pub const ANSI_CYAN: &str = "\x1b[36m";
-pub const ANSI_WHITE: &str = "\x1b[37m";
-pub const ANSI_BG_BLUE: &str = "\x1b[44m";
+use crate::core::health::HealthStatus;
+use crate::core::TunnelState;
+use crate::tui::app::{TuiApp, TuiTab};
 
-/// Format a byte count into human-readable string (B, KB, MB, GB).
+/// Format a byte count into a human-readable string (`B`, `KB`, `MB`, `GB`).
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
-
     if bytes >= GB {
         format!("{:.2} GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
@@ -42,580 +35,10 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Truncate a string to at most `max_chars` characters, appending `…` when clipped.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let count = s.chars().count();
-    if count <= max_chars {
-        return s.to_string();
-    }
-    if max_chars == 1 {
-        return "…".to_string();
-    }
-    let mut out: String = s.chars().take(max_chars - 1).collect();
-    out.push('…');
-    out
-}
-
-/// Render an ASCII/Unicode sparkline (`▁▂▃▄▅▆▇█`) from recent rate samples.
-fn render_sparkline(samples: &std::collections::VecDeque<u64>, max_cols: usize) -> String {
-    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    if max_cols == 0 || samples.is_empty() {
-        return "▁".repeat(max_cols.min(16));
-    }
-    let slice_len = samples.len().min(max_cols);
-    let start = samples.len() - slice_len;
-    let peak = samples.iter().skip(start).copied().max().unwrap_or(0).max(1);
-    let mut out = String::with_capacity(slice_len);
-    for &val in samples.iter().skip(start) {
-        let idx = ((val.saturating_mul(7)) / peak).min(7) as usize;
-        out.push(BARS[idx]);
-    }
-    out
-}
-
-/// Format a boxed line padded/clipped to `width` total columns.
-fn write_box_line(buf: &mut String, content: &str, visible_len: usize, width: usize) {
-    let inner_max = width.saturating_sub(2);
-    if visible_len > inner_max {
-        let clipped = truncate_chars(content, inner_max);
-        let _ = writeln!(buf, "│{}│", clipped);
-    } else {
-        let pad = inner_max - visible_len;
-        let _ = writeln!(buf, "│{}{}│", content, " ".repeat(pad));
-    }
-}
-
-/// Render the complete TUI dashboard into an ANSI-formatted String.
-pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String {
-    let width = width.max(24);
-    let height = height.max(8);
-    let mut buf = String::with_capacity(8192);
-
-    let total = app.tunnels.len();
-    let active = app.tunnels.iter().filter(|t| t.state == TunnelState::Active).count();
-    let suspended = app.tunnels.iter().filter(|t| t.state == TunnelState::Suspended).count();
-    let dormant = app.tunnels.iter().filter(|t| t.state == TunnelState::Dormant).count();
-    let healthy = app.tunnels.iter().filter(|t| t.health == HealthStatus::Healthy).count();
-    let unhealthy = app.tunnels.iter().filter(|t| t.health == HealthStatus::Unhealthy).count();
-    let total_conns: usize = app.tunnels.iter().map(|t| t.active_conns).sum();
-    let total_rx: u64 = app.tunnels.iter().map(|t| t.rx_bytes).sum();
-    let total_tx: u64 = app.tunnels.iter().map(|t| t.tx_bytes).sum();
-
-    let compact_height = height < 15;
-
-    // 1. Header Box (or compact 1-line header on very short terminals)
-    let header_lines = if compact_height {
-        let summary = format!(
-            " wpmulti v{} | T:{} A:{} H:{} U:{} | RX:{} TX:{} | C:{}",
-            env!("CARGO_PKG_VERSION"),
-            total,
-            active,
-            healthy,
-            unhealthy,
-            format_bytes(total_rx),
-            format_bytes(total_tx),
-            total_conns
-        );
-        let _ = writeln!(
-            buf,
-            "{}{}{}{}",
-            ANSI_BOLD,
-            ANSI_CYAN,
-            truncate_chars(&summary, width),
-            ANSI_RESET
-        );
-        1
-    } else {
-        let inner_w = width.saturating_sub(2);
-        let _ = writeln!(buf, "{}{}┌{}┐", ANSI_BOLD, ANSI_CYAN, "─".repeat(inner_w));
-        let title = format!(
-            "  ⚡ wpmulti v{} — High-Concurrency Multi-Tunnel Monitor",
-            env!("CARGO_PKG_VERSION")
-        );
-        write_box_line(&mut buf, &title, title.chars().count(), width);
-
-        let stats_raw = format!(
-            "  Tunnels: Total: {} | Active: {} | Healthy: {} | Unhealthy: {} | Suspended: {} | Dormant: {}",
-            total, active, healthy, unhealthy, suspended, dormant
-        );
-        let stats_raw_len = stats_raw.chars().count();
-        if stats_raw_len <= inner_w {
-            let stats_colored = format!(
-                "  Tunnels: Total: {} | Active: {}{}{} | Healthy: {}{}{} | Unhealthy: {}{}{} | Suspended: {}{}{} | Dormant: {}",
-                total, ANSI_GREEN, active, ANSI_CYAN, ANSI_GREEN, healthy, ANSI_CYAN, ANSI_RED, unhealthy, ANSI_CYAN, ANSI_MAGENTA, suspended, ANSI_CYAN, dormant
-            );
-            write_box_line(&mut buf, &stats_colored, stats_raw_len, width);
-        } else {
-            write_box_line(&mut buf, &stats_raw, stats_raw_len, width);
-        }
-
-        let traffic_line = format!(
-            "  Traffic: RX: {} | TX: {} | Active Conns: {}",
-            format_bytes(total_rx),
-            format_bytes(total_tx),
-            total_conns
-        );
-        write_box_line(&mut buf, &traffic_line, traffic_line.chars().count(), width);
-        let _ = writeln!(buf, "└{}┘{}", "─".repeat(inner_w), ANSI_RESET);
-        5
-    };
-
-    // 1.5 Tab Bar (nyx-style multi-tab navigation)
-    for tab in TuiTab::ALL {
-        let label = format!(" [{}] ", tab.label());
-        if tab == app.active_tab {
-            let _ = write!(buf, "{}{}{}{}", ANSI_REVERSE, ANSI_CYAN, label, ANSI_RESET);
-        } else {
-            let _ = write!(buf, "{}{}{}", ANSI_DIM, label, ANSI_RESET);
-        }
-    }
-    let _ = writeln!(buf);
-
-    // 2. Navigation / Key Hints Bar
-    let hints = match app.active_tab {
-        TuiTab::Tunnels => {
-            let sort_name = match app.sort_field {
-                TuiSortField::Id => "ID",
-                TuiSortField::Status => "Status",
-                TuiSortField::Conns => "Conns",
-                TuiSortField::Rx => "RX",
-                TuiSortField::Tx => "TX",
-            };
-            let dir = if app.sort_ascending { "▲" } else { "▼" };
-            format!(
-                " [1-5/←→] Tabs  [q] Quit  [r] Reload  [a] Activate  [s] Suspend  [/] Search  [Tab] Sort:{}{}",
-                sort_name, dir
-            )
-        }
-        TuiTab::Logs => {
-            let flt = app.log_level_filter.as_deref().unwrap_or("ALL");
-            format!(
-                " [1-5/←→] Tabs  [q] Quit  [f] Filter:{}  [c] Clear  [↑↓/jk] Scroll  [g/G] Top/End",
-                flt
-            )
-        }
-        TuiTab::Listeners => {
-            " [1-5/←→] Tabs  [q] Quit  [r] Reload  [↑↓/jk] Scroll".to_string()
-        }
-        TuiTab::Config => {
-            " [1-5/←→] Tabs  [q] Quit  [Enter] Edit/Toggle  [w] Save & Reload  [↑↓/jk] Select".to_string()
-        }
-        TuiTab::Probe => {
-            " [1-5/←→] Tabs  [q] Quit  [p] Probe Selected  [P] Probe All (<=16)  [↑↓/jk] Scroll".to_string()
-        }
-    };
-    let _ = writeln!(
-        buf,
-        "{}{}{}",
-        ANSI_DIM,
-        truncate_chars(&hints, width),
-        ANSI_RESET
-    );
-
-    let tab_bar_lines = 1usize;
-
-    match app.active_tab {
-        TuiTab::Tunnels => {
-            // Optional bandwidth sparkline on standard+ terminals
-            let spark_lines = if !compact_height && width >= 68 {
-                let rx_spark = render_sparkline(&app.rx_rates, 16);
-                let tx_spark = render_sparkline(&app.tx_rates, 16);
-                let bw_line = format!(
-                    " BW Rate: RX {}/s [{}]  |  TX {}/s [{}]",
-                    format_bytes(app.current_rx_bps),
-                    rx_spark,
-                    format_bytes(app.current_tx_bps),
-                    tx_spark
-                );
-                let _ = writeln!(
-                    buf,
-                    "{}{}{}",
-                    ANSI_CYAN,
-                    truncate_chars(&bw_line, width),
-                    ANSI_RESET
-                );
-                1
-            } else {
-                0
-            };
-
-            // 3. Search Bar
-            if app.is_searching || !app.search_query.is_empty() {
-                let cursor_ch = if app.is_searching { "█" } else { "" };
-                let search_line = format!("Search: {}{}", app.search_query, cursor_ch);
-                let _ = writeln!(
-                    buf,
-                    "{}{}{}{}",
-                    ANSI_BOLD,
-                    ANSI_YELLOW,
-                    truncate_chars(&search_line, width),
-                    ANSI_RESET
-                );
-            } else {
-                let _ = writeln!(buf);
-            }
-
-            // 4. Adaptive Table Columns based on terminal width
-            let (show_port, show_tx, show_endpoint, state_w, id_w, port_w, conns_w, bytes_w, endp_w) =
-                if width >= 96 {
-                    let fixed = 10 + 22 + 7 + 6 + 11 + 11 + 6;
-                    let ep_w = width.saturating_sub(fixed).max(12);
-                    (true, true, true, 10, 22, 7, 6, 11, ep_w)
-                } else if width >= 68 {
-                    let fixed = 10 + 7 + 5 + 10 + 10 + 5;
-                    let id_w = width.saturating_sub(fixed).max(12);
-                    (true, true, false, 10, id_w, 7, 5, 10, 0)
-                } else {
-                    let state_w = 7;
-                    let conns_w = 4;
-                    let bytes_w = 8;
-                    let fixed = state_w + conns_w + bytes_w + 3;
-                    let id_w = width.saturating_sub(fixed).max(4);
-                    (false, false, false, state_w, id_w, 0, conns_w, bytes_w, 0)
-                };
-
-            let mut hdr = format!(
-                "{:<state_w$} {:<id_w$}",
-                truncate_chars("STATE", state_w),
-                truncate_chars("TUNNEL ID", id_w),
-            );
-            if show_port {
-                let _ = write!(hdr, " {:<port_w$}", truncate_chars("PORT", port_w));
-            }
-            let _ = write!(hdr, " {:<conns_w$} {:<bytes_w$}", "CONNS", "RX");
-            if show_tx {
-                let _ = write!(hdr, " {:<bytes_w$}", "TX");
-            }
-            if show_endpoint {
-                let _ = write!(hdr, " {:<endp_w$}", truncate_chars("ENDPOINT", endp_w));
-            }
-            let _ = writeln!(
-                buf,
-                "{}{}{}{}",
-                ANSI_BOLD,
-                ANSI_BG_BLUE,
-                truncate_chars(&hdr, width),
-                ANSI_RESET
-            );
-
-            let reserved_lines = header_lines + tab_bar_lines + spark_lines + 5;
-            let table_height = height.saturating_sub(reserved_lines).max(1);
-            app.update_scroll(table_height);
-
-            let start = app.scroll_offset;
-            let end = (start + table_height).min(app.filtered_indices.len());
-
-            if app.filtered_indices.is_empty() {
-                let msg = if app.search_query.is_empty() {
-                    "  (No tunnels registered)"
-                } else {
-                    "  (No tunnels match search query)"
-                };
-                let _ = writeln!(buf, "{}{}{}", ANSI_DIM, truncate_chars(msg, width), ANSI_RESET);
-            } else {
-                for row_pos in start..end {
-                    let tunnel_idx = app.filtered_indices[row_pos];
-                    let t = &app.tunnels[tunnel_idx];
-                    let is_selected = row_pos == app.selected_index;
-
-                    let (state_color, state_str) = match (t.health, t.state) {
-                        (HealthStatus::Unhealthy, _) => (ANSI_RED, "Unhealthy"),
-                        (HealthStatus::HalfOpen, _) => (ANSI_YELLOW, "HalfOpen"),
-                        (HealthStatus::Healthy, TunnelState::Active) => (ANSI_GREEN, "Active"),
-                        (HealthStatus::Healthy, TunnelState::Activating) => (ANSI_CYAN, "Activating"),
-                        (HealthStatus::Healthy, TunnelState::Suspended) => (ANSI_MAGENTA, "Suspended"),
-                        (HealthStatus::Healthy, TunnelState::Dormant) => (ANSI_DIM, "Dormant"),
-                    };
-
-                    let port_str = t
-                        .assigned_port
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    let endpoint_str = if t.health == HealthStatus::Unhealthy {
-                        format!(
-                            "{} (fails:{}, {}s)",
-                            t.endpoint.as_deref().unwrap_or("-"),
-                            t.consecutive_failures,
-                            t.cooldown_remaining_secs
-                        )
-                    } else if t.health == HealthStatus::HalfOpen {
-                        format!("{} (probe)", t.endpoint.as_deref().unwrap_or("-"))
-                    } else {
-                        t.endpoint.clone().unwrap_or_else(|| "-".to_string())
-                    };
-
-                    if is_selected {
-                        let _ = write!(buf, "{}{}", ANSI_REVERSE, ANSI_BOLD);
-                    }
-
-                    let state_cell = truncate_chars(state_str, state_w);
-                    let id_cell = truncate_chars(&t.id, id_w);
-                    let mut tail = format!("{:<id_w$}", id_cell);
-                    if show_port {
-                        let _ = write!(tail, " {:<port_w$}", truncate_chars(&port_str, port_w));
-                    }
-                    let _ = write!(
-                        tail,
-                        " {:<conns_w$} {:<bytes_w$}",
-                        t.active_conns,
-                        truncate_chars(&format_bytes(t.rx_bytes), bytes_w),
-                    );
-                    if show_tx {
-                        let _ = write!(
-                            tail,
-                            " {:<bytes_w$}",
-                            truncate_chars(&format_bytes(t.tx_bytes), bytes_w),
-                        );
-                    }
-                    if show_endpoint {
-                        let _ = write!(tail, " {:<endp_w$}", truncate_chars(&endpoint_str, endp_w));
-                    }
-
-                    let tail_max = width.saturating_sub(state_w + 1);
-                    let _ = write!(
-                        buf,
-                        "{}{:<state_w$}{} {}",
-                        state_color,
-                        state_cell,
-                        if is_selected { "" } else { ANSI_RESET },
-                        truncate_chars(&tail, tail_max),
-                    );
-
-                    if is_selected {
-                        let _ = writeln!(buf, "{}", ANSI_RESET);
-                    } else {
-                        let _ = writeln!(buf);
-                    }
-                }
-            }
-        }
-
-        TuiTab::Logs => {
-            let hdr = format!(
-                "{:<width$}",
-                truncate_chars("LIVE DAEMON LOGS", width)
-            );
-            let _ = writeln!(buf, "{}{}{}{}", ANSI_BOLD, ANSI_BG_BLUE, hdr, ANSI_RESET);
-            let body_h = height.saturating_sub(header_lines + tab_bar_lines + 4).max(1);
-            let logs = app.filtered_logs();
-            if logs.is_empty() {
-                let msg = if app.log_buffer.is_some() {
-                    "  (No log entries matching filter)"
-                } else {
-                    "  (Live logs only available in `wpmulti run --tui` mode)"
-                };
-                let _ = writeln!(buf, "{}{}{}", ANSI_DIM, truncate_chars(msg, width), ANSI_RESET);
-            } else {
-                let max_scroll = logs.len().saturating_sub(body_h);
-                app.log_scroll = app.log_scroll.min(max_scroll);
-                let end = logs.len().saturating_sub(app.log_scroll);
-                let start = end.saturating_sub(body_h);
-                for line in &logs[start..end] {
-                    let color = if line.contains("ERROR") {
-                        ANSI_RED
-                    } else if line.contains("WARN") {
-                        ANSI_YELLOW
-                    } else if line.contains("DEBUG") || line.contains("TRACE") {
-                        ANSI_CYAN
-                    } else {
-                        ANSI_WHITE
-                    };
-                    let _ = writeln!(
-                        buf,
-                        "{}{}{}",
-                        color,
-                        truncate_chars(line, width),
-                        ANSI_RESET
-                    );
-                }
-            }
-        }
-
-        TuiTab::Listeners => {
-            let hdr = format!(
-                "{:<24} {:<8} {:<10} {:<22} {}",
-                "NAME", "TYPE", "SCOPE", "BIND ADDRESS", "TUNNEL ID"
-            );
-            let _ = writeln!(
-                buf,
-                "{}{}{}{}",
-                ANSI_BOLD,
-                ANSI_BG_BLUE,
-                truncate_chars(&hdr, width),
-                ANSI_RESET
-            );
-            let body_h = height.saturating_sub(header_lines + tab_bar_lines + 4).max(1);
-            if app.listeners.is_empty() {
-                let _ = writeln!(
-                    buf,
-                    "{}  (No active listeners loaded yet){}",
-                    ANSI_DIM, ANSI_RESET
-                );
-            } else {
-                let max_scroll = app.listeners.len().saturating_sub(body_h);
-                app.listener_scroll = app.listener_scroll.min(max_scroll);
-                let end = (app.listener_scroll + body_h).min(app.listeners.len());
-                for l in &app.listeners[app.listener_scroll..end] {
-                    let scope = if l.is_shared { "Shared" } else { "Dedicated" };
-                    let row = format!(
-                        "{:<24} {:<8} {:<10} {:<22} {}",
-                        truncate_chars(&l.name, 24),
-                        format!("{:?}", l.listener_type),
-                        scope,
-                        l.address,
-                        l.tunnel_id.as_deref().unwrap_or("-")
-                    );
-                    let _ = writeln!(buf, "{}", truncate_chars(&row, width));
-                }
-            }
-        }
-
-        TuiTab::Config => {
-            let hdr = format!("{:<30} {:<24} {}", "SETTING", "VALUE", "ACTION");
-            let _ = writeln!(
-                buf,
-                "{}{}{}{}",
-                ANSI_BOLD,
-                ANSI_BG_BLUE,
-                truncate_chars(&hdr, width),
-                ANSI_RESET
-            );
-            if let Some(cfg) = &app.config_snapshot {
-                for idx in 0..CONFIG_ROW_COUNT {
-                    let (key, val, is_toggle) = TuiApp::config_row_display(cfg, idx);
-                    let is_sel = idx == app.config_selected;
-                    let display_val = if is_sel && let Some(editing) = &app.config_editing {
-                        format!("{}█", editing)
-                    } else {
-                        val
-                    };
-                    let action_hint = if is_toggle {
-                        "[Enter] cycle"
-                    } else {
-                        "[Enter] edit"
-                    };
-                    let row = format!("{:<30} {:<24} {}", key, display_val, action_hint);
-                    if is_sel {
-                        let _ = writeln!(
-                            buf,
-                            "{}{}{}{}",
-                            ANSI_REVERSE,
-                            ANSI_YELLOW,
-                            truncate_chars(&row, width),
-                            ANSI_RESET
-                        );
-                    } else {
-                        let _ = writeln!(buf, "{}", truncate_chars(&row, width));
-                    }
-                }
-                if let Some(path) = &app.config_path {
-                    let path_line = format!("  Config file: {}", path.display());
-                    let _ = writeln!(
-                        buf,
-                        "{}{}{}",
-                        ANSI_DIM,
-                        truncate_chars(&path_line, width),
-                        ANSI_RESET
-                    );
-                }
-            } else {
-                let _ = writeln!(
-                    buf,
-                    "{}  (Loading configuration...){}",
-                    ANSI_DIM, ANSI_RESET
-                );
-            }
-        }
-
-        TuiTab::Probe => {
-            let hdr = format!(
-                "{:<22} {:<8} {:<10} {:<22} {}",
-                "TUNNEL ID", "RESULT", "RTT", "ENDPOINT", "DETAIL"
-            );
-            let _ = writeln!(
-                buf,
-                "{}{}{}{}",
-                ANSI_BOLD,
-                ANSI_BG_BLUE,
-                truncate_chars(&hdr, width),
-                ANSI_RESET
-            );
-            let body_h = height.saturating_sub(header_lines + tab_bar_lines + 4).max(1);
-            if app.probe_results.is_empty() {
-                let _ = writeln!(
-                    buf,
-                    "{}  Press [p] to probe selected tunnel or [P] to probe all (<=16){}",
-                    ANSI_DIM, ANSI_RESET
-                );
-            } else {
-                let max_scroll = app.probe_results.len().saturating_sub(body_h);
-                app.probe_scroll = app.probe_scroll.min(max_scroll);
-                let end = (app.probe_scroll + body_h).min(app.probe_results.len());
-                for r in &app.probe_results[app.probe_scroll..end] {
-                    let status_str = if r.ok { "OK" } else { "FAIL" };
-                    let color = if r.ok { ANSI_GREEN } else { ANSI_RED };
-                    let rtt = r
-                        .rtt_ms
-                        .map(|ms| format!("{} ms", ms))
-                        .unwrap_or_else(|| "-".into());
-                    let row = format!(
-                        "{:<22} {}{:<8}{} {:<10} {:<22} {}",
-                        truncate_chars(&r.id, 22),
-                        color,
-                        status_str,
-                        ANSI_RESET,
-                        rtt,
-                        truncate_chars(&r.endpoint, 22),
-                        r.message
-                    );
-                    let _ = writeln!(buf, "{}", row);
-                }
-            }
-        }
-    }
-
-    // 6. Footer / Status Message (no trailing newline to avoid 1-line terminal scroll)
-    let _ = writeln!(buf);
-    if let Some((msg, _)) = &app.status_message {
-        let line = format!(">>> {}", msg);
-        let _ = write!(
-            buf,
-            "{}{}{}{}",
-            ANSI_BOLD,
-            ANSI_GREEN,
-            truncate_chars(&line, width),
-            ANSI_RESET
-        );
-    } else {
-        let current_pos = if app.filtered_indices.is_empty() {
-            0
-        } else {
-            app.selected_index + 1
-        };
-        let footer = format!(
-            "Tunnel {} of {} matching ({} total)",
-            current_pos,
-            app.filtered_indices.len(),
-            app.tunnels.len()
-        );
-        let _ = write!(
-            buf,
-            "{}{}{}",
-            ANSI_DIM,
-            truncate_chars(&footer, width),
-            ANSI_RESET
-        );
-    }
-
-    buf
-}
-
-/// Parsed keyboard input events for the TUI.
+/// Decoded terminal input key used by `wpmulti` TUI handlers and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiKey {
+    Char(char),
     Up,
     Down,
     Left,
@@ -624,12 +47,18 @@ pub enum TuiKey {
     PageDown,
     Home,
     End,
+    Enter,
+    Backspace,
+    Tab,
     Esc,
-    Char(char),
 }
 
-/// Parse the next key event from `bytes`, returning `(event, bytes_consumed)`.
-/// Returns `(None, 0)` only when `bytes` is empty or contains an incomplete UTF-8/CSI prefix.
+/// Parse a single key sequence from raw bytes (retained for unit tests).
+pub fn parse_key_sequence(bytes: &[u8]) -> Option<TuiKey> {
+    parse_next_key(bytes).0
+}
+
+/// Parse the next key from `bytes` and return `(Option<TuiKey>, consumed_bytes)`.
 pub fn parse_next_key(bytes: &[u8]) -> (Option<TuiKey>, usize) {
     if bytes.is_empty() {
         return (None, 0);
@@ -642,66 +71,47 @@ pub fn parse_next_key(bytes: &[u8]) -> (Option<TuiKey>, usize) {
             if bytes.len() < 3 {
                 return (None, 0);
             }
-            match bytes[2] {
-                b'A' => return (Some(TuiKey::Up), 3),
-                b'B' => return (Some(TuiKey::Down), 3),
-                b'C' => return (Some(TuiKey::Right), 3),
-                b'D' => return (Some(TuiKey::Left), 3),
-                b'H' => return (Some(TuiKey::Home), 3),
-                b'F' => return (Some(TuiKey::End), 3),
-                b'1' | b'4' | b'5' | b'6' | b'7' | b'8' => {
-                    if bytes.len() < 4 {
-                        return (None, 0);
-                    }
-                    if bytes[3] == b'~' {
-                        let key = match bytes[2] {
-                            b'1' | b'7' => TuiKey::Home,
-                            b'4' | b'8' => TuiKey::End,
-                            b'5' => TuiKey::PageUp,
-                            b'6' => TuiKey::PageDown,
-                            _ => unreachable!(),
-                        };
-                        return (Some(key), 4);
-                    }
-                    return (None, 4);
-                }
-                _ => return (None, 3),
+            return match bytes[2] {
+                b'A' => (Some(TuiKey::Up), 3),
+                b'B' => (Some(TuiKey::Down), 3),
+                b'C' => (Some(TuiKey::Right), 3),
+                b'D' => (Some(TuiKey::Left), 3),
+                b'H' => (Some(TuiKey::Home), 3),
+                b'F' => (Some(TuiKey::End), 3),
+                b'5' if bytes.get(3) == Some(&b'~') => (Some(TuiKey::PageUp), 4),
+                b'6' if bytes.get(3) == Some(&b'~') => (Some(TuiKey::PageDown), 4),
+                b'7' if bytes.get(3) == Some(&b'~') => (Some(TuiKey::Home), 4),
+                b'8' if bytes.get(3) == Some(&b'~') => (Some(TuiKey::End), 4),
+                _ => (Some(TuiKey::Esc), 1),
+            };
+        }
+        return (Some(TuiKey::Esc), 1);
+    }
+    match bytes[0] {
+        b'\r' | b'\n' => (Some(TuiKey::Enter), 1),
+        0x7f | 0x08 => (Some(TuiKey::Backspace), 1),
+        b'\t' => (Some(TuiKey::Tab), 1),
+        _ => {
+            if let Ok(s) = std::str::from_utf8(bytes)
+                && let Some(ch) = s.chars().next()
+            {
+                return (Some(TuiKey::Char(ch)), ch.len_utf8());
             }
-        }
-        return (None, 2);
-    }
-
-    // Decode UTF-8 character
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        if let Some(ch) = s.chars().next() {
-            return (Some(TuiKey::Char(ch)), ch.len_utf8());
-        }
-    } else {
-        // Find valid UTF-8 prefix or drop invalid byte
-        let len = bytes.len().min(4);
-        for end in 1..=len {
-            if let Ok(s) = std::str::from_utf8(&bytes[..end])
-                && let Some(ch) = s.chars().next() {
-                    return (Some(TuiKey::Char(ch)), ch.len_utf8());
-                }
-        }
-        if bytes.len() < 4 && (bytes[0] & 0xC0) == 0xC0 {
-            return (None, 0);
+            (None, 1)
         }
     }
-    (None, 1)
 }
 
-/// Parse a raw stdin byte slice (including coalesced/UTF-8 sequences) into [`TuiKey`] events.
+/// Parse all coalesced keys from a byte slice.
 pub fn parse_keys_from_bytes(bytes: &[u8]) -> Vec<TuiKey> {
     let mut keys = Vec::new();
     let mut offset = 0;
     while offset < bytes.len() {
-        let (key, consumed) = parse_next_key(&bytes[offset..]);
+        let (maybe_key, consumed) = parse_next_key(&bytes[offset..]);
         if consumed == 0 {
             break;
         }
-        if let Some(k) = key {
+        if let Some(k) = maybe_key {
             keys.push(k);
         }
         offset += consumed;
@@ -709,412 +119,714 @@ pub fn parse_keys_from_bytes(bytes: &[u8]) -> Vec<TuiKey> {
     keys
 }
 
-/// Parse a single raw stdin byte slice into a [`TuiKey`].
-pub fn parse_key_sequence(bytes: &[u8]) -> Option<TuiKey> {
-    parse_next_key(bytes).0
-}
+/// Render the complete TUI dashboard into a plain-text String via `ratatui::TestBackend`.
+pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String {
+    let w = width.max(24) as u16;
+    let h = height.max(8) as u16;
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|f| draw_dashboard(f, app))
+        .expect("draw test dashboard");
 
-/// Query current terminal `(width, height)` via `TIOCGWINSZ`, falling back to `(100, 28)`.
-pub fn get_terminal_size() -> (usize, usize) {
-    #[cfg(unix)]
-    {
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
-        if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-            return ((ws.ws_col as usize).max(24), (ws.ws_row as usize).max(8));
+    let buf = terminal.backend().buffer();
+    let mut lines = Vec::with_capacity(h as usize);
+    for y in 0..h {
+        let mut row = String::with_capacity(w as usize);
+        for x in 0..w {
+            row.push_str(buf[(x, y)].symbol());
         }
+        lines.push(row.trim_end().to_string());
     }
-    (100, 28)
+    lines.join("\n")
 }
 
-/// RAII guard enabling raw/non-canonical stdin mode and alternate screen, restoring on drop.
-struct RawTerminalGuard {
-    #[cfg(unix)]
-    orig_termios: Option<libc::termios>,
-    is_tty: bool,
-}
+/// Draw the full 5-tab `nyx`-style dashboard onto a `ratatui::Frame`.
+pub fn draw_dashboard(f: &mut Frame, app: &mut TuiApp) {
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header + Tabs
+            Constraint::Min(3),    // Active Tab Body
+            Constraint::Length(2), // Footer / Status
+        ])
+        .split(area);
 
-impl RawTerminalGuard {
-    fn enter(is_tty: bool) -> Self {
-        #[cfg(unix)]
-        let orig_termios = if is_tty {
-            unsafe {
-                let mut orig: libc::termios = std::mem::zeroed();
-                if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) == 0 {
-                    let mut raw = orig;
-                    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
-                    raw.c_cc[libc::VMIN] = 1;
-                    raw.c_cc[libc::VTIME] = 0;
-                    let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
-                    Some(orig)
-                } else {
-                    None
-                }
-            }
-        } else {
-            None
-        };
+    draw_header_and_tabs(f, app, chunks[0]);
 
-        if is_tty {
-            print!("{}\x1b[?1049h{}", ANSI_CLEAR, ANSI_HIDE_CURSOR);
-            let _ = stdout().flush();
-        }
-
-        Self {
-            #[cfg(unix)]
-            orig_termios,
-            is_tty,
-        }
+    match app.active_tab {
+        TuiTab::Tunnels => draw_tunnels_tab(f, app, chunks[1]),
+        TuiTab::Logs => draw_logs_tab(f, app, chunks[1]),
+        TuiTab::Listeners => draw_listeners_tab(f, app, chunks[1]),
+        TuiTab::Config => draw_config_tab(f, app, chunks[1]),
+        TuiTab::Probe => draw_probe_tab(f, app, chunks[1]),
     }
+
+    draw_footer(f, app, chunks[2]);
 }
 
-impl Drop for RawTerminalGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(ref orig) = self.orig_termios {
-            unsafe {
-                let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, orig);
-            }
-        }
-        if self.is_tty {
-            print!("{}\x1b[?1049l{}", ANSI_SHOW_CURSOR, ANSI_RESET);
-            let _ = stdout().flush();
-        }
-    }
-}
-
-/// Write a rendered frame to stdout without full-screen clear flicker.
-fn write_frame(rendered: &str) {
-    let mut out = stdout().lock();
-    let _ = out.write_all(b"\x1b[H");
-    let mut lines = rendered.split('\n').peekable();
-    while let Some(line) = lines.next() {
-        let _ = out.write_all(line.as_bytes());
-        let _ = out.write_all(b"\x1b[K");
-        if lines.peek().is_some() {
-            let _ = out.write_all(b"\n");
-        }
-    }
-    let _ = out.write_all(b"\x1b[J");
-    let _ = out.flush();
-}
-
-/// Poll stdin with `timeout_ms` on Unix; returns `true` if bytes are ready to read.
-#[cfg(unix)]
-fn poll_stdin(timeout_ms: i32) -> bool {
-    let mut pfd = libc::pollfd {
-        fd: libc::STDIN_FILENO,
-        events: libc::POLLIN,
-        revents: 0,
+fn draw_header_and_tabs(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let active_count = app
+        .tunnels
+        .iter()
+        .filter(|t| t.state == TunnelState::Active)
+        .count();
+    let total_conns: usize = app.tunnels.iter().map(|t| t.active_conns).sum();
+    let title = if area.width < 60 {
+        format!(" wpmulti v{} ", env!("CARGO_PKG_VERSION"))
+    } else {
+        format!(
+            " wpmulti v{} | Tunnels: {} ({} active) | Conns: {} ",
+            env!("CARGO_PKG_VERSION"),
+            app.tunnels.len(),
+            active_count,
+            total_conns
+        )
     };
-    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    rc > 0 && (pfd.revents & libc::POLLIN) != 0
+
+    let tab_titles: Vec<Line> = TuiTab::ALL
+        .iter()
+        .map(|t| Line::from(t.label()))
+        .collect();
+    let selected_idx = TuiTab::ALL
+        .iter()
+        .position(|t| *t == app.active_tab)
+        .unwrap_or(0);
+
+    let tabs = Tabs::new(tab_titles)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        )
+        .select(selected_idx)
+        .style(Style::default().fg(Color::Gray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_widget(tabs, area);
 }
 
-/// Run the interactive terminal event loop for the TUI dashboard.
-pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> Result<(), io::Error> {
-    // Initial fetch of tunnel state
-    let _ = app.refresh().await;
+fn draw_tunnels_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
+    let show_sparkline = area.height >= 10 && area.width >= 40;
+    let (spark_area, table_area) = if show_sparkline {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(area);
+        (Some(split[0]), split[1])
+    } else {
+        (None, area)
+    };
 
-    let is_tty = io::stdin().is_terminal() && stdout().is_terminal();
-    if !is_tty {
-        let (w, h) = get_terminal_size();
-        let rendered = render_dashboard(&mut app, w, h);
-        println!("{}", rendered);
-        return Ok(());
+    if let Some(s_area) = spark_area {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(s_area);
+
+        let rx_data: Vec<u64> = app.rx_rates.iter().copied().collect();
+        let tx_data: Vec<u64> = app.tx_rates.iter().copied().collect();
+
+        let rx_spark = Sparkline::default()
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" RX {}/s ", format_bytes(app.current_rx_bps))),
+            )
+            .data(&rx_data)
+            .style(Style::default().fg(Color::Green));
+        let tx_spark = Sparkline::default()
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" TX {}/s ", format_bytes(app.current_tx_bps))),
+            )
+            .data(&tx_data)
+            .style(Style::default().fg(Color::Yellow));
+
+        f.render_widget(rx_spark, cols[0]);
+        f.render_widget(tx_spark, cols[1]);
     }
 
-    let refresh_interval = Duration::from_millis(refresh_rate_ms.max(50));
-    let mut interval = tokio::time::interval(refresh_interval);
+    let w = table_area.width;
+    let show_endpoint = w >= 92;
+    let show_port = w >= 66;
+    let show_tx = w >= 58;
 
-    let (key_tx, mut key_rx) = tokio::sync::mpsc::channel::<TuiKey>(64);
-    let stop_reader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_flag = std::sync::Arc::clone(&stop_reader);
+    let mut headers = vec!["ID", "STATE", "HEALTH", "CONNS", "RX"];
+    if show_tx {
+        headers.push("TX");
+    }
+    if show_port {
+        headers.push("PORT");
+    }
+    if show_endpoint {
+        headers.push("ENDPOINT");
+    }
 
-    let reader_handle = tokio::task::spawn_blocking(move || {
-        let mut stdin = io::stdin();
-        let mut pending: Vec<u8> = Vec::with_capacity(64);
-        let mut buf = [0u8; 64];
+    let header_row = Row::new(headers).style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
 
-        while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            #[cfg(unix)]
-            if !poll_stdin(200) {
-                continue;
+    let total_visible = app.filtered_indices.len();
+    let visible_rows = table_area.height.saturating_sub(3) as usize;
+    app.update_scroll(visible_rows.max(1));
+
+    let rows: Vec<Row> = app
+        .filtered_indices
+        .iter()
+        .enumerate()
+        .skip(app.scroll_offset)
+        .take(visible_rows.max(1))
+        .map(|(vis_idx, &orig_idx)| {
+            let t = &app.tunnels[orig_idx];
+            let state_str = format!("{:?}", t.state);
+            let health_str = match t.health {
+                HealthStatus::Healthy => "Healthy",
+                HealthStatus::HalfOpen => "HalfOpen",
+                HealthStatus::Unhealthy => "Unhealthy",
+            };
+            let mut cells = vec![
+                Cell::from(t.id.clone()),
+                Cell::from(state_str).style(state_style(t.state)),
+                Cell::from(health_str).style(health_style(t.health)),
+                Cell::from(t.active_conns.to_string()),
+                Cell::from(format_bytes(t.rx_bytes)),
+            ];
+            if show_tx {
+                cells.push(Cell::from(format_bytes(t.tx_bytes)));
             }
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    pending.extend_from_slice(&buf[..n]);
-                    // If a lone ESC arrived, wait briefly (50ms) to distinguish Esc vs split CSI sequence
-                    #[cfg(unix)]
-                    if pending == [0x1b] && poll_stdin(50)
-                        && let Ok(m) = stdin.read(&mut buf)
-                            && m > 0 {
-                                pending.extend_from_slice(&buf[..m]);
-                            }
+            if show_port {
+                let port = t
+                    .assigned_port
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                cells.push(Cell::from(port));
+            }
+            if show_endpoint {
+                cells.push(Cell::from(
+                    t.endpoint.clone().unwrap_or_else(|| "-".to_string()),
+                ));
+            }
+            let row = Row::new(cells);
+            if vis_idx == app.selected_index {
+                row.style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                row
+            }
+        })
+        .collect();
 
-                    let mut offset = 0;
-                    while offset < pending.len() {
-                        let (key, consumed) = parse_next_key(&pending[offset..]);
-                        if consumed == 0 {
-                            break;
-                        }
-                        if let Some(k) = key
-                            && key_tx.blocking_send(k).is_err() {
-                                return;
-                            }
-                        offset += consumed;
-                    }
-                    if offset > 0 {
-                        pending.drain(..offset);
-                    }
+    let mut widths = vec![
+        Constraint::Min(14),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(6),
+        Constraint::Length(9),
+    ];
+    if show_tx {
+        widths.push(Constraint::Length(9));
+    }
+    if show_port {
+        widths.push(Constraint::Length(6));
+    }
+    if show_endpoint {
+        widths.push(Constraint::Min(18));
+    }
+
+    let pos_title = if total_visible == 0 {
+        " Tunnels (0) ".to_string()
+    } else {
+        format!(" Tunnel {} of {} ", app.selected_index + 1, total_visible)
+    };
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(pos_title));
+    f.render_widget(table, table_area);
+}
+
+fn draw_logs_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let filter_label = app.log_level_filter.as_deref().unwrap_or("ALL");
+    let logs = app.filtered_logs();
+    let visible = area.height.saturating_sub(2) as usize;
+    let total = logs.len();
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = app.log_scroll.min(max_scroll);
+    let start = total.saturating_sub(visible + scroll);
+    let end = total.saturating_sub(scroll);
+
+    let lines: Vec<Line> = if logs.is_empty() {
+        vec![Line::from(Span::styled(
+            "No logs captured yet (live logs are captured in `wpmulti run --tui`).",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        logs[start..end]
+            .iter()
+            .map(|l| {
+                let style = if l.contains("ERROR") {
+                    Style::default().fg(Color::Red)
+                } else if l.contains("WARN") {
+                    Style::default().fg(Color::Yellow)
+                } else if l.contains("INFO") {
+                    Style::default().fg(Color::Green)
+                } else if l.contains("DEBUG") {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(l.as_str(), style))
+            })
+            .collect()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Live Logs [Filter: {}] ({} lines) ", filter_label, total));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_listeners_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let header = Row::new(vec!["NAME", "TYPE", "ADDRESS", "MODE", "TUNNEL"]).style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let visible = area.height.saturating_sub(3) as usize;
+    let rows: Vec<Row> = app
+        .listeners
+        .iter()
+        .skip(app.listener_scroll)
+        .take(visible.max(1))
+        .map(|l| {
+            Row::new(vec![
+                l.name.clone(),
+                format!("{:?}", l.listener_type),
+                l.address.to_string(),
+                if l.is_shared { "Shared" } else { "Dedicated" }.to_string(),
+                l.tunnel_id.clone().unwrap_or_else(|| "-".to_string()),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(16),
+            Constraint::Length(10),
+            Constraint::Min(18),
+            Constraint::Length(10),
+            Constraint::Min(14),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Active Listeners ({}) ", app.listeners.len())),
+    );
+    f.render_widget(table, area);
+}
+
+fn draw_config_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let Some(cfg) = &app.config_snapshot else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Runtime Config ");
+        f.render_widget(
+            Paragraph::new("Loading config from daemon...").block(block),
+            area,
+        );
+        return;
+    };
+
+    let header = Row::new(vec!["SETTING", "VALUE", "ACTION"]).style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let rows: Vec<Row> = (0..11)
+        .map(|idx| {
+            let (label, val, is_cycle) = TuiApp::config_row_display(cfg, idx);
+            let display_val = if idx == app.config_selected {
+                if let Some(edit_buf) = &app.config_editing {
+                    format!("{}_", edit_buf)
+                } else {
+                    val
                 }
+            } else {
+                val
+            };
+            let action = if is_cycle {
+                "Enter/Space: cycle"
+            } else {
+                "Enter: edit"
+            };
+            let row = Row::new(vec![label.to_string(), display_val, action.to_string()]);
+            if idx == app.config_selected {
+                row.style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                row
             }
+        })
+        .collect();
+
+    let path_label = app
+        .config_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "remote/in-memory".to_string());
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(28),
+            Constraint::Min(16),
+            Constraint::Length(20),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Config ({}) ", path_label)),
+    );
+    f.render_widget(table, area);
+}
+
+fn draw_probe_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let header = Row::new(vec!["TUNNEL", "ENDPOINT", "STATUS", "RTT", "MESSAGE"]).style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let visible = area.height.saturating_sub(3) as usize;
+    let rows: Vec<Row> = app
+        .probe_results
+        .iter()
+        .skip(app.probe_scroll)
+        .take(visible.max(1))
+        .map(|r| {
+            let status_cell = if r.ok {
+                Cell::from("OK").style(Style::default().fg(Color::Green))
+            } else {
+                Cell::from("FAIL").style(Style::default().fg(Color::Red))
+            };
+            let rtt = r
+                .rtt_ms
+                .map(|ms| format!("{}ms", ms))
+                .unwrap_or_else(|| "-".to_string());
+            Row::new(vec![
+                Cell::from(r.id.clone()),
+                Cell::from(r.endpoint.clone()),
+                status_cell,
+                Cell::from(rtt),
+                Cell::from(r.message.clone()),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(14),
+            Constraint::Min(20),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Handshake Probe ({}) ", app.probe_results.len())),
+    );
+    f.render_widget(table, area);
+}
+
+fn draw_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let help = match app.active_tab {
+        TuiTab::Tunnels => {
+            "1-5/Tab:Tabs  j/k:Nav  /:Search  s:Sort  a:Activate  d:Suspend  r:Reload  q:Quit"
         }
-    });
+        TuiTab::Logs => "1-5/Tab:Tabs  j/k:Scroll  f:Filter Level  c:Clear  q:Quit",
+        TuiTab::Listeners => "1-5/Tab:Tabs  j/k:Scroll  q:Quit",
+        TuiTab::Config => "1-5/Tab:Tabs  j/k:Select  Enter:Edit/Cycle  w:Save+Reload  q:Quit",
+        TuiTab::Probe => "1-5/Tab:Tabs  p:Probe Selected  P:Probe All  j/k:Scroll  q:Quit",
+    };
 
-    // Enter raw mode & alternate screen with RAII restoration
-    let _term_guard = RawTerminalGuard::enter(true);
+    let mut lines = Vec::new();
+    if app.is_searching {
+        lines.push(Line::from(Span::styled(
+            format!("Search: {}_", app.search_query),
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if let Some((msg, at)) = &app.status_message
+        && at.elapsed() < Duration::from_secs(5)
+    {
+        lines.push(Line::from(Span::styled(
+            format!(">>> {}", msg),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        help,
+        Style::default().fg(Color::DarkGray),
+    )));
 
-    #[cfg(unix)]
-    let mut sigwinch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
-    #[cfg(unix)]
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn state_style(state: TunnelState) -> Style {
+    match state {
+        TunnelState::Active => Style::default().fg(Color::Green),
+        TunnelState::Dormant => Style::default().fg(Color::DarkGray),
+        TunnelState::Activating => Style::default().fg(Color::Yellow),
+        TunnelState::Suspended => Style::default().fg(Color::Red),
+    }
+}
+
+fn health_style(health: HealthStatus) -> Style {
+    match health {
+        HealthStatus::Healthy => Style::default().fg(Color::Green),
+        HealthStatus::HalfOpen => Style::default().fg(Color::Yellow),
+        HealthStatus::Unhealthy => Style::default().fg(Color::Red),
+    }
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
+/// Run the interactive terminal TUI loop using `ratatui` + `crossterm`.
+pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let _guard = TerminalGuard;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let _ = app.refresh().await;
+    let mut last_refresh = Instant::now();
+    let refresh_interval = Duration::from_millis(refresh_rate_ms.max(100));
 
     while app.running {
-        tokio::select! {
-            _ = interval.tick() => {
-                let _ = app.refresh().await;
-                app.clear_status_if_expired(Duration::from_secs(3));
-                let (w, h) = get_terminal_size();
-                let rendered = render_dashboard(&mut app, w, h);
-                write_frame(&rendered);
-            }
-            _ = sigwinch.recv() => {
-                let (w, h) = get_terminal_size();
-                let rendered = render_dashboard(&mut app, w, h);
-                write_frame(&rendered);
-            }
-            _ = sigint.recv() => {
+        terminal.draw(|f| draw_dashboard(f, &mut app))?;
+
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('c')
+            {
                 app.running = false;
+                break;
             }
-            _ = sigterm.recv() => {
-                app.running = false;
+            if let Some(tui_key) = map_crossterm_key(key.code) {
+                handle_tui_key(&mut app, tui_key).await;
             }
-            Some(key) = key_rx.recv() => {
-                let (w, h) = get_terminal_size();
-                let reserved = if h < 15 { 6 } else { 10 };
-                let page_size = h.saturating_sub(reserved).max(1);
-                let typing = app.is_searching || app.config_editing.is_some();
-                match key {
-                    TuiKey::Left if !typing => {
-                        app.prev_tab();
-                        let _ = app.refresh().await;
-                    }
-                    TuiKey::Right if !typing => {
-                        app.next_tab();
-                        let _ = app.refresh().await;
-                    }
-                    TuiKey::Left | TuiKey::Right => {}
-                    TuiKey::Up => match app.active_tab {
-                        TuiTab::Tunnels => app.select_prev(),
-                        TuiTab::Logs => {
-                            app.log_scroll = app.log_scroll.saturating_add(1);
-                        }
-                        TuiTab::Listeners => {
-                            app.listener_scroll = app.listener_scroll.saturating_sub(1);
-                        }
-                        TuiTab::Config => {
-                            app.config_selected = app.config_selected.saturating_sub(1);
-                        }
-                        TuiTab::Probe => {
-                            app.probe_scroll = app.probe_scroll.saturating_sub(1);
-                        }
-                    },
-                    TuiKey::Down => match app.active_tab {
-                        TuiTab::Tunnels => app.select_next(),
-                        TuiTab::Logs => {
-                            app.log_scroll = app.log_scroll.saturating_sub(1);
-                        }
-                        TuiTab::Listeners => {
-                            if app.listener_scroll + 1 < app.listeners.len() {
-                                app.listener_scroll += 1;
-                            }
-                        }
-                        TuiTab::Config => {
-                            if app.config_selected + 1 < CONFIG_ROW_COUNT {
-                                app.config_selected += 1;
-                            }
-                        }
-                        TuiTab::Probe => {
-                            if app.probe_scroll + 1 < app.probe_results.len() {
-                                app.probe_scroll += 1;
-                            }
-                        }
-                    },
-                    TuiKey::PageUp => {
-                        if app.active_tab == TuiTab::Tunnels {
-                            app.page_up(page_size);
-                        } else if app.active_tab == TuiTab::Logs {
-                            app.log_scroll = app.log_scroll.saturating_add(page_size);
-                        }
-                    }
-                    TuiKey::PageDown => {
-                        if app.active_tab == TuiTab::Tunnels {
-                            app.page_down(page_size);
-                        } else if app.active_tab == TuiTab::Logs {
-                            app.log_scroll = app.log_scroll.saturating_sub(page_size);
-                        }
-                    }
-                    TuiKey::Home => {
-                        if app.active_tab == TuiTab::Tunnels {
-                            app.scroll_to_top();
-                        } else if app.active_tab == TuiTab::Logs {
-                            app.log_scroll = usize::MAX;
-                        }
-                    }
-                    TuiKey::End => {
-                        if app.active_tab == TuiTab::Tunnels {
-                            app.scroll_to_bottom();
-                        } else if app.active_tab == TuiTab::Logs {
-                            app.log_scroll = 0;
-                        }
-                    }
-                    TuiKey::Esc => {
-                        app.is_searching = false;
-                        app.config_editing = None;
-                        if app.active_tab == TuiTab::Tunnels {
-                            app.search_query.clear();
-                            app.apply_filter_and_sort();
-                        }
-                    }
-                    TuiKey::Char(ch) => match ch {
-                        '\x03' => {
-                            app.running = false;
-                        }
-                        'q' | 'Q' if !typing => {
-                            app.running = false;
-                        }
-                        '1' if !typing => {
-                            app.set_tab(TuiTab::Tunnels);
-                            let _ = app.refresh().await;
-                        }
-                        '2' if !typing => {
-                            app.set_tab(TuiTab::Logs);
-                        }
-                        '3' if !typing => {
-                            app.set_tab(TuiTab::Listeners);
-                            let _ = app.refresh().await;
-                        }
-                        '4' if !typing => {
-                            app.set_tab(TuiTab::Config);
-                            let _ = app.refresh().await;
-                        }
-                        '5' if !typing => {
-                            app.set_tab(TuiTab::Probe);
-                        }
-                        '/' if !typing && app.active_tab == TuiTab::Tunnels => {
-                            app.is_searching = true;
-                            app.search_query.clear();
-                            app.apply_filter_and_sort();
-                        }
-                        '\n' | '\r' => {
-                            if app.is_searching {
-                                app.is_searching = false;
-                            } else if app.config_editing.is_some() {
-                                if let Err(e) = app.commit_config_edit().await {
-                                    app.set_status(format!("Config error: {}", e));
-                                }
-                            } else if app.active_tab == TuiTab::Config
-                                && let Err(e) = app.activate_config_row().await
-                            {
-                                app.set_status(format!("Config error: {}", e));
-                            }
-                        }
-                        '\x08' | '\x7f' => {
-                            if app.is_searching {
-                                app.search_query.pop();
-                                app.apply_filter_and_sort();
-                            } else if let Some(ed) = &mut app.config_editing {
-                                ed.pop();
-                            }
-                        }
-                        'a' | 'A' if !typing && app.active_tab == TuiTab::Tunnels => {
-                            let _ = app.activate_selected().await;
-                        }
-                        's' | 'S' if !typing && app.active_tab == TuiTab::Tunnels => {
-                            let _ = app.suspend_selected().await;
-                        }
-                        'r' | 'R' if !typing => {
-                            let _ = app.trigger_reload().await;
-                        }
-                        '\t' if !typing && app.active_tab == TuiTab::Tunnels => {
-                            app.cycle_sort();
-                        }
-                        'f' | 'F' if !typing && app.active_tab == TuiTab::Logs => {
-                            app.cycle_log_filter();
-                        }
-                        'c' | 'C' if !typing && app.active_tab == TuiTab::Logs => {
-                            if let Some(buf) = &app.log_buffer {
-                                buf.clear();
-                            }
-                            app.log_scroll = 0;
-                        }
-                        'w' | 'W' if !typing && app.active_tab == TuiTab::Config => {
-                            if let Err(e) = app.save_config_and_reload().await {
-                                app.set_status(format!("Save error: {}", e));
-                            }
-                        }
-                        'p' if !typing && app.active_tab == TuiTab::Probe => {
-                            app.probe_selected_tunnel().await;
-                        }
-                        'P' if !typing && app.active_tab == TuiTab::Probe => {
-                            app.probe_all_tunnels().await;
-                        }
-                        'j' if !typing => match app.active_tab {
-                            TuiTab::Tunnels => app.select_next(),
-                            TuiTab::Logs => app.log_scroll = app.log_scroll.saturating_sub(1),
-                            TuiTab::Config if app.config_selected + 1 < CONFIG_ROW_COUNT => {
-                                app.config_selected += 1;
-                            }
-                            _ => {}
-                        },
-                        'k' if !typing => match app.active_tab {
-                            TuiTab::Tunnels => app.select_prev(),
-                            TuiTab::Logs => app.log_scroll = app.log_scroll.saturating_add(1),
-                            TuiTab::Config => {
-                                app.config_selected = app.config_selected.saturating_sub(1);
-                            }
-                            _ => {}
-                        },
-                        'g' if !typing && app.active_tab == TuiTab::Tunnels => {
-                            app.scroll_to_top();
-                        }
-                        'G' if !typing && app.active_tab == TuiTab::Tunnels => {
-                            app.scroll_to_bottom();
-                        }
-                        other => {
-                            if app.is_searching && !other.is_control() {
-                                app.search_query.push(other);
-                                app.apply_filter_and_sort();
-                            } else if let Some(ed) = &mut app.config_editing
-                                && !other.is_control()
-                            {
-                                ed.push(other);
-                            }
-                        }
-                    },
-                }
-                let rendered = render_dashboard(&mut app, w, h);
-                write_frame(&rendered);
-            }
+        }
+
+        if last_refresh.elapsed() >= refresh_interval {
+            let _ = app.refresh().await;
+            last_refresh = Instant::now();
         }
     }
 
-    stop_reader.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = reader_handle.await;
-
     Ok(())
+}
+
+fn map_crossterm_key(code: KeyCode) -> Option<TuiKey> {
+    match code {
+        KeyCode::Char(c) => Some(TuiKey::Char(c)),
+        KeyCode::Up => Some(TuiKey::Up),
+        KeyCode::Down => Some(TuiKey::Down),
+        KeyCode::Left => Some(TuiKey::Left),
+        KeyCode::Right => Some(TuiKey::Right),
+        KeyCode::PageUp => Some(TuiKey::PageUp),
+        KeyCode::PageDown => Some(TuiKey::PageDown),
+        KeyCode::Home => Some(TuiKey::Home),
+        KeyCode::End => Some(TuiKey::End),
+        KeyCode::Enter => Some(TuiKey::Enter),
+        KeyCode::Backspace => Some(TuiKey::Backspace),
+        KeyCode::Tab => Some(TuiKey::Tab),
+        KeyCode::Esc => Some(TuiKey::Esc),
+        _ => None,
+    }
+}
+
+async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
+    if app.is_searching {
+        match key {
+            TuiKey::Esc | TuiKey::Enter => app.is_searching = false,
+            TuiKey::Backspace => {
+                app.search_query.pop();
+                app.apply_filter_and_sort();
+            }
+            TuiKey::Char(c) => {
+                app.search_query.push(c);
+                app.apply_filter_and_sort();
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if app.active_tab == TuiTab::Config && app.config_editing.is_some() {
+        match key {
+            TuiKey::Esc => app.config_editing = None,
+            TuiKey::Enter => {
+                if let Err(e) = app.commit_config_edit().await {
+                    app.set_status(format!("Config error: {}", e));
+                }
+            }
+            TuiKey::Backspace => {
+                if let Some(buf) = &mut app.config_editing {
+                    buf.pop();
+                }
+            }
+            TuiKey::Char(c) => {
+                if let Some(buf) = &mut app.config_editing {
+                    buf.push(c);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key {
+        TuiKey::Char('q') => app.running = false,
+        TuiKey::Char('1') => app.set_tab(TuiTab::Tunnels),
+        TuiKey::Char('2') => app.set_tab(TuiTab::Logs),
+        TuiKey::Char('3') => app.set_tab(TuiTab::Listeners),
+        TuiKey::Char('4') => app.set_tab(TuiTab::Config),
+        TuiKey::Char('5') => app.set_tab(TuiTab::Probe),
+        TuiKey::Tab | TuiKey::Right => app.next_tab(),
+        TuiKey::Left => app.prev_tab(),
+        _ => match app.active_tab {
+            TuiTab::Tunnels => match key {
+                TuiKey::Up | TuiKey::Char('k') => app.select_prev(),
+                TuiKey::Down | TuiKey::Char('j') => app.select_next(),
+                TuiKey::PageUp => app.page_up(10),
+                TuiKey::PageDown => app.page_down(10),
+                TuiKey::Home => app.scroll_to_top(),
+                TuiKey::End => app.scroll_to_bottom(),
+                TuiKey::Char('/') => app.is_searching = true,
+                TuiKey::Char('s') => app.cycle_sort(),
+                TuiKey::Char('a') => {
+                    if let Err(e) = app.activate_selected().await {
+                        app.set_status(format!("Activate error: {}", e));
+                    }
+                }
+                TuiKey::Char('d') => {
+                    if let Err(e) = app.suspend_selected().await {
+                        app.set_status(format!("Suspend error: {}", e));
+                    }
+                }
+                TuiKey::Char('r') => {
+                    if let Err(e) = app.trigger_reload().await {
+                        app.set_status(format!("Reload error: {}", e));
+                    }
+                }
+                _ => {}
+            },
+            TuiTab::Logs => match key {
+                TuiKey::Up | TuiKey::Char('k') => app.log_scroll = app.log_scroll.saturating_add(1),
+                TuiKey::Down | TuiKey::Char('j') => {
+                    app.log_scroll = app.log_scroll.saturating_sub(1);
+                }
+                TuiKey::Char('f') => app.cycle_log_filter(),
+                TuiKey::Char('c') => {
+                    if let Some(buf) = &app.log_buffer {
+                        buf.clear();
+                    }
+                    app.log_scroll = 0;
+                    app.set_status("Logs cleared");
+                }
+                _ => {}
+            },
+            TuiTab::Listeners => match key {
+                TuiKey::Up | TuiKey::Char('k') => {
+                    app.listener_scroll = app.listener_scroll.saturating_sub(1);
+                }
+                TuiKey::Down | TuiKey::Char('j')
+                    if app.listener_scroll + 1 < app.listeners.len() =>
+                {
+                    app.listener_scroll += 1;
+                }
+                _ => {}
+            },
+            TuiTab::Config => match key {
+                TuiKey::Up | TuiKey::Char('k') => {
+                    app.config_selected = app.config_selected.saturating_sub(1);
+                }
+                TuiKey::Down | TuiKey::Char('j') => {
+                    if app.config_selected < 10 {
+                        app.config_selected += 1;
+                    }
+                }
+                TuiKey::Enter | TuiKey::Char(' ') => {
+                    if let Err(e) = app.activate_config_row().await {
+                        app.set_status(format!("Config error: {}", e));
+                    }
+                }
+                TuiKey::Char('w') => {
+                    if let Err(e) = app.save_config_and_reload().await {
+                        app.set_status(format!("Save error: {}", e));
+                    }
+                }
+                _ => {}
+            },
+            TuiTab::Probe => match key {
+                TuiKey::Up | TuiKey::Char('k') => {
+                    app.probe_scroll = app.probe_scroll.saturating_sub(1);
+                }
+                TuiKey::Down | TuiKey::Char('j') => {
+                    if app.probe_scroll + 1 < app.probe_results.len() {
+                        app.probe_scroll += 1;
+                    }
+                }
+                TuiKey::Char('p') => app.probe_selected_tunnel().await,
+                TuiKey::Char('P') => app.probe_all_tunnels().await,
+                _ => {}
+            },
+        },
+    }
 }
