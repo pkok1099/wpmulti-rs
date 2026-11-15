@@ -315,8 +315,9 @@ impl TunnelManager {
                     .registry
                     .register(TunnelEntry::new(new_id.clone(), t_cfg, mode))?;
 
-                if cfg_snapshot.per_tunnel.enabled && self.listeners.is_started() {
-                    let _ = self
+                if cfg_snapshot.per_tunnel.enabled
+                    && self.listeners.is_started()
+                    && let Err(e) = self
                         .listeners
                         .start_dedicated_for_tunnel(
                             &entry,
@@ -324,11 +325,24 @@ impl TunnelManager {
                             cfg_snapshot.global.bind_address,
                             &self.lifecycle,
                         )
-                        .await;
+                        .await
+                {
+                    tracing::warn!(
+                        "Failed to start dedicated listener for reloaded tunnel '{}': {}",
+                        new_id,
+                        e
+                    );
                 }
 
-                if mode == LifecycleMode::Eager && self.listeners.is_started() {
-                    let _ = self.lifecycle.activate_tunnel(&new_id).await;
+                if mode == LifecycleMode::Eager
+                    && self.listeners.is_started()
+                    && let Err(e) = self.lifecycle.activate_tunnel(&new_id).await
+                {
+                    tracing::warn!(
+                        "Failed to activate eager tunnel '{}' during reload: {}",
+                        new_id,
+                        e
+                    );
                 }
 
                 report.added += 1;

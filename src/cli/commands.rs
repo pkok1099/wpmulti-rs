@@ -165,7 +165,7 @@ pub async fn cmd_status(
         auth_token.as_deref(),
     )
     .await
-    .map_err(|e| std::io::Error::other(e))?;
+    .map_err(std::io::Error::other)?;
 
     let val: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| format!("Failed to parse JSON response: {}", e))?;

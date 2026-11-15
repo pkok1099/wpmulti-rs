@@ -485,7 +485,7 @@ impl LifecycleController {
             if self.registry.active_count() < max_active {
                 break;
             }
-            let _ = self.suspend_tunnel(&evict_id).await;
+            self.try_suspend_for_eviction(&evict_id).await;
         }
 
         if self.registry.active_count() >= max_active {
@@ -495,6 +495,29 @@ impl LifecycleController {
             ));
         }
         Ok(())
+    }
+
+    /// Non-blocking suspend helper used by `enforce_max_active_tunnels` to avoid lock-order inversion.
+    async fn try_suspend_for_eviction(&self, id: &str) {
+        let Some(entry) = self.registry.get(id) else {
+            return;
+        };
+        let Ok(_lock) = entry.activation_lock.try_lock() else {
+            return;
+        };
+        if entry.stats.active_conns.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        if *entry.state.read() != TunnelState::Active {
+            return;
+        }
+        let maybe_active = entry.active.read().clone();
+        if let Some(active) = maybe_active {
+            tracing::debug!("Evicting idle lazy tunnel '{}'", id);
+            active.device.suspend().await;
+            active.netstack.notify().notify_one();
+            *entry.state.write() = TunnelState::Suspended;
+        }
     }
 
     /// Get an active tunnel handle or dynamically boot/resume it on demand.

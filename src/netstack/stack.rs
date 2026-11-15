@@ -157,7 +157,7 @@ impl VirtualNetworkStack {
 
         if let Some(v6_ip) = local_v6 {
             let default_gw = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-            let gateway = if v6_ip == std::net::Ipv6Addr::from(default_gw) {
+            let gateway = if v6_ip == default_gw {
                 Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2)
             } else {
                 default_gw
