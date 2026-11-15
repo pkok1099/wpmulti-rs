@@ -76,3 +76,4 @@ curl -x http://auto@127.0.0.1:8080 https://ifconfig.co
 
 - [Configuration Reference (`wpmulti.toml` & `.conf`)](docs/configuration.md)
 - [Proxy Modes, Routing, TUI & Admin API](docs/proxy-and-api.md)
+- [Architecture, Performance & Hardening](docs/architecture-and-performance.md)
