@@ -62,6 +62,21 @@ default = ["aws-lc-rs"]
 aws-lc-rs = ["gotatun/aws-lc-rs"]
 ring = ["gotatun/ring"]
 
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
 [package.metadata.deb]
 maintainer = "pkok1099"
 copyright = "2026, pkok1099"
