@@ -656,51 +656,116 @@ impl TunnelManager {
     }
 }
 
-/// Atomically serialize/write config contents to `path` via sibling temp file + `fsync` + `rename`.
+fn write_and_sync_file(file: &mut std::fs::File, data: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    file.write_all(data.as_bytes())?;
+    file.sync_all()
+}
+
+fn is_parent_dir_write_blocked(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EACCES | libc::EPERM | libc::EROFS | libc::EBUSY | libc::EXDEV)
+    ) {
+        return true;
+    }
+    false
+}
+
+fn try_atomic_replace_blocking(path: &std::path::Path, data: &str) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let suffix: u64 = rand::random();
+    let tmp_name = format!(
+        ".{}.{suffix:016x}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("wpmulti.toml")
+    );
+    let tmp_path = parent.join(tmp_name);
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp_path)?;
+    if let Err(e) = write_and_sync_file(&mut file, data) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    drop(file);
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn write_in_place_and_sync(file: &mut std::fs::File, data: &str) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let target_len = u64::try_from(data.len()).map_err(std::io::Error::other)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(data.as_bytes())?;
+    file.set_len(target_len)?;
+    file.sync_all()
+}
+
+fn try_in_place_fallback_blocking(path: &std::path::Path, data: &str) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing in-place config write to non-regular file or symlink",
+        ));
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o007 != 0 {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(mode & 0o770));
+        }
+    }
+    write_in_place_and_sync(&mut file, data)
+}
+
+/// Atomically serialize and write config contents to `path`.
+///
+/// Uses a sibling temp file + `fsync` + `rename`, falling back to a direct `O_NOFOLLOW` in-place
+/// write when only the target file (not its parent directory) is writable.
 pub async fn write_config_atomically(
     path: &std::path::Path,
     contents: &str,
 ) -> std::io::Result<()> {
     let path_owned = path.to_path_buf();
     let data = contents.to_owned();
-    tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        let parent = path_owned
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let suffix: u64 = rand::random();
-        let tmp_name = format!(
-            ".{}.{suffix:016x}.tmp",
-            path_owned
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("wpmulti.toml")
-        );
-        let tmp_path = parent.join(tmp_name);
-
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&tmp_path)?;
-        if let Err(e) = file
-            .write_all(data.as_bytes())
-            .and_then(|()| file.sync_all())
-        {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        drop(file);
-        if let Err(e) = std::fs::rename(&tmp_path, &path_owned) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        Ok(())
-    })
+    tokio::task::spawn_blocking(
+        move || match try_atomic_replace_blocking(&path_owned, &data) {
+            Ok(()) => Ok(()),
+            Err(e) if is_parent_dir_write_blocked(&e) => {
+                try_in_place_fallback_blocking(&path_owned, &data)
+            }
+            Err(e) => Err(e),
+        },
+    )
     .await
     .map_err(std::io::Error::other)?
 }

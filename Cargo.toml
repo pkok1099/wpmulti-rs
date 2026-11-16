@@ -87,7 +87,7 @@ conf-files = ["/etc/wpmulti/wpmulti.toml"]
 maintainer-scripts = "packaging/debian"
 assets = [
     ["target/release/wpmulti", "usr/bin/", "755"],
-    ["packaging/wpmulti.toml", "etc/wpmulti/wpmulti.toml", "640"],
+    ["packaging/wpmulti.toml", "etc/wpmulti/wpmulti.toml", "660"],
     ["packaging/wpmulti.service", "lib/systemd/system/wpmulti.service", "644"],
     ["README.md", "usr/share/doc/wpmulti/README.md", "644"],
     ["THIRD_PARTY_NOTICES.md", "usr/share/doc/wpmulti/THIRD_PARTY_NOTICES.md", "644"],

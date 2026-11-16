@@ -11,15 +11,30 @@ case "$1" in
                 --shell /usr/sbin/nologin --gecos "wpmulti daemon user" wpmulti
         fi
 
+        if [ -L /etc/wpmulti ]; then
+            echo "Refusing to modify symlinked /etc/wpmulti" >&2
+            exit 1
+        fi
         install -d -o root -g wpmulti -m 0750 /etc/wpmulti
+
+        if [ -L /etc/wpmulti/confs ]; then
+            echo "Refusing to modify symlinked /etc/wpmulti/confs" >&2
+            exit 1
+        fi
         install -d -o root -g wpmulti -m 0750 /etc/wpmulti/confs
-        if [ -f /etc/wpmulti/wpmulti.toml ]; then
+
+        if [ -L /etc/wpmulti/wpmulti.toml ]; then
+            echo "Warning: /etc/wpmulti/wpmulti.toml is a symlink; skipping chown/chmod" >&2
+        elif [ -f /etc/wpmulti/wpmulti.toml ]; then
             chown root:wpmulti /etc/wpmulti/wpmulti.toml
-            chmod 0640 /etc/wpmulti/wpmulti.toml
+            chmod 0660 /etc/wpmulti/wpmulti.toml
         fi
 
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload >/dev/null 2>&1 || true
+            if [ -n "$2" ]; then
+                systemctl try-restart wpmulti.service >/dev/null 2>&1 || true
+            fi
         fi
 
         echo "wpmulti installed."

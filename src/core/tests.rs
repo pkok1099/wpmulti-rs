@@ -1175,3 +1175,266 @@ async fn test_half_open_trial_slot_released_when_guarded_target_dropped_unused()
     );
     lifecycle.stop().await;
 }
+
+#[cfg(unix)]
+struct RestoreDirPerms(std::path::PathBuf, u32);
+
+#[cfg(unix)]
+impl Drop for RestoreDirPerms {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_in_place_fallback_shrinks_tightens_perms_and_reports_errors() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let cfg_path = temp.path().join("wpmulti.toml");
+    std::fs::write(&cfg_path, "initial_longer_value = true\n").unwrap();
+    std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    crate::core::try_in_place_fallback_blocking(&cfg_path, "ok = 1\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), "ok = 1\n");
+    let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640, "world permission bits must be stripped");
+
+    let link_path = temp.path().join("link.toml");
+    std::os::unix::fs::symlink(&cfg_path, &link_path).unwrap();
+    let sym_err =
+        crate::core::try_in_place_fallback_blocking(&link_path, "pwned = true\n").unwrap_err();
+    assert_eq!(sym_err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), "ok = 1\n");
+
+    let missing_err =
+        crate::core::try_in_place_fallback_blocking(&temp.path().join("missing.toml"), "x = 1\n")
+            .unwrap_err();
+    assert_eq!(missing_err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_write_config_atomically_fallback_when_parent_dir_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let cfg_dir = temp.path().join("etc_wpmulti");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let cfg_path = cfg_dir.join("wpmulti.toml");
+
+    crate::core::write_config_atomically(&cfg_path, "initial_longer_value = true\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        "initial_longer_value = true\n"
+    );
+
+    let link_path = cfg_dir.join("link.toml");
+    std::os::unix::fs::symlink(&cfg_path, &link_path).unwrap();
+
+    let _restore = RestoreDirPerms(cfg_dir.clone(), 0o755);
+    std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Skip DAC-dependent fallback assertion if process runs with UID 0 / CAP_DAC_OVERRIDE.
+    let probe_path = cfg_dir.join(".dac_probe");
+    if let Ok(_f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)
+    {
+        drop(_restore);
+        let _ = std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_file(&probe_path);
+        return;
+    }
+
+    // Parent dir is read-only (0o555) so atomic temp+rename is blocked,
+    // regular writable target falls back in-place (including shrinking),
+    // and symlink target surfaces real InvalidInput without masking.
+    crate::core::write_config_atomically(&cfg_path, "updated = true\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        "updated = true\n"
+    );
+
+    let err = crate::core::write_config_atomically(&link_path, "pwned = true\n")
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        "updated = true\n"
+    );
+}
+
+async fn send_socks5_ipv6_connect(addr: SocketAddr) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method_resp = [0u8; 2];
+    stream.read_exact(&mut method_resp).await.unwrap();
+    assert_eq!(method_resp, [0x05, 0x00]);
+
+    // CONNECT [2001:db8::1]:80 (ATYP=0x04)
+    let mut req = vec![0x05, 0x01, 0x00, 0x04];
+    req.extend_from_slice(
+        &"2001:db8::1"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets(),
+    );
+    req.extend_from_slice(&80u16.to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+
+    // Verify SOCKS5 error reply and drain EOF so handler finishes recording failure.
+    let mut reply = [0u8; 10];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], 0x05);
+    assert_ne!(reply[1], 0x00);
+    let mut eof = [0u8; 16];
+    let _ = stream.read(&mut eof).await;
+}
+
+#[tokio::test]
+async fn test_shared_listener_health_override_and_dynamic_lifecycle_tracking() {
+    use crate::config::{SharedListenerSettings, TunnelPoolSelection};
+    use crate::core::health::HealthStatus;
+
+    let registry = Arc::new(TunnelRegistry::new());
+    let mut t_cfg = make_test_tunnel_config("v4-only-health");
+    t_cfg.interface.addresses = vec!["172.16.0.2/32".parse().unwrap()];
+    let entry = registry
+        .register(TunnelEntry::new(
+            "v4-only-health",
+            t_cfg,
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    // Lifecycle defaults to threshold = 3.
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let supervisor = ListenerSupervisor::new();
+
+    let s1 = SharedListenerSettings {
+        name: "health-override".to_string(),
+        listener_type: ListenerType::Socks5,
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_mode: AuthMode::None,
+        global_password: None,
+        default_strategy: PoolStrategy::RoundRobin,
+        allow_anonymous: true,
+        pool: TunnelPoolSelection::All,
+        ip_mode: None,
+    };
+    let info1 = supervisor
+        .start_shared_listener_with_health(&s1, &registry, &lifecycle, 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    // One IPv6 connect failure on IPv4-only tunnel trips threshold=1 immediately.
+    send_socks5_ipv6_connect(info1.address).await;
+    assert_eq!(entry.health.current_status(), HealthStatus::Unhealthy);
+
+    // Dynamic listener without override tracks lifecycle.set_health_check(...) dynamically.
+    entry.health.reset();
+    lifecycle.set_health_check(2, Duration::from_secs(45));
+    let info2 = supervisor
+        .start_shared_listener(&s1, &registry, &lifecycle)
+        .await
+        .unwrap();
+
+    send_socks5_ipv6_connect(info2.address).await;
+    assert_eq!(entry.health.current_status(), HealthStatus::Healthy);
+    send_socks5_ipv6_connect(info2.address).await;
+    assert_eq!(entry.health.current_status(), HealthStatus::Unhealthy);
+
+    supervisor.stop().await;
+    lifecycle.stop().await;
+}
+
+#[tokio::test]
+async fn test_router_registry_keyword_least_conn_and_all_unhealthy() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "reg-a",
+            make_test_tunnel_config("reg-a"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "reg-b",
+            make_test_tunnel_config("reg-b"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e3_disabled = registry
+        .register(TunnelEntry::new(
+            "reg-c-disabled",
+            make_test_tunnel_config("reg-c-disabled"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    e1.stats.active_conns.store(5, Ordering::Relaxed);
+    e2.stats.active_conns.store(1, Ordering::Relaxed);
+    e3_disabled.stats.active_conns.store(0, Ordering::Relaxed);
+    e3_disabled.set_disabled(true);
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+
+    let _t = router
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::LeastConn))
+        .await
+        .unwrap();
+    assert_eq!(e2.stats.active_conns.load(Ordering::Relaxed), 2);
+    assert_eq!(e1.stats.active_conns.load(Ordering::Relaxed), 5);
+    assert_eq!(e3_disabled.stats.active_conns.load(Ordering::Relaxed), 0);
+
+    // Random and RoundRobin skip disabled tunnel.
+    drop(_t);
+    e2.health.mark_unhealthy(Duration::from_secs(60));
+    let _t_rand = router
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::Random))
+        .await
+        .unwrap();
+    assert_eq!(e1.stats.active_conns.load(Ordering::Relaxed), 6);
+    assert_eq!(e3_disabled.stats.active_conns.load(Ordering::Relaxed), 0);
+    drop(_t_rand);
+
+    e1.health.mark_unhealthy(Duration::from_secs(60));
+    for kw in [
+        PoolKeyword::LeastConn,
+        PoolKeyword::RoundRobin,
+        PoolKeyword::Random,
+    ] {
+        assert!(
+            router
+                .select_tunnel(&TunnelSelector::ByKeyword(kw))
+                .await
+                .is_err()
+        );
+    }
+
+    lifecycle.stop().await;
+}

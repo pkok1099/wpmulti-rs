@@ -108,11 +108,11 @@ impl ListenerSupervisor {
 
         for shared_cfg in &config.shared_listeners {
             let info = match self
-                .start_shared_listener_with_options(
+                .start_shared_listener_inner(
                     shared_cfg,
                     registry,
                     lifecycle,
-                    (config.health_check.threshold, config.health_check.cooldown),
+                    None,
                     per_tunnel_passwords.clone(),
                 )
                 .await
@@ -360,24 +360,25 @@ impl ListenerSupervisor {
         Ok(started)
     }
 
-    /// Start a single shared listener from [`SharedListenerSettings`].
+    /// Start a single shared listener from [`SharedListenerSettings`], tracking
+    /// [`LifecycleController::health_check`] dynamically.
     pub async fn start_shared_listener(
         &self,
         settings: &SharedListenerSettings,
         registry: &Arc<TunnelRegistry>,
         lifecycle: &Arc<LifecycleController>,
     ) -> Result<ActiveListenerInfo, CoreError> {
-        self.start_shared_listener_with_health(
+        self.start_shared_listener_inner(
             settings,
             registry,
             lifecycle,
-            3,
-            Duration::from_secs(30),
+            None,
+            std::collections::HashMap::new(),
         )
         .await
     }
 
-    /// Start a single shared listener with specified health check parameters.
+    /// Start a single shared listener with explicit static health check parameters.
     pub async fn start_shared_listener_with_health(
         &self,
         settings: &SharedListenerSettings,
@@ -396,13 +397,31 @@ impl ListenerSupervisor {
         .await
     }
 
-    /// Start a single shared listener with health check parameters and per-tunnel password overrides.
+    /// Start a single shared listener with explicit health check parameters and per-tunnel password overrides.
     pub async fn start_shared_listener_with_options(
         &self,
         settings: &SharedListenerSettings,
         registry: &Arc<TunnelRegistry>,
         lifecycle: &Arc<LifecycleController>,
-        _health: (usize, Duration),
+        health: (usize, Duration),
+        per_tunnel_passwords: std::collections::HashMap<String, String>,
+    ) -> Result<ActiveListenerInfo, CoreError> {
+        self.start_shared_listener_inner(
+            settings,
+            registry,
+            lifecycle,
+            Some(health),
+            per_tunnel_passwords,
+        )
+        .await
+    }
+
+    async fn start_shared_listener_inner(
+        &self,
+        settings: &SharedListenerSettings,
+        registry: &Arc<TunnelRegistry>,
+        lifecycle: &Arc<LifecycleController>,
+        health_override: Option<(usize, Duration)>,
         per_tunnel_passwords: std::collections::HashMap<String, String>,
     ) -> Result<ActiveListenerInfo, CoreError> {
         let bind_addr = settings.bind;
@@ -412,9 +431,21 @@ impl ListenerSupervisor {
             ))
         })?;
 
-        let router =
-            MultiTenantRouter::from_settings(settings, Arc::clone(lifecycle), Arc::clone(registry))
-                .with_per_tunnel_passwords(per_tunnel_passwords);
+        let router = match health_override {
+            Some((threshold, cooldown)) => MultiTenantRouter::from_settings_with_health(
+                settings,
+                Arc::clone(lifecycle),
+                Arc::clone(registry),
+                threshold,
+                cooldown,
+            ),
+            None => MultiTenantRouter::from_settings(
+                settings,
+                Arc::clone(lifecycle),
+                Arc::clone(registry),
+            ),
+        }
+        .with_per_tunnel_passwords(per_tunnel_passwords);
 
         let actual_addr = listener.local_addr().unwrap_or(bind_addr);
 

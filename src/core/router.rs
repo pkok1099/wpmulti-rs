@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 
 use crate::config::{AuthMode, IpMode, PoolStrategy, SharedListenerSettings, TunnelPoolSelection};
 use crate::core::lifecycle::{GuardedTunnelTarget, LifecycleController};
-use crate::core::registry::TunnelRegistry;
+use crate::core::registry::{TunnelEntry, TunnelRegistry};
 use crate::proxy::{
     DynStream, PoolKeyword, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket, TunnelRouter,
     TunnelSelector,
@@ -243,6 +243,47 @@ impl MultiTenantRouter {
         }
     }
 
+    fn select_least_conn_registry(&self, entries: &[Arc<TunnelEntry>]) -> Option<String> {
+        let mut candidates: Vec<(usize, &str)> = entries
+            .iter()
+            .filter(|e| !e.is_disabled() && e.health.can_route())
+            .map(|e| (e.stats.active_conns.load(Ordering::Relaxed), e.id.as_str()))
+            .collect();
+        candidates.sort_by_key(|(conns, _)| *conns);
+        candidates
+            .into_iter()
+            .find_map(|(_, id)| self.try_claim_candidate(id).then(|| id.to_string()))
+    }
+
+    fn select_rr_or_random_registry(
+        &self,
+        entries: &[Arc<TunnelEntry>],
+        is_random: bool,
+    ) -> Option<String> {
+        let healthy: Vec<_> = entries
+            .iter()
+            .filter(|e| !e.is_disabled() && e.health.can_route())
+            .collect();
+        if healthy.is_empty() {
+            return None;
+        }
+        let start_idx = if is_random {
+            (rand::random::<u32>() as usize) % healthy.len()
+        } else {
+            self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len()
+        };
+        for offset in 0..healthy.len() {
+            let idx = (start_idx + offset) % healthy.len();
+            if let Some(entry) = healthy.get(idx)
+                && !entry.is_disabled()
+                && entry.health.is_routable()
+            {
+                return Some(entry.id.clone());
+            }
+        }
+        None
+    }
+
     /// Select a tunnel ID directly from the registry without candidate vector or HashMap lookups.
     fn select_by_keyword_registry(&self, keyword: PoolKeyword) -> io::Result<String> {
         let entries = self.registry.all_entries();
@@ -253,56 +294,20 @@ impl MultiTenantRouter {
             ));
         }
 
-        match keyword {
-            PoolKeyword::LeastConn => {
-                let mut candidates: Vec<(usize, &str)> = entries
-                    .iter()
-                    .filter(|e| !e.is_disabled() && e.health.can_route())
-                    .map(|e| (e.stats.active_conns.load(Ordering::Relaxed), e.id.as_str()))
-                    .collect();
-                candidates.sort_by_key(|(conns, _)| *conns);
-                for (_, id) in candidates {
-                    if self.try_claim_candidate(id) {
-                        return Ok(id.to_string());
-                    }
-                }
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "no healthy tunnels available in pool",
-                ))
+        let selected = match keyword {
+            PoolKeyword::LeastConn => self.select_least_conn_registry(&entries),
+            PoolKeyword::Random => self.select_rr_or_random_registry(&entries, true),
+            PoolKeyword::RoundRobin | PoolKeyword::Auto => {
+                self.select_rr_or_random_registry(&entries, false)
             }
-            PoolKeyword::Random | PoolKeyword::RoundRobin | PoolKeyword::Auto => {
-                let healthy: Vec<_> = entries
-                    .iter()
-                    .filter(|e| !e.is_disabled() && e.health.can_route())
-                    .collect();
-                if healthy.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "no healthy tunnels available in pool",
-                    ));
-                }
-                let start_idx = match keyword {
-                    PoolKeyword::Random => (rand::random::<u32>() as usize) % healthy.len(),
-                    PoolKeyword::Auto | PoolKeyword::RoundRobin | PoolKeyword::LeastConn => {
-                        self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len()
-                    }
-                };
-                for offset in 0..healthy.len() {
-                    let idx = (start_idx + offset) % healthy.len();
-                    if let Some(entry) = healthy.get(idx)
-                        && !entry.is_disabled()
-                        && entry.health.is_routable()
-                    {
-                        return Ok(entry.id.clone());
-                    }
-                }
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "no healthy tunnels available in pool",
-                ))
-            }
-        }
+        };
+
+        selected.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no healthy tunnels available in pool",
+            )
+        })
     }
 
     /// Select a candidate tunnel with lowest active connections among healthy candidates.
