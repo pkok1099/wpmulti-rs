@@ -23,7 +23,7 @@ impl WgPeerFixture {
     }
 
     pub fn allowed_ips(mut self, ips: &[&str]) -> Self {
-        self.allowed_ips = ips.iter().map(|s| s.to_string()).collect();
+        self.allowed_ips = ips.iter().map(ToString::to_string).collect();
         self
     }
 
@@ -74,12 +74,12 @@ impl WgConfBuilder {
     }
 
     pub fn addresses(mut self, addrs: &[&str]) -> Self {
-        self.addresses = addrs.iter().map(|s| s.to_string()).collect();
+        self.addresses = addrs.iter().map(ToString::to_string).collect();
         self
     }
 
     pub fn dns(mut self, dns_servers: &[&str]) -> Self {
-        self.dns = dns_servers.iter().map(|s| s.to_string()).collect();
+        self.dns = dns_servers.iter().map(ToString::to_string).collect();
         self
     }
 
@@ -238,7 +238,7 @@ impl WpMultiTomlBuilder {
     pub fn admin(mut self, enabled: bool, bind: Option<SocketAddr>, token: Option<&str>) -> Self {
         self.admin_enabled = enabled;
         self.admin_bind = bind;
-        self.admin_token = token.map(|s| s.to_string());
+        self.admin_token = token.map(ToString::to_string);
         self
     }
 

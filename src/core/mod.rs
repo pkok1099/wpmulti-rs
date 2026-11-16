@@ -76,6 +76,61 @@ pub struct TunnelManager {
     log_buffer: crate::tui::TuiLogBuffer,
 }
 
+/// Append `id` to `selected` unless it is already present.
+fn add_unique(selected: &mut Vec<String>, id: &str) {
+    if !selected.iter().any(|existing| existing.as_str() == id) {
+        selected.push(id.to_string());
+    }
+}
+
+/// Append every sorted ID to `selected` (deduped).
+fn add_all_ids(sorted_ids: &[String], selected: &mut Vec<String>) {
+    for id in sorted_ids {
+        add_unique(selected, id);
+    }
+}
+
+/// Resolve a `1`-based inclusive range token (`a-b`) against sorted IDs.
+fn select_id_range(
+    tok: &str,
+    a: usize,
+    b: usize,
+    sorted_ids: &[String],
+    selected: &mut Vec<String>,
+) -> Result<(), CoreError> {
+    if a == 0 || b == 0 || a > b {
+        return Err(CoreError::ActivationFailed(
+            tok.to_string(),
+            "invalid 1-based range".into(),
+        ));
+    }
+    let start = a - 1;
+    let end = b.min(sorted_ids.len());
+    if let Some(slice) = sorted_ids.get(start..end) {
+        for id in slice {
+            add_unique(selected, id);
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a `1`-based index token against sorted IDs.
+fn select_id_index(
+    idx: usize,
+    sorted_ids: &[String],
+    selected: &mut Vec<String>,
+) -> Result<(), CoreError> {
+    let Some(id) = idx.checked_sub(1).and_then(|i| sorted_ids.get(i)) else {
+        return Err(CoreError::TunnelNotFound(format!(
+            "tunnel index {} out of range (1..={})",
+            idx,
+            sorted_ids.len()
+        )));
+    };
+    add_unique(selected, id);
+    Ok(())
+}
+
 impl TunnelManager {
     /// Construct a new [`TunnelManager`] from [`MainConfig`] and an initial set of [`TunnelConfig`]s.
     pub fn new(config: MainConfig, tunnels: Vec<TunnelConfig>) -> Result<Self, CoreError> {
@@ -171,61 +226,39 @@ impl TunnelManager {
             if tok.is_empty() {
                 continue;
             }
-            if tok.eq_ignore_ascii_case("all") || tok == "*" {
-                for id in &sorted_ids {
-                    if !selected.contains(id) {
-                        selected.push(id.clone());
-                    }
-                }
-                continue;
-            }
-            if let Some((a_str, b_str)) = tok.split_once('-')
-                && let (Ok(a), Ok(b)) =
-                    (a_str.trim().parse::<usize>(), b_str.trim().parse::<usize>())
-            {
-                if a == 0 || b == 0 || a > b {
-                    return Err(CoreError::ActivationFailed(
-                        tok.to_string(),
-                        "invalid 1-based range".into(),
-                    ));
-                }
-                let start = a - 1;
-                let end = b.min(sorted_ids.len());
-                if let Some(slice) = sorted_ids.get(start..end) {
-                    for id in slice {
-                        if !selected.contains(id) {
-                            selected.push(id.clone());
-                        }
-                    }
-                }
-                continue;
-            }
-            if let Ok(idx) = tok.parse::<usize>() {
-                let Some(id) = idx.checked_sub(1).and_then(|i| sorted_ids.get(i)) else {
-                    return Err(CoreError::TunnelNotFound(format!(
-                        "tunnel index {} out of range (1..={})",
-                        idx,
-                        sorted_ids.len()
-                    )));
-                };
-                if !selected.contains(id) {
-                    selected.push(id.clone());
-                }
-                continue;
-            }
-            if self.registry.get(tok).is_none() {
-                return Err(CoreError::TunnelNotFound(tok.to_string()));
-            }
-            let id = tok.to_string();
-            if !selected.contains(&id) {
-                selected.push(id);
-            }
+            self.resolve_tunnel_token(tok, &sorted_ids, &mut selected)?;
         }
 
         if selected.is_empty() {
             return Err(CoreError::TunnelNotFound(spec.to_string()));
         }
         Ok(selected)
+    }
+
+    /// Resolve one comma-separated token (`all`, `1-200`, `1`, or a tunnel ID).
+    fn resolve_tunnel_token(
+        &self,
+        tok: &str,
+        sorted_ids: &[String],
+        selected: &mut Vec<String>,
+    ) -> Result<(), CoreError> {
+        if tok.eq_ignore_ascii_case("all") || tok == "*" {
+            add_all_ids(sorted_ids, selected);
+            return Ok(());
+        }
+        if let Some((a_str, b_str)) = tok.split_once('-')
+            && let (Ok(a), Ok(b)) = (a_str.trim().parse::<usize>(), b_str.trim().parse::<usize>())
+        {
+            return select_id_range(tok, a, b, sorted_ids, selected);
+        }
+        if let Ok(idx) = tok.parse::<usize>() {
+            return select_id_index(idx, sorted_ids, selected);
+        }
+        if self.registry.get(tok).is_none() {
+            return Err(CoreError::TunnelNotFound(tok.to_string()));
+        }
+        add_unique(selected, tok);
+        Ok(())
     }
 
     /// Enable or disable one or more tunnels (`A`, `1`, `1-200`, `all`) in runtime and persist

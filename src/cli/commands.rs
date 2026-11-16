@@ -148,7 +148,8 @@ pub async fn cmd_run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let saved_config_path = config_path.clone();
     let mut config = if let Some(path) = config_path {
-        let content = fs::read_to_string(&path)
+        let content = tokio::fs::read_to_string(&path)
+            .await
             .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
         MainConfig::from_toml_str(&content)
             .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?

@@ -387,6 +387,18 @@ struct TcpConnState {
     client_seq: u32,
 }
 
+/// Parameters for building one synthetic TCP packet (reply direction).
+struct TcpPacketSpec<'a> {
+    src: SocketAddr,
+    dst: SocketAddr,
+    seq: u32,
+    ack: Option<u32>,
+    syn: bool,
+    fin: bool,
+    psh: bool,
+    payload: &'a [u8],
+}
+
 pub struct MockIpEngine {
     mock_ipv4: Ipv4Addr,
     mock_ipv6: Ipv6Addr,
@@ -463,38 +475,32 @@ impl MockIpEngine {
                     client_seq,
                 },
             );
-            return self.build_tcp(
-                dst_ip,
-                src_ip,
-                dst_port,
-                src_port,
-                server_isn,
-                client_seq,
-                true,
-                true,
-                false,
-                false,
-                &[],
-            );
+            return self.build_tcp(TcpPacketSpec {
+                src: SocketAddr::new(dst_ip, dst_port),
+                dst: SocketAddr::new(src_ip, src_port),
+                seq: server_isn,
+                ack: Some(client_seq),
+                syn: true,
+                fin: false,
+                psh: false,
+                payload: &[],
+            });
         }
 
         if tcp.fin() {
             self.stats.tcp_closed.fetch_add(1, Ordering::Relaxed);
             let server_seq = self.tcp_conns.remove(&key).map_or(1000, |st| st.server_seq);
             let client_seq = tcp.sequence_number().wrapping_add(1);
-            return self.build_tcp(
-                dst_ip,
-                src_ip,
-                dst_port,
-                src_port,
-                server_seq,
-                client_seq,
-                false,
-                true,
-                true,
-                false,
-                &[],
-            );
+            return self.build_tcp(TcpPacketSpec {
+                src: SocketAddr::new(dst_ip, dst_port),
+                dst: SocketAddr::new(src_ip, src_port),
+                seq: server_seq,
+                ack: Some(client_seq),
+                syn: false,
+                fin: true,
+                psh: false,
+                payload: &[],
+            });
         }
 
         if tcp.rst() {
@@ -522,10 +528,16 @@ impl MockIpEngine {
             )
         };
 
-        self.build_tcp(
-            dst_ip, src_ip, dst_port, src_port, server_seq, client_seq, false, true, false, true,
+        self.build_tcp(TcpPacketSpec {
+            src: SocketAddr::new(dst_ip, dst_port),
+            dst: SocketAddr::new(src_ip, src_port),
+            seq: server_seq,
+            ack: Some(client_seq),
+            syn: false,
+            fin: false,
+            psh: true,
             payload,
-        )
+        })
     }
 
     fn process_udp_packet(
@@ -598,57 +610,52 @@ impl MockIpEngine {
         Some(resp)
     }
 
-    fn build_tcp(
-        &self,
-        src_ip: IpAddr,
-        dst_ip: IpAddr,
-        src_port: u16,
-        dst_port: u16,
-        seq: u32,
-        ack: u32,
-        syn: bool,
-        ack_flag: bool,
-        fin: bool,
-        psh: bool,
-        payload: &[u8],
-    ) -> Option<Vec<u8>> {
+    fn build_tcp(&self, spec: TcpPacketSpec<'_>) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
-        match (src_ip, dst_ip) {
-            (IpAddr::V4(s), IpAddr::V4(d)) => {
-                let mut b = PacketBuilder::ipv4(s.octets(), d.octets(), 64)
-                    .tcp(src_port, dst_port, seq, 65535);
-                if syn {
+        match (spec.src, spec.dst) {
+            (SocketAddr::V4(s), SocketAddr::V4(d)) => {
+                let mut b = PacketBuilder::ipv4(s.ip().octets(), d.ip().octets(), 64).tcp(
+                    s.port(),
+                    d.port(),
+                    spec.seq,
+                    65535,
+                );
+                if spec.syn {
                     b = b.syn();
                 }
-                if ack_flag {
+                if let Some(ack) = spec.ack {
                     b = b.ack(ack);
                 }
-                if fin {
+                if spec.fin {
                     b = b.fin();
                 }
-                if psh {
+                if spec.psh {
                     b = b.psh();
                 }
-                buf.reserve(b.size(payload.len()));
-                b.write(&mut buf, payload).ok()?;
+                buf.reserve(b.size(spec.payload.len()));
+                b.write(&mut buf, spec.payload).ok()?;
             }
-            (IpAddr::V6(s), IpAddr::V6(d)) => {
-                let mut b = PacketBuilder::ipv6(s.octets(), d.octets(), 64)
-                    .tcp(src_port, dst_port, seq, 65535);
-                if syn {
+            (SocketAddr::V6(s), SocketAddr::V6(d)) => {
+                let mut b = PacketBuilder::ipv6(s.ip().octets(), d.ip().octets(), 64).tcp(
+                    s.port(),
+                    d.port(),
+                    spec.seq,
+                    65535,
+                );
+                if spec.syn {
                     b = b.syn();
                 }
-                if ack_flag {
+                if let Some(ack) = spec.ack {
                     b = b.ack(ack);
                 }
-                if fin {
+                if spec.fin {
                     b = b.fin();
                 }
-                if psh {
+                if spec.psh {
                     b = b.psh();
                 }
-                buf.reserve(b.size(payload.len()));
-                b.write(&mut buf, payload).ok()?;
+                buf.reserve(b.size(spec.payload.len()));
+                b.write(&mut buf, spec.payload).ok()?;
             }
             _ => return None,
         }

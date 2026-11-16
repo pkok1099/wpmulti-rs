@@ -20,6 +20,7 @@ pub use wg_conf::{
 };
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Self-contained WireGuard tunnel configuration indexed by unique ID.
@@ -48,7 +49,7 @@ pub fn load_tunnel_config_from_file<P: AsRef<Path>>(path: P) -> Result<TunnelCon
     let path = path.as_ref();
     let id = path
         .file_stem()
-        .and_then(|s| s.to_str())
+        .and_then(OsStr::to_str)
         .ok_or_else(|| {
             ConfigError::InvalidTunnelId(format!(
                 "Path '{}' has no valid filename stem",
@@ -121,7 +122,7 @@ pub fn load_tunnel_configs_from_dir<P: AsRef<Path>>(
             continue;
         }
         let path = entry.path();
-        if let Some(ext) = path.extension().and_then(|s| s.to_str())
+        if let Some(ext) = path.extension().and_then(OsStr::to_str)
             && ext.eq_ignore_ascii_case("conf")
         {
             entries.push(path);
@@ -137,7 +138,7 @@ pub fn load_tunnel_configs_from_dir<P: AsRef<Path>>(
     for path in entries {
         let id = path
             .file_stem()
-            .and_then(|s| s.to_str())
+            .and_then(OsStr::to_str)
             .ok_or_else(|| {
                 ConfigError::InvalidTunnelId(format!(
                     "Path '{}' has no valid filename stem",

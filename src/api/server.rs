@@ -229,8 +229,6 @@ async fn read_admin_request_bytes<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
 ) -> Result<Vec<u8>, ()> {
     const MAX_ADMIN_HEADER_BYTES: usize = 65536;
-    const MAX_ADMIN_BODY_BYTES: usize = 65536;
-    const MAX_ADMIN_TOTAL_BYTES: usize = MAX_ADMIN_HEADER_BYTES + MAX_ADMIN_BODY_BYTES;
 
     let mut buf = Vec::with_capacity(4096);
     let mut temp = [0u8; 1024];
@@ -246,68 +244,98 @@ async fn read_admin_request_bytes<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             buf.extend_from_slice(chunk);
         }
 
-        let search_start = prev_len.saturating_sub(3);
-        if let Some(rel_pos) = buf
-            .get(search_start..)
-            .and_then(|tail| tail.windows(4).position(|w| w == b"\r\n\r\n"))
-        {
-            let pos = search_start + rel_pos;
-            if pos + 4 > MAX_ADMIN_HEADER_BYTES {
-                let resp = HttpResponse::bad_request("Request header too large");
-                let _ = stream.write_all(&resp.to_bytes()).await;
-                return Err(());
-            }
-            let header_bytes = buf.get(..pos).unwrap_or_default();
-            let content_len = match parse_request_content_length(header_bytes) {
-                Ok(len) => len,
-                Err(resp) => {
-                    let _ = stream.write_all(&resp.to_bytes()).await;
-                    return Err(());
-                }
-            };
-
-            if content_len > MAX_ADMIN_BODY_BYTES {
-                let resp = HttpResponse::payload_too_large("Request body too large (max 64 KiB)");
-                let _ = stream.write_all(&resp.to_bytes()).await;
-                return Err(());
-            }
-
-            let required_total = pos + 4 + content_len;
-            if required_total > MAX_ADMIN_TOTAL_BYTES {
-                let resp = HttpResponse::payload_too_large("Request too large");
-                let _ = stream.write_all(&resp.to_bytes()).await;
-                return Err(());
-            }
-
-            while buf.len() < required_total {
-                let n = match stream.read(&mut temp).await {
-                    Ok(0) => {
-                        let resp = HttpResponse::bad_request("Truncated request body");
-                        let _ = stream.write_all(&resp.to_bytes()).await;
-                        return Err(());
-                    }
-                    Ok(n) => n,
-                    Err(_) => return Err(()),
-                };
-                if let Some(chunk) = temp.get(..n) {
-                    buf.extend_from_slice(chunk);
-                }
-                if buf.len() > MAX_ADMIN_TOTAL_BYTES {
-                    let resp = HttpResponse::payload_too_large("Request too large");
-                    let _ = stream.write_all(&resp.to_bytes()).await;
-                    return Err(());
-                }
-            }
-            buf.truncate(required_total);
-            break;
+        if let Some(pos) = find_header_end(&buf, prev_len) {
+            return read_admin_request_body(stream, buf, pos).await;
         }
 
         if buf.len() > MAX_ADMIN_HEADER_BYTES {
-            let resp = HttpResponse::bad_request("Request header too large");
-            let _ = stream.write_all(&resp.to_bytes()).await;
+            send_admin_error(
+                stream,
+                HttpResponse::bad_request("Request header too large"),
+            )
+            .await;
             return Err(());
         }
     }
+    Ok(buf)
+}
+
+/// Locate the end of the HTTP header (`\r\n\r\n`) in `buf`, if fully received.
+fn find_header_end(buf: &[u8], prev_len: usize) -> Option<usize> {
+    let search_start = prev_len.saturating_sub(3);
+    buf.get(search_start..)
+        .and_then(|tail| tail.windows(4).position(|w| w == b"\r\n\r\n"))
+        .map(|rel_pos| search_start + rel_pos)
+}
+
+/// Write an error response to the admin client (best effort).
+async fn send_admin_error<S: AsyncWriteExt + Unpin>(stream: &mut S, resp: HttpResponse) {
+    let _ = stream.write_all(&resp.to_bytes()).await;
+}
+
+/// Validate the header and read the remaining body bytes for a request whose
+/// header ends at `pos`; `buf` already holds the bytes read so far.
+async fn read_admin_request_body<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    mut buf: Vec<u8>,
+    pos: usize,
+) -> Result<Vec<u8>, ()> {
+    const MAX_ADMIN_HEADER_BYTES: usize = 65536;
+    const MAX_ADMIN_BODY_BYTES: usize = 65536;
+    const MAX_ADMIN_TOTAL_BYTES: usize = MAX_ADMIN_HEADER_BYTES + MAX_ADMIN_BODY_BYTES;
+
+    let mut temp = [0u8; 1024];
+
+    if pos + 4 > MAX_ADMIN_HEADER_BYTES {
+        send_admin_error(
+            stream,
+            HttpResponse::bad_request("Request header too large"),
+        )
+        .await;
+        return Err(());
+    }
+    let header_bytes = buf.get(..pos).unwrap_or_default();
+    let content_len = match parse_request_content_length(header_bytes) {
+        Ok(len) => len,
+        Err(resp) => {
+            send_admin_error(stream, resp).await;
+            return Err(());
+        }
+    };
+
+    if content_len > MAX_ADMIN_BODY_BYTES {
+        send_admin_error(
+            stream,
+            HttpResponse::payload_too_large("Request body too large (max 64 KiB)"),
+        )
+        .await;
+        return Err(());
+    }
+
+    let required_total = pos + 4 + content_len;
+    if required_total > MAX_ADMIN_TOTAL_BYTES {
+        send_admin_error(stream, HttpResponse::payload_too_large("Request too large")).await;
+        return Err(());
+    }
+
+    while buf.len() < required_total {
+        let n = match stream.read(&mut temp).await {
+            Ok(0) => {
+                send_admin_error(stream, HttpResponse::bad_request("Truncated request body")).await;
+                return Err(());
+            }
+            Ok(n) => n,
+            Err(_) => return Err(()),
+        };
+        if let Some(chunk) = temp.get(..n) {
+            buf.extend_from_slice(chunk);
+        }
+        if buf.len() > MAX_ADMIN_TOTAL_BYTES {
+            send_admin_error(stream, HttpResponse::payload_too_large("Request too large")).await;
+            return Err(());
+        }
+    }
+    buf.truncate(required_total);
     Ok(buf)
 }
 

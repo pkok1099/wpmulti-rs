@@ -711,26 +711,7 @@ impl MainConfig {
         let mut listener_names = HashSet::new();
         let mut bound_addrs: Vec<SocketAddr> = Vec::new();
 
-        if self.admin.enabled {
-            if self.admin.bind.port() == 0 {
-                return Err(ConfigError::Validation(
-                    "admin.bind cannot use port 0 when admin is enabled".into(),
-                ));
-            }
-            if self.admin.auth_token.as_deref() == Some("") {
-                return Err(ConfigError::Validation(
-                    "admin.auth_token cannot be an empty string".into(),
-                ));
-            }
-            if !self.admin.bind.ip().is_loopback()
-                && self.admin.auth_token.as_deref().is_none_or(str::is_empty)
-            {
-                return Err(ConfigError::Validation(
-                    "admin.auth_token is required when admin.bind is not a loopback address".into(),
-                ));
-            }
-            bound_addrs.push(self.admin.bind);
-        }
+        self.validate_admin_bind(&mut bound_addrs)?;
 
         for listener in &self.shared_listeners {
             if listener.name.trim().is_empty() {
@@ -750,13 +731,7 @@ impl MainConfig {
                     listener.name
                 )));
             }
-            let conflicts = bound_addrs.iter().any(|existing| {
-                existing.port() == listener.bind.port()
-                    && (existing.ip() == listener.bind.ip()
-                        || existing.ip().is_unspecified()
-                        || listener.bind.ip().is_unspecified())
-            });
-            if conflicts {
+            if Self::bind_conflicts(&bound_addrs, listener.bind) {
                 return Err(ConfigError::Validation(format!(
                     "Port conflict: shared_listener '{}' bind address '{}' is already in use",
                     listener.name, listener.bind
@@ -769,42 +744,83 @@ impl MainConfig {
                     listener.name, msg
                 )));
             }
-            if listener.auth_mode == AuthMode::Global {
-                match &listener.global_password {
-                    Some(pwd) if !pwd.is_empty() => {}
-                    _ => {
-                        return Err(ConfigError::Validation(format!(
-                            "shared_listener '{}' specifies auth_mode = 'global' but global_password is missing or empty",
-                            listener.name
-                        )));
-                    }
-                }
-            }
-            if listener.auth_mode == AuthMode::PerTunnel {
-                if let Some(pwd) = &listener.global_password
-                    && pwd.is_empty()
-                {
+            self.validate_listener_auth(listener)?;
+        }
+        Ok(())
+    }
+
+    /// Validate the admin bind address (when enabled) and reserve it for conflict checks.
+    fn validate_admin_bind(&self, bound_addrs: &mut Vec<SocketAddr>) -> Result<(), ConfigError> {
+        if !self.admin.enabled {
+            return Ok(());
+        }
+        if self.admin.bind.port() == 0 {
+            return Err(ConfigError::Validation(
+                "admin.bind cannot use port 0 when admin is enabled".into(),
+            ));
+        }
+        if self.admin.auth_token.as_deref() == Some("") {
+            return Err(ConfigError::Validation(
+                "admin.auth_token cannot be an empty string".into(),
+            ));
+        }
+        if !self.admin.bind.ip().is_loopback()
+            && self.admin.auth_token.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(ConfigError::Validation(
+                "admin.auth_token is required when admin.bind is not a loopback address".into(),
+            ));
+        }
+        bound_addrs.push(self.admin.bind);
+        Ok(())
+    }
+
+    /// Validate the auth settings of one shared listener.
+    fn validate_listener_auth(&self, listener: &SharedListenerSettings) -> Result<(), ConfigError> {
+        if listener.auth_mode == AuthMode::Global {
+            match &listener.global_password {
+                Some(pwd) if !pwd.is_empty() => {}
+                _ => {
                     return Err(ConfigError::Validation(format!(
-                        "shared_listener '{}' specifies empty global_password",
+                        "shared_listener '{}' specifies auth_mode = 'global' but global_password is missing or empty",
                         listener.name
                     )));
                 }
-                let has_global = listener
-                    .global_password
-                    .as_ref()
-                    .is_some_and(|p| !p.is_empty());
-                let has_override = self
-                    .per_tunnel
-                    .overrides
-                    .values()
-                    .any(|o| o.password.as_ref().is_some_and(|p| !p.is_empty()));
-                if !has_global && !has_override && !listener.allow_anonymous {
-                    return Err(ConfigError::Validation(format!(
-                        "shared_listener '{}' specifies auth_mode = 'per_tunnel' but neither global_password nor any per_tunnel.overrides.<id>.password is configured",
-                        listener.name
-                    )));
-                }
             }
+        }
+        if listener.auth_mode == AuthMode::PerTunnel {
+            self.validate_per_tunnel_auth(listener)?;
+        }
+        Ok(())
+    }
+
+    /// Validate `per_tunnel` auth: a password must exist somewhere unless anonymous is allowed.
+    fn validate_per_tunnel_auth(
+        &self,
+        listener: &SharedListenerSettings,
+    ) -> Result<(), ConfigError> {
+        if let Some(pwd) = &listener.global_password
+            && pwd.is_empty()
+        {
+            return Err(ConfigError::Validation(format!(
+                "shared_listener '{}' specifies empty global_password",
+                listener.name
+            )));
+        }
+        let has_global = listener
+            .global_password
+            .as_ref()
+            .is_some_and(|p| !p.is_empty());
+        let has_override = self
+            .per_tunnel
+            .overrides
+            .values()
+            .any(|o| o.password.as_ref().is_some_and(|p| !p.is_empty()));
+        if !has_global && !has_override && !listener.allow_anonymous {
+            return Err(ConfigError::Validation(format!(
+                "shared_listener '{}' specifies auth_mode = 'per_tunnel' but neither global_password nor any per_tunnel.overrides.<id>.password is configured",
+                listener.name
+            )));
         }
         Ok(())
     }
@@ -879,6 +895,17 @@ impl MainConfig {
 
     fn ips_overlap(a: IpAddr, b: IpAddr) -> bool {
         a == b || (a.is_ipv4() == b.is_ipv4() && (a.is_unspecified() || b.is_unspecified()))
+    }
+
+    /// True when `bind` would clash with an already-reserved address (same port and
+    /// same, wildcard, or overlapping IP).
+    fn bind_conflicts(bound_addrs: &[SocketAddr], bind: SocketAddr) -> bool {
+        bound_addrs.iter().any(|existing| {
+            existing.port() == bind.port()
+                && (existing.ip() == bind.ip()
+                    || existing.ip().is_unspecified()
+                    || bind.ip().is_unspecified())
+        })
     }
 
     fn validate_port_conflicts(&self) -> Result<(), ConfigError> {

@@ -333,12 +333,8 @@ pub(crate) async fn connect_via_router(
     let mut tried_ids: Vec<String> = Vec::with_capacity(max_attempts);
     let failover_deadline = tokio::time::Instant::now() + MAX_POOL_FAILOVER_BUDGET;
     for attempt in 0..max_attempts {
-        if attempt > 0 {
-            let remaining =
-                failover_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining < MIN_ATTEMPT_TIMEOUT {
-                break;
-            }
+        if !within_failover_budget(attempt, failover_deadline) {
+            break;
         }
         let target_tunnel = match router.select_tunnel(selector).await {
             Ok(t) => t,
@@ -354,42 +350,18 @@ pub(crate) async fn connect_via_router(
             tried_ids.push(id.to_string());
         }
 
-        let attempt_fut = async {
-            match target {
-                TargetAddr::Ip(dst_addr) => target_tunnel
-                    .tcp_connect(*dst_addr)
-                    .await
-                    .map_err(RouterConnectError::TcpConnect),
-                TargetAddr::Domain(domain, port) => {
-                    match resolve_and_validate_domain(target_tunnel.as_ref(), domain).await {
-                        Ok(ips) => connect_validated_addrs(target_tunnel.as_ref(), &ips, *port)
-                            .await
-                            .map_err(RouterConnectError::TcpConnect),
-                        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                            Err(RouterConnectError::ForbiddenDestination(e))
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to resolve target domain '{}' (attempt {}/{}): {:?}",
-                                domain,
-                                attempt + 1,
-                                max_attempts,
-                                e
-                            );
-                            Err(RouterConnectError::DnsResolution(e))
-                        }
-                    }
-                }
-            }
-        };
-
         let attempt_res = if max_attempts > 1 {
             let remaining =
                 failover_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            if let Ok(res) = tokio::time::timeout(remaining, attempt_fut).await {
+            if let Ok(res) = tokio::time::timeout(
+                remaining,
+                connect_target(&target_tunnel, target, attempt, max_attempts),
+            )
+            .await
+            {
                 res
             } else {
                 last_err = Some(RouterConnectError::TcpConnect(io::Error::new(
@@ -399,7 +371,7 @@ pub(crate) async fn connect_via_router(
                 break;
             }
         } else {
-            attempt_fut.await
+            connect_target(&target_tunnel, target, attempt, max_attempts).await
         };
 
         match attempt_res {
@@ -417,6 +389,49 @@ pub(crate) async fn connect_via_router(
             "no healthy tunnels available in pool",
         ))
     }))
+}
+
+/// True while the pool-failover budget still allows another attempt.
+fn within_failover_budget(attempt: usize, deadline: tokio::time::Instant) -> bool {
+    if attempt == 0 {
+        return true;
+    }
+    deadline.saturating_duration_since(tokio::time::Instant::now()) >= MIN_ATTEMPT_TIMEOUT
+}
+
+/// Attempt one connection through `target_tunnel` for `target`.
+async fn connect_target(
+    target_tunnel: &Arc<dyn ProxyTunnelTarget>,
+    target: &TargetAddr,
+    attempt: usize,
+    max_attempts: usize,
+) -> Result<DynStream, RouterConnectError> {
+    match target {
+        TargetAddr::Ip(dst_addr) => target_tunnel
+            .tcp_connect(*dst_addr)
+            .await
+            .map_err(RouterConnectError::TcpConnect),
+        TargetAddr::Domain(domain, port) => {
+            match resolve_and_validate_domain(target_tunnel.as_ref(), domain).await {
+                Ok(ips) => connect_validated_addrs(target_tunnel.as_ref(), &ips, *port)
+                    .await
+                    .map_err(RouterConnectError::TcpConnect),
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    Err(RouterConnectError::ForbiddenDestination(e))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to resolve target domain '{}' (attempt {}/{}): {:?}",
+                        domain,
+                        attempt + 1,
+                        max_attempts,
+                        e
+                    );
+                    Err(RouterConnectError::DnsResolution(e))
+                }
+            }
+        }
+    }
 }
 
 /// Dial TCP sequentially over validated candidate `IpAddr`s on `port` without re-resolving DNS,
@@ -897,6 +912,38 @@ impl PoolRouter {
         self
     }
 
+    /// `DefaultPool` when anonymous access is allowed, else auth is required.
+    const fn anonymous_or_required(&self) -> Result<TunnelSelector, ProxyAuthError> {
+        if self.allow_anonymous {
+            Ok(TunnelSelector::DefaultPool)
+        } else {
+            Err(ProxyAuthError::AuthRequired)
+        }
+    }
+
+    /// Check `pass` against the global password, falling back to anonymous access.
+    fn check_global_password(
+        &self,
+        user: &str,
+        pass: &str,
+    ) -> Result<TunnelSelector, ProxyAuthError> {
+        match &self.global_password {
+            Some(expected_pass) if constant_time_eq_str(pass, expected_pass) => {
+                Ok(TunnelSelector::parse(user))
+            }
+            None if self.allow_anonymous => Ok(TunnelSelector::parse(user)),
+            _ => Err(ProxyAuthError::InvalidCredentials),
+        }
+    }
+
+    /// The configured per-tunnel password for a `ById` selector, if any.
+    fn per_tunnel_password(&self, selector: &TunnelSelector) -> Option<String> {
+        let TunnelSelector::ById(id) = selector else {
+            return None;
+        };
+        self.per_tunnel_passwords.read().get(id).cloned()
+    }
+
     /// Register or update a per-tunnel password override.
     pub fn set_tunnel_password(&self, id: impl Into<String>, password: impl Into<String>) {
         self.per_tunnel_passwords
@@ -950,55 +997,28 @@ impl TunnelRouter for PoolRouter {
         credentials: Option<(&str, &str)>,
     ) -> Result<TunnelSelector, ProxyAuthError> {
         match self.auth_mode {
-            AuthMode::None => {
-                if let Some((user, _pass)) = credentials {
-                    Ok(TunnelSelector::parse(user))
-                } else {
-                    Ok(TunnelSelector::DefaultPool)
-                }
-            }
+            AuthMode::None => match credentials {
+                Some((user, _pass)) => Ok(TunnelSelector::parse(user)),
+                None => Ok(TunnelSelector::DefaultPool),
+            },
             AuthMode::Global => match credentials {
-                None => {
-                    if self.allow_anonymous {
-                        Ok(TunnelSelector::DefaultPool)
-                    } else {
-                        Err(ProxyAuthError::AuthRequired)
-                    }
-                }
-                Some((user, pass)) => match &self.global_password {
-                    Some(expected_pass) if constant_time_eq_str(pass, expected_pass) => {
-                        Ok(TunnelSelector::parse(user))
-                    }
-                    None if self.allow_anonymous => Ok(TunnelSelector::parse(user)),
-                    _ => Err(ProxyAuthError::InvalidCredentials),
-                },
+                None => self.anonymous_or_required(),
+                Some((user, pass)) => self.check_global_password(user, pass),
             },
             AuthMode::PerTunnel => match credentials {
-                None => {
-                    if self.allow_anonymous {
-                        Ok(TunnelSelector::DefaultPool)
-                    } else {
-                        Err(ProxyAuthError::AuthRequired)
-                    }
-                }
+                None => self.anonymous_or_required(),
                 Some((user, pass)) => {
                     let selector = TunnelSelector::parse(user);
-                    if let TunnelSelector::ById(ref id) = selector
-                        && let Some(tunnel_pass) = self.per_tunnel_passwords.read().get(id)
-                    {
-                        return if constant_time_eq_str(pass, tunnel_pass) {
-                            Ok(selector)
-                        } else {
-                            Err(ProxyAuthError::InvalidCredentials)
-                        };
-                    }
-                    match &self.global_password {
-                        Some(expected_pass) if constant_time_eq_str(pass, expected_pass) => {
-                            Ok(selector)
-                        }
-                        None if self.allow_anonymous => Ok(selector),
-                        _ => Err(ProxyAuthError::InvalidCredentials),
-                    }
+                    self.per_tunnel_password(&selector).map_or_else(
+                        || self.check_global_password(user, pass),
+                        |tunnel_pass| {
+                            if constant_time_eq_str(pass, &tunnel_pass) {
+                                Ok(selector)
+                            } else {
+                                Err(ProxyAuthError::InvalidCredentials)
+                            }
+                        },
+                    )
                 }
             },
         }
