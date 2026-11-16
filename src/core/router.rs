@@ -736,6 +736,10 @@ impl ProxyTunnelTarget for IpFilteredTunnelTarget {
         self.inner
             .resolve_all_in_tunnel_with_mode(domain, self.ip_mode)
     }
+
+    fn connect_timeout(&self) -> Duration {
+        self.inner.connect_timeout()
+    }
 }
 
 /// UDP socket wrapper enforcing an [`IpMode`] filter on outbound datagrams.

@@ -10,12 +10,22 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::{AuthMode, PoolStrategy};
-use crate::netstack::{VirtualNetworkStack, VirtualUdpSocket};
+use crate::netstack::{DEFAULT_CONNECT_TIMEOUT, VirtualNetworkStack, VirtualUdpSocket};
+
+/// Maximum number of candidate IP addresses attempted per resolved domain.
+pub(crate) const MAX_CANDIDATE_IPS: usize = 8;
+
+/// Minimum timeout budget allocated to each candidate dial/send attempt while budget remains.
+pub(crate) const MIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Default overall timeout budget for validated multi-address UDP datagram sends.
+pub(crate) const DEFAULT_UDP_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Returns `true` if `v4` is a forbidden IPv4 destination (unspecified, link-local, multicast, or broadcast).
 pub(crate) const fn is_forbidden_ipv4(v4: Ipv4Addr) -> bool {
@@ -207,6 +217,63 @@ pub trait ProxyTunnelTarget: Send + Sync {
     fn resolve_all_in_tunnel<'a>(&'a self, domain: &'a str) -> ResolveAllFut<'a> {
         Box::pin(async move { Ok(vec![self.resolve_in_tunnel(domain).await?]) })
     }
+
+    /// Maximum total timeout budget for connecting across candidate addresses.
+    fn connect_timeout(&self) -> Duration {
+        DEFAULT_CONNECT_TIMEOUT
+    }
+}
+
+/// Filter out forbidden destination IPs and cap candidates at [`MAX_CANDIDATE_IPS`],
+/// preserving the caller's address-family priority ordering.
+fn collect_bounded_candidates<I>(iter: I) -> Vec<SocketAddr>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    iter.into_iter()
+        .filter(|addr| !is_forbidden_destination_ip(addr.ip()))
+        .take(MAX_CANDIDATE_IPS)
+        .collect()
+}
+
+/// Build bounded TCP socket candidates from validated IP addresses while preserving order.
+pub(crate) fn bound_candidate_addrs(ips: &[IpAddr], port: u16) -> Vec<SocketAddr> {
+    collect_bounded_candidates(ips.iter().copied().map(|ip| SocketAddr::new(ip, port)))
+}
+
+/// Filter and bound UDP target socket addresses to [`MAX_CANDIDATE_IPS`] while preserving order.
+pub(crate) fn bound_candidate_socket_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    collect_bounded_candidates(addrs.iter().copied())
+}
+
+/// Compute the timeout budget for the next candidate attempt given the overall deadline.
+///
+/// Returns `None` once the total deadline has elapsed.
+pub(crate) fn next_attempt_timeout(
+    deadline: tokio::time::Instant,
+    remaining_attempts: usize,
+) -> Option<Duration> {
+    let remaining_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining_budget.is_zero() || remaining_attempts == 0 {
+        return None;
+    }
+    let divisor = u32::try_from(remaining_attempts).unwrap_or(u32::MAX);
+    let fair_share = remaining_budget / divisor;
+    Some(fair_share.max(MIN_ATTEMPT_TIMEOUT).min(remaining_budget))
+}
+
+fn empty_candidates_error(was_empty: bool, action: &str) -> io::Error {
+    if was_empty {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no candidate IP addresses to {action}"),
+        )
+    } else {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("all candidate IP addresses for {action} are forbidden"),
+        )
+    }
 }
 
 /// Resolve `domain` via `tunnel` and fail-closed reject if ANY returned IP is forbidden.
@@ -230,24 +297,118 @@ pub(crate) async fn resolve_and_validate_domain(
     Ok(ips)
 }
 
-/// Dial TCP sequentially over validated candidate `IpAddr`s on `port` without re-resolving DNS.
+/// Dial TCP sequentially over validated candidate `IpAddr`s on `port` without re-resolving DNS,
+/// using the tunnel's configured connection timeout as the total deadline budget.
 pub(crate) async fn connect_validated_addrs(
     tunnel: &dyn ProxyTunnelTarget,
     ips: &[IpAddr],
     port: u16,
 ) -> io::Result<DynStream> {
+    connect_validated_addrs_with_timeout(tunnel, ips, port, tunnel.connect_timeout()).await
+}
+
+/// Dial TCP sequentially over at most [`MAX_CANDIDATE_IPS`] validated candidates bounded by
+/// `total_timeout` and proportional per-attempt timeout sharing.
+pub(crate) async fn connect_validated_addrs_with_timeout(
+    tunnel: &dyn ProxyTunnelTarget,
+    ips: &[IpAddr],
+    port: u16,
+    total_timeout: Duration,
+) -> io::Result<DynStream> {
+    let candidates = bound_candidate_addrs(ips, port);
+    if candidates.is_empty() {
+        return Err(empty_candidates_error(ips.is_empty(), "connect"));
+    }
+
+    let deadline = tokio::time::Instant::now() + total_timeout;
+    let total_candidates = candidates.len();
     let mut last_err = None;
-    for &ip in ips {
-        let dst_addr = SocketAddr::new(ip, port);
-        match tunnel.tcp_connect(dst_addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last_err = Some(e),
+
+    for (idx, dst_addr) in candidates.into_iter().enumerate() {
+        let Some(attempt_timeout) = next_attempt_timeout(deadline, total_candidates - idx) else {
+            return Err(last_err.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "connection attempt deadline exceeded",
+                )
+            }));
+        };
+
+        match tokio::time::timeout(attempt_timeout, tunnel.tcp_connect(dst_addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {
+                last_err = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect attempt to {dst_addr} timed out after {attempt_timeout:?}"),
+                ));
+            }
         }
     }
+
     Err(last_err.unwrap_or_else(|| {
         io::Error::new(
-            io::ErrorKind::NotFound,
-            "no candidate IP addresses to connect",
+            io::ErrorKind::TimedOut,
+            "all candidate connection attempts failed",
+        )
+    }))
+}
+
+/// Send a UDP datagram sequentially over validated candidate `SocketAddr`s within the default
+/// total timeout budget.
+pub(crate) async fn send_udp_to_validated_addrs(
+    virtual_udp: &dyn ProxyUdpSocket,
+    payload: &[u8],
+    addrs: &[SocketAddr],
+) -> io::Result<()> {
+    send_udp_to_validated_addrs_with_timeout(virtual_udp, payload, addrs, DEFAULT_UDP_SEND_TIMEOUT)
+        .await
+}
+
+/// Send a UDP datagram sequentially over at most [`MAX_CANDIDATE_IPS`] validated candidates
+/// bounded by `total_timeout` and proportional per-attempt timeout sharing.
+pub(crate) async fn send_udp_to_validated_addrs_with_timeout(
+    virtual_udp: &dyn ProxyUdpSocket,
+    payload: &[u8],
+    addrs: &[SocketAddr],
+    total_timeout: Duration,
+) -> io::Result<()> {
+    let candidates = bound_candidate_socket_addrs(addrs);
+    if candidates.is_empty() {
+        return Err(empty_candidates_error(addrs.is_empty(), "send UDP"));
+    }
+
+    let deadline = tokio::time::Instant::now() + total_timeout;
+    let total_candidates = candidates.len();
+    let mut last_err = None;
+
+    for (idx, target_sock) in candidates.into_iter().enumerate() {
+        let Some(attempt_timeout) = next_attempt_timeout(deadline, total_candidates - idx) else {
+            return Err(last_err.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "UDP send attempt deadline exceeded",
+                )
+            }));
+        };
+
+        match tokio::time::timeout(attempt_timeout, virtual_udp.send_to(payload, target_sock)).await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {
+                last_err = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("UDP send to {target_sock} timed out after {attempt_timeout:?}"),
+                ));
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "all candidate UDP send attempts failed",
         )
     }))
 }
@@ -284,6 +445,10 @@ impl ProxyTunnelTarget for VirtualNetworkStack {
     fn resolve_all_in_tunnel<'a>(&'a self, domain: &'a str) -> ResolveAllFut<'a> {
         Box::pin(async move { self.resolve_all_in_tunnel(domain).await })
     }
+
+    fn connect_timeout(&self) -> Duration {
+        self.connect_timeout()
+    }
 }
 
 impl<T: ProxyTunnelTarget + ?Sized> ProxyTunnelTarget for Arc<T> {
@@ -310,6 +475,10 @@ impl<T: ProxyTunnelTarget + ?Sized> ProxyTunnelTarget for Arc<T> {
 
     fn resolve_all_in_tunnel<'a>(&'a self, domain: &'a str) -> ResolveAllFut<'a> {
         (**self).resolve_all_in_tunnel(domain)
+    }
+
+    fn connect_timeout(&self) -> Duration {
+        (**self).connect_timeout()
     }
 }
 

@@ -1633,3 +1633,276 @@ async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
         ]
     );
 }
+
+struct BlackholeCapMockTarget {
+    blackhole_ips: std::collections::HashSet<IpAddr>,
+    refused_ips: std::collections::HashSet<IpAddr>,
+    dialed_addrs: parking_lot::Mutex<Vec<SocketAddr>>,
+}
+
+impl BlackholeCapMockTarget {
+    fn new(blackhole_ips: Vec<IpAddr>, refused_ips: Vec<IpAddr>) -> Self {
+        Self {
+            blackhole_ips: blackhole_ips.into_iter().collect(),
+            refused_ips: refused_ips.into_iter().collect(),
+            dialed_addrs: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ProxyTunnelTarget for BlackholeCapMockTarget {
+    fn tcp_connect<'a>(
+        &'a self,
+        dst: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
+        self.dialed_addrs.lock().push(dst);
+        let is_blackhole = self.blackhole_ips.contains(&dst.ip());
+        let is_refused = self.refused_ips.contains(&dst.ip());
+        Box::pin(async move {
+            if is_blackhole {
+                std::future::pending::<io::Result<DynStream>>().await
+            } else if is_refused {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "mock refused",
+                ))
+            } else {
+                let stream = TcpStream::connect(dst).await?;
+                Ok(Box::new(stream) as DynStream)
+            }
+        })
+    }
+
+    fn udp_bind<'a>(
+        &'a self,
+        _local_port: u16,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
+        Box::pin(async { Err(io::Error::other("unused")) })
+    }
+
+    fn resolve_in_tunnel<'a>(
+        &'a self,
+        _domain: &'a str,
+    ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
+        Box::pin(async { Err(io::Error::other("unused")) })
+    }
+}
+
+struct MockUdpFallbackSocket {
+    blackhole_addrs: std::collections::HashSet<SocketAddr>,
+    failing_addrs: std::collections::HashSet<SocketAddr>,
+    sent_addrs: parking_lot::Mutex<Vec<SocketAddr>>,
+}
+
+impl MockUdpFallbackSocket {
+    fn new(blackhole_addrs: Vec<SocketAddr>, failing_addrs: Vec<SocketAddr>) -> Self {
+        Self {
+            blackhole_addrs: blackhole_addrs.into_iter().collect(),
+            failing_addrs: failing_addrs.into_iter().collect(),
+            sent_addrs: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ProxyUdpSocket for MockUdpFallbackSocket {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        self.sent_addrs.lock().push(target);
+        let is_blackhole = self.blackhole_addrs.contains(&target);
+        let is_failing = self.failing_addrs.contains(&target);
+        let len = buf.len();
+        Box::pin(async move {
+            if is_blackhole {
+                std::future::pending::<io::Result<usize>>().await
+            } else if is_failing {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "mock udp send refused",
+                ))
+            } else {
+                Ok(len)
+            }
+        })
+    }
+
+    fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> crate::proxy::router::RecvFromFut<'a> {
+        Box::pin(async { std::future::pending().await })
+    }
+
+    fn local_port(&self) -> u16 {
+        0
+    }
+}
+
+#[test]
+fn test_bound_candidate_addrs_filters_before_capping_and_preserves_order() {
+    use crate::proxy::router::{
+        MAX_CANDIDATE_IPS, MIN_ATTEMPT_TIMEOUT, bound_candidate_addrs,
+        bound_candidate_socket_addrs, next_attempt_timeout,
+    };
+
+    let forbidden: IpAddr = "169.254.169.254".parse().unwrap();
+    let v6_preferred: IpAddr = "2001:db8::1".parse().unwrap();
+    let mut ips = vec![forbidden, v6_preferred];
+    for octet in 1..=12u8 {
+        ips.push(IpAddr::V4(Ipv4Addr::new(198, 51, 100, octet)));
+    }
+
+    let bounded = bound_candidate_addrs(&ips, 443);
+    assert_eq!(bounded.len(), MAX_CANDIDATE_IPS);
+    assert_eq!(bounded[0], SocketAddr::new(v6_preferred, 443));
+    assert_eq!(
+        bounded[MAX_CANDIDATE_IPS - 1],
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 443)
+    );
+
+    let sock_inputs: Vec<SocketAddr> = ips.iter().map(|&ip| SocketAddr::new(ip, 53)).collect();
+    let sock_bounded = bound_candidate_socket_addrs(&sock_inputs);
+    assert_eq!(sock_bounded.len(), MAX_CANDIDATE_IPS);
+    assert_eq!(sock_bounded[0], SocketAddr::new(v6_preferred, 53));
+
+    let now = tokio::time::Instant::now();
+    let fair = next_attempt_timeout(now + Duration::from_secs(2), 4).unwrap();
+    assert!(fair > MIN_ATTEMPT_TIMEOUT && fair <= Duration::from_secs(2));
+    let floored = next_attempt_timeout(now + Duration::from_millis(600), 8).unwrap();
+    assert!(floored >= Duration::from_millis(200) && floored <= MIN_ATTEMPT_TIMEOUT);
+    let clamped = next_attempt_timeout(now + Duration::from_millis(80), 4).unwrap();
+    assert!(clamped <= Duration::from_millis(80));
+    assert!(next_attempt_timeout(now - Duration::from_millis(1), 1).is_none());
+}
+
+#[tokio::test]
+async fn test_connect_validated_addrs_caps_attempts_at_max_candidate_ips() {
+    use crate::proxy::router::{MAX_CANDIDATE_IPS, connect_validated_addrs_with_timeout};
+
+    let ips: Vec<IpAddr> = (1..=14u8)
+        .map(|octet| IpAddr::V4(Ipv4Addr::new(198, 51, 100, octet)))
+        .collect();
+    let mock = BlackholeCapMockTarget::new(Vec::new(), ips.clone());
+
+    let err = connect_validated_addrs_with_timeout(&mock, &ips, 80, Duration::from_secs(2))
+        .await
+        .err()
+        .expect("all refused IPs must error");
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+
+    let dialed = mock.dialed_addrs.lock();
+    assert_eq!(dialed.len(), MAX_CANDIDATE_IPS);
+    assert_eq!(dialed[0], SocketAddr::new(ips[0], 80));
+    assert_eq!(
+        dialed[MAX_CANDIDATE_IPS - 1],
+        SocketAddr::new(ips[MAX_CANDIDATE_IPS - 1], 80)
+    );
+}
+
+#[tokio::test]
+async fn test_connect_validated_addrs_all_blackhole_bounded_by_total_timeout() {
+    use crate::proxy::router::{MAX_CANDIDATE_IPS, connect_validated_addrs_with_timeout};
+
+    let ips: Vec<IpAddr> = (1..=10u8)
+        .map(|octet| IpAddr::V4(Ipv4Addr::new(198, 51, 100, octet)))
+        .collect();
+    let mock = BlackholeCapMockTarget::new(ips.clone(), Vec::new());
+    let total_budget = Duration::from_millis(650);
+
+    let start = tokio::time::Instant::now();
+    let err = connect_validated_addrs_with_timeout(&mock, &ips, 80, total_budget)
+        .await
+        .err()
+        .expect("all blackhole IPs must time out");
+    let elapsed = start.elapsed();
+
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    assert!(
+        elapsed < Duration::from_millis(1200),
+        "elapsed {elapsed:?} exceeded bounded total budget {total_budget:?}"
+    );
+    assert!(mock.dialed_addrs.lock().len() <= MAX_CANDIDATE_IPS);
+}
+
+#[tokio::test]
+async fn test_connect_validated_addrs_falls_back_after_blackhole_within_budget() {
+    use crate::proxy::router::connect_validated_addrs_with_timeout;
+
+    let echo_addr = spawn_echo_tcp_server().await;
+    let blackhole_ip: IpAddr = "198.51.100.1".parse().unwrap();
+    let mock = BlackholeCapMockTarget::new(vec![blackhole_ip], Vec::new());
+
+    let start = tokio::time::Instant::now();
+    let mut stream = connect_validated_addrs_with_timeout(
+        &mock,
+        &[blackhole_ip, echo_addr.ip()],
+        echo_addr.port(),
+        Duration::from_millis(900),
+    )
+    .await
+    .expect("should fall back from blackhole IP to valid echo IP within budget");
+    let elapsed = start.elapsed();
+
+    assert!(elapsed < Duration::from_millis(900));
+    stream.write_all(b"pong").await.unwrap();
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"pong");
+    assert_eq!(
+        *mock.dialed_addrs.lock(),
+        vec![SocketAddr::new(blackhole_ip, echo_addr.port()), echo_addr,]
+    );
+}
+
+#[tokio::test]
+async fn test_send_udp_to_validated_addrs_caps_and_falls_back_from_blackhole() {
+    use crate::proxy::router::{MAX_CANDIDATE_IPS, send_udp_to_validated_addrs_with_timeout};
+
+    let failing_addrs: Vec<SocketAddr> = (1..=12u8)
+        .map(|octet| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, octet)), 5353))
+        .collect();
+    let mock_cap = MockUdpFallbackSocket::new(Vec::new(), failing_addrs.clone());
+    let cap_err = send_udp_to_validated_addrs_with_timeout(
+        &mock_cap,
+        b"pkt",
+        &failing_addrs,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect_err("all refused UDP targets should error");
+    assert_eq!(cap_err.kind(), io::ErrorKind::ConnectionRefused);
+    assert_eq!(mock_cap.sent_addrs.lock().len(), MAX_CANDIDATE_IPS);
+
+    let blackhole_sock = SocketAddr::new("198.51.100.50".parse().unwrap(), 5353);
+    let valid_sock = SocketAddr::new("203.0.113.50".parse().unwrap(), 5353);
+    let mock_fb = MockUdpFallbackSocket::new(vec![blackhole_sock], Vec::new());
+
+    let start = tokio::time::Instant::now();
+    send_udp_to_validated_addrs_with_timeout(
+        &mock_fb,
+        b"pkt",
+        &[blackhole_sock, valid_sock],
+        Duration::from_millis(900),
+    )
+    .await
+    .expect("UDP send should fall back to valid target after blackhole timeout");
+    assert!(start.elapsed() < Duration::from_millis(900));
+    assert_eq!(*mock_fb.sent_addrs.lock(), vec![blackhole_sock, valid_sock]);
+
+    let all_blackhole_socks: Vec<SocketAddr> = (1..=10u8)
+        .map(|octet| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, octet)), 5353))
+        .collect();
+    let mock_bh = MockUdpFallbackSocket::new(all_blackhole_socks.clone(), Vec::new());
+    let total_budget = Duration::from_millis(650);
+    let bh_start = tokio::time::Instant::now();
+    let bh_err = send_udp_to_validated_addrs_with_timeout(
+        &mock_bh,
+        b"pkt",
+        &all_blackhole_socks,
+        total_budget,
+    )
+    .await
+    .expect_err("all blackhole UDP targets should time out");
+    assert_eq!(bh_err.kind(), io::ErrorKind::TimedOut);
+    assert!(bh_start.elapsed() < Duration::from_millis(1200));
+    assert!(mock_bh.sent_addrs.lock().len() <= MAX_CANDIDATE_IPS);
+}

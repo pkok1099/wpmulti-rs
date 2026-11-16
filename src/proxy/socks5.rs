@@ -11,8 +11,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proxy::router::{
     DynStream, ProxyTunnelTarget, ProxyUdpSocket, TargetAddr, TunnelRouter, TunnelSelector,
-    connect_validated_addrs, is_forbidden_destination_ip, is_valid_target_domain,
-    parse_domain_ip_literal, resolve_and_validate_domain,
+    bound_candidate_addrs, connect_validated_addrs, is_forbidden_destination_ip,
+    is_valid_target_domain, parse_domain_ip_literal, resolve_and_validate_domain,
+    send_udp_to_validated_addrs,
 };
 
 // SOCKS Protocol Versions
@@ -710,10 +711,7 @@ async fn forward_client_udp_datagram(
                 .await
                 {
                     Ok(Ok(ips)) => {
-                        let addrs: Vec<SocketAddr> = ips
-                            .into_iter()
-                            .map(|ip| SocketAddr::new(ip, port))
-                            .collect();
+                        let addrs = bound_candidate_addrs(&ips, port);
                         let _ = tx.send((addrs, payload_owned)).await;
                     }
                     Ok(Err(e)) => {
@@ -747,15 +745,13 @@ async fn forward_virtual_to_relay(
     }
 }
 
-async fn send_udp_to_validated_addrs(
+async fn dispatch_resolved_udp_datagram(
     virtual_udp: &dyn ProxyUdpSocket,
     payload: &[u8],
     addrs: &[SocketAddr],
 ) {
-    for &target_sock in addrs {
-        if virtual_udp.send_to(payload, target_sock).await.is_ok() {
-            break;
-        }
+    if let Err(e) = send_udp_to_validated_addrs(virtual_udp, payload, addrs).await {
+        tracing::debug!("UDP relay send to validated candidates failed: {:?}", e);
     }
 }
 
@@ -799,7 +795,7 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
             }
 
             Some((target_socks, payload)) = dns_rx.recv() => {
-                send_udp_to_validated_addrs(virtual_udp.as_ref(), &payload, &target_socks).await;
+                dispatch_resolved_udp_datagram(virtual_udp.as_ref(), &payload, &target_socks).await;
             }
 
             relay_res = relay_socket.recv_from(&mut relay_buf) => {

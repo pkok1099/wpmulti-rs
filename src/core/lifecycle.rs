@@ -271,6 +271,10 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         let mode = self.tunnel.netstack.effective_ip_mode();
         self.resolve_all_in_tunnel_with_mode(domain, mode)
     }
+
+    fn connect_timeout(&self) -> Duration {
+        self.tunnel.netstack.connect_timeout()
+    }
 }
 
 /// A wrapper around a [`ProxyUdpSocket`] that keeps a [`TunnelConnGuard`] alive until dropped.

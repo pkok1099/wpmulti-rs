@@ -230,6 +230,10 @@ impl ProxyTunnelTarget for ActiveTunnel {
     ) -> crate::proxy::router::ResolveAllFut<'a> {
         Box::pin(self.netstack.resolve_all_in_tunnel(domain))
     }
+
+    fn connect_timeout(&self) -> std::time::Duration {
+        self.netstack.connect_timeout()
+    }
 }
 
 /// A wrapper around a [`DynStream`] that updates tunnel RX and TX statistics.
