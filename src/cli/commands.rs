@@ -23,6 +23,7 @@ fn init_logging(
     tui_mode: bool,
     log_buffer: &crate::tui::TuiLogBuffer,
 ) {
+    use tracing_subscriber::util::SubscriberInitExt;
     let max_level = match log_level {
         crate::config::LogLevel::Trace => tracing::Level::TRACE,
         crate::config::LogLevel::Debug => tracing::Level::DEBUG,
@@ -31,17 +32,18 @@ fn init_logging(
         crate::config::LogLevel::Error => tracing::Level::ERROR,
     };
     if tui_mode {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(max_level)
-            .with_ansi(false)
-            .with_writer(log_buffer.clone())
-            .try_init();
+        let _ =
+            super::build_cli_tracing_subscriber(max_level, false, log_buffer.clone()).try_init();
     } else {
+        use std::io::IsTerminal;
         use tracing_subscriber::fmt::writer::MakeWriterExt;
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(max_level)
-            .with_writer(log_buffer.clone().and(std::io::stdout))
-            .try_init();
+        let ansi = super::cli_log_ansi_enabled(false, std::io::stderr().is_terminal());
+        let _ = super::build_cli_tracing_subscriber(
+            max_level,
+            ansi,
+            log_buffer.clone().and(std::io::stderr),
+        )
+        .try_init();
     }
 }
 
@@ -561,10 +563,12 @@ pub async fn cmd_probe(
     };
 
     if configs_with_path.is_empty() {
-        let _ = writeln!(
-            std::io::stdout().lock(),
-            "No tunnel configurations found to probe."
-        );
+        let mut out = std::io::stdout().lock();
+        if json_output {
+            write_probe_json(&mut out, &[])?;
+        } else {
+            let _ = writeln!(out, "No tunnel configurations found to probe.");
+        }
         return Ok(Vec::new());
     }
 
@@ -591,16 +595,21 @@ pub async fn cmd_probe(
     let results: Vec<ProbeResult> = indexed_results.into_iter().map(|(_, r)| r).collect();
 
     if json_output {
-        let _ = writeln!(
-            std::io::stdout().lock(),
-            "{}",
-            serde_json::to_string_pretty(&results)?
-        );
+        write_probe_json(&mut std::io::stdout().lock(), &results)?;
     } else {
         print_probe_table(&results);
     }
 
     Ok(results)
+}
+
+/// Write serialized probe results as a single pretty-printed JSON payload.
+pub(crate) fn write_probe_json<W: Write>(
+    out: &mut W,
+    results: &[ProbeResult],
+) -> Result<(), Box<dyn std::error::Error>> {
+    writeln!(out, "{}", serde_json::to_string_pretty(results)?)?;
+    Ok(())
 }
 
 fn print_probe_table(results: &[ProbeResult]) {

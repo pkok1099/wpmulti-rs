@@ -293,3 +293,89 @@ AllowedIPs = 0.0.0.0/0
     assert_eq!(*entry.state.read(), TunnelState::Dormant);
     assert!(entry.active.read().is_none());
 }
+
+#[test]
+fn test_cli_tracing_subscriber_disables_ansi_for_json_and_captures_writer() {
+    use std::sync::{Arc, Mutex};
+
+    assert!(!super::cli_log_ansi_enabled(true, true));
+    assert!(!super::cli_log_ansi_enabled(true, false));
+    assert!(!super::cli_log_ansi_enabled(false, false));
+    assert!(super::cli_log_ansi_enabled(false, true));
+
+    #[derive(Clone)]
+    struct VecMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct VecWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for VecWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecMakeWriter {
+        type Writer = VecWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            VecWriter(Arc::clone(&self.0))
+        }
+    }
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = super::build_cli_tracing_subscriber(
+        tracing::Level::INFO,
+        super::cli_log_ansi_enabled(true, true),
+        VecMakeWriter(Arc::clone(&captured)),
+    );
+
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(tunnel = "wgcf-001", "Peer added");
+    });
+
+    let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(rendered.contains("Peer added"));
+    assert!(rendered.contains("wgcf-001"));
+    assert!(
+        !rendered.contains("\x1b["),
+        "ANSI escapes must be disabled in json mode: {rendered:?}"
+    );
+}
+
+#[test]
+fn test_write_probe_json_produces_pure_json_for_empty_and_populated_results() {
+    let mut empty_buf = Vec::new();
+    super::commands::write_probe_json(&mut empty_buf, &[]).unwrap();
+    let parsed_empty: Vec<super::ProbeResult> = serde_json::from_slice(&empty_buf).unwrap();
+    assert!(parsed_empty.is_empty());
+
+    let sample = super::ProbeResult {
+        id: "wgcf-001".to_string(),
+        config_file: "wgcf-001.conf".to_string(),
+        endpoint: "162.159.192.1:2408".to_string(),
+        healthy: true,
+        rtt_ms: Some(12.5),
+        exit_ip: Some("104.28.1.1".to_string()),
+        error: None,
+    };
+    let mut populated_buf = Vec::new();
+    super::commands::write_probe_json(&mut populated_buf, &[sample]).unwrap();
+    let parsed: Vec<super::ProbeResult> = serde_json::from_slice(&populated_buf).unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].id, "wgcf-001");
+    assert_eq!(parsed[0].exit_ip.as_deref(), Some("104.28.1.1"));
+}
+
+#[tokio::test]
+async fn test_cli_probe_empty_dir_json_returns_empty_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let results = super::cmd_probe(None, Some(dir.path().to_path_buf()), true, "1s".to_string())
+        .await
+        .unwrap();
+    assert!(results.is_empty());
+}

@@ -153,6 +153,31 @@ pub enum Commands {
     },
 }
 
+/// Compute whether ANSI color escape codes should be enabled for CLI diagnostics.
+///
+/// ANSI escapes are disabled whenever structured JSON output is requested or `stderr`
+/// is not an interactive terminal so log lines never inject control sequences into pipes
+/// or combined streams.
+pub(crate) const fn cli_log_ansi_enabled(json_mode: bool, stderr_is_terminal: bool) -> bool {
+    !json_mode && stderr_is_terminal
+}
+
+/// Construct a `tracing` subscriber writing diagnostic logs to `writer`.
+pub(crate) fn build_cli_tracing_subscriber<W>(
+    max_level: tracing::Level,
+    ansi: bool,
+    writer: W,
+) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt()
+        .with_max_level(max_level)
+        .with_ansi(ansi)
+        .with_writer(writer)
+        .finish()
+}
+
 /// Parse arguments and execute the selected subcommand.
 pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -161,9 +186,12 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if !matches!(cli.command, Commands::Top { .. }) {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .try_init();
+        use std::io::IsTerminal;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let json_mode = matches!(cli.command, Commands::Probe { json: true, .. });
+        let ansi = cli_log_ansi_enabled(json_mode, std::io::stderr().is_terminal());
+        let _ =
+            build_cli_tracing_subscriber(tracing::Level::INFO, ansi, std::io::stderr).try_init();
     }
     let env_token = std::env::var("WPMULTI_ADMIN_TOKEN")
         .ok()

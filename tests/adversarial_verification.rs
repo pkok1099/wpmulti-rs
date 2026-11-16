@@ -679,3 +679,51 @@ async fn test_adv_raw_malformed_http_requests() {
         assert!(res.is_err());
     }
 }
+
+#[test]
+fn test_cli_probe_json_stdout_pure_and_logs_to_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let priv_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        StaticSecret::from([7u8; 32]).to_bytes(),
+    );
+    let peer_pub = PublicKey::from(&StaticSecret::from([8u8; 32]));
+    let pub_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        peer_pub.as_bytes(),
+    );
+    let conf = format!(
+        "[Interface]\nPrivateKey = {priv_b64}\nAddress = 10.99.0.2/32\nDNS = 1.1.1.1\n\
+         \n[Peer]\nPublicKey = {pub_b64}\nEndpoint = 127.0.0.1:59999\nAllowedIPs = 0.0.0.0/0\n"
+    );
+    std::fs::write(dir.path().join("probe-clean.conf"), conf).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wpmulti"))
+        .args([
+            "probe",
+            "-d",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--timeout",
+            "200ms",
+        ])
+        .output()
+        .expect("failed to execute wpmulti binary");
+
+    assert!(output.status.success(), "status={:?}", output.status);
+    let stdout_str = String::from_utf8(output.stdout).unwrap();
+    let stderr_str = String::from_utf8(output.stderr).unwrap();
+
+    assert!(
+        !stdout_str.contains("\x1b["),
+        "stdout must never contain ANSI escapes: {stdout_str:?}"
+    );
+    assert!(
+        !stderr_str.contains("\x1b["),
+        "stderr must not contain ANSI escapes in --json mode: {stderr_str:?}"
+    );
+    let parsed: Vec<wpmulti::cli::ProbeResult> = serde_json::from_str(&stdout_str)
+        .expect("probe --json stdout must parse cleanly as single JSON array without log mixing");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].id, "probe-clean");
+}
