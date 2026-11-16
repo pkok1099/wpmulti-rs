@@ -306,11 +306,10 @@ async fn negotiate_socks5_auth<S: AsyncRead + AsyncWrite + Unpin>(
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;
 
-    let allow_anonymous = router.authenticate(None).is_ok();
-    let chosen_method = if allow_anonymous && methods.contains(&METHOD_NO_AUTH) {
-        METHOD_NO_AUTH
-    } else if methods.contains(&METHOD_USER_PASS) {
+    let chosen_method = if methods.contains(&METHOD_USER_PASS) {
         METHOD_USER_PASS
+    } else if methods.contains(&METHOD_NO_AUTH) && router.authenticate(None).is_ok() {
+        METHOD_NO_AUTH
     } else {
         METHOD_NO_ACCEPTABLE
     };

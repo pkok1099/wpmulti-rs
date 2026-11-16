@@ -1906,3 +1906,141 @@ async fn test_send_udp_to_validated_addrs_caps_and_falls_back_from_blackhole() {
     assert!(bh_start.elapsed() < Duration::from_millis(1200));
     assert!(mock_bh.sent_addrs.lock().len() <= MAX_CANDIDATE_IPS);
 }
+
+async fn perform_socks5_greeting_and_auth(
+    router: Arc<PoolRouter>,
+    methods: &[u8],
+    creds: Option<(&str, &str)>,
+    dst: SocketAddr,
+) -> (u8, Option<u8>) {
+    let (client_raw, server) = tokio::io::duplex(4096);
+    let server_task = tokio::spawn(async move {
+        let _ = handle_socks5(server, router).await;
+    });
+    let mut client = client_raw;
+
+    let mut greeting = Vec::with_capacity(2 + methods.len());
+    greeting.push(SOCKS5_VERSION);
+    greeting.push(u8::try_from(methods.len()).unwrap());
+    greeting.extend_from_slice(methods);
+    client.write_all(&greeting).await.unwrap();
+
+    let mut g_resp = [0u8; 2];
+    client.read_exact(&mut g_resp).await.unwrap();
+    assert_eq!(g_resp[0], SOCKS5_VERSION);
+    let chosen_method = g_resp[1];
+
+    let auth_status = if chosen_method == METHOD_USER_PASS {
+        if let Some((user, pass)) = creds {
+            let mut pkt = vec![RFC1929_VERSION, u8::try_from(user.len()).unwrap()];
+            pkt.extend_from_slice(user.as_bytes());
+            pkt.push(u8::try_from(pass.len()).unwrap());
+            pkt.extend_from_slice(pass.as_bytes());
+            client.write_all(&pkt).await.unwrap();
+
+            let mut a_resp = [0u8; 2];
+            client.read_exact(&mut a_resp).await.unwrap();
+            assert_eq!(a_resp[0], RFC1929_VERSION);
+            if a_resp[1] != 0x00 {
+                drop(client);
+                let _ = server_task.await;
+                return (chosen_method, Some(a_resp[1]));
+            }
+            Some(a_resp[1])
+        } else {
+            drop(client);
+            let _ = server_task.await;
+            return (chosen_method, None);
+        }
+    } else {
+        None
+    };
+
+    let SocketAddr::V4(v4) = dst else {
+        panic!("expected ipv4 echo listener");
+    };
+    let mut req = vec![SOCKS5_VERSION, 0x01, 0x00, 0x01];
+    req.extend_from_slice(&v4.ip().octets());
+    req.extend_from_slice(&v4.port().to_be_bytes());
+    client.write_all(&req).await.unwrap();
+
+    let mut rep = [0u8; 10];
+    client.read_exact(&mut rep).await.unwrap();
+    assert_eq!(rep[1], REP_SUCCESS);
+
+    drop(client);
+    let _ = server_task.await;
+    (chosen_method, auth_status)
+}
+
+#[tokio::test]
+async fn test_socks5_prefers_user_pass_over_no_auth_when_anonymous_allowed() {
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 16];
+                let _ = s.read(&mut buf).await;
+            });
+        }
+    });
+
+    // 1. AuthMode::None + allow_anonymous=true: client offering [0x00, 0x02] gets 0x02 and routes to tenant.
+    let t1 = Arc::new(MockTunnelTarget::new("wgcf-001"));
+    let t2 = Arc::new(MockTunnelTarget::new("wgcf-002"));
+    let pool_none = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool_none.add_tunnel("wgcf-001", Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>);
+    pool_none.add_tunnel("wgcf-002", Arc::clone(&t2) as Arc<dyn ProxyTunnelTarget>);
+
+    let (chosen, status) = perform_socks5_greeting_and_auth(
+        Arc::clone(&pool_none),
+        &[METHOD_NO_AUTH, METHOD_USER_PASS],
+        Some(("wgcf-002", "any")),
+        echo_addr,
+    )
+    .await;
+    assert_eq!(chosen, METHOD_USER_PASS);
+    assert_eq!(status, Some(0x00));
+    assert_eq!(t2.tcp_conns.load(Ordering::SeqCst), 1);
+    assert_eq!(t1.tcp_conns.load(Ordering::SeqCst), 0);
+
+    // 2. Client offering only [0x00] still falls back to anonymous NO_AUTH (0x00).
+    let (anon_chosen, anon_status) =
+        perform_socks5_greeting_and_auth(pool_none, &[METHOD_NO_AUTH], None, echo_addr).await;
+    assert_eq!(anon_chosen, METHOD_NO_AUTH);
+    assert_eq!(anon_status, None);
+    assert_eq!(t1.tcp_conns.load(Ordering::SeqCst), 1);
+
+    // 3. AuthMode::Global + allow_anonymous=true: offering [0x00, 0x02] picks 0x02 and validates password.
+    let g1 = Arc::new(MockTunnelTarget::new("wgcf-001"));
+    let g2 = Arc::new(MockTunnelTarget::new("wgcf-002"));
+    let pool_global = Arc::new(
+        PoolRouter::new(PoolStrategy::RoundRobin, true)
+            .with_auth(AuthMode::Global, Some("secret".to_string())),
+    );
+    pool_global.add_tunnel("wgcf-001", Arc::clone(&g1) as Arc<dyn ProxyTunnelTarget>);
+    pool_global.add_tunnel("wgcf-002", Arc::clone(&g2) as Arc<dyn ProxyTunnelTarget>);
+
+    let (bad_chosen, bad_status) = perform_socks5_greeting_and_auth(
+        Arc::clone(&pool_global),
+        &[METHOD_NO_AUTH, METHOD_USER_PASS],
+        Some(("wgcf-002", "wrong")),
+        echo_addr,
+    )
+    .await;
+    assert_eq!(bad_chosen, METHOD_USER_PASS);
+    assert_eq!(bad_status, Some(0x01));
+    assert_eq!(g2.tcp_conns.load(Ordering::SeqCst), 0);
+
+    let (ok_chosen, ok_status) = perform_socks5_greeting_and_auth(
+        pool_global,
+        &[METHOD_NO_AUTH, METHOD_USER_PASS],
+        Some(("wgcf-002", "secret")),
+        echo_addr,
+    )
+    .await;
+    assert_eq!(ok_chosen, METHOD_USER_PASS);
+    assert_eq!(ok_status, Some(0x00));
+    assert_eq!(g2.tcp_conns.load(Ordering::SeqCst), 1);
+}
