@@ -28,23 +28,38 @@ pub use socks5::{
     write_socks5_udp_header,
 };
 
+const MAX_PROXY_CONCURRENT_CONNS: usize = 4096;
+
 /// Runs an asynchronous SOCKS5 server listening on the provided [`tokio::net::TcpListener`].
 pub async fn run_socks5_listener(
     listener: tokio::net::TcpListener,
     router: Arc<dyn TunnelRouter>,
 ) -> io::Result<()> {
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONCURRENT_CONNS));
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!("SOCKS5 listener accept error: {:?}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
+            break;
+        };
         let local_ip = stream.local_addr().ok().map(|a| a.ip());
         let peer_ip = Some(peer_addr.ip());
         let router_clone = Arc::clone(&router);
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_socks5_with_addrs(stream, router_clone, local_ip, peer_ip).await
             {
                 tracing::debug!("SOCKS5 client {} disconnected: {:?}", peer_addr, e);
             }
         });
     }
+    Ok(())
 }
 
 /// Runs an asynchronous HTTP/HTTPS CONNECT proxy server listening on the provided [`tokio::net::TcpListener`].
@@ -52,13 +67,26 @@ pub async fn run_http_listener(
     listener: tokio::net::TcpListener,
     router: Arc<dyn TunnelRouter>,
 ) -> io::Result<()> {
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONCURRENT_CONNS));
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!("HTTP listener accept error: {:?}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
+            break;
+        };
         let router_clone = Arc::clone(&router);
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_http(stream, router_clone).await {
                 tracing::debug!("HTTP proxy client {} disconnected: {:?}", peer_addr, e);
             }
         });
     }
+    Ok(())
 }

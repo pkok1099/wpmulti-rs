@@ -68,6 +68,7 @@ pub struct ReloadReport {
 pub struct TunnelManager {
     config: RwLock<MainConfig>,
     config_path: RwLock<Option<std::path::PathBuf>>,
+    config_write_lock: tokio::sync::Mutex<()>,
     registry: Arc<TunnelRegistry>,
     lifecycle: Arc<LifecycleController>,
     listeners: Arc<ListenerSupervisor>,
@@ -114,6 +115,7 @@ impl TunnelManager {
         Ok(Self {
             config: RwLock::new(config),
             config_path: RwLock::new(None),
+            config_write_lock: tokio::sync::Mutex::new(()),
             registry,
             lifecycle,
             listeners,
@@ -260,16 +262,20 @@ impl TunnelManager {
         };
 
         let maybe_path = self.config_path.read().clone();
-        if let Some(path) = maybe_path
-            && let Ok(toml_str) = toml::to_string_pretty(&cfg_snapshot)
-            && let Err(e) = tokio::fs::write(&path, toml_str).await
-        {
-            tracing::warn!(
-                "Failed to persist disabled_tunnels to '{}': {}",
-                path.display(),
-                e
-            );
+        if let Some(path) = maybe_path {
+            let _write_guard = self.config_write_lock.lock().await;
+            let latest_snapshot = self.config.read().clone();
+            if let Ok(toml_str) = toml::to_string_pretty(&latest_snapshot)
+                && let Err(e) = write_config_atomically(&path, &toml_str).await
+            {
+                tracing::warn!(
+                    "Failed to persist disabled_tunnels to '{}': {}",
+                    path.display(),
+                    e
+                );
+            }
         }
+        let _ = cfg_snapshot;
 
         Ok(targets)
     }
@@ -339,8 +345,16 @@ impl TunnelManager {
             while let Some(res) = set.join_next().await {
                 match res {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => return Err(e),
+                    Ok(Err(e)) => {
+                        set.abort_all();
+                        while set.join_next().await.is_some() {}
+                        let _ = self.stop().await;
+                        return Err(e);
+                    }
                     Err(e) => {
+                        set.abort_all();
+                        while set.join_next().await.is_some() {}
+                        let _ = self.stop().await;
                         return Err(CoreError::Other(format!(
                             "Parallel tunnel boot task failed: {e}"
                         )));
@@ -355,9 +369,14 @@ impl TunnelManager {
             .start(Arc::clone(&self.registry), cfg.health_check.clone());
 
         // 4. Start listeners
-        self.listeners
+        if let Err(e) = self
+            .listeners
             .start_all(&cfg, &self.registry, &self.lifecycle)
-            .await?;
+            .await
+        {
+            let _ = self.stop().await;
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -516,31 +535,78 @@ impl TunnelManager {
             return false;
         }
 
-        let _act_lock = existing.activation_lock.lock().await;
-        if existing.stats.active_conns.load(Ordering::SeqCst) == 0 {
+        let should_reactivate = {
+            let _act_lock = existing.activation_lock.lock().await;
+            let active_conns = existing.stats.active_conns.load(Ordering::SeqCst);
             let maybe_active = existing.active.write().take();
-            if let Some(active) = maybe_active {
-                active.device.suspend().await;
-                active.netstack.close().await;
+            if active_conns == 0 {
+                if let Some(active) = maybe_active {
+                    active.device.suspend().await;
+                    active.netstack.close().await;
+                }
+            } else {
+                // Existing connections retain their Arc<ActiveTunnel> until completion;
+                // detaching it from `existing.active` ensures new connections boot with the new config.
+                drop(maybe_active);
             }
             *existing.state.write() = TunnelState::Dormant;
-
-            let saved_port = *existing.assigned_port.read();
-            let was_disabled = existing.is_disabled()
-                || cfg_snapshot.disabled_tunnels.iter().any(|d| d == &t_cfg.id);
             *existing.config.write() = t_cfg.clone();
 
-            let new_entry = TunnelEntry::new(t_cfg.id.clone(), t_cfg, existing.lifecycle_mode);
-            if was_disabled {
-                new_entry.set_disabled(true);
-            }
-            if let Some(p) = saved_port {
-                new_entry.set_assigned_port(p);
-            }
-            self.registry.replace(new_entry);
-        } else {
-            *existing.config.write() = t_cfg;
+            let disabled = existing.is_disabled()
+                || cfg_snapshot.disabled_tunnels.iter().any(|d| d == &t_cfg.id);
+            existing.set_disabled(disabled);
+            existing.health.reset();
+
+            existing.lifecycle_mode == LifecycleMode::Eager && !disabled
+        };
+        if should_reactivate {
+            let _ = self.lifecycle.activate_tunnel(&existing.id).await;
         }
         true
     }
+}
+
+async fn write_config_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let path_owned = path.to_path_buf();
+    let data = contents.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let parent = path_owned
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let suffix: u64 = rand::random();
+        let tmp_name = format!(
+            ".{}.{suffix:016x}.tmp",
+            path_owned
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("wpmulti.toml")
+        );
+        let tmp_path = parent.join(tmp_name);
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp_path)?;
+        if let Err(e) = file
+            .write_all(data.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        drop(file);
+        if let Err(e) = std::fs::rename(&tmp_path, &path_owned) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }

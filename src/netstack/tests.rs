@@ -866,3 +866,39 @@ async fn test_stack_ipv6_only_isolation() {
 
     stack.close().await;
 }
+
+#[tokio::test]
+async fn test_stack_close_wakes_parked_udp_and_connect() {
+    let config = make_test_config("10.2.0.3/32", None);
+    let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack = std::sync::Arc::new(VirtualNetworkStack::new(&config, bridge).unwrap());
+
+    let udp = stack.udp_bind(0).unwrap();
+    let recv_task = tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        udp.recv_from(&mut buf).await
+    });
+
+    let stack_for_connect = std::sync::Arc::clone(&stack);
+    let connect_task = tokio::spawn(async move {
+        stack_for_connect
+            .tcp_connect("1.1.1.1:80".parse().unwrap())
+            .await
+    });
+
+    // Yield briefly so both tasks park on wakers, then close stack
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    stack.close().await;
+
+    let recv_res = tokio::time::timeout(std::time::Duration::from_millis(200), recv_task)
+        .await
+        .expect("parked udp recv_from must wake immediately on close")
+        .unwrap();
+    assert!(recv_res.is_err());
+
+    let conn_res = tokio::time::timeout(std::time::Duration::from_millis(200), connect_task)
+        .await
+        .expect("parked tcp_connect must wake immediately on close")
+        .unwrap();
+    assert!(conn_res.is_err());
+}

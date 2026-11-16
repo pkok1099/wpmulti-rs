@@ -76,8 +76,9 @@ impl VirtualTunBridge {
     /// - `BridgeIpSend`: for gotatun WireGuard incoming packet handling (`ip_tx`).
     /// - `BridgeIpRecv`: for gotatun WireGuard outgoing packet handling (`ip_rx`).
     pub fn new(mtu: u16, channel_capacity: usize) -> (Self, BridgeIpSend, BridgeIpRecv) {
-        let (rx_sender, rx_receiver) = mpsc::channel(channel_capacity);
-        let (tx_sender, tx_receiver) = mpsc::channel(channel_capacity);
+        let cap = channel_capacity.max(1);
+        let (rx_sender, rx_receiver) = mpsc::channel(cap);
+        let (tx_sender, tx_receiver) = mpsc::channel(cap);
         let notify = Arc::new(Notify::new());
         let buf_pool = Arc::new(Mutex::new(Vec::with_capacity(64)));
 
@@ -142,6 +143,9 @@ impl Device for VirtualTunBridge {
     }
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.tx_sender.capacity() == 0 {
+            return None;
+        }
         match self.rx_receiver.try_recv() {
             Ok(packet) => {
                 let rx = VirtualTunRxToken { packet };
@@ -296,6 +300,16 @@ impl BridgeIpRecv {
         buf_pool: &Arc<Mutex<Vec<Vec<u8>>>>,
     ) -> io::Result<Packet<Ip>> {
         let mut pkt = pool.get();
+        if raw.len() > pkt.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "IP packet length {} exceeds buffer pool capacity {}",
+                    raw.len(),
+                    pkt.len()
+                ),
+            ));
+        }
         pkt.truncate(raw.len());
         pkt.copy_from_slice(&raw);
         raw.clear();
@@ -315,6 +329,16 @@ impl BridgeIpRecv {
     #[inline]
     fn to_packet(raw: &[u8], pool: &PacketBufPool) -> io::Result<Packet<Ip>> {
         let mut pkt = pool.get();
+        if raw.len() > pkt.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "IP packet length {} exceeds buffer pool capacity {}",
+                    raw.len(),
+                    pkt.len()
+                ),
+            ));
+        }
         pkt.truncate(raw.len());
         pkt.copy_from_slice(raw);
         pkt.try_into_ip().map_err(|e| {

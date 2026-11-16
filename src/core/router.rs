@@ -179,9 +179,36 @@ impl MultiTenantRouter {
             .filter(|id| {
                 self.registry
                     .get(id)
-                    .is_some_and(|entry| !entry.is_disabled() && entry.health.is_routable())
+                    .is_some_and(|entry| !entry.is_disabled() && entry.health.can_route())
             })
             .collect()
+    }
+
+    fn try_claim_candidate(&self, id: &str) -> bool {
+        self.registry
+            .get(id)
+            .is_some_and(|entry| !entry.is_disabled() && entry.health.is_routable())
+    }
+
+    fn claim_from_healthy(&self, healthy: &[&String], start_idx: usize) -> io::Result<String> {
+        if healthy.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no healthy tunnels available in pool",
+            ));
+        }
+        for offset in 0..healthy.len() {
+            let idx = (start_idx + offset) % healthy.len();
+            if let Some(&id) = healthy.get(idx)
+                && self.try_claim_candidate(id)
+            {
+                return Ok(id.clone());
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no healthy tunnels available in pool",
+        ))
     }
 
     /// Select a tunnel ID from slice based on keyword without cloning candidate lists.
@@ -201,17 +228,11 @@ impl MultiTenantRouter {
         match keyword {
             PoolKeyword::Random => {
                 let idx = (rand::random::<u32>() as usize) % healthy.len();
-                healthy
-                    .get(idx)
-                    .map(|s| (*s).clone())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "empty pool"))
+                self.claim_from_healthy(&healthy, idx)
             }
             PoolKeyword::RoundRobin | PoolKeyword::Auto => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len();
-                healthy
-                    .get(idx)
-                    .map(|s| (*s).clone())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "empty pool"))
+                self.claim_from_healthy(&healthy, idx)
             }
             PoolKeyword::LeastConn => self.select_least_conn_refs(&healthy),
         }
@@ -229,28 +250,26 @@ impl MultiTenantRouter {
 
         match keyword {
             PoolKeyword::LeastConn => {
-                let mut best_id: Option<&str> = None;
-                let mut min_conns = usize::MAX;
-                for entry in &entries {
-                    if !entry.is_disabled() && entry.health.is_routable() {
-                        let conns = entry.stats.active_conns.load(Ordering::Relaxed);
-                        if conns < min_conns {
-                            min_conns = conns;
-                            best_id = Some(entry.id.as_str());
-                        }
+                let mut candidates: Vec<(usize, &str)> = entries
+                    .iter()
+                    .filter(|e| !e.is_disabled() && e.health.can_route())
+                    .map(|e| (e.stats.active_conns.load(Ordering::Relaxed), e.id.as_str()))
+                    .collect();
+                candidates.sort_by_key(|(conns, _)| *conns);
+                for (_, id) in candidates {
+                    if self.try_claim_candidate(id) {
+                        return Ok(id.to_string());
                     }
                 }
-                best_id.map(str::to_string).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "no healthy tunnels available in pool",
-                    )
-                })
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no healthy tunnels available in pool",
+                ))
             }
             PoolKeyword::Random | PoolKeyword::RoundRobin | PoolKeyword::Auto => {
                 let healthy: Vec<_> = entries
                     .iter()
-                    .filter(|e| !e.is_disabled() && e.health.is_routable())
+                    .filter(|e| !e.is_disabled() && e.health.can_route())
                     .collect();
                 if healthy.is_empty() {
                     return Err(io::Error::new(
@@ -258,46 +277,51 @@ impl MultiTenantRouter {
                         "no healthy tunnels available in pool",
                     ));
                 }
-                let target_idx = match keyword {
+                let start_idx = match keyword {
                     PoolKeyword::Random => (rand::random::<u32>() as usize) % healthy.len(),
                     PoolKeyword::Auto | PoolKeyword::RoundRobin | PoolKeyword::LeastConn => {
                         self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len()
                     }
                 };
-                healthy
-                    .get(target_idx)
-                    .map(|e| e.id.clone())
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            "no healthy tunnels available in pool",
-                        )
-                    })
+                for offset in 0..healthy.len() {
+                    let idx = (start_idx + offset) % healthy.len();
+                    if let Some(entry) = healthy.get(idx)
+                        && !entry.is_disabled()
+                        && entry.health.is_routable()
+                    {
+                        return Ok(entry.id.clone());
+                    }
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no healthy tunnels available in pool",
+                ))
             }
         }
     }
 
     /// Select a candidate tunnel with lowest active connections among healthy candidates.
     fn select_least_conn_refs(&self, healthy: &[&String]) -> io::Result<String> {
-        let mut best_id = None;
-        let mut min_conns = usize::MAX;
+        let mut ranked: Vec<(usize, &String)> = healthy
+            .iter()
+            .filter_map(|&id| {
+                self.registry
+                    .get(id)
+                    .map(|entry| (entry.stats.active_conns.load(Ordering::Relaxed), id))
+            })
+            .collect();
+        ranked.sort_by_key(|(conns, _)| *conns);
 
-        for &id in healthy {
-            if let Some(entry) = self.registry.get(id) {
-                let conns = entry.stats.active_conns.load(Ordering::Relaxed);
-                if conns < min_conns {
-                    min_conns = conns;
-                    best_id = Some(id.clone());
-                }
+        for (_, id) in ranked {
+            if self.try_claim_candidate(id) {
+                return Ok(id.clone());
             }
         }
 
-        best_id.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "no candidate tunnels found in registry",
-            )
-        })
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no healthy tunnels available in pool",
+        ))
     }
 
     /// Select a candidate tunnel with lowest active connections from a slice.
@@ -325,10 +349,7 @@ impl MultiTenantRouter {
             PoolStrategy::Fallback => {
                 // True priority fallback: select first routable candidate in sequence
                 for id in candidates {
-                    if let Some(entry) = self.registry.get(id)
-                        && !entry.is_disabled()
-                        && entry.health.is_routable()
-                    {
+                    if self.try_claim_candidate(id) {
                         return Ok(id.clone());
                     }
                 }
@@ -339,31 +360,21 @@ impl MultiTenantRouter {
             }
             PoolStrategy::RoundRobin => {
                 let healthy = self.filter_healthy_candidates(candidates);
-                if healthy.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "no healthy tunnels available in pool",
-                    ));
-                }
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len();
-                healthy
-                    .get(idx)
-                    .map(|s| (*s).clone())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "empty pool"))
+                let idx = if healthy.is_empty() {
+                    0
+                } else {
+                    self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len()
+                };
+                self.claim_from_healthy(&healthy, idx)
             }
             PoolStrategy::Random => {
                 let healthy = self.filter_healthy_candidates(candidates);
-                if healthy.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "no healthy tunnels available in pool",
-                    ));
-                }
-                let idx = (rand::random::<u32>() as usize) % healthy.len();
-                healthy
-                    .get(idx)
-                    .map(|s| (*s).clone())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "empty pool"))
+                let idx = if healthy.is_empty() {
+                    0
+                } else {
+                    (rand::random::<u32>() as usize) % healthy.len()
+                };
+                self.claim_from_healthy(&healthy, idx)
             }
             PoolStrategy::LeastConn => self.select_least_conn_slice(candidates),
         }
@@ -384,7 +395,6 @@ fn resolve_selector(
     match selector {
         TunnelSelector::ById(id) => {
             if let Some(allowed) = allowed_guard
-                && !allowed.is_empty()
                 && !allowed.iter().any(|s| s == id)
             {
                 return Err(io::Error::new(
@@ -417,13 +427,7 @@ fn resolve_selector(
                 |allowed| {
                     allowed
                         .iter()
-                        .find(|id| {
-                            id.contains(tag)
-                                && router
-                                    .registry
-                                    .get(id)
-                                    .is_some_and(|e| !e.is_disabled() && e.health.is_routable())
-                        })
+                        .find(|id| id.contains(tag) && router.try_claim_candidate(id))
                         .cloned()
                 },
             );
@@ -546,6 +550,9 @@ impl TunnelRouter for MultiTenantRouter {
                         break;
                     }
                     Err(e) => {
+                        if let Some(entry) = self.registry.get(&target_id) {
+                            entry.health.release_trial_slot();
+                        }
                         tracing::warn!(
                             "Tunnel '{}' activation failed (attempt {}/{}): {:?}",
                             target_id,

@@ -61,17 +61,31 @@ pub fn load_tunnel_config_from_file<P: AsRef<Path>>(path: P) -> Result<TunnelCon
     load_tunnel_config_from_str(id, &content)
 }
 
+const MAX_WG_CONF_BYTES: u64 = 1024 * 1024;
+
+fn validate_tunnel_id(id: &str) -> Result<(), ConfigError> {
+    if id.trim().is_empty() || id == "." || id == ".." {
+        return Err(ConfigError::InvalidTunnelId(
+            "Tunnel ID cannot be empty or '.' / '..'".into(),
+        ));
+    }
+    if id.chars().any(|c| {
+        c.is_control() || c.is_whitespace() || matches!(c, '?' | '#' | '/' | '%' | '"' | '\\')
+    }) {
+        return Err(ConfigError::InvalidTunnelId(format!(
+            "Tunnel ID '{id}' contains disallowed characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Load a tunnel configuration from a string with an explicitly specified tunnel ID.
 pub fn load_tunnel_config_from_str(
     id: impl Into<String>,
     content: &str,
 ) -> Result<TunnelConfig, ConfigError> {
     let id = id.into();
-    if id.trim().is_empty() {
-        return Err(ConfigError::InvalidTunnelId(
-            "Tunnel ID cannot be empty".into(),
-        ));
-    }
+    validate_tunnel_id(&id)?;
     let (interface, peers) =
         parse_wg_conf(content).map_err(|e| ConfigError::WgConf(e.to_string()))?;
 
@@ -95,9 +109,11 @@ pub fn load_tunnel_configs_from_dir<P: AsRef<Path>>(
     let mut entries: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_file()
-            && let Some(ext) = path.extension().and_then(|s| s.to_str())
+        if let Some(ext) = path.extension().and_then(|s| s.to_str())
             && ext.eq_ignore_ascii_case("conf")
         {
             entries.push(path);
@@ -121,6 +137,7 @@ pub fn load_tunnel_configs_from_dir<P: AsRef<Path>>(
                 ))
             })?
             .to_string();
+        validate_tunnel_id(&id)?;
 
         if let Some(first_path) = seen_ids.get(&id) {
             return Err(ConfigError::DuplicateTunnelId {
@@ -131,6 +148,14 @@ pub fn load_tunnel_configs_from_dir<P: AsRef<Path>>(
         }
         seen_ids.insert(id.clone(), path.clone());
 
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.len() > MAX_WG_CONF_BYTES {
+            return Err(ConfigError::WgConf(format!(
+                "File '{}' exceeds maximum size of {} bytes",
+                path.display(),
+                MAX_WG_CONF_BYTES
+            )));
+        }
         let content = std::fs::read_to_string(&path)?;
         let (interface, peers) = parse_wg_conf(&content)
             .map_err(|e| ConfigError::WgConf(format!("Failed parsing {}: {e}", path.display())))?;

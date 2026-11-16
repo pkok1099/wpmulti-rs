@@ -3,6 +3,10 @@ set -e
 
 PREFIX="/data/data/com.termux/files/usr"
 mkdir -p "$PREFIX/etc/wpmulti/confs"
+chmod 0700 "$PREFIX/etc/wpmulti" "$PREFIX/etc/wpmulti/confs"
+if [ -f "$PREFIX/etc/wpmulti/wpmulti.toml" ]; then
+  chmod 0600 "$PREFIX/etc/wpmulti/wpmulti.toml"
+fi
 mkdir -p "$PREFIX/var/log/wpmulti"
 
 echo "wpmulti installed for Termux."

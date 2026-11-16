@@ -56,17 +56,23 @@ pub fn build_query(domain: &str, qtype: QueryType, id: u16) -> Result<Vec<u8>, D
 
     // Question: QNAME
     let clean = domain.trim().trim_end_matches('.');
-    if !clean.is_empty() {
-        for label in clean.split('.') {
-            if label.is_empty() {
-                return Err(DnsError::InvalidDomain("empty label in domain"));
-            }
-            if label.len() > 63 {
-                return Err(DnsError::InvalidDomain("label exceeds 63 bytes"));
-            }
-            packet.push(label.len() as u8);
-            packet.extend_from_slice(label.as_bytes());
+    if clean.is_empty() {
+        return Err(DnsError::InvalidDomain("empty domain"));
+    }
+    let mut qname_len = 1usize; // trailing 0 byte
+    for label in clean.split('.') {
+        if label.is_empty() {
+            return Err(DnsError::InvalidDomain("empty label in domain"));
         }
+        if label.len() > 63 {
+            return Err(DnsError::InvalidDomain("label exceeds 63 bytes"));
+        }
+        qname_len += 1 + label.len();
+        if qname_len > 255 {
+            return Err(DnsError::InvalidDomain("domain name exceeds 255 bytes"));
+        }
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
     }
     packet.push(0);
 
@@ -145,7 +151,7 @@ pub fn parse_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)
         }
 
         let atype = read_u16_be(buf, offset)?;
-        let _aclass = read_u16_be(buf, offset + 2)?;
+        let aclass = read_u16_be(buf, offset + 2)?;
         let ttl = read_u32_be(buf, offset + 4)?;
         let rdlength = read_u16_be(buf, offset + 8)? as usize;
         offset += 10;
@@ -155,6 +161,9 @@ pub fn parse_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)
             .ok_or(DnsError::PacketTooShort)?;
         offset += rdlength;
 
+        if aclass != 1 {
+            continue;
+        }
         if atype == 1
             && let Ok(octets) = <[u8; 4]>::try_from(rdata)
         {
@@ -254,33 +263,35 @@ impl DnsLruCache {
         let key = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let now = Instant::now();
 
-        let cached = {
+        let (cached, has_expired) = {
             let entries = self.entries.read();
-            entries.get(&key).and_then(|entry| {
-                if now < entry.expires_at {
+            match entries.get(&key) {
+                Some(entry) if now < entry.expires_at => {
                     let access_time = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
                     entry.last_accessed.store(access_time, Ordering::Relaxed);
-                    Some(entry.ips.clone())
-                } else {
-                    None
+                    (Some(entry.ips.clone()), false)
                 }
-            })
+                Some(_) => (None, true),
+                None => (None, false),
+            }
         };
         if let Some(ips) = cached {
             return Some(ips);
         }
 
-        let mut entries = self.entries.write();
-        if let Some(entry) = entries.get(&key)
-            && now >= entry.expires_at
-        {
-            entries.remove(&key);
+        if has_expired {
+            let mut entries = self.entries.write();
+            if let Some(entry) = entries.get(&key)
+                && now >= entry.expires_at
+            {
+                entries.remove(&key);
+            }
         }
         None
     }
 
     pub fn insert(&self, domain: &str, ips: Vec<IpAddr>, ttl_secs: u32) {
-        if ips.is_empty() {
+        if self.capacity == 0 || ips.is_empty() {
             return;
         }
         let key = domain.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -599,17 +610,23 @@ impl InTunnelDnsResolver {
             }
         };
 
+        let mut collected_ips = Vec::new();
+        let mut min_ttl = u32::MAX;
         let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no DNS records found");
         for &qtype in qtypes {
             match self.query_record(stack, domain, server, qtype).await {
                 Ok((mut ips, ttl)) => {
                     ips.retain(|ip| mode.allows_ip(*ip));
                     if !ips.is_empty() {
-                        return Ok((ips, ttl));
+                        min_ttl = min_ttl.min(ttl);
+                        collected_ips.extend(ips);
                     }
                 }
                 Err(e) => last_err = e,
             }
+        }
+        if !collected_ips.is_empty() {
+            return Ok((collected_ips, min_ttl));
         }
         Err(last_err)
     }
@@ -631,23 +648,137 @@ impl InTunnelDnsResolver {
             socket.send_to(&query, server).await?;
 
             let mut buf = [0u8; 1500];
-            let (len, from) = socket.recv_from(&mut buf).await?;
-            if from.ip() != server.ip() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "DNS response received from unexpected IP",
-                ));
+            loop {
+                let (len, from) = socket.recv_from(&mut buf).await?;
+                if from != server {
+                    continue;
+                }
+                let resp_slice = buf.get(..len).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "short DNS buffer")
+                })?;
+                if let (Ok(id), Ok(flags)) =
+                    (read_u16_be(resp_slice, 0), read_u16_be(resp_slice, 2))
+                {
+                    if id != tx_id || (flags & 0x8000) == 0 {
+                        continue;
+                    }
+                    if !response_matches_question(resp_slice, domain, qtype) {
+                        continue;
+                    }
+                    // TC (Truncated) bit set -> fall back to DNS-over-TCP
+                    if flags & 0x0200 != 0 {
+                        return self
+                            .query_record_tcp(stack, server, &query, domain, qtype)
+                            .await;
+                    }
+                } else {
+                    continue;
+                }
+                let (ips, ttl) = parse_response(resp_slice, tx_id)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                return Ok((ips, ttl));
             }
-
-            let resp_slice = buf
-                .get(..len)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short DNS buffer"))?;
-            let (ips, ttl) =
-                parse_response(resp_slice, tx_id).map_err(|e| io::Error::other(e.to_string()))?;
-
-            Ok((ips, ttl))
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))?
     }
+
+    async fn query_record_tcp(
+        &self,
+        stack: &VirtualNetworkStack,
+        server: SocketAddr,
+        query: &[u8],
+        domain: &str,
+        qtype: QueryType,
+    ) -> Result<(Vec<IpAddr>, u32), io::Error> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tx_id = read_u16_be(query, 0)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let mut stream = stack.tcp_connect(server).await?;
+        let len_prefix = u16::try_from(query.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "DNS query too large for TCP")
+        })?;
+        stream.write_all(&len_prefix.to_be_bytes()).await?;
+        stream.write_all(query).await?;
+        stream.flush().await?;
+
+        let mut resp_len_buf = [0u8; 2];
+        stream.read_exact(&mut resp_len_buf).await?;
+        let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+        if resp_len < 12 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS TCP response too short",
+            ));
+        }
+        let mut resp = vec![0u8; resp_len];
+        stream.read_exact(&mut resp).await?;
+        if !response_matches_question(&resp, domain, qtype) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS TCP response question mismatch",
+            ));
+        }
+        parse_response(&resp, tx_id).map_err(|e| io::Error::other(e.to_string()))
+    }
+}
+
+fn response_matches_question(buf: &[u8], expected_domain: &str, expected_qtype: QueryType) -> bool {
+    let Ok(qdcount) = read_u16_be(buf, 4) else {
+        return false;
+    };
+    if qdcount == 0 {
+        return false;
+    }
+    let expected_clean = expected_domain.trim().trim_end_matches('.');
+    let Some((decoded_name, next_offset)) = decode_name(buf, 12, 0) else {
+        return false;
+    };
+    let Ok(qtype) = read_u16_be(buf, next_offset) else {
+        return false;
+    };
+    let Ok(qclass) = read_u16_be(buf, next_offset + 2) else {
+        return false;
+    };
+    decoded_name.eq_ignore_ascii_case(expected_clean)
+        && qtype == expected_qtype as u16
+        && qclass == 1
+}
+
+fn decode_name(buf: &[u8], mut offset: usize, depth: usize) -> Option<(String, usize)> {
+    if depth > 16 {
+        return None;
+    }
+    let mut labels = Vec::new();
+    let mut jumped_next = None;
+    loop {
+        let len = *buf.get(offset)?;
+        if len == 0 {
+            if jumped_next.is_none() {
+                jumped_next = Some(offset + 1);
+            }
+            break;
+        }
+        if (len & 0xC0) == 0xC0 {
+            let b2 = *buf.get(offset + 1)?;
+            let ptr = ((usize::from(len & 0x3F)) << 8) | usize::from(b2);
+            if jumped_next.is_none() {
+                jumped_next = Some(offset + 2);
+            }
+            let (rest, _) = decode_name(buf, ptr, depth + 1)?;
+            if !rest.is_empty() {
+                labels.push(rest);
+            }
+            break;
+        }
+        if len > 63 {
+            return None;
+        }
+        offset += 1;
+        let label_bytes = buf.get(offset..offset + usize::from(len))?;
+        let label = std::str::from_utf8(label_bytes).ok()?;
+        labels.push(label.to_string());
+        offset += usize::from(len);
+    }
+    Some((labels.join("."), jumped_next?))
 }

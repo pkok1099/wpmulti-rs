@@ -50,6 +50,13 @@ impl AdminServer {
     /// Start listening and accepting incoming administrative HTTP connections.
     /// Returns the bound [`SocketAddr`] (useful when configured with port `0`).
     pub async fn start(&self) -> Result<SocketAddr, std::io::Error> {
+        if self.task_handle.lock().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "AdminServer is already running",
+            ));
+        }
+        let _ = self.shutdown_tx.send(false);
         let listener = TcpListener::bind(self.bind_addr).await?;
         let local_addr = listener.local_addr()?;
 
@@ -122,7 +129,11 @@ impl AdminServer {
     pub async fn stop(&self) {
         let _ = self.shutdown_tx.send(true);
         let handle = self.task_handle.lock().take();
-        if let Some(h) = handle {
+        if let Some(mut h) = handle
+            && tokio::time::timeout(std::time::Duration::from_secs(2), &mut h)
+                .await
+                .is_err()
+        {
             h.abort();
             let _ = h.await;
         }
@@ -131,8 +142,50 @@ impl AdminServer {
 
 /// Maximum time allowed to read a single HTTP request from an Admin API client.
 const ADMIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Maximum time allowed to write an HTTP response to an Admin API client.
+const ADMIN_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Handle a single incoming HTTP connection.
+fn parse_request_content_length(header_bytes: &[u8]) -> Result<usize, HttpResponse> {
+    let Ok(header_str) = std::str::from_utf8(header_bytes) else {
+        return Err(HttpResponse::bad_request("Invalid UTF-8 in headers"));
+    };
+    let mut parsed_len: Option<usize> = None;
+    for (idx, line) in header_str.split("\r\n").enumerate() {
+        if line.contains(['\r', '\n', '\0']) {
+            return Err(HttpResponse::bad_request(
+                "Invalid control character in headers",
+            ));
+        }
+        if idx == 0 || line.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else {
+            return Err(HttpResponse::bad_request("Malformed HTTP header line"));
+        };
+        if k.is_empty() || k.chars().any(char::is_whitespace) {
+            return Err(HttpResponse::bad_request("Invalid HTTP header name"));
+        }
+        if k.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(HttpResponse::bad_request("Transfer-Encoding not supported"));
+        }
+        if k.eq_ignore_ascii_case("content-length") {
+            let val_trim = v.trim();
+            if val_trim.is_empty() || !val_trim.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(HttpResponse::bad_request("Invalid Content-Length"));
+            }
+            let Ok(len) = val_trim.parse::<usize>() else {
+                return Err(HttpResponse::payload_too_large("Content-Length overflow"));
+            };
+            if parsed_len.is_some() {
+                return Err(HttpResponse::bad_request("Duplicate Content-Length"));
+            }
+            parsed_len = Some(len);
+        }
+    }
+    Ok(parsed_len.unwrap_or(0))
+}
+
 async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
     manager: Arc<TunnelManager>,
@@ -155,17 +208,14 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             }
 
             if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                // Check Content-Length to read remainder of body if any
                 let header_bytes = buf.get(..pos).unwrap_or_default();
-                let header_str = String::from_utf8_lossy(header_bytes);
-                let mut content_len = 0;
-                for line in header_str.lines() {
-                    if let Some((k, v)) = line.split_once(':')
-                        && k.trim().eq_ignore_ascii_case("content-length")
-                    {
-                        content_len = v.trim().parse::<usize>().unwrap_or(0);
+                let content_len = match parse_request_content_length(header_bytes) {
+                    Ok(len) => len,
+                    Err(resp) => {
+                        let _ = stream.write_all(&resp.to_bytes()).await;
+                        return Err(());
                     }
-                }
+                };
 
                 if content_len > 65536 {
                     let resp =
@@ -183,17 +233,19 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
                 while buf.len() < required_total {
                     let n = match stream.read(&mut temp).await {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            let resp = HttpResponse::bad_request("Truncated request body");
+                            let _ = stream.write_all(&resp.to_bytes()).await;
+                            return Err(());
+                        }
                         Ok(n) => n,
                         Err(_) => return Err(()),
                     };
                     if let Some(chunk) = temp.get(..n) {
                         buf.extend_from_slice(chunk);
                     }
-                    if buf.len() > required_total {
-                        break;
-                    }
                 }
+                buf.truncate(required_total);
                 break;
             }
 
@@ -230,6 +282,9 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     };
 
     let resp_bytes = response.to_bytes();
-    let _ = stream.write_all(&resp_bytes).await;
-    let _ = stream.flush().await;
+    let _ = tokio::time::timeout(ADMIN_WRITE_TIMEOUT, async {
+        stream.write_all(&resp_bytes).await?;
+        stream.flush().await
+    })
+    .await;
 }

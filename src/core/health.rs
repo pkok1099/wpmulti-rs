@@ -77,6 +77,26 @@ impl TunnelHealthTracker {
         }
     }
 
+    /// Pure read-only check whether the tunnel is eligible to route traffic (does not claim a trial slot).
+    pub fn can_route(&self) -> bool {
+        let state = self.state.read();
+        match state.status {
+            HealthStatus::Healthy => true,
+            HealthStatus::HalfOpen => !state.trial_in_flight,
+            HealthStatus::Unhealthy => state
+                .cooldown_until
+                .is_none_or(|until| Instant::now() >= until),
+        }
+    }
+
+    /// Release an unclaimed `HalfOpen` trial slot (e.g. when a selected tunnel was not actually used).
+    pub fn release_trial_slot(&self) {
+        let mut state = self.state.write();
+        if state.status == HealthStatus::HalfOpen {
+            state.trial_in_flight = false;
+        }
+    }
+
     /// Check whether the tunnel is eligible to route traffic.
     ///
     /// If in `Unhealthy` state and cooldown timer has elapsed, lazily transitions
@@ -154,7 +174,6 @@ impl TunnelHealthTracker {
     /// Increments consecutive failure count. If it meets or exceeds `threshold`,
     /// transitions status to `Unhealthy` and arms cooldown timer.
     pub fn record_failure(&self, threshold: usize, cooldown: Duration) {
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -162,10 +181,25 @@ impl TunnelHealthTracker {
         self.last_failure_at.store(now_secs, Ordering::Relaxed);
 
         let mut state = self.state.write();
-        if state.status == HealthStatus::HalfOpen || failures >= threshold {
-            state.cooldown_until = Some(Instant::now() + cooldown);
-            state.status = HealthStatus::Unhealthy;
-            state.trial_in_flight = false;
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
+        match state.status {
+            HealthStatus::Healthy => {
+                if failures >= threshold {
+                    state.cooldown_until = Some(Instant::now() + cooldown);
+                    state.status = HealthStatus::Unhealthy;
+                    state.trial_in_flight = false;
+                }
+            }
+            HealthStatus::HalfOpen => {
+                state.cooldown_until = Some(Instant::now() + cooldown);
+                state.status = HealthStatus::Unhealthy;
+                state.trial_in_flight = false;
+            }
+            HealthStatus::Unhealthy => {
+                // Keep existing cooldown_until so repeated probe/request failures
+                // cannot permanently trap the tunnel in Unhealthy.
+                state.trial_in_flight = false;
+            }
         }
     }
 
@@ -205,13 +239,18 @@ impl TunnelHealthTracker {
     }
 }
 
+#[derive(Debug)]
+struct ProberTask {
+    shutdown_tx: watch::Sender<bool>,
+    handle: JoinHandle<()>,
+}
+
 /// Background supervisor periodically checking eager tunnels via `force_handshake`.
 ///
 /// Strictly ignores lazy tunnels to ensure zero background overhead while dormant.
 #[derive(Debug)]
 pub struct ActiveProber {
-    shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
-    task_handle: Mutex<Option<JoinHandle<()>>>,
+    task: Mutex<Option<ProberTask>>,
 }
 
 impl Default for ActiveProber {
@@ -224,21 +263,17 @@ impl ActiveProber {
     /// Create a new dormant active prober.
     pub const fn new() -> Self {
         Self {
-            shutdown_tx: Mutex::new(None),
-            task_handle: Mutex::new(None),
+            task: Mutex::new(None),
         }
     }
 
     /// Start the active prober background task.
     pub fn start(&self, registry: Arc<TunnelRegistry>, settings: HealthCheckSettings) {
-        let (tx, mut rx) = watch::channel(false);
-        {
-            let mut tx_guard = self.shutdown_tx.lock();
-            if tx_guard.is_some() {
-                return;
-            }
-            *tx_guard = Some(tx);
+        let mut guard = self.task.lock();
+        if guard.is_some() {
+            return;
         }
+        let (tx, mut rx) = watch::channel(false);
 
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(settings.probe_interval);
@@ -259,7 +294,10 @@ impl ActiveProber {
             }
         });
 
-        *self.task_handle.lock() = Some(handle);
+        *guard = Some(ProberTask {
+            shutdown_tx: tx,
+            handle,
+        });
     }
 
     /// Run a single probe pass over all Eager tunnels with bounded concurrency.
@@ -351,13 +389,10 @@ impl ActiveProber {
 
     /// Stop the prober background task and wait for its clean shutdown.
     pub async fn stop(&self) {
-        let tx = self.shutdown_tx.lock().take();
-        if let Some(tx) = tx {
-            let _ = tx.send(true);
-        }
-        let handle = self.task_handle.lock().take();
-        if let Some(handle) = handle {
-            let _ = handle.await;
+        let task = self.task.lock().take();
+        if let Some(t) = task {
+            let _ = t.shutdown_tx.send(true);
+            let _ = t.handle.await;
         }
     }
 }
@@ -438,5 +473,23 @@ mod tests {
         assert_eq!(tracker.current_status(), HealthStatus::Healthy);
         assert!(tracker.is_routable());
         assert_eq!(tracker.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_record_failure_while_unhealthy_does_not_extend_cooldown() {
+        let tracker = TunnelHealthTracker::new();
+        tracker.record_failure(1, Duration::from_millis(80));
+        assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
+
+        std::thread::sleep(Duration::from_millis(50));
+        // Repeated failure while already Unhealthy must NOT reset cooldown_until
+        tracker.record_failure(1, Duration::from_millis(80));
+
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(
+            tracker.is_routable(),
+            "cooldown should have expired without being extended"
+        );
+        assert_eq!(tracker.current_status(), HealthStatus::HalfOpen);
     }
 }

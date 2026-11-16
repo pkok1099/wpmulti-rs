@@ -583,7 +583,7 @@ impl TunnelRegistry {
                 inner
                     .entries
                     .get(*k)
-                    .is_some_and(|entry| entry.health.is_routable())
+                    .is_some_and(|entry| entry.health.can_route())
             })
             .cloned()
             .collect()

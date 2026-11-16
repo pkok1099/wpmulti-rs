@@ -77,10 +77,10 @@ pub struct TuiProbeResult {
 }
 
 /// Number of editable runtime configuration rows in the Config tab.
-pub const CONFIG_ROW_COUNT: usize = 8;
+pub const CONFIG_ROW_COUNT: usize = 15;
 
 /// Data source powering the TUI dashboard: either an in-process manager or a remote Admin API.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum TuiDataSource {
     InProcess(Arc<TunnelManager>),
     Remote {
@@ -89,11 +89,33 @@ pub enum TuiDataSource {
     },
 }
 
-/// Validate that a string contains no HTTP control characters (`\r`, `\n`, `\0`) or whitespace.
+impl std::fmt::Debug for TuiDataSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InProcess(mgr) => f.debug_tuple("InProcess").field(mgr).finish(),
+            Self::Remote {
+                admin_url,
+                auth_token,
+            } => f
+                .debug_struct("Remote")
+                .field("admin_url", admin_url)
+                .field("auth_token", &auth_token.as_ref().map(|_| "[REDACTED]"))
+                .finish(),
+        }
+    }
+}
+
+/// Validate that a string contains no HTTP control characters, whitespace, or path separators.
 fn validate_http_token_or_segment(val: &str, field: &str) -> Result<(), String> {
-    if val.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+    if val.is_empty()
+        || val == "."
+        || val == ".."
+        || val
+            .bytes()
+            .any(|b| b <= 0x20 || b == 0x7f || matches!(b, b'/' | b'\\' | b'?' | b'#'))
+    {
         return Err(format!(
-            "Invalid {field} (contains control characters or whitespace)"
+            "Invalid {field} (contains control characters, whitespace, or path delimiters)"
         ));
     }
     Ok(())
@@ -139,6 +161,7 @@ pub(crate) async fn admin_http_request_with_body(
     auth_token: Option<&str>,
     body_bytes: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
+    const MAX_ADMIN_RESP_BYTES: u64 = 8 * 1024 * 1024;
     let host_port = parse_admin_http_url(admin_url)?;
     validate_http_token_or_segment(path, "request path")?;
     if let Some(tok) = auth_token
@@ -153,7 +176,7 @@ pub(crate) async fn admin_http_request_with_body(
         .map_err(|_| format!("Timed out connecting to Admin API at '{admin_url}'"))?
         .map_err(|e| format!("Failed to connect to Admin API at '{admin_url}': {e}"))?;
 
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host_port}\r\n");
+    let mut req = format!("{method} {path} HTTP/1.0\r\nHost: {host_port}\r\n");
     if let Some(payload) = body_bytes {
         let _ = std::fmt::Write::write_fmt(
             &mut req,
@@ -182,10 +205,16 @@ pub(crate) async fn admin_http_request_with_body(
         .map_err(|e| format!("Write failed: {e}"))?;
 
     let mut resp_buf = Vec::new();
-    tokio::time::timeout(io_timeout, stream.read_to_end(&mut resp_buf))
-        .await
-        .map_err(|_| "Timed out reading Admin API response".to_string())?
-        .map_err(|e| format!("Read failed: {e}"))?;
+    tokio::time::timeout(
+        io_timeout,
+        AsyncReadExt::take(stream, MAX_ADMIN_RESP_BYTES + 1).read_to_end(&mut resp_buf),
+    )
+    .await
+    .map_err(|_| "Timed out reading Admin API response".to_string())?
+    .map_err(|e| format!("Read failed: {e}"))?;
+    if resp_buf.len() as u64 > MAX_ADMIN_RESP_BYTES {
+        return Err("Admin API response exceeded 8 MiB size limit".to_string());
+    }
 
     let header_end = resp_buf
         .windows(4)
@@ -583,11 +612,12 @@ impl TuiApp {
         self
     }
 
-    /// Switch active tab and cancel any active inline edit/search mode.
+    /// Switch active tab and cancel any active inline edit/search/batch mode.
     pub fn set_tab(&mut self, tab: TuiTab) {
         self.active_tab = tab;
         self.is_searching = false;
         self.config_editing = None;
+        self.batch_prompt = None;
     }
 
     /// Cycle to the next TUI tab.
@@ -833,8 +863,42 @@ impl TuiApp {
             if let (Some(cfg), Some(path)) = (&self.config_snapshot, &self.config_path) {
                 let serialized = toml::to_string_pretty(cfg)
                     .map_err(|e| format!("Failed to serialize TOML: {e}"))?;
-                std::fs::write(path, serialized)
-                    .map_err(|e| format!("Failed to write '{}': {}", path.display(), e))?;
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let suffix: u64 = rand::random();
+                let tmp_name = format!(
+                    ".{}.{suffix:016x}.tmp",
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("wpmulti.toml")
+                );
+                let tmp_path = parent.join(tmp_name);
+                {
+                    use std::io::Write;
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.write(true).create_new(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        opts.mode(0o600);
+                    }
+                    let mut f = opts.open(&tmp_path).map_err(|e| {
+                        format!("Failed to create temp file '{}': {}", tmp_path.display(), e)
+                    })?;
+                    if let Err(e) = f
+                        .write_all(serialized.as_bytes())
+                        .and_then(|()| f.sync_all())
+                    {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(format!("Failed to write '{}': {}", tmp_path.display(), e));
+                    }
+                }
+                std::fs::rename(&tmp_path, path).map_err(|e| {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    format!("Failed to rename config to '{}': {}", path.display(), e)
+                })?;
                 true
             } else {
                 false
@@ -893,10 +957,19 @@ impl TuiApp {
             self.set_status("No tunnels available to probe");
             return;
         }
-        let mut results = Vec::with_capacity(targets.len());
-        for (id, endpoint) in targets {
-            results.push(self.data_source.probe_tunnel(&id, &endpoint).await);
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, (id, endpoint)) in targets.into_iter().enumerate() {
+            let ds = self.data_source.clone();
+            set.spawn(async move { (idx, ds.probe_tunnel(&id, &endpoint).await) });
         }
+        let mut indexed = Vec::new();
+        while let Some(res) = set.join_next().await {
+            if let Ok(item) = res {
+                indexed.push(item);
+            }
+        }
+        indexed.sort_by_key(|(idx, _)| *idx);
+        let results: Vec<TuiProbeResult> = indexed.into_iter().map(|(_, r)| r).collect();
         let ok_count = results.iter().filter(|r| r.ok).count();
         let total = results.len();
         self.probe_results = results;
@@ -1075,8 +1148,12 @@ impl TuiApp {
     /// Fetch latest tunnel states (and active tab data + bandwidth samples) from data source.
     pub async fn refresh(&mut self) -> Result<(), String> {
         let list = self.data_source.fetch_tunnels().await?;
-        let total_rx: u64 = list.iter().map(|t| t.rx_bytes).sum();
-        let total_tx: u64 = list.iter().map(|t| t.tx_bytes).sum();
+        let total_rx: u64 = list
+            .iter()
+            .fold(0u64, |acc, t| acc.saturating_add(t.rx_bytes));
+        let total_tx: u64 = list
+            .iter()
+            .fold(0u64, |acc, t| acc.saturating_add(t.tx_bytes));
         let now = Instant::now();
         if let (Some(prev_rx), Some(prev_tx), Some(prev_at)) =
             (self.prev_total_rx, self.prev_total_tx, self.last_sample_at)
@@ -1114,6 +1191,9 @@ impl TuiApp {
             && let Ok(listeners) = self.data_source.fetch_listeners().await
         {
             self.listeners = listeners;
+            self.listener_scroll = self
+                .listener_scroll
+                .min(self.listeners.len().saturating_sub(1));
         }
         if self.active_tab == TuiTab::Config
             && self.config_snapshot.is_none()

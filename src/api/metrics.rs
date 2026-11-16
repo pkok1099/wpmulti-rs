@@ -13,6 +13,20 @@ fn write_scalar_gauge(out: &mut String, name: &str, help: &str, value: usize) {
     let _ = writeln!(out, "{name} {value}");
 }
 
+fn escape_prometheus_label(val: &str) -> String {
+    let mut out = String::with_capacity(val.len());
+    for ch in val.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn write_tunnel_metric<T: std::fmt::Display>(
     out: &mut String,
     name: &str,
@@ -25,7 +39,8 @@ fn write_tunnel_metric<T: std::fmt::Display>(
     let _ = writeln!(out, "# TYPE {name} {metric_type}");
     for entry in entries {
         let val = val_fn(entry);
-        let _ = writeln!(out, "{name}{{tunnel_id=\"{}\"}} {val}", entry.id);
+        let escaped_id = escape_prometheus_label(&entry.id);
+        let _ = writeln!(out, "{name}{{tunnel_id=\"{escaped_id}\"}} {val}");
     }
 }
 

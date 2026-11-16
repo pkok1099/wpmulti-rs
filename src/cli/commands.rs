@@ -139,7 +139,15 @@ async fn run_tui_or_wait(
         if let Some(path) = saved_config_path {
             app = app.with_config_path(path);
         }
-        let _ = run_terminal_tui(app, config.tui.refresh_rate_ms).await;
+        let tui_res = run_terminal_tui(app, config.tui.refresh_rate_ms).await;
+        if let Err(e) = tui_res {
+            tracing::error!("TUI exited with error: {e}");
+            let _ = manager.stop().await;
+            if let Some(srv) = admin_server {
+                srv.stop().await;
+            }
+            return Err(e.into());
+        }
         tracing::info!("TUI exited. Stopping daemon...");
     } else {
         tracing::info!("Daemon running. Press Ctrl+C to terminate.");
@@ -168,12 +176,19 @@ pub fn cmd_validate(
         MainConfig::default()
     };
 
+    let explicit_dir = dir_path.is_some();
     if let Some(dir) = dir_path {
         config.global.config_dir = dir;
     }
 
     let tunnels = if config.global.config_dir.exists() {
         load_tunnel_configs_from_dir(&config.global.config_dir)?
+    } else if explicit_dir {
+        return Err(format!(
+            "Tunnel directory '{}' does not exist",
+            config.global.config_dir.display()
+        )
+        .into());
     } else {
         Vec::new()
     };
@@ -511,13 +526,17 @@ fn print_probe_table(results: &[ProbeResult]) {
 
         let exit_ip = r.exit_ip.as_deref().unwrap_or("-");
 
+        let clean_id: String = r.id.chars().filter(|c| !c.is_control()).collect();
+        let clean_exit: String = exit_ip.chars().filter(|c| !c.is_control()).collect();
+        let clean_ep: String = r.endpoint.chars().filter(|c| !c.is_control()).collect();
+
         println!(
             "│ {:<8} │ {:<20} │ {:<11} │ {:<14} │ {:<22} │",
             status,
-            truncate_str(&r.id, 20),
+            truncate_str(&clean_id, 20),
             truncate_str(&rtt, 11),
-            truncate_str(exit_ip, 14),
-            truncate_str(&r.endpoint, 22),
+            truncate_str(&clean_exit, 14),
+            truncate_str(&clean_ep, 22),
         );
     }
 

@@ -441,7 +441,7 @@ impl Default for LifecycleSettings {
 }
 
 /// Explicit port and credential overrides for specific tunnel IDs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TunnelPortOverride {
     #[serde(default)]
     pub socks5_port: Option<u16>,
@@ -451,6 +451,16 @@ pub struct TunnelPortOverride {
 
     #[serde(default)]
     pub password: Option<String>,
+}
+
+impl std::fmt::Debug for TunnelPortOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunnelPortOverride")
+            .field("socks5_port", &self.socks5_port)
+            .field("http_port", &self.http_port)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 /// Per-tunnel dedicated port configuration `[per_tunnel]`.
@@ -497,7 +507,7 @@ impl Default for PerTunnelSettings {
 }
 
 /// Shared listener section `[[shared_listener]]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedListenerSettings {
     pub name: String,
 
@@ -525,12 +535,31 @@ pub struct SharedListenerSettings {
     pub ip_mode: Option<IpMode>,
 }
 
+impl std::fmt::Debug for SharedListenerSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedListenerSettings")
+            .field("name", &self.name)
+            .field("listener_type", &self.listener_type)
+            .field("bind", &self.bind)
+            .field("auth_mode", &self.auth_mode)
+            .field(
+                "global_password",
+                &self.global_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("default_strategy", &self.default_strategy)
+            .field("allow_anonymous", &self.allow_anonymous)
+            .field("pool", &self.pool)
+            .field("ip_mode", &self.ip_mode)
+            .finish()
+    }
+}
+
 const fn default_false() -> bool {
     false
 }
 
 /// Admin HTTP REST API section `[admin]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminSettings {
     #[serde(default = "default_false")]
     pub enabled: bool,
@@ -540,6 +569,19 @@ pub struct AdminSettings {
 
     #[serde(default)]
     pub auth_token: Option<String>,
+}
+
+impl std::fmt::Debug for AdminSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminSettings")
+            .field("enabled", &self.enabled)
+            .field("bind", &self.bind)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 const fn default_admin_bind() -> SocketAddr {
@@ -667,10 +709,20 @@ impl MainConfig {
 
     fn validate_shared_listeners(&self) -> Result<(), ConfigError> {
         let mut listener_names = HashSet::new();
-        let mut bind_ports = HashSet::new();
+        let mut bound_addrs: Vec<SocketAddr> = Vec::new();
 
         if self.admin.enabled {
-            bind_ports.insert(self.admin.bind);
+            if self.admin.bind.port() == 0 {
+                return Err(ConfigError::Validation(
+                    "admin.bind cannot use port 0 when admin is enabled".into(),
+                ));
+            }
+            if self.admin.auth_token.as_deref() == Some("") {
+                return Err(ConfigError::Validation(
+                    "admin.auth_token cannot be an empty string".into(),
+                ));
+            }
+            bound_addrs.push(self.admin.bind);
         }
 
         for listener in &self.shared_listeners {
@@ -691,12 +743,19 @@ impl MainConfig {
                     listener.name
                 )));
             }
-            if !bind_ports.insert(listener.bind) {
+            let conflicts = bound_addrs.iter().any(|existing| {
+                existing.port() == listener.bind.port()
+                    && (existing.ip() == listener.bind.ip()
+                        || existing.ip().is_unspecified()
+                        || listener.bind.ip().is_unspecified())
+            });
+            if conflicts {
                 return Err(ConfigError::Validation(format!(
                     "Port conflict: shared_listener '{}' bind address '{}' is already in use",
                     listener.name, listener.bind
                 )));
             }
+            bound_addrs.push(listener.bind);
             if let Err(msg) = IpMode::effective_with_global(listener.ip_mode, self.global.ip_mode) {
                 return Err(ConfigError::Validation(format!(
                     "shared_listener '{}': {}",
@@ -734,7 +793,7 @@ impl MainConfig {
                     .any(|o| o.password.as_ref().is_some_and(|p| !p.is_empty()));
                 if !has_global && !has_override && !listener.allow_anonymous {
                     return Err(ConfigError::Validation(format!(
-                        "shared_listener '{}' specifies auth_mode = 'per-tunnel' but neither global_password nor any per_tunnel.overrides.<id>.password is configured",
+                        "shared_listener '{}' specifies auth_mode = 'per_tunnel' but neither global_password nor any per_tunnel.overrides.<id>.password is configured",
                         listener.name
                     )));
                 }
@@ -781,20 +840,31 @@ impl MainConfig {
                 "per_tunnel.base_socks5_port and base_http_port cannot be identical".into(),
             ));
         }
+        let mut override_ports = HashSet::new();
         for (id, override_port) in &self.per_tunnel.overrides {
-            if let Some(p) = override_port.socks5_port
-                && p == 0
-            {
-                return Err(ConfigError::Validation(format!(
-                    "Override socks5_port for tunnel '{id}' cannot be 0"
-                )));
+            if let Some(p) = override_port.socks5_port {
+                if p == 0 {
+                    return Err(ConfigError::Validation(format!(
+                        "Override socks5_port for tunnel '{id}' cannot be 0"
+                    )));
+                }
+                if !override_ports.insert(p) {
+                    return Err(ConfigError::Validation(format!(
+                        "Override port {p} for tunnel '{id}' conflicts with another override port"
+                    )));
+                }
             }
-            if let Some(p) = override_port.http_port
-                && p == 0
-            {
-                return Err(ConfigError::Validation(format!(
-                    "Override http_port for tunnel '{id}' cannot be 0"
-                )));
+            if let Some(p) = override_port.http_port {
+                if p == 0 {
+                    return Err(ConfigError::Validation(format!(
+                        "Override http_port for tunnel '{id}' cannot be 0"
+                    )));
+                }
+                if !override_ports.insert(p) {
+                    return Err(ConfigError::Validation(format!(
+                        "Override port {p} for tunnel '{id}' conflicts with another override port"
+                    )));
+                }
             }
         }
         Ok(())

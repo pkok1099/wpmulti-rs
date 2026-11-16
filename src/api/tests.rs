@@ -418,7 +418,7 @@ async fn test_listeners_and_config_endpoints() {
         method: "POST".to_string(),
         path: "/config".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: serde_json::to_vec(&cfg).unwrap(),
     };
     let resp_post_cfg = handle_admin_request(&req_post_cfg, &manager, None, 10).await;
@@ -452,7 +452,7 @@ async fn test_batch_and_single_tunnel_disable_enable() {
         method: "POST".to_string(),
         path: "/tunnels/batch/disable".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: br#"{"target":"1-2"}"#.to_vec(),
     };
     let resp = handle_admin_request(&req_batch_disable, &manager, None, 10).await;
@@ -480,7 +480,7 @@ async fn test_batch_and_single_tunnel_disable_enable() {
         method: "POST".to_string(),
         path: "/tunnels/batch/enable".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: br#"{"target":"all"}"#.to_vec(),
     };
     let resp3 = handle_admin_request(&req_batch_enable, &manager, None, 10).await;
@@ -544,10 +544,13 @@ async fn test_config_endpoint_redacts_and_preserves_secrets_and_auth_rejects_emp
         method: "POST".to_string(),
         path: "/config".to_string(),
         query: None,
-        headers: HashMap::from([(
-            "authorization".to_string(),
-            "Bearer super-secret-token".to_string(),
-        )]),
+        headers: HashMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer super-secret-token".to_string(),
+            ),
+            ("content-type".to_string(), "application/json".to_string()),
+        ]),
         body: resp_get.body,
     };
     let resp_post = handle_admin_request(&post_req, &manager, Some("super-secret-token"), 10).await;
@@ -556,4 +559,39 @@ async fn test_config_endpoint_redacts_and_preserves_secrets_and_auth_rejects_emp
         manager.config_snapshot().admin.auth_token.as_deref(),
         Some("super-secret-token")
     );
+}
+
+#[tokio::test]
+async fn test_admin_rejects_dns_rebinding_host_and_non_json_post() {
+    let manager = create_test_manager();
+
+    let rebind_req = HttpRequest {
+        method: "GET".to_string(),
+        path: "/status".to_string(),
+        query: None,
+        headers: HashMap::from([("host".to_string(), "attacker.example:9090".to_string())]),
+        body: Vec::new(),
+    };
+    let resp = handle_admin_request(&rebind_req, &manager, None, 10).await;
+    assert_eq!(resp.status, 403);
+
+    let csrf_post = HttpRequest {
+        method: "POST".to_string(),
+        path: "/tunnels/batch/disable".to_string(),
+        query: None,
+        headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+        body: br#"{"target":"all"}"#.to_vec(),
+    };
+    let resp2 = handle_admin_request(&csrf_post, &manager, None, 10).await;
+    assert_eq!(resp2.status, 400);
+}
+
+#[test]
+fn test_admin_parse_http_request_rejects_bare_lf_and_duplicate_auth() {
+    let bare_lf = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\nX-Test: 1\r\n\r\n";
+    assert!(crate::api::routes::parse_http_request(bare_lf).is_err());
+
+    let dup_auth =
+        b"GET /health HTTP/1.1\r\nAuthorization: Bearer a\r\nAuthorization: Bearer b\r\n\r\n";
+    assert!(crate::api::routes::parse_http_request(dup_auth).is_err());
 }

@@ -160,15 +160,20 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         return cmd_run(config, dir, tui).await;
     }
 
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
+    if !matches!(cli.command, Commands::Top { .. }) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+    }
+    let env_token = std::env::var("WPMULTI_ADMIN_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
     match cli.command {
         Commands::Run { .. } => unreachable!(),
         Commands::Top {
             admin_url,
             auth_token,
-        } => cmd_top(admin_url, auth_token).await,
+        } => cmd_top(admin_url, auth_token.or(env_token)).await,
         Commands::Validate { config, dir } => {
             cmd_validate(config, dir)?;
             Ok(())
@@ -177,7 +182,7 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             admin_url,
             auth_token,
         } => {
-            cmd_status(admin_url, auth_token).await?;
+            cmd_status(admin_url, auth_token.or(env_token)).await?;
             Ok(())
         }
         Commands::Probe {
@@ -193,11 +198,11 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             target,
             admin_url,
             auth_token,
-        } => cmd_toggle_tunnels(target, true, admin_url, auth_token).await,
+        } => cmd_toggle_tunnels(target, true, admin_url, auth_token.or(env_token)).await,
         Commands::Enable {
             target,
             admin_url,
             auth_token,
-        } => cmd_toggle_tunnels(target, false, admin_url, auth_token).await,
+        } => cmd_toggle_tunnels(target, false, admin_url, auth_token.or(env_token)).await,
     }
 }

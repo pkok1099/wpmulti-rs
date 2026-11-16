@@ -94,6 +94,28 @@ impl HttpResponse {
         }
     }
 
+    /// Construct a 405 Method Not Allowed response.
+    pub fn method_not_allowed(msg: &str) -> Self {
+        let body = serde_json::to_vec(&json!({ "error": msg })).unwrap_or_default();
+        Self {
+            status: 405,
+            reason: "Method Not Allowed",
+            content_type: "application/json",
+            body,
+        }
+    }
+
+    /// Construct a 403 Forbidden response.
+    pub fn forbidden(msg: &str) -> Self {
+        let body = serde_json::to_vec(&json!({ "error": msg })).unwrap_or_default();
+        Self {
+            status: 403,
+            reason: "Forbidden",
+            content_type: "application/json",
+            body,
+        }
+    }
+
     /// Construct a 500 Internal Server Error response.
     pub fn internal_error(msg: &str) -> Self {
         let body = serde_json::to_vec(&json!({ "error": msg })).unwrap_or_default();
@@ -138,18 +160,26 @@ pub fn parse_http_request(bytes: &[u8]) -> Result<HttpRequest, String> {
     let req_line = lines
         .next()
         .ok_or_else(|| "Missing request line".to_string())?;
-    let mut req_parts = req_line.split_whitespace();
-    let method = req_parts
-        .next()
-        .ok_or_else(|| "Missing HTTP method".to_string())?
-        .to_uppercase();
-    let uri = req_parts
-        .next()
-        .ok_or_else(|| "Missing HTTP URI".to_string())?;
+    if req_line.contains(['\r', '\n', '\0', '\t']) {
+        return Err("Invalid control character in request line".to_string());
+    }
+    let mut req_parts = req_line.split(' ');
+    let (Some(method_raw), Some(uri), Some(version), None) = (
+        req_parts.next(),
+        req_parts.next(),
+        req_parts.next(),
+        req_parts.next(),
+    ) else {
+        return Err("Malformed HTTP request line".to_string());
+    };
+    if method_raw.is_empty() || uri.is_empty() || (version != "HTTP/1.1" && version != "HTTP/1.0") {
+        return Err("Invalid HTTP method, URI, or version".to_string());
+    }
+    let method = method_raw.to_uppercase();
 
     let (path, query) = match uri.split_once('?') {
-        Some((p, q)) => (p.to_string(), Some(q.to_string())),
-        None => (uri.to_string(), None),
+        Some((p, q)) => (percent_decode(p), Some(q.to_string())),
+        None => (percent_decode(uri), None),
     };
 
     let mut headers = HashMap::new();
@@ -157,9 +187,25 @@ pub fn parse_http_request(bytes: &[u8]) -> Result<HttpRequest, String> {
         if line.is_empty() {
             continue;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+        if line.contains(['\r', '\n', '\0']) {
+            return Err("Invalid control character in header".to_string());
         }
+        let Some((k, v)) = line.split_once(':') else {
+            return Err("Malformed HTTP header line".to_string());
+        };
+        if k.is_empty() || k.chars().any(char::is_whitespace) {
+            return Err("Invalid HTTP header name".to_string());
+        }
+        let key = k.to_ascii_lowercase();
+        if key == "transfer-encoding" {
+            return Err("Transfer-Encoding is not supported".to_string());
+        }
+        if matches!(key.as_str(), "content-length" | "authorization" | "host")
+            && headers.contains_key(&key)
+        {
+            return Err(format!("Duplicate '{key}' header"));
+        }
+        headers.insert(key, v.trim().to_string());
     }
 
     let body_start = header_end + 4;
@@ -174,13 +220,37 @@ pub fn parse_http_request(bytes: &[u8]) -> Result<HttpRequest, String> {
     })
 }
 
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes.get(i) == Some(&b'%')
+            && let (Some(&hi), Some(&lo)) = (bytes.get(i + 1), bytes.get(i + 2))
+            && let (Some(h), Some(l)) = (char::from(hi).to_digit(16), char::from(lo).to_digit(16))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
+        }
+        if let Some(&b) = bytes.get(i) {
+            out.push(b);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Parse query string pairs into key-value map.
 fn parse_query_params(query: Option<&str>) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if let Some(q) = query {
         for part in q.split('&') {
             if let Some((k, v)) = part.split_once('=') {
-                map.insert(k.trim().to_lowercase(), v.trim().to_string());
+                map.insert(
+                    percent_decode(k.trim()).to_lowercase(),
+                    percent_decode(v.trim()),
+                );
             }
         }
     }
@@ -189,12 +259,12 @@ fn parse_query_params(query: Option<&str>) -> HashMap<String, String> {
 
 /// Constant-time byte slice comparison to prevent timing side-channels on bearer tokens.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let max_len = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
     }
     diff == 0
 }
@@ -359,20 +429,32 @@ async fn handle_tunnel_subroute(
                 "Suspend error",
                 manager,
             ),
-            ("POST", "disable") => tunnel_action_response(
-                manager.set_tunnels_disabled(id, true).await,
-                id,
-                "disabled",
-                "Disable error",
-                manager,
-            ),
-            ("POST", "enable") => tunnel_action_response(
-                manager.set_tunnels_disabled(id, false).await,
-                id,
-                "enabled",
-                "Enable error",
-                manager,
-            ),
+            ("POST", "disable") => {
+                if manager.registry().get(id).is_none() {
+                    HttpResponse::not_found(&format!("Tunnel '{id}' not found"))
+                } else {
+                    tunnel_action_response(
+                        manager.set_tunnels_disabled(id, true).await,
+                        id,
+                        "disabled",
+                        "Disable error",
+                        manager,
+                    )
+                }
+            }
+            ("POST", "enable") => {
+                if manager.registry().get(id).is_none() {
+                    HttpResponse::not_found(&format!("Tunnel '{id}' not found"))
+                } else {
+                    tunnel_action_response(
+                        manager.set_tunnels_disabled(id, false).await,
+                        id,
+                        "enabled",
+                        "Enable error",
+                        manager,
+                    )
+                }
+            }
             _ => HttpResponse::not_found("Action not found"),
         };
     }
@@ -382,8 +464,25 @@ async fn handle_tunnel_subroute(
             || HttpResponse::not_found(&format!("Tunnel '{sub}' not found")),
             |entry| HttpResponse::ok_json(&entry.summary()),
         ),
-        _ => HttpResponse::bad_request("Method not allowed"),
+        _ => HttpResponse::method_not_allowed("Method not allowed"),
     }
+}
+
+fn is_allowed_unauthenticated_host(host_header: &str) -> bool {
+    let trimmed = host_header.trim();
+    let host_only = trimmed.strip_prefix('[').map_or_else(
+        || trimmed.split_once(':').map_or(trimmed, |(h, _)| h),
+        |rest| rest.split_once(']').map_or(trimmed, |(h, _)| h),
+    );
+    host_only.eq_ignore_ascii_case("localhost") || host_only.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn has_json_content_type(req: &HttpRequest) -> bool {
+    req.headers.get("content-type").is_some_and(|ct| {
+        ct.split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    })
 }
 
 /// Core routing function for incoming Admin REST API requests.
@@ -393,6 +492,13 @@ pub async fn handle_admin_request(
     auth_token: Option<&str>,
     uptime_secs: u64,
 ) -> HttpResponse {
+    if auth_token.is_none()
+        && let Some(host) = req.headers.get("host")
+        && !is_allowed_unauthenticated_host(host)
+    {
+        return HttpResponse::forbidden("Invalid Host header for unauthenticated Admin API");
+    }
+
     if !is_authorized(req, auth_token) {
         return HttpResponse::unauthorized();
     }
@@ -413,17 +519,21 @@ pub async fn handle_admin_request(
         ("GET", "/config") => {
             HttpResponse::ok_json(&redact_config_secrets(manager.config_snapshot()))
         }
-        ("POST", "/config") => match serde_json::from_slice::<crate::config::MainConfig>(&req.body)
-        {
-            Ok(mut new_cfg) => {
-                preserve_config_secrets(&mut new_cfg, &manager.config_snapshot());
-                match manager.update_runtime_config(new_cfg) {
-                    Ok(()) => HttpResponse::ok_json(&json!({ "status": "updated" })),
-                    Err(e) => HttpResponse::bad_request(&format!("Invalid config: {e}")),
-                }
+        ("POST", "/config") => {
+            if !has_json_content_type(req) {
+                return HttpResponse::bad_request("Content-Type must be application/json");
             }
-            Err(e) => HttpResponse::bad_request(&format!("Invalid JSON config: {e}")),
-        },
+            match serde_json::from_slice::<crate::config::MainConfig>(&req.body) {
+                Ok(mut new_cfg) => {
+                    preserve_config_secrets(&mut new_cfg, &manager.config_snapshot());
+                    match manager.update_runtime_config(new_cfg) {
+                        Ok(()) => HttpResponse::ok_json(&json!({ "status": "updated" })),
+                        Err(e) => HttpResponse::bad_request(&format!("Invalid config: {e}")),
+                    }
+                }
+                Err(e) => HttpResponse::bad_request(&format!("Invalid JSON config: {e}")),
+            }
+        }
         ("POST", "/reload") => match manager.reload().await {
             Ok(report) => HttpResponse::ok_json(&json!({
                 "status": "reloaded",
@@ -435,13 +545,24 @@ pub async fn handle_admin_request(
                 },
                 "reloaded": report.total
             })),
-            Err(e) => HttpResponse::internal_error(&format!("Reload failed: {e}")),
+            Err(e) => {
+                tracing::error!("Admin API /reload failed: {:?}", e);
+                let msg = if e.to_string().contains("does not exist") {
+                    "Reload failed: config directory does not exist"
+                } else {
+                    "Reload failed"
+                };
+                HttpResponse::internal_error(msg)
+            }
         },
         ("GET", "/metrics") => HttpResponse::ok_text(
             generate_prometheus_metrics(manager),
             "text/plain; version=0.0.4; charset=utf-8",
         ),
         ("POST", "/tunnels/batch/disable" | "/tunnels/batch/enable") => {
+            if !has_json_content_type(req) {
+                return HttpResponse::bad_request("Content-Type must be application/json");
+            }
             handle_batch_toggle(path, &req.body, manager).await
         }
         _ => {
@@ -469,7 +590,17 @@ fn preserve_config_secrets(
     new_cfg: &mut crate::config::MainConfig,
     existing: &crate::config::MainConfig,
 ) {
-    if new_cfg.admin.auth_token.is_none() {
+    // Prevent remote config updates from redirecting config_dir to an arbitrary path
+    new_cfg
+        .global
+        .config_dir
+        .clone_from(&existing.global.config_dir);
+    if new_cfg
+        .admin
+        .auth_token
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
         new_cfg
             .admin
             .auth_token

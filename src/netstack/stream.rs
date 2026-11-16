@@ -17,7 +17,7 @@ use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint};
 use tokio::sync::Notify;
 
-use crate::netstack::stack::StackInner;
+use crate::netstack::stack::{StackInner, register_shutdown_waker};
 
 impl std::fmt::Debug for VirtualTcpStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -25,7 +25,7 @@ impl std::fmt::Debug for VirtualTcpStream {
             .field("handle", &self.handle)
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
-            .field("closed", &self.closed)
+            .field("write_closed", &self.write_closed)
             .finish_non_exhaustive()
     }
 }
@@ -60,7 +60,7 @@ pub struct VirtualTcpStream {
     pub(crate) notify: Arc<Notify>,
     pub(crate) local_addr: SocketAddr,
     pub(crate) peer_addr: SocketAddr,
-    pub(crate) closed: bool,
+    pub(crate) write_closed: bool,
 }
 
 impl VirtualTcpStream {
@@ -78,7 +78,7 @@ impl VirtualTcpStream {
             notify,
             local_addr,
             peer_addr,
-            closed: false,
+            write_closed: false,
         }
     }
 
@@ -99,11 +99,13 @@ impl AsyncRead for VirtualTcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.closed {
-            return Poll::Ready(Ok(()));
-        }
-
         let mut inner = self.inner.lock();
+        if inner.shutdown {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network stack is shut down",
+            )));
+        }
         if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
             drop(inner);
             return Poll::Ready(Err(io::Error::new(
@@ -135,6 +137,7 @@ impl AsyncRead for VirtualTcpStream {
                     Poll::Ready(Ok(()))
                 } else {
                     socket.register_recv_waker(cx.waker());
+                    register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                     Poll::Pending
                 }
             }
@@ -152,6 +155,7 @@ impl AsyncRead for VirtualTcpStream {
             }
             State::SynSent | State::SynReceived => {
                 socket.register_recv_waker(cx.waker());
+                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                 Poll::Pending
             }
             State::Listen => Poll::Ready(Err(io::Error::new(
@@ -168,7 +172,7 @@ impl AsyncWrite for VirtualTcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.closed {
+        if self.write_closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stream is closed",
@@ -180,6 +184,12 @@ impl AsyncWrite for VirtualTcpStream {
         }
 
         let mut inner = self.inner.lock();
+        if inner.shutdown {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network stack is shut down",
+            )));
+        }
         if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
             drop(inner);
             return Poll::Ready(Err(io::Error::new(
@@ -212,11 +222,13 @@ impl AsyncWrite for VirtualTcpStream {
                     }
                 } else {
                     socket.register_send_waker(cx.waker());
+                    register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                     Poll::Pending
                 }
             }
             State::SynSent | State::SynReceived => {
                 socket.register_send_waker(cx.waker());
+                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                 Poll::Pending
             }
             State::FinWait1
@@ -236,11 +248,17 @@ impl AsyncWrite for VirtualTcpStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.closed {
+        if self.write_closed {
             return Poll::Ready(Ok(()));
         }
 
         let mut inner = self.inner.lock();
+        if inner.shutdown {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network stack is shut down",
+            )));
+        }
         if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
             drop(inner);
             return Poll::Ready(Err(io::Error::new(
@@ -256,11 +274,13 @@ impl AsyncWrite for VirtualTcpStream {
                     Poll::Ready(Ok(()))
                 } else {
                     socket.register_send_waker(cx.waker());
+                    register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                     Poll::Pending
                 }
             }
             State::SynSent | State::SynReceived => {
                 socket.register_send_waker(cx.waker());
+                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                 Poll::Pending
             }
             State::Closed
@@ -276,11 +296,17 @@ impl AsyncWrite for VirtualTcpStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.closed {
+        if self.write_closed {
             return Poll::Ready(Ok(()));
         }
 
         let mut inner = self.inner.lock();
+        if inner.shutdown {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network stack is shut down",
+            )));
+        }
         if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
             drop(inner);
             return Poll::Ready(Err(io::Error::new(
@@ -294,21 +320,24 @@ impl AsyncWrite for VirtualTcpStream {
             State::Established | State::CloseWait => {
                 socket.close();
                 socket.register_send_waker(cx.waker());
+                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                 drop(inner);
                 self.notify.notify_one();
                 Poll::Pending
             }
-            State::FinWait1 | State::FinWait2 | State::Closing | State::LastAck => {
+            State::FinWait1 | State::Closing | State::LastAck => {
                 socket.register_send_waker(cx.waker());
+                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                 Poll::Pending
             }
-            State::Closed
+            State::FinWait2
+            | State::Closed
             | State::Listen
             | State::SynSent
             | State::SynReceived
             | State::TimeWait => {
                 drop(inner);
-                self.get_mut().closed = true;
+                self.get_mut().write_closed = true;
                 Poll::Ready(Ok(()))
             }
         }
@@ -320,11 +349,14 @@ impl Drop for VirtualTcpStream {
         let mut inner = self.inner.lock();
         let exists = inner.sockets.iter().any(|(h, _)| h == self.handle);
         if exists {
+            let shutdown = inner.shutdown;
             let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
-            if socket.is_active() {
+            if shutdown || !socket.is_active() {
+                inner.sockets.remove(self.handle);
+            } else {
                 socket.abort();
+                inner.pending_reap.push(self.handle);
             }
-            inner.sockets.remove(self.handle);
             drop(inner);
             self.notify.notify_one();
         }
@@ -364,6 +396,12 @@ impl VirtualUdpSocket {
         let endpoint = to_smoltcp_endpoint(target);
         std::future::poll_fn(|cx| {
             let mut inner = self.inner.lock();
+            if inner.shutdown {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "network stack is shut down",
+                )));
+            }
             if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -371,6 +409,12 @@ impl VirtualUdpSocket {
                 )));
             }
             let socket = inner.sockets.get_mut::<udp::Socket<'_>>(self.handle);
+            if buf.len() > socket.payload_send_capacity() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP datagram exceeds socket send buffer capacity",
+                )));
+            }
 
             if socket.can_send() {
                 match socket.send_slice(buf, endpoint) {
@@ -381,6 +425,7 @@ impl VirtualUdpSocket {
                     }
                     Err(udp::SendError::BufferFull) => {
                         socket.register_send_waker(cx.waker());
+                        register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                         Poll::Pending
                     }
                     Err(udp::SendError::Unaddressable) => Poll::Ready(Err(io::Error::new(
@@ -390,6 +435,7 @@ impl VirtualUdpSocket {
                 }
             } else {
                 socket.register_send_waker(cx.waker());
+                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                 Poll::Pending
             }
         })
@@ -400,6 +446,12 @@ impl VirtualUdpSocket {
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), io::Error> {
         std::future::poll_fn(|cx| {
             let mut inner = self.inner.lock();
+            if inner.shutdown {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "network stack is shut down",
+                )));
+            }
             if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -422,11 +474,13 @@ impl VirtualUdpSocket {
                     ))),
                     Err(udp::RecvError::Exhausted) => {
                         socket.register_recv_waker(cx.waker());
+                        register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                         Poll::Pending
                     }
                 }
             } else {
                 socket.register_recv_waker(cx.waker());
+                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
                 Poll::Pending
             }
         })

@@ -18,11 +18,12 @@ trap 'rm -rf "$STAGE_DIR"' EXIT
 mkdir -p "$STAGE_DIR/DEBIAN"
 mkdir -p "$STAGE_DIR/$PREFIX/bin"
 mkdir -p "$STAGE_DIR/$PREFIX/etc/wpmulti/confs"
+chmod 0700 "$STAGE_DIR/$PREFIX/etc/wpmulti" "$STAGE_DIR/$PREFIX/etc/wpmulti/confs"
 mkdir -p "$STAGE_DIR/$PREFIX/var/service/wpmulti/log"
 mkdir -p "$STAGE_DIR/$PREFIX/share/doc/wpmulti"
 
 install -m 0755 "$BIN_PATH" "$STAGE_DIR/$PREFIX/bin/wpmulti"
-install -m 0644 packaging/termux/wpmulti.toml "$STAGE_DIR/$PREFIX/etc/wpmulti/wpmulti.toml"
+install -m 0600 packaging/termux/wpmulti.toml "$STAGE_DIR/$PREFIX/etc/wpmulti/wpmulti.toml"
 install -m 0755 packaging/termux/sv-run "$STAGE_DIR/$PREFIX/var/service/wpmulti/run"
 install -m 0755 packaging/termux/sv-log-run "$STAGE_DIR/$PREFIX/var/service/wpmulti/log/run"
 install -m 0644 LICENSE "$STAGE_DIR/$PREFIX/share/doc/wpmulti/LICENSE"

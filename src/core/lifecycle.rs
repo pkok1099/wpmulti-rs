@@ -190,13 +190,28 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
         let tunnel = Arc::clone(&self.tunnel);
         let guard = Arc::clone(&self.guard);
+        let health = self.health.clone();
+        let threshold = self.threshold;
+        let cooldown = self.cooldown;
         Box::pin(async move {
-            let socket = tunnel.udp_bind(local_port).await?;
-            let guarded: Box<dyn ProxyUdpSocket> = Box::new(GuardedUdpSocket {
-                inner: socket,
-                _guard: guard,
-            });
-            Ok(guarded)
+            match tunnel.udp_bind(local_port).await {
+                Ok(socket) => {
+                    if let Some(h) = &health {
+                        h.record_success();
+                    }
+                    let guarded: Box<dyn ProxyUdpSocket> = Box::new(GuardedUdpSocket {
+                        inner: socket,
+                        _guard: guard,
+                    });
+                    Ok(guarded)
+                }
+                Err(e) => {
+                    if let Some(h) = &health {
+                        h.record_failure(threshold, cooldown);
+                    }
+                    Err(e)
+                }
+            }
         })
     }
 
@@ -290,14 +305,20 @@ impl AsyncWrite for GuardedStream {
 /// RAII guard ensuring `TunnelState::Activating` reverts to `Dormant` if activation is cancelled.
 struct ActivatingGuard<'a> {
     entry: &'a TunnelEntry,
+    revert_state: TunnelState,
     defused: bool,
 }
 
 impl<'a> ActivatingGuard<'a> {
     fn new(entry: &'a TunnelEntry) -> Self {
+        Self::with_revert_state(entry, TunnelState::Dormant)
+    }
+
+    fn with_revert_state(entry: &'a TunnelEntry, revert_state: TunnelState) -> Self {
         *entry.state.write() = TunnelState::Activating;
         Self {
             entry,
+            revert_state,
             defused: false,
         }
     }
@@ -310,7 +331,7 @@ impl<'a> ActivatingGuard<'a> {
 impl Drop for ActivatingGuard<'_> {
     fn drop(&mut self) {
         if !self.defused {
-            *self.entry.state.write() = TunnelState::Dormant;
+            *self.entry.state.write() = self.revert_state;
         }
     }
 }
@@ -518,42 +539,58 @@ impl LifecycleController {
         Ok(())
     }
 
-    /// Ensure active tunnel count is below `max_active_tunnels`, evicting oldest idle lazy tunnels if needed.
-    async fn enforce_max_active_tunnels(&self, target_id: &str) -> Result<(), CoreError> {
+    /// Ensure active+activating tunnel count is below `max_active_tunnels`, evicting oldest idle lazy tunnels if needed,
+    /// and atomically reserve an `Activating` slot under `eviction_lock`.
+    async fn enforce_max_active_tunnels(&self, target: &TunnelEntry) -> Result<(), CoreError> {
         let _evict_guard = self.eviction_lock.lock().await;
         let max_active = self.max_active_tunnels.load(Ordering::Relaxed);
-        if max_active == usize::MAX || self.registry.active_count() < max_active {
-            return Ok(());
-        }
+        let active_or_activating_count = || {
+            self.registry
+                .all_entries()
+                .into_iter()
+                .filter(|e| {
+                    e.id != target.id
+                        && matches!(
+                            *e.state.read(),
+                            TunnelState::Active | TunnelState::Activating
+                        )
+                })
+                .count()
+        };
 
-        let mut candidates: Vec<(u64, String)> = self
-            .registry
-            .all_entries()
-            .into_iter()
-            .filter(|e| {
-                e.id != target_id
-                    && e.lifecycle_mode == LifecycleMode::Lazy
-                    && *e.state.read() == TunnelState::Active
-                    && e.stats.active_conns.load(Ordering::SeqCst) == 0
-            })
-            .map(|e| (e.stats.last_active_at.load(Ordering::Relaxed), e.id.clone()))
-            .collect();
+        if max_active != usize::MAX && active_or_activating_count() >= max_active {
+            let mut candidates: Vec<(u64, String)> = self
+                .registry
+                .all_entries()
+                .into_iter()
+                .filter(|e| {
+                    e.id != target.id
+                        && e.lifecycle_mode == LifecycleMode::Lazy
+                        && *e.state.read() == TunnelState::Active
+                        && e.stats.active_conns.load(Ordering::SeqCst) == 0
+                })
+                .map(|e| (e.stats.last_active_at.load(Ordering::Relaxed), e.id.clone()))
+                .collect();
 
-        candidates.sort_by_key(|(last_active, _)| *last_active);
+            candidates.sort_by_key(|(last_active, _)| *last_active);
 
-        for (_, evict_id) in candidates {
-            if self.registry.active_count() < max_active {
-                break;
+            for (_, evict_id) in candidates {
+                if active_or_activating_count() < max_active {
+                    break;
+                }
+                self.try_suspend_for_eviction(&evict_id).await;
             }
-            self.try_suspend_for_eviction(&evict_id).await;
+
+            if active_or_activating_count() >= max_active {
+                return Err(CoreError::ActivationFailed(
+                    target.id.clone(),
+                    format!("max_active_tunnels ({max_active}) limit reached"),
+                ));
+            }
         }
 
-        if self.registry.active_count() >= max_active {
-            return Err(CoreError::ActivationFailed(
-                target_id.to_string(),
-                format!("max_active_tunnels ({max_active}) limit reached"),
-            ));
-        }
+        // Reserve slot while holding eviction_lock to eliminate TOCTOU race
+        *target.state.write() = TunnelState::Activating;
         Ok(())
     }
 
@@ -574,9 +611,9 @@ impl LifecycleController {
         let maybe_active = entry.active.read().clone();
         if let Some(active) = maybe_active {
             tracing::debug!("Evicting idle lazy tunnel '{}'", id);
+            *entry.state.write() = TunnelState::Suspended;
             active.device.suspend().await;
             active.netstack.notify().notify_one();
-            *entry.state.write() = TunnelState::Suspended;
         }
     }
 
@@ -601,10 +638,17 @@ impl LifecycleController {
 
         let _lock = entry.activation_lock.lock().await;
 
+        if entry.is_disabled() {
+            return Err(CoreError::ActivationFailed(
+                id.to_string(),
+                "tunnel is disabled".into(),
+            ));
+        }
+
         // Check if already active or suspended
         let current_state = *entry.state.read();
         if current_state != TunnelState::Active {
-            self.enforce_max_active_tunnels(id).await?;
+            self.enforce_max_active_tunnels(&entry).await?;
         }
 
         match current_state {
@@ -616,10 +660,17 @@ impl LifecycleController {
                 Ok((active, guard))
             }
             TunnelState::Suspended => {
-                // Resume existing device
-                let active = entry.active.read().clone().ok_or_else(|| {
-                    CoreError::ActivationFailed(id.to_string(), "suspended handle missing".into())
-                })?;
+                // Resume existing device with cancellation guard
+                let activating_guard =
+                    ActivatingGuard::with_revert_state(&entry, TunnelState::Suspended);
+                let Some(active) = entry.active.read().clone() else {
+                    *entry.state.write() = TunnelState::Dormant;
+                    activating_guard.defuse();
+                    return Err(CoreError::ActivationFailed(
+                        id.to_string(),
+                        "suspended handle missing".into(),
+                    ));
+                };
 
                 tracing::debug!("Resuming suspended tunnel '{}'", id);
                 if let Err(e) = active.device.resume().await {
@@ -632,6 +683,7 @@ impl LifecycleController {
                 }
 
                 *entry.state.write() = TunnelState::Active;
+                activating_guard.defuse();
                 let guard = TunnelConnGuard::new(id, Arc::clone(&entry.stats));
                 Ok((active, guard))
             }
@@ -683,9 +735,16 @@ impl LifecycleController {
 
         let _lock = entry.activation_lock.lock().await;
 
+        if entry.is_disabled() {
+            return Err(CoreError::ActivationFailed(
+                id.to_string(),
+                "tunnel is disabled".into(),
+            ));
+        }
+
         let current_state = *entry.state.read();
         if current_state != TunnelState::Active {
-            self.enforce_max_active_tunnels(id).await?;
+            self.enforce_max_active_tunnels(&entry).await?;
         }
 
         match current_state {
@@ -700,19 +759,26 @@ impl LifecycleController {
                 })
             }
             TunnelState::Suspended => {
-                let active = entry.active.read().clone().ok_or_else(|| {
-                    CoreError::ActivationFailed(id.to_string(), "suspended handle missing".into())
-                })?;
+                let activating_guard =
+                    ActivatingGuard::with_revert_state(&entry, TunnelState::Suspended);
+                let Some(active) = entry.active.read().clone() else {
+                    *entry.state.write() = TunnelState::Dormant;
+                    activating_guard.defuse();
+                    return Err(CoreError::ActivationFailed(
+                        id.to_string(),
+                        "suspended handle missing".into(),
+                    ));
+                };
 
                 tracing::debug!("Resuming suspended tunnel '{}'", id);
-                active.device.resume().await.map_err(|e| {
+                if let Err(e) = active.device.resume().await {
                     let (threshold, cooldown) = self.health_check();
                     entry.health.record_failure(threshold, cooldown);
-                    CoreError::ActivationFailed(
+                    return Err(CoreError::ActivationFailed(
                         id.to_string(),
                         format!("device resume error: {e:?}"),
-                    )
-                })?;
+                    ));
+                }
 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -721,6 +787,7 @@ impl LifecycleController {
                 entry.stats.last_active_at.store(now, Ordering::Relaxed);
 
                 *entry.state.write() = TunnelState::Active;
+                activating_guard.defuse();
                 Ok(active)
             }
             TunnelState::Dormant | TunnelState::Activating => {
@@ -777,9 +844,9 @@ impl LifecycleController {
         let maybe_active = entry.active.read().clone();
         if let Some(active) = maybe_active {
             tracing::debug!("Suspending active tunnel '{}'", id);
+            *entry.state.write() = TunnelState::Suspended;
             active.device.suspend().await;
             active.netstack.notify().notify_one();
-            *entry.state.write() = TunnelState::Suspended;
         }
 
         Ok(())
@@ -815,14 +882,22 @@ impl LifecycleController {
                 .await
                 {
                     Ok(Ok(mut addrs)) => {
-                        peer.endpoint = addrs.next();
+                        let Some(addr) = addrs.next() else {
+                            return Err(CoreError::ActivationFailed(
+                                entry.id.clone(),
+                                format!(
+                                    "endpoint DNS lookup returned no addresses for '{}'",
+                                    p_cfg.endpoint
+                                ),
+                            ));
+                        };
+                        peer.endpoint = Some(addr);
                     }
                     Ok(Err(e)) => {
-                        tracing::debug!(
-                            "Failed to resolve peer endpoint '{}': {}",
-                            p_cfg.endpoint,
-                            e
-                        );
+                        return Err(CoreError::ActivationFailed(
+                            entry.id.clone(),
+                            format!("endpoint DNS lookup failed for '{}': {e}", p_cfg.endpoint),
+                        ));
                     }
                     Err(_) => {
                         return Err(CoreError::ActivationFailed(

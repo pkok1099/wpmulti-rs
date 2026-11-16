@@ -7,17 +7,30 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proxy::router::{DynStream, ProxyTunnelTarget, TunnelRouter, TunnelSelector};
 
 const MAX_HEADER_SIZE: usize = 16384;
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Returns `true` if `ip` is an unsafe/forbidden proxy destination (unspecified or link-local).
+pub(crate) const fn is_forbidden_destination_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_unspecified() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
 
 /// Parses authority-form string `host:port` or `[ipv6]:port`.
 pub fn parse_authority(authority: &str) -> Option<(String, u16)> {
     let auth = authority.trim();
+    if auth.contains('@') {
+        return None;
+    }
     if let Some(rest) = auth.strip_prefix('[') {
         let (host, port_str) = rest.split_once("]:")?;
         if host.is_empty() || host.parse::<std::net::Ipv6Addr>().is_err() {
@@ -41,11 +54,7 @@ pub fn parse_authority(authority: &str) -> Option<(String, u16)> {
     }
 }
 
-/// Extracts and decodes RFC 7617 Basic credentials from `Proxy-Authorization` header.
-pub fn extract_basic_auth<S: std::hash::BuildHasher>(
-    headers: &HashMap<String, String, S>,
-) -> Option<(String, String)> {
-    let header_val = headers.get("proxy-authorization")?;
+fn decode_basic_auth_header(header_val: &str) -> Option<(String, String)> {
     let b64 = header_val
         .strip_prefix("Basic ")
         .or_else(|| header_val.strip_prefix("basic "))?;
@@ -55,70 +64,177 @@ pub fn extract_basic_auth<S: std::hash::BuildHasher>(
     Some((user.to_string(), pass.to_string()))
 }
 
+/// Extracts and decodes RFC 7617 Basic credentials from `Proxy-Authorization` header.
+pub fn extract_basic_auth<S: std::hash::BuildHasher>(
+    headers: &HashMap<String, String, S>,
+) -> Option<(String, String)> {
+    let header_val = headers.get("proxy-authorization")?;
+    decode_basic_auth_header(header_val)
+}
+
+fn extract_basic_auth_vec(headers: &[(String, String)]) -> Option<(String, String)> {
+    let (_, val) = headers.iter().find(|(k, _)| k == "proxy-authorization")?;
+    decode_basic_auth_header(val)
+}
+
+type ParsedHttpHeadersVec = (String, String, String, Vec<(String, String)>);
+
+async fn read_http_request_headers_raw<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<(String, String, String, Vec<(String, String)>, Vec<u8>)> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+
+    let read_fut = async {
+        while buf.len() < MAX_HEADER_SIZE {
+            let n = reader.read(&mut chunk).await?;
+            if n == 0 {
+                if buf.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed before request",
+                    ));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "request truncated",
+                ));
+            }
+            if let Some(received) = chunk.get(..n) {
+                buf.extend_from_slice(received);
+            }
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header_bytes = buf.get(..pos + 4).unwrap_or_default();
+                let (method, uri, version, headers) = parse_header_bytes_vec(header_bytes)?;
+                let leftover = buf.get(pos + 4..).unwrap_or_default().to_vec();
+                return Ok((method, uri, version, headers, leftover));
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTP request headers too large",
+        ))
+    };
+
+    tokio::time::timeout(HEADER_READ_TIMEOUT, read_fut)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP header read timed out"))?
+}
+
 /// Reads HTTP request line and headers using buffered chunked reads.
 ///
 /// Returns `(method, uri, version, headers, leftover_bytes)`.
 pub async fn read_http_request_headers_buffered<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> io::Result<(String, String, String, HashMap<String, String>, Vec<u8>)> {
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
+    let (method, uri, version, headers_vec, leftover) =
+        read_http_request_headers_raw(reader).await?;
+    let headers: HashMap<String, String> = headers_vec.into_iter().collect();
+    Ok((method, uri, version, headers, leftover))
+}
 
-    while buf.len() < MAX_HEADER_SIZE {
-        let n = reader.read(&mut chunk).await?;
-        if n == 0 {
-            if buf.is_empty() {
+fn validate_request_framing(headers: &[(String, String)]) -> io::Result<()> {
+    let mut has_transfer_encoding = false;
+    let mut content_length: Option<u64> = None;
+    let mut host_count: usize = 0;
+
+    for (name, val) in headers {
+        if name == "host" {
+            host_count += 1;
+            if host_count > 1 {
                 return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed before request",
+                    io::ErrorKind::InvalidData,
+                    "duplicate Host header",
                 ));
             }
+        }
+        if name == "connection"
+            && val.split(',').any(|t| {
+                matches!(
+                    t.trim().to_ascii_lowercase().as_str(),
+                    "content-length" | "transfer-encoding" | "host"
+                )
+            })
+        {
             return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "request truncated",
+                io::ErrorKind::InvalidData,
+                "Connection header cannot reference end-to-end framing headers",
             ));
         }
-        if let Some(received) = chunk.get(..n) {
-            buf.extend_from_slice(received);
-        }
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let header_bytes = buf.get(..pos + 4).unwrap_or_default();
-            let (method, uri, version, headers) = parse_header_bytes(header_bytes)?;
-            let leftover = buf.get(pos + 4..).unwrap_or_default().to_vec();
-            return Ok((method, uri, version, headers, leftover));
+        if name == "transfer-encoding" {
+            if !val.trim().eq_ignore_ascii_case("chunked") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported Transfer-Encoding",
+                ));
+            }
+            has_transfer_encoding = true;
+        } else if name == "content-length" {
+            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Content-Length header",
+                ));
+            }
+            let parsed = val.parse::<u64>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "Content-Length overflow")
+            })?;
+            if let Some(prev) = content_length
+                && prev != parsed
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conflicting Content-Length headers",
+                ));
+            }
+            content_length = Some(parsed);
         }
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "HTTP request headers too large",
-    ))
+    if has_transfer_encoding && content_length.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "both Transfer-Encoding and Content-Length present",
+        ));
+    }
+
+    Ok(())
 }
 
-type ParsedHttpHeaders = (String, String, String, HashMap<String, String>);
-
-fn parse_header_bytes(header_bytes: &[u8]) -> io::Result<ParsedHttpHeaders> {
-    let header_str = String::from_utf8_lossy(header_bytes);
+fn parse_header_bytes_vec(header_bytes: &[u8]) -> io::Result<ParsedHttpHeadersVec> {
+    let header_str = std::str::from_utf8(header_bytes).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 HTTP request headers")
+    })?;
     let mut lines = header_str.split("\r\n");
 
     let req_line = lines
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing request line"))?;
+    if req_line.contains(['\r', '\n', '\0', '\t']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid control character in request line",
+        ));
+    }
 
-    let mut parts = req_line.split_whitespace();
-    let (Some(method), Some(uri), Some(version)) = (parts.next(), parts.next(), parts.next())
+    let mut parts = req_line.split(' ');
+    let (Some(method), Some(uri), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "malformed request line",
         ));
     };
+    if method.is_empty() || uri.is_empty() || (version != "HTTP/1.1" && version != "HTTP/1.0") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid method, URI, or HTTP version",
+        ));
+    }
 
-    let method = method.to_string();
-    let uri = uri.to_string();
-    let version = version.to_string();
-
-    let mut headers = HashMap::new();
+    let mut headers = Vec::new();
     for line in lines {
         if line.is_empty() {
             break;
@@ -129,20 +245,29 @@ fn parse_header_bytes(header_bytes: &[u8]) -> io::Result<ParsedHttpHeaders> {
                 "invalid control character in header",
             ));
         }
-        if let Some((k, v)) = line.split_once(':') {
-            let name = k.trim().to_ascii_lowercase();
-            let val = v.trim().to_string();
-            if name.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "empty header name",
-                ));
-            }
-            headers.insert(name, val);
+        let Some((k, v)) = line.split_once(':') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed header line",
+            ));
+        };
+        if k.is_empty() || k.chars().any(char::is_whitespace) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid header field name",
+            ));
         }
+        headers.push((k.to_ascii_lowercase(), v.trim().to_string()));
     }
 
-    Ok((method, uri, version, headers))
+    validate_request_framing(&headers)?;
+
+    Ok((
+        method.to_string(),
+        uri.to_string(),
+        version.to_string(),
+        headers,
+    ))
 }
 
 /// Reads HTTP request line and headers using buffered chunked reads up to `\r\n\r\n`.
@@ -162,22 +287,32 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // 1. Read HTTP request line and headers using buffered chunked reads
-    let (method, uri, version, headers, leftover) =
-        match read_http_request_headers_buffered(&mut stream).await {
-            Ok(res) => res,
-            Err(e) => {
-                if e.kind() == io::ErrorKind::UnexpectedEof
-                    && e.to_string().contains("before request")
-                {
-                    return Ok(());
-                }
-                send_response(&mut stream, "400 Bad Request", "text/plain", b"Bad Request").await?;
-                return Err(e);
+    let (method, uri, version, headers, leftover) = match read_http_request_headers_raw(&mut stream)
+        .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            if e.kind() == io::ErrorKind::UnexpectedEof && e.to_string().contains("before request")
+            {
+                return Ok(());
             }
-        };
+            if e.kind() == io::ErrorKind::TimedOut {
+                send_response(
+                    &mut stream,
+                    "408 Request Timeout",
+                    "text/plain",
+                    b"Request Timeout",
+                )
+                .await?;
+            } else {
+                send_response(&mut stream, "400 Bad Request", "text/plain", b"Bad Request").await?;
+            }
+            return Err(e);
+        }
+    };
 
     // 2. Validate Basic Authentication if required
-    let credentials = extract_basic_auth(&headers);
+    let credentials = extract_basic_auth_vec(&headers);
     let cred_refs = credentials.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
 
     let Ok(selector) = router.authenticate(cred_refs) else {
@@ -192,7 +327,10 @@ where
     // 3. Dispatch based on HTTP method and URI form
     if method.eq_ignore_ascii_case("CONNECT") {
         handle_http_connect(stream, router, &selector, &uri, leftover).await
-    } else if uri.starts_with("http://") || uri.starts_with("https://") {
+    } else if uri
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+    {
         let req = ForwardRequest {
             method,
             uri,
@@ -200,6 +338,21 @@ where
             headers,
         };
         handle_http_forward(stream, router, &selector, req, leftover).await
+    } else if uri
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+    {
+        send_response(
+            &mut stream,
+            "501 Not Implemented",
+            "text/plain",
+            b"HTTPS absolute-URI forwarding is not supported; use CONNECT",
+        )
+        .await?;
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plaintext forwarding of https:// absolute-URI is disallowed",
+        ))
     } else {
         // Non-CONNECT origin-form requests received on forward proxy port
         send_response(
@@ -268,6 +421,20 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
+    if is_forbidden_destination_ip(dst_addr.ip()) {
+        send_response(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain",
+            b"Forbidden Destination",
+        )
+        .await?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("blocked forbidden destination IP: {}", dst_addr.ip()),
+        ));
+    }
+
     // Connect to target via tunnel connector
     let mut tunnel_stream: DynStream = match target_tunnel.tcp_connect(dst_addr).await {
         Ok(s) => s,
@@ -306,14 +473,15 @@ struct ForwardRequest {
     method: String,
     uri: String,
     version: String,
-    headers: HashMap<String, String>,
+    headers: Vec<(String, String)>,
 }
 
 fn parse_forward_uri(uri: &str) -> io::Result<(String, u16, String)> {
     let (default_port, rest) = uri
-        .strip_prefix("http://")
+        .get(..7)
+        .filter(|s| s.eq_ignore_ascii_case("http://"))
+        .and_then(|_| uri.get(7..))
         .map(|r| (80u16, r))
-        .or_else(|| uri.strip_prefix("https://").map(|r| (443u16, r)))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid absolute URI"))?;
 
     let (authority, path) = rest.find(['/', '?', '#']).map_or_else(
@@ -321,16 +489,24 @@ fn parse_forward_uri(uri: &str) -> io::Result<(String, u16, String)> {
         |idx| {
             let auth = rest.get(..idx).unwrap_or(rest);
             let suffix = rest.get(idx..).unwrap_or("");
-            let path = if suffix.starts_with('/') {
-                suffix.to_string()
-            } else if suffix.starts_with('?') {
-                format!("/{suffix}")
+            let without_fragment = suffix.split('#').next().unwrap_or("");
+            let path = if without_fragment.starts_with('/') {
+                without_fragment.to_string()
+            } else if without_fragment.starts_with('?') {
+                format!("/{without_fragment}")
             } else {
                 "/".to_string()
             };
             (auth, path)
         },
     );
+
+    if authority.contains('@') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "userinfo not allowed in proxy URI authority",
+        ));
+    }
 
     let (host, port) = if let Some(inner) = authority
         .strip_prefix('[')
@@ -367,6 +543,299 @@ fn parse_forward_uri(uri: &str) -> io::Result<(String, u16, String)> {
     Ok((host, port, path))
 }
 
+fn parse_host_header(val: &str) -> Option<(String, u16)> {
+    let trimmed = val.trim();
+    if trimmed.is_empty() || trimmed.contains('@') || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((h, port_str)) = rest.split_once("]:") {
+            let port = port_str.parse::<u16>().ok().filter(|&p| p != 0)?;
+            h.parse::<std::net::Ipv6Addr>().ok()?;
+            Some((h.to_string(), port))
+        } else if let Some(h) = rest.strip_suffix(']') {
+            h.parse::<std::net::Ipv6Addr>().ok()?;
+            Some((h.to_string(), 80))
+        } else {
+            None
+        }
+    } else if let Some((h, port_str)) = trimmed.split_once(':') {
+        if h.is_empty() || h.contains('[') || h.contains(']') {
+            return None;
+        }
+        let port = port_str.parse::<u16>().ok().filter(|&p| p != 0)?;
+        Some((h.to_string(), port))
+    } else {
+        Some((trimmed.to_string(), 80))
+    }
+}
+
+fn hosts_match(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    if let (Ok(ip_a), Ok(ip_b)) = (a.parse::<IpAddr>(), b.parse::<IpAddr>()) {
+        return ip_a == ip_b;
+    }
+    false
+}
+
+fn validate_forward_host_header(
+    headers: &[(String, String)],
+    uri_host: &str,
+    uri_port: u16,
+) -> io::Result<Option<String>> {
+    if let Some((_, host_val)) = headers.iter().find(|(k, _)| k == "host") {
+        let Some((hdr_host, hdr_port)) = parse_host_header(host_val) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Host header",
+            ));
+        };
+        if !hosts_match(&hdr_host, uri_host) || hdr_port != uri_port {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Host header does not match request-target authority",
+            ));
+        }
+        Ok(None)
+    } else {
+        let authority = if uri_host.contains(':') {
+            if uri_port == 80 {
+                format!("[{uri_host}]")
+            } else {
+                format!("[{uri_host}]:{uri_port}")
+            }
+        } else if uri_port == 80 {
+            uri_host.to_string()
+        } else {
+            format!("{uri_host}:{uri_port}")
+        };
+        Ok(Some(authority))
+    }
+}
+
+async fn read_crlf_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        let n = reader.read_until(b'\n', &mut line).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected EOF in chunked body",
+            ));
+        }
+        if line.len() > max_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunked header or trailer line too long",
+            ));
+        }
+        if line.ends_with(b"\r\n") {
+            return Ok(line);
+        }
+        if line.ends_with(b"\n") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bare LF in chunked body",
+            ));
+        }
+    }
+}
+
+async fn forward_chunked_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: R,
+    writer: &mut W,
+    leftover: &[u8],
+) -> io::Result<()> {
+    let chained = io::Cursor::new(leftover).chain(reader);
+    let mut buf_reader = tokio::io::BufReader::new(chained);
+
+    loop {
+        let size_line = read_crlf_line(&mut buf_reader, 4096).await?;
+        let line_str = std::str::from_utf8(
+            size_line
+                .get(..size_line.len().saturating_sub(2))
+                .unwrap_or_default(),
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 chunk size"))?;
+        let size_hex = line_str.split(';').next().unwrap_or("").trim();
+        let chunk_size = u64::from_str_radix(size_hex, 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
+
+        writer.write_all(&size_line).await?;
+
+        if chunk_size == 0 {
+            loop {
+                let trailer = read_crlf_line(&mut buf_reader, 8192).await?;
+                writer.write_all(&trailer).await?;
+                if trailer == b"\r\n" {
+                    break;
+                }
+            }
+            writer.flush().await?;
+            return Ok(());
+        }
+
+        let copied = tokio::io::copy(&mut (&mut buf_reader).take(chunk_size), writer).await?;
+        if copied != chunk_size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated chunk payload",
+            ));
+        }
+        let mut crlf = [0u8; 2];
+        buf_reader.read_exact(&mut crlf).await?;
+        if crlf != *b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing CRLF after chunk payload",
+            ));
+        }
+        writer.write_all(&crlf).await?;
+    }
+}
+
+async fn forward_request_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    mut client_read: R,
+    upstream_write: &mut W,
+    leftover: &[u8],
+    content_length: Option<u64>,
+    is_chunked: bool,
+) -> io::Result<()> {
+    if is_chunked {
+        forward_chunked_body(client_read, upstream_write, leftover).await?;
+    } else if let Some(cl) = content_length
+        && cl > 0
+    {
+        let from_leftover = (leftover.len() as u64).min(cl) as usize;
+        if let Some(slice) = leftover.get(..from_leftover)
+            && !slice.is_empty()
+        {
+            upstream_write.write_all(slice).await?;
+        }
+        let remaining = cl - from_leftover as u64;
+        if remaining > 0 {
+            let copied =
+                tokio::io::copy(&mut (&mut client_read).take(remaining), upstream_write).await?;
+            if copied != remaining {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated HTTP request body",
+                ));
+            }
+        }
+        upstream_write.flush().await?;
+    }
+    let _ = upstream_write.shutdown().await;
+    Ok(())
+}
+
+fn build_forward_request_head(
+    req: &ForwardRequest,
+    path: &str,
+    synthesized_host: Option<&str>,
+) -> String {
+    let conn_tokens: Vec<String> = req
+        .headers
+        .iter()
+        .filter(|(k, _)| k == "connection")
+        .flat_map(|(_, v)| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let mut req_buf = format!("{} {} {}\r\n", req.method, path, req.version);
+    if let Some(synth_host) = synthesized_host {
+        let _ = std::fmt::Write::write_fmt(&mut req_buf, format_args!("host: {synth_host}\r\n"));
+    }
+    for (k, v) in &req.headers {
+        if matches!(
+            k.as_str(),
+            "proxy-authorization"
+                | "proxy-connection"
+                | "proxy-authenticate"
+                | "connection"
+                | "keep-alive"
+                | "te"
+                | "upgrade"
+                | "trailer"
+        ) || (!matches!(k.as_str(), "content-length" | "transfer-encoding" | "host")
+            && conn_tokens.iter().any(|t| t == k))
+        {
+            continue;
+        }
+        let _ = std::fmt::Write::write_fmt(&mut req_buf, format_args!("{k}: {v}\r\n"));
+    }
+    req_buf.push_str("connection: close\r\n\r\n");
+    req_buf
+}
+
+async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    router: &Arc<dyn TunnelRouter>,
+    selector: &TunnelSelector,
+    host: &str,
+    port: u16,
+) -> io::Result<DynStream> {
+    let target_tunnel = match router.select_tunnel(selector).await {
+        Ok(t) => t,
+        Err(e) => {
+            send_response(stream, "502 Bad Gateway", "text/plain", b"Bad Gateway").await?;
+            return Err(e);
+        }
+    };
+
+    let dst_addr = if let Ok(ip) = host.parse::<IpAddr>() {
+        SocketAddr::new(ip, port)
+    } else {
+        match target_tunnel.resolve_in_tunnel(host).await {
+            Ok(ip) => SocketAddr::new(ip, port),
+            Err(e) => {
+                send_response(
+                    stream,
+                    "502 Bad Gateway",
+                    "text/plain",
+                    b"DNS Resolution Failed",
+                )
+                .await?;
+                return Err(e);
+            }
+        }
+    };
+
+    if is_forbidden_destination_ip(dst_addr.ip()) {
+        send_response(
+            stream,
+            "403 Forbidden",
+            "text/plain",
+            b"Forbidden Destination",
+        )
+        .await?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("blocked forbidden destination IP: {}", dst_addr.ip()),
+        ));
+    }
+
+    match target_tunnel.tcp_connect(dst_addr).await {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            send_response(
+                stream,
+                "502 Bad Gateway",
+                "text/plain",
+                b"Connection Failed",
+            )
+            .await?;
+            Err(e)
+        }
+    }
+}
+
 /// Executes RFC 9110 Forward Proxy request forwarding for absolute URIs.
 async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
@@ -389,90 +858,55 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
-    // Resolve tunnel target
-    let target_tunnel = match router.select_tunnel(selector).await {
-        Ok(t) => t,
-        Err(e) => {
-            send_response(&mut stream, "502 Bad Gateway", "text/plain", b"Bad Gateway").await?;
-            return Err(e);
-        }
-    };
-
-    // Resolve destination IP address
-    let dst_addr = if let Ok(ip) = host.parse::<IpAddr>() {
-        SocketAddr::new(ip, port)
-    } else {
-        match target_tunnel.resolve_in_tunnel(&host).await {
-            Ok(ip) => SocketAddr::new(ip, port),
-            Err(e) => {
-                send_response(
-                    &mut stream,
-                    "502 Bad Gateway",
-                    "text/plain",
-                    b"DNS Resolution Failed",
-                )
-                .await?;
-                return Err(e);
-            }
-        }
-    };
-
-    // Connect to destination server via tunnel
-    let mut tunnel_stream: DynStream = match target_tunnel.tcp_connect(dst_addr).await {
-        Ok(s) => s,
+    let synthesized_host = match validate_forward_host_header(&req.headers, &host, port) {
+        Ok(h) => h,
         Err(e) => {
             send_response(
                 &mut stream,
-                "502 Bad Gateway",
+                "400 Bad Request",
                 "text/plain",
-                b"Connection Failed",
+                b"Invalid or Mismatched Host Header",
             )
             .await?;
             return Err(e);
         }
     };
 
-    // Rewrite request line with relative path, filter hop-by-hop headers, and inject Connection: close
-    let conn_tokens: Vec<String> = req
-        .headers
-        .get("connection")
-        .map(|v| {
-            v.split(',')
-                .map(|t| t.trim().to_ascii_lowercase())
-                .filter(|t| !t.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut tunnel_stream =
+        resolve_and_connect_http_target(&mut stream, &router, selector, &host, port).await?;
 
-    let mut req_buf = format!("{} {} {}\r\n", req.method, path, req.version);
-    for (k, v) in &req.headers {
-        if matches!(
-            k.as_str(),
-            "proxy-authorization"
-                | "proxy-connection"
-                | "proxy-authenticate"
-                | "connection"
-                | "keep-alive"
-                | "te"
-                | "upgrade"
-                | "trailer"
-        ) || conn_tokens.iter().any(|t| t == k)
-        {
-            continue;
-        }
-        let _ = std::fmt::Write::write_fmt(&mut req_buf, format_args!("{k}: {v}\r\n"));
-    }
-    req_buf.push_str("connection: close\r\n\r\n");
+    let content_length = req
+        .headers
+        .iter()
+        .find(|(k, _)| k == "content-length")
+        .and_then(|(_, v)| v.parse::<u64>().ok());
+    let is_chunked = req
+        .headers
+        .iter()
+        .any(|(k, v)| k == "transfer-encoding" && v.trim().eq_ignore_ascii_case("chunked"));
+
+    let req_buf = build_forward_request_head(&req, &path, synthesized_host.as_deref());
 
     // Forward request line and headers to destination server
     tunnel_stream.write_all(req_buf.as_bytes()).await?;
-    if !leftover.is_empty() {
-        tunnel_stream.write_all(&leftover).await?;
-    }
     tunnel_stream.flush().await?;
 
-    // Bidirectional copy: streams any request payload (e.g. POST) and response back to client
-    tokio::io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
+    let (client_read, mut client_write) = tokio::io::split(stream);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(tunnel_stream);
+
+    let req_fut = forward_request_body(
+        client_read,
+        &mut upstream_write,
+        &leftover,
+        content_length,
+        is_chunked,
+    );
+    let resp_fut = async {
+        tokio::io::copy(&mut upstream_read, &mut client_write).await?;
+        client_write.flush().await
+    };
+
+    tokio::try_join!(req_fut, resp_fut)?;
 
     Ok(())
 }

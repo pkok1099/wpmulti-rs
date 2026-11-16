@@ -103,7 +103,7 @@ impl ListenerSupervisor {
             .collect();
 
         for shared_cfg in &config.shared_listeners {
-            let info = self
+            let info = match self
                 .start_shared_listener_with_options(
                     shared_cfg,
                     registry,
@@ -111,13 +111,38 @@ impl ListenerSupervisor {
                     (config.health_check.threshold, config.health_check.cooldown),
                     per_tunnel_passwords.clone(),
                 )
-                .await?;
+                .await
+            {
+                Ok(info) => info,
+                Err(e) => {
+                    self.rollback_started_listeners(&started, Some(registry));
+                    return Err(e);
+                }
+            };
             started.push(info);
         }
 
         self.started
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(started)
+    }
+
+    fn pick_free_dedicated_port(
+        used_ports: &mut std::collections::HashSet<u16>,
+        next_port: &mut u16,
+    ) -> Option<u16> {
+        for _ in 0..=u16::MAX {
+            if *next_port == 0 {
+                *next_port = 1;
+            }
+            if used_ports.insert(*next_port) {
+                let chosen = *next_port;
+                *next_port = next_port.wrapping_add(1);
+                return Some(chosen);
+            }
+            *next_port = next_port.wrapping_add(1);
+        }
+        None
     }
 
     async fn start_dedicated_protocol_listeners(
@@ -140,19 +165,23 @@ impl ListenerSupervisor {
             ListenerType::Http => "http",
         };
         let mut started = Vec::with_capacity(entries.len());
-        let mut used_ports: std::collections::HashSet<u16> = entries
-            .iter()
-            .filter_map(|e| {
-                per_tunnel
-                    .overrides
-                    .get(&e.id)
-                    .and_then(|o| match listener_type {
-                        ListenerType::Socks5 => o.socks5_port,
-                        ListenerType::Http => o.http_port,
-                    })
-            })
-            .collect();
-        let mut next_port = base_port;
+        let mut used_ports: std::collections::HashSet<u16> = {
+            let handles = self.handles.lock();
+            handles.iter().map(|h| h.info.address.port()).collect()
+        };
+        for e in entries {
+            if let Some(p) = per_tunnel
+                .overrides
+                .get(&e.id)
+                .and_then(|o| match listener_type {
+                    ListenerType::Socks5 => o.socks5_port,
+                    ListenerType::Http => o.http_port,
+                })
+            {
+                used_ports.insert(p);
+            }
+        }
+        let mut next_port = if base_port == 0 { 1 } else { base_port };
 
         for entry in entries {
             let override_port =
@@ -163,30 +192,35 @@ impl ListenerSupervisor {
                         ListenerType::Socks5 => o.socks5_port,
                         ListenerType::Http => o.http_port,
                     });
-            let port = override_port.unwrap_or_else(|| {
-                while used_ports.contains(&next_port) {
-                    next_port = next_port.wrapping_add(1);
-                }
-                let p = next_port;
-                used_ports.insert(p);
-                next_port = next_port.wrapping_add(1);
+            let port = if let Some(p) = override_port {
                 p
-            });
+            } else {
+                let Some(p) = Self::pick_free_dedicated_port(&mut used_ports, &mut next_port)
+                else {
+                    self.rollback_started_listeners(&started, None);
+                    return Err(CoreError::ListenerError(format!(
+                        "no free {proto_label} port available for tunnel '{}'",
+                        entry.id
+                    )));
+                };
+                p
+            };
 
             let bind_addr = SocketAddr::new(bind_address, port);
             let listener = match TcpListener::bind(bind_addr).await {
                 Ok(l) => l,
                 Err(e) => {
-                    self.rollback_started_listeners(&started);
+                    self.rollback_started_listeners(&started, None);
                     return Err(CoreError::ListenerError(format!(
                         "failed to bind dedicated {proto_label} listener for tunnel '{}' on {bind_addr}: {e:?}",
                         entry.id
                     )));
                 }
             };
+            let actual_addr = listener.local_addr().unwrap_or(bind_addr);
 
             if listener_type == ListenerType::Socks5 || entry.assigned_port.read().is_none() {
-                entry.set_assigned_port(port);
+                entry.set_assigned_port(actual_addr.port());
             }
 
             let auth = per_tunnel
@@ -203,7 +237,7 @@ impl ListenerSupervisor {
 
             let info = ActiveListenerInfo {
                 name: format!("dedicated-{proto_label}-{}", entry.id),
-                address: bind_addr,
+                address: actual_addr,
                 listener_type,
                 is_shared: false,
                 tunnel_id: Some(entry.id.clone()),
@@ -227,24 +261,42 @@ impl ListenerSupervisor {
         Ok(started)
     }
 
-    fn rollback_started_listeners(&self, started: &[ActiveListenerInfo]) {
-        let rollback_names: std::collections::HashSet<&str> =
-            started.iter().map(|i| i.name.as_str()).collect();
+    fn rollback_started_listeners(
+        &self,
+        started: &[ActiveListenerInfo],
+        registry: Option<&Arc<TunnelRegistry>>,
+    ) {
+        let rollback_keys: std::collections::HashSet<(&str, SocketAddr)> = started
+            .iter()
+            .map(|i| (i.name.as_str(), i.address))
+            .collect();
         let mut removed = Vec::new();
         {
             let mut handles = self.handles.lock();
             let mut idx = 0;
             while idx < handles.len() {
-                if handles
-                    .get(idx)
-                    .is_some_and(|h| rollback_names.contains(h.info.name.as_str()))
-                {
+                if handles.get(idx).is_some_and(|h| {
+                    rollback_keys.contains(&(h.info.name.as_str(), h.info.address))
+                }) {
                     removed.push(handles.swap_remove(idx));
                 } else {
                     idx += 1;
                 }
             }
+            if handles.is_empty() {
+                self.started
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             drop(handles);
+        }
+        if let Some(reg) = registry {
+            for info in started {
+                if let Some(ref tid) = info.tunnel_id
+                    && let Some(entry) = reg.get(tid)
+                {
+                    *entry.assigned_port.write() = None;
+                }
+            }
         }
         for h in removed {
             h.task.abort();
@@ -269,19 +321,24 @@ impl ListenerSupervisor {
                 lifecycle,
             )
             .await?;
-        started.extend(
-            self.start_dedicated_protocol_listeners(
+        let http_started = match self
+            .start_dedicated_protocol_listeners(
                 &entries,
                 per_tunnel,
                 bind_address,
                 ListenerType::Http,
                 lifecycle,
             )
-            .await?,
-        );
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                self.rollback_started_listeners(&started, Some(registry));
+                return Err(e);
+            }
+        };
+        started.extend(http_started);
 
-        self.started
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(started)
     }
 
@@ -346,9 +403,11 @@ impl ListenerSupervisor {
         )
         .with_per_tunnel_passwords(per_tunnel_passwords);
 
+        let actual_addr = listener.local_addr().unwrap_or(bind_addr);
+
         let info = ActiveListenerInfo {
             name: settings.name.clone(),
-            address: bind_addr,
+            address: actual_addr,
             listener_type: settings.listener_type,
             is_shared: true,
             tunnel_id: None,
@@ -417,8 +476,9 @@ impl ListenerSupervisor {
                 kind, entry.id, bind_addr, e
             ))
         })?;
+        let actual_addr = listener.local_addr().unwrap_or(bind_addr);
         if entry.assigned_port.read().is_none() {
-            entry.set_assigned_port(bind_addr.port());
+            entry.set_assigned_port(actual_addr.port());
         }
 
         let router = Arc::new(DedicatedTunnelRouter::new(
@@ -428,7 +488,7 @@ impl ListenerSupervisor {
         ));
         let info = ActiveListenerInfo {
             name: format!("dedicated-{}-{}", kind.to_ascii_lowercase(), entry.id),
-            address: bind_addr,
+            address: actual_addr,
             listener_type,
             is_shared: false,
             tunnel_id: Some(entry.id.clone()),
@@ -463,11 +523,11 @@ impl ListenerSupervisor {
         let pick_free_port = |base: u16, used: &mut std::collections::HashSet<u16>| -> u16 {
             for offset in 0..=u16::MAX {
                 let candidate = base.wrapping_add(offset);
-                if used.insert(candidate) {
+                if candidate != 0 && used.insert(candidate) {
                     return candidate;
                 }
             }
-            base
+            base.max(1)
         };
 
         let ovr = per_tunnel.overrides.get(&entry.id);
@@ -499,7 +559,7 @@ impl ListenerSupervisor {
                 }
                 None => pick_free_port(base, &mut used_ports),
             };
-            let info = self
+            let info = match self
                 .spawn_dedicated_listener(
                     entry,
                     SocketAddr::new(bind_address, port),
@@ -507,7 +567,14 @@ impl ListenerSupervisor {
                     auth.clone(),
                     lifecycle,
                 )
-                .await?;
+                .await
+            {
+                Ok(info) => info,
+                Err(e) => {
+                    self.rollback_started_listeners(&started, None);
+                    return Err(e);
+                }
+            };
             started.push(info);
         }
 
@@ -524,10 +591,34 @@ impl ListenerSupervisor {
             std::mem::take(&mut *guard)
         };
 
-        for handle in handles {
-            handle.task.abort();
-            let _ = handle.task.await;
+        for mut handle in handles {
+            if tokio::time::timeout(Duration::from_millis(500), &mut handle.task)
+                .await
+                .is_err()
+            {
+                handle.task.abort();
+                let _ = handle.task.await;
+            }
         }
+    }
+}
+
+/// Maximum concurrent client connections accepted per proxy listener.
+const MAX_LISTENER_CONNS: usize = 4096;
+
+async fn acquire_listener_permit(
+    conn_sem: &Arc<tokio::sync::Semaphore>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => {
+            if *shutdown_rx.borrow() {
+                return None;
+            }
+            Arc::clone(conn_sem).acquire_owned().await.ok()
+        }
+        res = Arc::clone(conn_sem).acquire_owned() => res.ok(),
     }
 }
 
@@ -539,11 +630,16 @@ async fn run_listener_loop(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut client_tasks = tokio::task::JoinSet::new();
+    let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_LISTENER_CONNS));
 
     loop {
         while let Some(res) = client_tasks.try_join_next() {
             let _ = res;
         }
+
+        let Some(permit) = acquire_listener_permit(&conn_sem, &mut shutdown_rx).await else {
+            break;
+        };
 
         tokio::select! {
             biased;
@@ -559,6 +655,7 @@ async fn run_listener_loop(
                         let local_ip = stream.local_addr().ok().map(|a| a.ip());
                         let peer_ip = Some(peer_addr.ip());
                         client_tasks.spawn(async move {
+                            let _permit = permit;
                             match listener_type {
                                 ListenerType::Socks5 => {
                                     let _ = handle_socks5_with_addrs(stream, r, local_ip, peer_ip).await;

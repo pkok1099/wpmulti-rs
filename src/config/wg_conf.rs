@@ -545,10 +545,19 @@ pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConf
             continue;
         }
 
+        let redact_if_secret = |raw: &str| -> String {
+            let lower = raw.to_ascii_lowercase();
+            if lower.contains("privatekey") || lower.contains("presharedkey") {
+                "[REDACTED SECRET LINE]".to_string()
+            } else {
+                raw.to_string()
+            }
+        };
+
         let Some((k, v)) = line.split_once('=') else {
             return Err(WgConfError::MalformedLine {
                 line_number,
-                line: line.to_string(),
+                line: redact_if_secret(line),
             });
         };
         let (key, val) = (k.trim(), v.trim());
@@ -557,7 +566,7 @@ pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConf
             CurrentSection::None => {
                 return Err(WgConfError::MissingSectionHeader {
                     line_number,
-                    line: line.to_string(),
+                    line: redact_if_secret(line),
                 });
             }
             CurrentSection::Interface => {

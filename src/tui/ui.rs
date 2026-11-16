@@ -135,8 +135,8 @@ pub fn parse_keys_from_bytes(bytes: &[u8]) -> Vec<TuiKey> {
 
 /// Render the complete TUI dashboard into a plain-text String via `ratatui::TestBackend`.
 pub fn render_dashboard(app: &mut TuiApp, width: usize, height: usize) -> String {
-    let w = width.max(24) as u16;
-    let h = height.max(8) as u16;
+    let w = width.clamp(24, u16::MAX as usize) as u16;
+    let h = height.clamp(8, u16::MAX as usize) as u16;
     let backend = TestBackend::new(w, h);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     terminal
@@ -389,7 +389,7 @@ fn build_tunnel_table_rows(
                 HealthStatus::Unhealthy => "Unhealthy",
             };
             let mut cells = vec![
-                Cell::from(t.id.clone()),
+                Cell::from(sanitize_terminal_text(&t.id)),
                 Cell::from(state_str).style(st_style),
                 Cell::from(health_str).style(health_style(t.health)),
                 Cell::from(t.active_conns.to_string()),
@@ -405,9 +405,11 @@ fn build_tunnel_table_rows(
                 cells.push(Cell::from(port));
             }
             if cols.endpoint {
-                cells.push(Cell::from(
-                    t.endpoint.clone().unwrap_or_else(|| "-".to_string()),
-                ));
+                let ep = t
+                    .endpoint
+                    .as_deref()
+                    .map_or_else(|| "-".to_string(), sanitize_terminal_text);
+                cells.push(Cell::from(ep));
             }
             let row = Row::new(cells);
             if vis_idx == app.selected_index {
@@ -554,7 +556,7 @@ fn draw_logs_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
                         } else {
                             Style::default()
                         };
-                        Line::from(Span::styled(l.as_str(), style))
+                        Line::from(Span::styled(sanitize_terminal_text(l), style))
                     })
                     .collect()
             },
@@ -580,11 +582,13 @@ fn draw_listeners_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         .take(visible.max(1))
         .map(|l| {
             Row::new(vec![
-                l.name.clone(),
+                sanitize_terminal_text(&l.name),
                 format!("{:?}", l.listener_type),
                 l.address.to_string(),
                 if l.is_shared { "Shared" } else { "Dedicated" }.to_string(),
-                l.tunnel_id.clone().unwrap_or_else(|| "-".to_string()),
+                l.tunnel_id
+                    .as_deref()
+                    .map_or_else(|| "-".to_string(), sanitize_terminal_text),
             ])
         })
         .collect();
@@ -720,11 +724,11 @@ fn draw_probe_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
                 .rtt_ms
                 .map_or_else(|| "-".to_string(), |ms| format!("{ms}ms"));
             Row::new(vec![
-                Cell::from(r.id.clone()),
-                Cell::from(r.endpoint.clone()),
+                Cell::from(sanitize_terminal_text(&r.id)),
+                Cell::from(sanitize_terminal_text(&r.endpoint)),
                 status_cell,
                 Cell::from(rtt),
-                Cell::from(r.message.clone()),
+                Cell::from(sanitize_terminal_text(&r.message)),
             ])
         })
         .collect();
@@ -774,7 +778,7 @@ fn draw_footer(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         && at.elapsed() < Duration::from_secs(5)
     {
         lines.push(Line::from(Span::styled(
-            format!(">>> {msg}"),
+            format!(">>> {}", sanitize_terminal_text(msg)),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -808,6 +812,20 @@ fn health_style(health: HealthStatus) -> Style {
     }
 }
 
+fn sanitize_terminal_text(s: &str) -> String {
+    s.chars()
+        .filter_map(|c| {
+            if c == '\t' {
+                Some(' ')
+            } else if c.is_control() {
+                None
+            } else {
+                Some(c)
+            }
+        })
+        .collect()
+}
+
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -817,12 +835,59 @@ impl Drop for TerminalGuard {
     }
 }
 
+fn install_terminal_panic_hook() {
+    static PANIC_HOOK_INIT: std::sync::Once = std::sync::Once::new();
+    PANIC_HOOK_INIT.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            prev(info);
+        }));
+    });
+}
+
+async fn process_terminal_event(app: &mut TuiApp, ev: Event) {
+    match ev {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                app.running = false;
+                return;
+            }
+            if let Some(tui_key) = map_crossterm_key(key.code) {
+                handle_tui_key(app, tui_key).await;
+            }
+        }
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollDown => handle_tui_key(app, TuiKey::Down).await,
+            MouseEventKind::ScrollUp => handle_tui_key(app, TuiKey::Up).await,
+            MouseEventKind::Down(MouseButton::Left) if mouse.row == 1 => {
+                if let Some(tab) = tab_at_column(mouse.column as usize) {
+                    app.set_tab(tab);
+                }
+            }
+            MouseEventKind::Down(_)
+            | MouseEventKind::Up(_)
+            | MouseEventKind::Drag(_)
+            | MouseEventKind::Moved
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {}
+        },
+        Event::Key(_)
+        | Event::FocusGained
+        | Event::FocusLost
+        | Event::Paste(_)
+        | Event::Resize(_, _) => {}
+    }
+}
+
 /// Run the interactive terminal TUI loop using `ratatui` + `crossterm`.
 pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Result<()> {
+    install_terminal_panic_hook();
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -832,6 +897,10 @@ pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Resu
     let mut last_anim = Instant::now();
     let refresh_interval = Duration::from_millis(refresh_rate_ms.max(100));
 
+    #[cfg(unix)]
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+
     while app.running {
         if last_anim.elapsed() >= Duration::from_millis(100) {
             app.anim_tick = app.anim_tick.wrapping_add(1);
@@ -839,39 +908,45 @@ pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Resu
         }
         terminal.draw(|f| draw_dashboard(f, &mut app))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
-                        app.running = false;
-                        break;
-                    }
-                    if let Some(tui_key) = map_crossterm_key(key.code) {
-                        handle_tui_key(&mut app, tui_key).await;
-                    }
+        let poll_fut = tokio::task::spawn_blocking(|| -> io::Result<Option<Event>> {
+            if event::poll(Duration::from_millis(100))? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
+            }
+        });
+
+        let term_fut = async {
+            #[cfg(unix)]
+            if let Some(ref mut s) = sigterm {
+                s.recv().await;
+                return;
+            }
+            std::future::pending::<()>().await;
+        };
+
+        let maybe_event = tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                app.running = false;
+                break;
+            }
+            () = term_fut => {
+                app.running = false;
+                break;
+            }
+            res = poll_fut => {
+                match res {
+                    Ok(Ok(ev)) => ev,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => None,
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollDown => handle_tui_key(&mut app, TuiKey::Down).await,
-                    MouseEventKind::ScrollUp => handle_tui_key(&mut app, TuiKey::Up).await,
-                    MouseEventKind::Down(MouseButton::Left) if mouse.row == 1 => {
-                        if let Some(tab) = tab_at_column(mouse.column as usize) {
-                            app.set_tab(tab);
-                        }
-                    }
-                    MouseEventKind::Down(_)
-                    | MouseEventKind::Up(_)
-                    | MouseEventKind::Drag(_)
-                    | MouseEventKind::Moved
-                    | MouseEventKind::ScrollLeft
-                    | MouseEventKind::ScrollRight => {}
-                },
-                Event::Key(_)
-                | Event::FocusGained
-                | Event::FocusLost
-                | Event::Paste(_)
-                | Event::Resize(_, _) => {}
+            }
+        };
+
+        if let Some(ev) = maybe_event {
+            process_terminal_event(&mut app, ev).await;
+            if !app.running {
+                break;
             }
         }
 

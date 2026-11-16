@@ -159,33 +159,42 @@ pub fn parse_socks5_udp_packet(buf: &[u8]) -> Option<(TargetAddr, &[u8])> {
             let ip_octets: [u8; 4] = addr_bytes.try_into().ok()?;
             let (port_bytes, payload) = payload.split_at_checked(2)?;
             let port_octets: [u8; 2] = port_bytes.try_into().ok()?;
-            let addr =
-                SocketAddrV4::new(Ipv4Addr::from(ip_octets), u16::from_be_bytes(port_octets));
+            let port = u16::from_be_bytes(port_octets);
+            if port == 0 {
+                return None;
+            }
+            let addr = SocketAddrV4::new(Ipv4Addr::from(ip_octets), port);
             (TargetAddr::Ip(SocketAddr::V4(addr)), payload)
         }
         ATYP_DOMAIN => {
             let (&len_byte, after_len) = rest.split_first()?;
             let len = len_byte as usize;
+            if len == 0 {
+                return None;
+            }
             let (domain_bytes, after_domain) = after_len.split_at_checked(len)?;
             let domain = String::from_utf8(domain_bytes.to_vec()).ok()?;
+            if domain.chars().any(char::is_control) {
+                return None;
+            }
             let (port_bytes, payload) = after_domain.split_at_checked(2)?;
             let port_octets: [u8; 2] = port_bytes.try_into().ok()?;
-            (
-                TargetAddr::Domain(domain, u16::from_be_bytes(port_octets)),
-                payload,
-            )
+            let port = u16::from_be_bytes(port_octets);
+            if port == 0 {
+                return None;
+            }
+            (TargetAddr::Domain(domain, port), payload)
         }
         ATYP_IPV6 => {
             let (addr_bytes, after_addr) = rest.split_at_checked(16)?;
             let ip_octets: [u8; 16] = addr_bytes.try_into().ok()?;
             let (port_bytes, payload) = after_addr.split_at_checked(2)?;
             let port_octets: [u8; 2] = port_bytes.try_into().ok()?;
-            let addr = SocketAddrV6::new(
-                Ipv6Addr::from(ip_octets),
-                u16::from_be_bytes(port_octets),
-                0,
-                0,
-            );
+            let port = u16::from_be_bytes(port_octets);
+            if port == 0 {
+                return None;
+            }
+            let addr = SocketAddrV6::new(Ipv6Addr::from(ip_octets), port, 0, 0);
             (TargetAddr::Ip(SocketAddr::V6(addr)), payload)
         }
         _ => return None,
@@ -214,6 +223,57 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     handle_socks5_with_addrs(stream, router, None, None).await
+}
+
+async fn read_rfc1929_credentials<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> io::Result<(String, String)> {
+    let mut auth_ver = [0u8; 2];
+    stream.read_exact(&mut auth_ver).await?;
+    if auth_ver[0] != RFC1929_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported RFC 1929 auth version: 0x{:02X}", auth_ver[0]),
+        ));
+    }
+
+    if auth_ver[1] == 0 {
+        stream.write_all(&[RFC1929_VERSION, 0x01]).await?;
+        stream.flush().await?;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty RFC 1929 username",
+        ));
+    }
+    let mut uname_buf = vec![0u8; auth_ver[1] as usize];
+    stream.read_exact(&mut uname_buf).await?;
+
+    let mut plen_buf = [0u8; 1];
+    stream.read_exact(&mut plen_buf).await?;
+    if plen_buf[0] == 0 {
+        stream.write_all(&[RFC1929_VERSION, 0x01]).await?;
+        stream.flush().await?;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty RFC 1929 password",
+        ));
+    }
+    let mut pass_buf = vec![0u8; plen_buf[0] as usize];
+    stream.read_exact(&mut pass_buf).await?;
+
+    let (Ok(username), Ok(password)) = (
+        std::str::from_utf8(&uname_buf),
+        std::str::from_utf8(&pass_buf),
+    ) else {
+        stream.write_all(&[RFC1929_VERSION, 0x01]).await?;
+        stream.flush().await?;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-UTF-8 RFC 1929 credentials",
+        ));
+    };
+
+    Ok((username.to_string(), password.to_string()))
 }
 
 async fn negotiate_socks5_auth<S: AsyncRead + AsyncWrite + Unpin>(
@@ -268,25 +328,7 @@ async fn negotiate_socks5_auth<S: AsyncRead + AsyncWrite + Unpin>(
         });
     }
 
-    let mut auth_ver = [0u8; 2];
-    stream.read_exact(&mut auth_ver).await?;
-    if auth_ver[0] != RFC1929_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported RFC 1929 auth version: 0x{:02X}", auth_ver[0]),
-        ));
-    }
-
-    let mut uname_buf = vec![0u8; auth_ver[1] as usize];
-    stream.read_exact(&mut uname_buf).await?;
-
-    let mut plen_buf = [0u8; 1];
-    stream.read_exact(&mut plen_buf).await?;
-    let mut pass_buf = vec![0u8; plen_buf[0] as usize];
-    stream.read_exact(&mut pass_buf).await?;
-
-    let username = String::from_utf8_lossy(&uname_buf);
-    let password = String::from_utf8_lossy(&pass_buf);
+    let (username, password) = read_rfc1929_credentials(stream).await?;
 
     match router.authenticate(Some((&username, &password))) {
         Ok(sel) => {
@@ -311,10 +353,10 @@ async fn read_socks5_command<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> io::Result<(u8, TargetAddr)> {
     let mut cmd_hdr = [0u8; 4];
     stream.read_exact(&mut cmd_hdr).await?;
-    if cmd_hdr[0] != SOCKS5_VERSION {
+    if cmd_hdr[0] != SOCKS5_VERSION || cmd_hdr[2] != 0x00 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid version in SOCKS5 command request",
+            "invalid version or reserved byte in SOCKS5 command request",
         ));
     }
 
@@ -330,10 +372,22 @@ async fn read_socks5_command<S: AsyncRead + AsyncWrite + Unpin>(
         ATYP_DOMAIN => {
             let mut len_buf = [0u8; 1];
             stream.read_exact(&mut len_buf).await?;
+            if len_buf[0] == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "empty domain string",
+                ));
+            }
             let mut dom_buf = vec![0u8; len_buf[0] as usize];
             stream.read_exact(&mut dom_buf).await?;
             let domain = String::from_utf8(dom_buf)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid domain string"))?;
+            if domain.chars().any(char::is_control) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "control character in domain string",
+                ));
+            }
             let mut port_buf = [0u8; 2];
             stream.read_exact(&mut port_buf).await?;
             TargetAddr::Domain(domain, u16::from_be_bytes(port_buf))
@@ -373,13 +427,41 @@ pub async fn handle_socks5_with_addrs<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let selector = negotiate_socks5_auth(&mut stream, &router).await?;
-    let (cmd, target) = read_socks5_command(&mut stream).await?;
+    let handshake_timeout = std::time::Duration::from_secs(30);
+    let selector = tokio::time::timeout(
+        handshake_timeout,
+        negotiate_socks5_auth(&mut stream, &router),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 auth timed out"))??;
+    let (cmd, target) = tokio::time::timeout(handshake_timeout, read_socks5_command(&mut stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 command timed out"))??;
 
     match cmd {
-        CMD_CONNECT => handle_connect(stream, router, &selector, target).await,
+        CMD_CONNECT => {
+            let port = match &target {
+                TargetAddr::Ip(addr) => addr.port(),
+                TargetAddr::Domain(_, p) => *p,
+            };
+            if port == 0 {
+                let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+                let _ = send_socks5_reply(&mut stream, REP_GENERAL_FAILURE, dummy_addr).await;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CONNECT target port cannot be 0",
+                ));
+            }
+            handle_connect(stream, router, &selector, target).await
+        }
         CMD_UDP_ASSOCIATE => {
-            handle_udp_associate(stream, router, &selector, local_ip, peer_ip).await
+            let initial_client = match target {
+                TargetAddr::Ip(addr) if !addr.ip().is_unspecified() && addr.port() != 0 => {
+                    Some(addr)
+                }
+                TargetAddr::Ip(_) | TargetAddr::Domain(_, _) => None,
+            };
+            handle_udp_associate(stream, router, &selector, local_ip, peer_ip, initial_client).await
         }
         other => {
             let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
@@ -426,6 +508,14 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
+    if crate::proxy::http::is_forbidden_destination_ip(dst_addr.ip()) {
+        let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("blocked forbidden destination IP: {}", dst_addr.ip()),
+        ));
+    }
+
     // Connect to target via tunnel connector
     let mut tunnel_stream: DynStream = match target_tunnel.tcp_connect(dst_addr).await {
         Ok(s) => s,
@@ -459,6 +549,7 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     selector: &TunnelSelector,
     local_ip: Option<IpAddr>,
     peer_ip: Option<IpAddr>,
+    initial_client: Option<SocketAddr>,
 ) -> io::Result<()> {
     let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
 
@@ -520,6 +611,7 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
         virtual_udp,
         target_tunnel,
         peer_ip,
+        initial_client,
     )
     .await
 }
@@ -535,15 +627,23 @@ const fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+const MAX_UDP_DNS_TASKS: usize = 16;
+
+struct UdpRelayCtx<'a> {
+    client_udp_addr: &'a mut Option<SocketAddr>,
+    normalized_expected_ip: Option<IpAddr>,
+    virtual_udp: &'a dyn ProxyUdpSocket,
+    target_tunnel: &'a Arc<dyn ProxyTunnelTarget>,
+    dns_tasks: &'a mut tokio::task::JoinSet<()>,
+    dns_tx: &'a tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>,
+}
+
 async fn forward_client_udp_datagram(
     packet: &[u8],
     from_addr: SocketAddr,
-    client_udp_addr: &mut Option<SocketAddr>,
-    normalized_expected_ip: Option<IpAddr>,
-    virtual_udp: &dyn ProxyUdpSocket,
-    target_tunnel: &Arc<dyn ProxyTunnelTarget>,
+    ctx: &mut UdpRelayCtx<'_>,
 ) {
-    if let Some(expected_addr) = *client_udp_addr {
+    if let Some(expected_addr) = *ctx.client_udp_addr {
         if expected_addr != from_addr {
             tracing::warn!(
                 "Ignoring UDP packet from unexpected source {}; expected locked source {}",
@@ -552,35 +652,80 @@ async fn forward_client_udp_datagram(
             );
             return;
         }
-    } else {
-        if let Some(expected_ip) = normalized_expected_ip
-            && normalize_ip(from_addr.ip()) != expected_ip
-        {
-            tracing::warn!(
-                "Rejecting UDP associate packet from {} (does not match control TCP peer IP {})",
-                from_addr,
-                expected_ip
-            );
-            return;
-        }
-        *client_udp_addr = Some(from_addr);
+    } else if let Some(expected_ip) = ctx.normalized_expected_ip
+        && normalize_ip(from_addr.ip()) != expected_ip
+    {
+        tracing::warn!(
+            "Rejecting UDP associate packet from {} (does not match control TCP peer IP {})",
+            from_addr,
+            expected_ip
+        );
+        return;
     }
 
     let Some((target_addr, payload)) = parse_socks5_udp_packet(packet) else {
         return;
     };
-    let resolved = match target_addr {
-        TargetAddr::Ip(addr) => Some(addr),
-        TargetAddr::Domain(ref dom, port) => match target_tunnel.resolve_in_tunnel(dom).await {
-            Ok(ip) => Some(SocketAddr::new(ip, port)),
-            Err(e) => {
-                tracing::warn!("Failed to resolve UDP target domain '{}': {:?}", dom, e);
-                None
+    if ctx.client_udp_addr.is_none() {
+        *ctx.client_udp_addr = Some(from_addr);
+    }
+    match target_addr {
+        TargetAddr::Ip(addr) => {
+            if !crate::proxy::http::is_forbidden_destination_ip(addr.ip()) {
+                let _ = ctx.virtual_udp.send_to(payload, addr).await;
             }
-        },
+        }
+        TargetAddr::Domain(dom, port) => {
+            if ctx.dns_tasks.len() >= MAX_UDP_DNS_TASKS {
+                tracing::debug!(
+                    "Dropping UDP datagram for '{}': DNS resolution queue full",
+                    dom
+                );
+                return;
+            }
+            let tunnel = Arc::clone(ctx.target_tunnel);
+            let tx = ctx.dns_tx.clone();
+            let payload_owned = payload.to_vec();
+            ctx.dns_tasks.spawn(async move {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    tunnel.resolve_in_tunnel(&dom),
+                )
+                .await
+                {
+                    Ok(Ok(ip)) => {
+                        if !crate::proxy::http::is_forbidden_destination_ip(ip) {
+                            let _ = tx.send((SocketAddr::new(ip, port), payload_owned)).await;
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("Failed to resolve UDP target domain '{}': {:?}", dom, e);
+                    }
+                    Err(_) => {
+                        tracing::warn!("Timed out resolving UDP target domain '{}'", dom);
+                    }
+                }
+            });
+        }
+    }
+}
+
+async fn forward_virtual_to_relay(
+    payload: &[u8],
+    peer_addr: SocketAddr,
+    client_udp_addr: Option<SocketAddr>,
+    out_pkt_buf: &mut [u8],
+    relay_socket: &tokio::net::UdpSocket,
+) {
+    let Some(c_addr) = client_udp_addr else {
+        return;
     };
-    if let Some(target_sock) = resolved {
-        let _ = virtual_udp.send_to(payload, target_sock).await;
+    let hdr_len = write_socks5_udp_header(&TargetAddr::Ip(peer_addr), out_pkt_buf);
+    if let Some(dst) = out_pkt_buf.get_mut(hdr_len..hdr_len + payload.len()) {
+        dst.copy_from_slice(payload);
+        if let Some(frame) = out_pkt_buf.get(..hdr_len + payload.len()) {
+            let _ = relay_socket.send_to(frame, c_addr).await;
+        }
     }
 }
 
@@ -591,18 +736,31 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
     virtual_udp: Box<dyn ProxyUdpSocket>,
     target_tunnel: Arc<dyn ProxyTunnelTarget>,
     expected_client_ip: Option<IpAddr>,
+    initial_client: Option<SocketAddr>,
 ) -> io::Result<()> {
     let relay_socket = Arc::new(relay_socket);
     let mut tcp_byte = [0u8; 1];
-    let mut client_udp_addr: Option<SocketAddr> = None;
+    let mut client_udp_addr: Option<SocketAddr> = initial_client.filter(|addr| {
+        expected_client_ip.is_none_or(|exp| normalize_ip(addr.ip()) == normalize_ip(exp))
+    });
     let normalized_expected_ip = expected_client_ip.map(normalize_ip);
 
     let mut relay_buf = vec![0u8; 65536];
     let mut virtual_buf = vec![0u8; 65536];
     let mut out_pkt_buf = vec![0u8; 65536 + 32];
+    let idle_timeout = std::time::Duration::from_mins(5);
+    let mut dns_tasks = tokio::task::JoinSet::new();
+    let (dns_tx, mut dns_rx) = tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(64);
 
     loop {
+        while let Some(res) = dns_tasks.try_join_next() {
+            let _ = res;
+        }
         tokio::select! {
+            () = tokio::time::sleep(idle_timeout) => {
+                tracing::debug!("SOCKS5 UDP ASSOCIATE relay timed out after {:?} of inactivity", idle_timeout);
+                break;
+            }
             tcp_res = control_stream.read(&mut tcp_byte) => {
                 if !matches!(tcp_res, Ok(1..)) {
                     tracing::debug!("SOCKS5 UDP ASSOCIATE control connection closed by client");
@@ -610,46 +768,41 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
                 }
             }
 
+            Some((target_sock, payload)) = dns_rx.recv() => {
+                let _ = virtual_udp.send_to(&payload, target_sock).await;
+            }
+
             relay_res = relay_socket.recv_from(&mut relay_buf) => {
-                match relay_res {
-                    Ok((n, from_addr)) => {
-                        if let Some(pkt) = relay_buf.get(..n) {
-                            forward_client_udp_datagram(
-                                pkt,
-                                from_addr,
-                                &mut client_udp_addr,
-                                normalized_expected_ip,
-                                virtual_udp.as_ref(),
-                                &target_tunnel,
-                            ).await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Tokio UDP relay socket recv error: {:?}", e);
-                        break;
-                    }
+                let Ok((n, from_addr)) = relay_res else {
+                    tracing::debug!("Tokio UDP relay socket recv error: {:?}", relay_res.err());
+                    break;
+                };
+                if let Some(pkt) = relay_buf.get(..n) {
+                    let mut ctx = UdpRelayCtx {
+                        client_udp_addr: &mut client_udp_addr,
+                        normalized_expected_ip,
+                        virtual_udp: virtual_udp.as_ref(),
+                        target_tunnel: &target_tunnel,
+                        dns_tasks: &mut dns_tasks,
+                        dns_tx: &dns_tx,
+                    };
+                    forward_client_udp_datagram(pkt, from_addr, &mut ctx).await;
                 }
             }
 
             virtual_res = virtual_udp.recv_from(&mut virtual_buf) => {
-                match virtual_res {
-                    Ok((n, peer_addr)) => {
-                        if let Some(c_addr) = client_udp_addr
-                            && let Some(payload) = virtual_buf.get(..n)
-                        {
-                            let hdr_len = write_socks5_udp_header(&TargetAddr::Ip(peer_addr), &mut out_pkt_buf);
-                            if let Some(dst) = out_pkt_buf.get_mut(hdr_len..hdr_len + n) {
-                                dst.copy_from_slice(payload);
-                                if let Some(frame) = out_pkt_buf.get(..hdr_len + n) {
-                                    let _ = relay_socket.send_to(frame, c_addr).await;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Virtual UDP socket recv error: {:?}", e);
-                        break;
-                    }
+                let Ok((n, peer_addr)) = virtual_res else {
+                    tracing::debug!("Virtual UDP socket recv error: {:?}", virtual_res.err());
+                    break;
+                };
+                if let Some(payload) = virtual_buf.get(..n) {
+                    forward_virtual_to_relay(
+                        payload,
+                        peer_addr,
+                        client_udp_addr,
+                        &mut out_pkt_buf,
+                        &relay_socket,
+                    ).await;
                 }
             }
         }

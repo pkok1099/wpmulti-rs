@@ -1054,3 +1054,62 @@ async fn read_http_headers_helper<R: AsyncReadExt + Unpin>(
 
     Ok((status_code, reason, headers, body))
 }
+
+#[tokio::test]
+async fn test_http_forward_rejects_mismatched_and_duplicate_host() {
+    let target: Arc<dyn ProxyTunnelTarget> = Arc::new(DirectTunnelTarget);
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("test", target, None));
+
+    // Mismatched Host header
+    let (mut client, server) = tokio::io::duplex(2048);
+    let r1 = Arc::clone(&router);
+    tokio::spawn(async move {
+        let _ = handle_http(server, r1).await;
+    });
+    client
+        .write_all(b"GET http://127.0.0.1:8080/test HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+        .await
+        .unwrap();
+    let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
+    assert_eq!(status, 400);
+
+    // Duplicate Host header
+    let (mut client2, server2) = tokio::io::duplex(2048);
+    tokio::spawn(async move {
+        let _ = handle_http(server2, router).await;
+    });
+    client2
+        .write_all(b"GET http://127.0.0.1:8080/test HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nHost: evil.example\r\n\r\n")
+        .await
+        .unwrap();
+    let (status2, _, _, _) = read_http_headers_helper(&mut client2).await.unwrap();
+    assert_eq!(status2, 400);
+}
+
+#[tokio::test]
+async fn test_http_connect_blocks_link_local_ssrf() {
+    let target: Arc<dyn ProxyTunnelTarget> = Arc::new(DirectTunnelTarget);
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("test", target, None));
+
+    let (mut client, server) = tokio::io::duplex(2048);
+    tokio::spawn(async move {
+        let _ = handle_http(server, router).await;
+    });
+    client
+        .write_all(b"CONNECT 169.254.169.254:80 HTTP/1.1\r\nHost: 169.254.169.254:80\r\n\r\n")
+        .await
+        .unwrap();
+    let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
+    assert_eq!(status, 403);
+}
+
+#[test]
+fn test_socks5_udp_rejects_empty_domain_and_zero_port() {
+    // Empty domain (ATYP=0x03, len=0)
+    let empty_dom = [0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x50, b'h', b'i'];
+    assert!(parse_socks5_udp_packet(&empty_dom).is_none());
+
+    // Port 0
+    let zero_port = [0x00, 0x00, 0x00, 0x01, 1, 1, 1, 1, 0x00, 0x00, b'h', b'i'];
+    assert!(parse_socks5_udp_packet(&zero_port).is_none());
+}

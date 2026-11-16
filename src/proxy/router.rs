@@ -270,7 +270,9 @@ impl TunnelSelector {
         if u.eq_ignore_ascii_case("least-conn") || u.eq_ignore_ascii_case("leastconn") {
             return Self::ByKeyword(PoolKeyword::LeastConn);
         }
-        if let Some(tag) = u.strip_prefix("tag:") {
+        if let Some(tag) = u.strip_prefix("tag:")
+            && !tag.is_empty()
+        {
             return Self::ByTag(tag.to_string());
         }
         Self::ById(u.to_string())

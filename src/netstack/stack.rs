@@ -37,11 +37,26 @@ pub const UDP_PACKET_QUEUE_CAPACITY: usize = 16;
 pub const UDP_PAYLOAD_BUF_SIZE: usize = 65536;
 /// Default connection timeout.
 pub const DEFAULT_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+/// Maximum concurrent sockets in `SocketSet` to prevent unbounded buffer allocation.
+pub const MAX_ACTIVE_SOCKETS: usize = 4096;
 
 /// Shared inner network stack state protected by a fast synchronous mutex.
 pub struct StackInner {
     pub iface: Interface,
     pub sockets: SocketSet<'static>,
+    pub pending_reap: Vec<smoltcp::iface::SocketHandle>,
+    pub shutdown: bool,
+    pub shutdown_wakers: Vec<std::task::Waker>,
+}
+
+/// Register a waker to be notified when the network stack shuts down.
+pub(crate) fn register_shutdown_waker(
+    wakers: &mut Vec<std::task::Waker>,
+    waker: &std::task::Waker,
+) {
+    if !wakers.iter().any(|w| w.will_wake(waker)) {
+        wakers.push(waker.clone());
+    }
 }
 
 impl std::fmt::Debug for StackInner {
@@ -62,6 +77,39 @@ pub struct VirtualNetworkStack {
     next_ephemeral_port: AtomicU16,
     dns_resolver: InTunnelDnsResolver,
     connect_timeout: StdDuration,
+}
+
+fn configure_default_routes(
+    iface: &mut Interface,
+    local_v4: Option<Ipv4Addr>,
+    local_v6: Option<Ipv6Addr>,
+) -> io::Result<()> {
+    if let Some(v4_ip) = local_v4 {
+        let octets = v4_ip.octets();
+        let gateway = if octets[3] == 1 {
+            Ipv4Address::new(octets[0], octets[1], octets[2], 2)
+        } else {
+            Ipv4Address::new(octets[0], octets[1], octets[2], 1)
+        };
+        iface
+            .routes_mut()
+            .add_default_ipv4_route(gateway)
+            .map_err(|e| io::Error::other(format!("add default ipv4 route failed: {e:?}")))?;
+    }
+
+    if let Some(v6_ip) = local_v6 {
+        let default_gw = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let gateway = if v6_ip == default_gw {
+            Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2)
+        } else {
+            default_gw
+        };
+        iface
+            .routes_mut()
+            .add_default_ipv6_route(gateway)
+            .map_err(|e| io::Error::other(format!("add default ipv6 route failed: {e:?}")))?;
+    }
+    Ok(())
 }
 
 impl VirtualNetworkStack {
@@ -160,41 +208,22 @@ impl VirtualNetworkStack {
         }
 
         // 3. Configure point-to-point default routes
-        if let Some(v4_ip) = local_v4 {
-            let octets = v4_ip.octets();
-            let gateway = if octets[3] == 1 {
-                Ipv4Address::new(octets[0], octets[1], octets[2], 2)
-            } else {
-                Ipv4Address::new(octets[0], octets[1], octets[2], 1)
-            };
-            iface
-                .routes_mut()
-                .add_default_ipv4_route(gateway)
-                .map_err(|e| io::Error::other(format!("add default ipv4 route failed: {e:?}")))?;
-        }
-
-        if let Some(v6_ip) = local_v6 {
-            let default_gw = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-            let gateway = if v6_ip == default_gw {
-                Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2)
-            } else {
-                default_gw
-            };
-            iface
-                .routes_mut()
-                .add_default_ipv6_route(gateway)
-                .map_err(|e| io::Error::other(format!("add default ipv6 route failed: {e:?}")))?;
-        }
+        configure_default_routes(&mut iface, local_v4, local_v6)?;
 
         // 4. Initialize SocketSet with owned storage
         let sockets = SocketSet::new(vec![]);
-        let inner = Arc::new(Mutex::new(StackInner { iface, sockets }));
+        let inner = Arc::new(Mutex::new(StackInner {
+            iface,
+            sockets,
+            pending_reap: Vec::new(),
+            shutdown: false,
+            shutdown_wakers: Vec::new(),
+        }));
 
         // 5. Spawn background reactor event loop
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let reactor_inner = Arc::clone(&inner);
         let reactor_notify = Arc::clone(&notify);
-
         let reactor_handle = tokio::spawn(async move {
             run_reactor(reactor_inner, bridge, reactor_notify, shutdown_rx).await;
         });
@@ -204,7 +233,6 @@ impl VirtualNetworkStack {
         resolver.set_ip_mode(ip_mode);
         resolver.set_prefer_ipv6(prefer_ipv6);
         resolver.set_dns_strategy(dns_strategy);
-
         Ok(Self {
             inner,
             notify,
@@ -266,14 +294,18 @@ impl VirtualNetworkStack {
     }
 
     /// Allocate an ephemeral port that is not currently used by any socket in `sockets`.
-    fn alloc_free_ephemeral_port(&self, sockets: &SocketSet<'_>) -> u16 {
-        for _ in 0..16384 {
-            let port = self.alloc_ephemeral_port();
+    fn alloc_free_ephemeral_port(sockets: &SocketSet<'_>) -> io::Result<u16> {
+        let start = 49152 + (rand::random::<u16>() % 16384);
+        for offset in 0..1024u16 {
+            let port = 49152 + ((start - 49152 + offset) % 16384);
             if !Self::is_port_in_use(sockets, port) {
-                return port;
+                return Ok(port);
             }
         }
-        self.alloc_ephemeral_port()
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no free ephemeral port available",
+        ))
     }
 
     /// Initiate an asynchronous TCP connection to the destination address.
@@ -308,7 +340,19 @@ impl VirtualNetworkStack {
         // Initiate connection under lock with collision-free ephemeral port
         let (handle, local_port) = {
             let mut inner = self.inner.lock();
-            let port = self.alloc_free_ephemeral_port(&inner.sockets);
+            if inner.shutdown {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "network stack is shut down",
+                ));
+            }
+            if inner.sockets.iter().count() >= MAX_ACTIVE_SOCKETS {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "maximum active virtual sockets reached",
+                ));
+            }
+            let port = Self::alloc_free_ephemeral_port(&inner.sockets)?;
             let cx = inner.iface.context();
             socket
                 .connect(cx, remote_endpoint, port)
@@ -326,35 +370,7 @@ impl VirtualNetworkStack {
         self.notify.notify_one();
 
         // Wait for connection handshake completion (with timeout)
-        let inner_clone = Arc::clone(&self.inner);
-        let connect_fut = std::future::poll_fn(|cx| {
-            let mut inner = inner_clone.lock();
-            let sock = inner.sockets.get_mut::<TcpSocket<'_>>(handle);
-            let poll_res = match sock.state() {
-                tcp::State::Established => std::task::Poll::Ready(Ok(())),
-                tcp::State::SynSent => {
-                    sock.register_send_waker(cx.waker());
-                    std::task::Poll::Pending
-                }
-                tcp::State::Closed => std::task::Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "connection refused by peer",
-                ))),
-                state @ (tcp::State::Listen
-                | tcp::State::SynReceived
-                | tcp::State::FinWait1
-                | tcp::State::FinWait2
-                | tcp::State::CloseWait
-                | tcp::State::Closing
-                | tcp::State::LastAck
-                | tcp::State::TimeWait) => std::task::Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    format!("connection failed in state: {state:?}"),
-                ))),
-            };
-            drop(inner);
-            poll_res
-        });
+        let connect_fut = wait_tcp_handshake(&self.inner, handle);
 
         match tokio::time::timeout(self.connect_timeout, connect_fut).await {
             Ok(Ok(())) => {
@@ -394,8 +410,20 @@ impl VirtualNetworkStack {
 
         let (handle, port) = {
             let mut inner = self.inner.lock();
+            if inner.shutdown {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "network stack is shut down",
+                ));
+            }
+            if inner.sockets.iter().count() >= MAX_ACTIVE_SOCKETS {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "maximum active virtual sockets reached",
+                ));
+            }
             let port = if local_port == 0 {
-                self.alloc_free_ephemeral_port(&inner.sockets)
+                Self::alloc_free_ephemeral_port(&inner.sockets)?
             } else {
                 local_port
             };
@@ -443,6 +471,14 @@ impl VirtualNetworkStack {
 
     /// Cleanly shutdown the virtual network stack and stop the reactor.
     pub async fn close(&self) {
+        let wakers = {
+            let mut inner = self.inner.lock();
+            inner.shutdown = true;
+            std::mem::take(&mut inner.shutdown_wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
         let _ = self.shutdown_tx.send(true);
         self.notify.notify_one();
 
@@ -455,6 +491,14 @@ impl VirtualNetworkStack {
 
 impl Drop for VirtualNetworkStack {
     fn drop(&mut self) {
+        let wakers = {
+            let mut inner = self.inner.lock();
+            inner.shutdown = true;
+            std::mem::take(&mut inner.shutdown_wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
         let _ = self.shutdown_tx.send(true);
         self.notify.notify_one();
         let handle = self.reactor_handle.lock().take();
@@ -464,20 +508,90 @@ impl Drop for VirtualNetworkStack {
     }
 }
 
+async fn wait_tcp_handshake(
+    inner: &Arc<Mutex<StackInner>>,
+    handle: smoltcp::iface::SocketHandle,
+) -> io::Result<()> {
+    let inner_clone = Arc::clone(inner);
+    std::future::poll_fn(|cx| {
+        let mut inner = inner_clone.lock();
+        if inner.shutdown {
+            return std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network stack is shut down",
+            )));
+        }
+        if !inner.sockets.iter().any(|(h, _)| h == handle) {
+            return std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "tcp socket handle not found in socket set",
+            )));
+        }
+        let sock = inner.sockets.get_mut::<TcpSocket<'_>>(handle);
+        let poll_res = match sock.state() {
+            tcp::State::Established => std::task::Poll::Ready(Ok(())),
+            tcp::State::SynSent => {
+                sock.register_send_waker(cx.waker());
+                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                std::task::Poll::Pending
+            }
+            tcp::State::Closed => std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "connection refused by peer",
+            ))),
+            state @ (tcp::State::Listen
+            | tcp::State::SynReceived
+            | tcp::State::FinWait1
+            | tcp::State::FinWait2
+            | tcp::State::CloseWait
+            | tcp::State::Closing
+            | tcp::State::LastAck
+            | tcp::State::TimeWait) => std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("connection failed in state: {state:?}"),
+            ))),
+        };
+        drop(inner);
+        poll_res
+    })
+    .await
+}
+
+async fn wait_zero_delay(
+    consecutive_zero_delays: &mut u32,
+    notify: &Notify,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    *consecutive_zero_delays = consecutive_zero_delays.saturating_add(1);
+    if *consecutive_zero_delays <= 8 {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => !*shutdown_rx.borrow(),
+            () = tokio::task::yield_now() => true,
+        }
+    } else {
+        // Back off briefly when TX is backpressured to avoid 100% CPU spin
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => !*shutdown_rx.borrow(),
+            () = notify.notified() => true,
+            () = tokio::time::sleep(StdDuration::from_millis(1)) => true,
+        }
+    }
+}
+
 async fn wait_reactor_step(
     delay: Option<smoltcp::time::Duration>,
+    consecutive_zero_delays: &mut u32,
     notify: &Notify,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> bool {
     match delay {
         Some(smol_dur) if smol_dur.total_micros() == 0 => {
-            tokio::select! {
-                biased;
-                _ = shutdown_rx.changed() => !*shutdown_rx.borrow(),
-                () = tokio::task::yield_now() => true,
-            }
+            wait_zero_delay(consecutive_zero_delays, notify, shutdown_rx).await
         }
         Some(smol_dur) => {
+            *consecutive_zero_delays = 0;
             let wait_ms = smol_dur.total_millis().clamp(1, 500);
             let sleep_dur = StdDuration::from_millis(wait_ms);
             tokio::select! {
@@ -488,6 +602,7 @@ async fn wait_reactor_step(
             }
         }
         None => {
+            *consecutive_zero_delays = 0;
             tokio::select! {
                 biased;
                 _ = shutdown_rx.changed() => !*shutdown_rx.borrow(),
@@ -505,19 +620,53 @@ async fn run_reactor(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     tracing::debug!("smoltcp reactor loop started");
+    let mut consecutive_zero_delays = 0u32;
 
     loop {
         let now = SmolInstant::now();
         let delay = {
             let mut guard = inner.lock();
-            let StackInner { iface, sockets } = &mut *guard;
+            let StackInner {
+                iface,
+                sockets,
+                pending_reap,
+                ..
+            } = &mut *guard;
             let _ = iface.poll(now, &mut device, sockets);
+            if !pending_reap.is_empty() {
+                let mut still_pending = Vec::new();
+                for handle in pending_reap.drain(..) {
+                    let exists = sockets.iter().any(|(h, _)| h == handle);
+                    if !exists {
+                        continue;
+                    }
+                    let can_remove = match sockets.get::<smoltcp::socket::Socket<'_>>(handle) {
+                        smoltcp::socket::Socket::Tcp(s) => {
+                            matches!(s.state(), tcp::State::Closed | tcp::State::TimeWait)
+                        }
+                        smoltcp::socket::Socket::Udp(_) | smoltcp::socket::Socket::Dns(_) => true,
+                    };
+                    if can_remove {
+                        sockets.remove(handle);
+                    } else {
+                        still_pending.push(handle);
+                    }
+                }
+                *pending_reap = still_pending;
+            }
             let d = iface.poll_delay(now, sockets);
             drop(guard);
             d
         };
 
-        if !wait_reactor_step(delay, &notify, &mut shutdown_rx).await {
+        if !wait_reactor_step(
+            delay,
+            &mut consecutive_zero_delays,
+            &notify,
+            &mut shutdown_rx,
+        )
+        .await
+        {
             break;
         }
     }
