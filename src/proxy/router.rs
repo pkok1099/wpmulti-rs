@@ -21,6 +21,12 @@ use crate::netstack::{DEFAULT_CONNECT_TIMEOUT, VirtualNetworkStack, VirtualUdpSo
 /// Maximum number of candidate IP addresses attempted per resolved domain.
 pub(crate) const MAX_CANDIDATE_IPS: usize = 8;
 
+/// Maximum number of tunnel attempts for pool selectors (`round-robin`, `random`, `least-conn`, `auto`, `tag`).
+pub(crate) const MAX_POOL_FAILOVER_ATTEMPTS: usize = 3;
+
+/// Maximum total elapsed time spent failing over across pool tunnels for a single connect request.
+pub(crate) const MAX_POOL_FAILOVER_BUDGET: Duration = Duration::from_millis(3500);
+
 /// Minimum timeout budget allocated to each candidate dial/send attempt while budget remains.
 pub(crate) const MIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -222,6 +228,11 @@ pub trait ProxyTunnelTarget: Send + Sync {
     fn connect_timeout(&self) -> Duration {
         DEFAULT_CONNECT_TIMEOUT
     }
+
+    /// Optional identifier of the underlying tunnel for deduplicating pool failover attempts.
+    fn tunnel_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Filter out forbidden destination IPs and cap candidates at [`MAX_CANDIDATE_IPS`],
@@ -295,6 +306,117 @@ pub(crate) async fn resolve_and_validate_domain(
         ));
     }
     Ok(ips)
+}
+
+/// Categorized error from [`connect_via_router`] so protocol handlers can emit accurate status codes.
+pub(crate) enum RouterConnectError {
+    SelectTunnel(io::Error),
+    ForbiddenDestination(io::Error),
+    DnsResolution(io::Error),
+    TcpConnect(io::Error),
+}
+
+/// Select a tunnel (with failover across healthy pool tunnels on transient DNS/connect failures)
+/// and establish a validated TCP stream to `target`.
+pub(crate) async fn connect_via_router(
+    router: &Arc<dyn TunnelRouter>,
+    selector: &TunnelSelector,
+    target: &TargetAddr,
+) -> Result<DynStream, RouterConnectError> {
+    let max_attempts = if matches!(selector, TunnelSelector::ById(_)) {
+        1
+    } else {
+        MAX_POOL_FAILOVER_ATTEMPTS
+    };
+
+    let mut last_err: Option<RouterConnectError> = None;
+    let mut tried_ids: Vec<String> = Vec::with_capacity(max_attempts);
+    let failover_deadline = tokio::time::Instant::now() + MAX_POOL_FAILOVER_BUDGET;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            let remaining =
+                failover_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining < MIN_ATTEMPT_TIMEOUT {
+                break;
+            }
+        }
+        let target_tunnel = match router.select_tunnel(selector).await {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(last_err.unwrap_or(RouterConnectError::SelectTunnel(e)));
+            }
+        };
+
+        if let Some(id) = target_tunnel.tunnel_id() {
+            if tried_ids.iter().any(|prev| prev == id) {
+                break;
+            }
+            tried_ids.push(id.to_string());
+        }
+
+        let attempt_fut = async {
+            match target {
+                TargetAddr::Ip(dst_addr) => target_tunnel
+                    .tcp_connect(*dst_addr)
+                    .await
+                    .map_err(RouterConnectError::TcpConnect),
+                TargetAddr::Domain(domain, port) => {
+                    match resolve_and_validate_domain(target_tunnel.as_ref(), domain).await {
+                        Ok(ips) => connect_validated_addrs(target_tunnel.as_ref(), &ips, *port)
+                            .await
+                            .map_err(RouterConnectError::TcpConnect),
+                        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                            Err(RouterConnectError::ForbiddenDestination(e))
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to resolve target domain '{}' (attempt {}/{}): {:?}",
+                                domain,
+                                attempt + 1,
+                                max_attempts,
+                                e
+                            );
+                            Err(RouterConnectError::DnsResolution(e))
+                        }
+                    }
+                }
+            }
+        };
+
+        let attempt_res = if max_attempts > 1 {
+            let remaining =
+                failover_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Ok(res) = tokio::time::timeout(remaining, attempt_fut).await {
+                res
+            } else {
+                last_err = Some(RouterConnectError::TcpConnect(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "pool failover budget exceeded",
+                )));
+                break;
+            }
+        } else {
+            attempt_fut.await
+        };
+
+        match attempt_res {
+            Ok(stream) => return Ok(stream),
+            Err(err @ RouterConnectError::ForbiddenDestination(_)) => return Err(err),
+            Err(err) => {
+                last_err = Some(err);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        RouterConnectError::SelectTunnel(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no healthy tunnels available in pool",
+        ))
+    }))
 }
 
 /// Dial TCP sequentially over validated candidate `IpAddr`s on `port` without re-resolving DNS,
@@ -479,6 +601,10 @@ impl<T: ProxyTunnelTarget + ?Sized> ProxyTunnelTarget for Arc<T> {
 
     fn connect_timeout(&self) -> Duration {
         (**self).connect_timeout()
+    }
+
+    fn tunnel_id(&self) -> Option<&str> {
+        (**self).tunnel_id()
     }
 }
 
@@ -843,6 +969,7 @@ impl TunnelRouter for PoolRouter {
                     Some(expected_pass) if constant_time_eq_str(pass, expected_pass) => {
                         Ok(TunnelSelector::parse(user))
                     }
+                    None if self.allow_anonymous => Ok(TunnelSelector::parse(user)),
                     _ => Err(ProxyAuthError::InvalidCredentials),
                 },
             },
@@ -869,6 +996,7 @@ impl TunnelRouter for PoolRouter {
                         Some(expected_pass) if constant_time_eq_str(pass, expected_pass) => {
                             Ok(selector)
                         }
+                        None if self.allow_anonymous => Ok(selector),
                         _ => Err(ProxyAuthError::InvalidCredentials),
                     }
                 }

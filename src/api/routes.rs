@@ -304,6 +304,10 @@ fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> Http
         .iter()
         .filter(|s| s.health == crate::core::HealthStatus::Unhealthy)
         .count();
+    let half_open_tunnels = stats
+        .iter()
+        .filter(|s| s.health == crate::core::HealthStatus::HalfOpen)
+        .count();
     let total_connections: u64 = stats.iter().map(|s| s.total_conns).sum();
     let active_connections: usize = stats.iter().map(|s| s.active_conns).sum();
     let rx_bytes: u64 = stats.iter().map(|s| s.rx_bytes).sum();
@@ -319,6 +323,7 @@ fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> Http
         "suspended_tunnels": suspended_tunnels,
         "dormant_tunnels": dormant_tunnels,
         "healthy_tunnels": healthy_tunnels,
+        "half_open_tunnels": half_open_tunnels,
         "unhealthy_tunnels": unhealthy_tunnels,
         "total_connections": total_connections,
         "active_connections": active_connections,

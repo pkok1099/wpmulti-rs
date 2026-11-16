@@ -10,8 +10,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proxy::router::{
-    DynStream, ProxyTunnelTarget, ProxyUdpSocket, TargetAddr, TunnelRouter, TunnelSelector,
-    bound_candidate_addrs, connect_validated_addrs, is_forbidden_destination_ip,
+    DynStream, ProxyTunnelTarget, ProxyUdpSocket, RouterConnectError, TargetAddr, TunnelRouter,
+    TunnelSelector, bound_candidate_addrs, connect_via_router, is_forbidden_destination_ip,
     is_valid_target_domain, parse_domain_ip_literal, resolve_and_validate_domain,
     send_udp_to_validated_addrs,
 };
@@ -256,16 +256,10 @@ async fn read_rfc1929_credentials<S: AsyncRead + AsyncWrite + Unpin>(
 
     let mut plen_buf = [0u8; 1];
     stream.read_exact(&mut plen_buf).await?;
-    if plen_buf[0] == 0 {
-        stream.write_all(&[RFC1929_VERSION, 0x01]).await?;
-        stream.flush().await?;
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "empty RFC 1929 password",
-        ));
-    }
     let mut pass_buf = vec![0u8; plen_buf[0] as usize];
-    stream.read_exact(&mut pass_buf).await?;
+    if !pass_buf.is_empty() {
+        stream.read_exact(&mut pass_buf).await?;
+    }
 
     let (Ok(username), Ok(password)) = (
         std::str::from_utf8(&uname_buf),
@@ -502,40 +496,22 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         ));
     }
 
-    // Resolve tunnel
-    let target_tunnel = match router.select_tunnel(selector).await {
-        Ok(t) => t,
-        Err(e) => {
+    let mut tunnel_stream: DynStream = match connect_via_router(&router, selector, &target).await {
+        Ok(s) => s,
+        Err(RouterConnectError::SelectTunnel(e)) => {
             tracing::warn!("Failed to select tunnel for {:?}: {:?}", selector, e);
             let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
             return Err(e);
         }
-    };
-
-    // Connect to target via tunnel connector directly from validated SocketAddr(s) (zero TOCTOU)
-    let connect_res = match target {
-        TargetAddr::Ip(dst_addr) => target_tunnel.tcp_connect(dst_addr).await,
-        TargetAddr::Domain(ref domain, port) => {
-            let ips = match resolve_and_validate_domain(target_tunnel.as_ref(), domain).await {
-                Ok(ips) => ips,
-                Err(e) => {
-                    let rep = if e.kind() == io::ErrorKind::PermissionDenied {
-                        REP_CONN_NOT_ALLOWED
-                    } else {
-                        REP_HOST_UNREACHABLE
-                    };
-                    tracing::warn!("Failed to resolve target domain '{}': {:?}", domain, e);
-                    let _ = send_socks5_reply(&mut stream, rep, dummy_addr).await;
-                    return Err(e);
-                }
-            };
-            connect_validated_addrs(target_tunnel.as_ref(), &ips, port).await
+        Err(RouterConnectError::ForbiddenDestination(e)) => {
+            let _ = send_socks5_reply(&mut stream, REP_CONN_NOT_ALLOWED, dummy_addr).await;
+            return Err(e);
         }
-    };
-
-    let mut tunnel_stream: DynStream = match connect_res {
-        Ok(s) => s,
-        Err(e) => {
+        Err(RouterConnectError::DnsResolution(e)) => {
+            let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
+            return Err(e);
+        }
+        Err(RouterConnectError::TcpConnect(e)) => {
             // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; map all others to general failure.
             #[allow(clippy::wildcard_enum_match_arm)]
             let rep = match e.kind() {

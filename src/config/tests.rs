@@ -212,8 +212,8 @@ fn test_toml_config_full_schema() {
         base_http_port = 20000
 
         [per_tunnel.overrides."wg-gateway"]
-        socks5_port = 1080
-        http_port = 8080
+        socks5_port = 1081
+        http_port = 8081
 
         [[shared_listener]]
         name = "shared-socks5"
@@ -266,8 +266,8 @@ fn test_toml_config_full_schema() {
     assert_eq!(
         cfg.per_tunnel.overrides.get("wg-gateway"),
         Some(&TunnelPortOverride {
-            socks5_port: Some(1080),
-            http_port: Some(8080),
+            socks5_port: Some(1081),
+            http_port: Some(8081),
             password: None,
         })
     );
@@ -676,4 +676,55 @@ fn test_wg_conf_mtu_bounds_duplicate_keys_oversized_and_secret_redaction() {
     let bare_long_secret = format!("{VALID_PRIVATE_KEY}\n[Interface]\n");
     let err_msg2 = parse_wg_conf(&bare_long_secret).unwrap_err().to_string();
     assert!(!err_msg2.contains(VALID_PRIVATE_KEY));
+}
+
+#[test]
+fn test_validate_detects_internal_port_conflicts() {
+    let toml_conflict = r#"
+[global]
+bind_address = "127.0.0.1"
+
+[per_tunnel]
+enabled = true
+base_socks5_port = 20000
+base_http_port = 21000
+
+[per_tunnel.overrides.peer1]
+socks5_port = 18080
+
+[[shared_listener]]
+name = "shared-socks"
+type = "socks5"
+bind = "127.0.0.1:18080"
+auth_mode = "none"
+"#;
+    let cfg: MainConfig = toml::from_str(toml_conflict).unwrap();
+    let err = cfg.validate().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("peer1") && msg.contains("shared-socks"),
+        "expected conflict error naming peer1 and shared-socks, got: {msg}"
+    );
+
+    let base_conflict = r#"
+[global]
+bind_address = "127.0.0.1"
+
+[per_tunnel]
+enabled = true
+base_socks5_port = 11080
+base_http_port = 21000
+
+[[shared_listener]]
+name = "shared-socks"
+type = "socks5"
+bind = "127.0.0.1:11080"
+auth_mode = "none"
+"#;
+    let base_cfg: MainConfig = toml::from_str(base_conflict).unwrap();
+    let base_err = base_cfg.validate().unwrap_err().to_string();
+    assert!(
+        base_err.contains("base_socks5_port") && base_err.contains("shared-socks"),
+        "expected conflict error naming base_socks5_port and shared-socks, got: {base_err}"
+    );
 }

@@ -201,6 +201,18 @@ pub async fn cmd_run(
         "wpmulti daemon started successfully with {} tunnels",
         total_tunnels
     );
+    if total_tunnels == 0 {
+        tracing::warn!(
+            "No WireGuard tunnel configurations found in '{}'; daemon has 0 tunnels.",
+            config.global.config_dir.display()
+        );
+    }
+    if saved_config_path.is_none() {
+        tracing::info!(
+            "Running without wpmulti.toml: dedicated per-tunnel ports active (pass -c wpmulti.toml for shared listeners & Admin API)."
+        );
+    }
+    log_active_listeners(&manager.listeners().list_listeners());
 
     run_tui_or_wait(
         tui_mode,
@@ -214,6 +226,63 @@ pub async fn cmd_run(
 
     tracing::info!("wpmulti stopped cleanly.");
     Ok(())
+}
+
+fn log_active_listeners(listeners: &[crate::core::ActiveListenerInfo]) {
+    if listeners.is_empty() {
+        tracing::info!("No proxy listeners active.");
+        return;
+    }
+    let mut dedicated_socks = Vec::new();
+    let mut dedicated_http = Vec::new();
+    for info in listeners {
+        if info.is_shared {
+            let kind = match info.listener_type {
+                crate::config::ListenerType::Socks5 => "socks5",
+                crate::config::ListenerType::Http => "http",
+            };
+            tracing::info!(
+                "Shared {} listener '{}' listening on {}",
+                kind,
+                info.name,
+                info.address
+            );
+        } else {
+            let tid = info.tunnel_id.as_deref().unwrap_or("unknown");
+            match info.listener_type {
+                crate::config::ListenerType::Socks5 => {
+                    dedicated_socks.push((tid.to_string(), info.address));
+                }
+                crate::config::ListenerType::Http => {
+                    dedicated_http.push((tid.to_string(), info.address));
+                }
+            }
+        }
+    }
+    for (label, entries) in [("socks5", dedicated_socks), ("http", dedicated_http)] {
+        if let (Some((_, first)), Some((_, last))) = (entries.first(), entries.last()) {
+            if entries.len() == 1 {
+                if let Some((tid, addr)) = entries.first() {
+                    tracing::info!("Dedicated {label} listener: {tid} -> {addr}");
+                }
+            } else if entries.len() <= 20 {
+                let mapping: Vec<String> = entries
+                    .iter()
+                    .map(|(tid, addr)| format!("{tid}={addr}"))
+                    .collect();
+                tracing::info!(
+                    "Dedicated {label} listeners ({}): {}",
+                    entries.len(),
+                    mapping.join(", ")
+                );
+            } else {
+                tracing::info!(
+                    "Dedicated {label} listeners: {} ({first} .. {last})",
+                    entries.len()
+                );
+            }
+        }
+    }
 }
 
 async fn run_tui_or_wait(
@@ -266,22 +335,18 @@ pub fn cmd_validate(
         MainConfig::default()
     };
 
-    let explicit_dir = dir_path.is_some();
     if let Some(dir) = dir_path {
         config.global.config_dir = dir;
     }
 
-    let tunnels = if config.global.config_dir.exists() {
-        load_tunnel_configs_from_dir(&config.global.config_dir)?
-    } else if explicit_dir {
+    if !config.global.config_dir.exists() {
         return Err(format!(
             "Tunnel directory '{}' does not exist",
             config.global.config_dir.display()
         )
         .into());
-    } else {
-        Vec::new()
-    };
+    }
+    let tunnels = load_tunnel_configs_from_dir(&config.global.config_dir)?;
 
     let count = tunnels.len();
     let mut out = std::io::stdout().lock();
@@ -539,6 +604,16 @@ pub async fn cmd_probe(
 
     let configs_with_path: Vec<(TunnelConfig, String)> = match (config_path, dir_path) {
         (Some(file), None) => {
+            if file
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("toml"))
+            {
+                return Err(format!(
+                    "File '{}' looks like a wpmulti.toml config; pass a single WireGuard .conf file to -c/--config or use -d/--dir <conf.d>",
+                    file.display()
+                )
+                .into());
+            }
             let t = load_tunnel_config_from_file(&file)
                 .map_err(|e| format!("Failed to load config '{}': {}", file.display(), e))?;
             vec![(t, file.display().to_string())]
@@ -616,15 +691,15 @@ fn print_probe_table(results: &[ProbeResult]) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(
         out,
-        "┌──────────┬──────────────────────┬─────────────┬────────────────┬────────────────────────┐"
+        "┌──────────┬──────────────────────┬─────────────┬────────────────┬────────────────────────┬──────────────────────────────┐"
     );
     let _ = writeln!(
         out,
-        "│ STATUS   │ CONFIG               │ RTT         │ EXIT IP        │ ENDPOINT               │"
+        "│ STATUS   │ CONFIG               │ RTT         │ EXIT IP        │ ENDPOINT               │ ERROR                        │"
     );
     let _ = writeln!(
         out,
-        "├──────────┼──────────────────────┼─────────────┼────────────────┼────────────────────────┤"
+        "├──────────┼──────────────────────┼─────────────┼────────────────┼────────────────────────┼──────────────────────────────┤"
     );
 
     let mut passed = 0;
@@ -644,25 +719,28 @@ fn print_probe_table(results: &[ProbeResult]) {
             .map_or_else(|| "-".to_string(), |ms| format!("{ms:.1} ms"));
 
         let exit_ip = r.exit_ip.as_deref().unwrap_or("-");
+        let err_msg = r.error.as_deref().unwrap_or("-");
 
         let clean_id: String = r.id.chars().filter(|c| !c.is_control()).collect();
         let clean_exit: String = exit_ip.chars().filter(|c| !c.is_control()).collect();
         let clean_ep: String = r.endpoint.chars().filter(|c| !c.is_control()).collect();
+        let clean_err: String = err_msg.chars().filter(|c| !c.is_control()).collect();
 
         let _ = writeln!(
             out,
-            "│ {:<8} │ {:<20} │ {:<11} │ {:<14} │ {:<22} │",
+            "│ {:<8} │ {:<20} │ {:<11} │ {:<14} │ {:<22} │ {:<28} │",
             status,
             truncate_str(&clean_id, 20),
             truncate_str(&rtt, 11),
             truncate_str(&clean_exit, 14),
             truncate_str(&clean_ep, 22),
+            truncate_str(&clean_err, 28),
         );
     }
 
     let _ = writeln!(
         out,
-        "└──────────┴──────────────────────┴─────────────┴────────────────┴────────────────────────┘"
+        "└──────────┴──────────────────────┴─────────────┴────────────────┴────────────────────────┴──────────────────────────────┘"
     );
     let _ = writeln!(
         out,

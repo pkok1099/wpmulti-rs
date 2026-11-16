@@ -107,7 +107,7 @@ pub enum Commands {
         #[clap(short, long)]
         dir: Option<PathBuf>,
 
-        /// Output results as JSON
+        /// Output results as JSON (exits 0 with JSON array; table mode exits 1 if all probes fail)
         #[clap(long)]
         json: bool,
 
@@ -189,9 +189,13 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         use std::io::IsTerminal;
         use tracing_subscriber::util::SubscriberInitExt;
         let json_mode = matches!(cli.command, Commands::Probe { json: true, .. });
+        let level = if matches!(cli.command, Commands::Probe { .. }) {
+            tracing::Level::WARN
+        } else {
+            tracing::Level::INFO
+        };
         let ansi = cli_log_ansi_enabled(json_mode, std::io::stderr().is_terminal());
-        let _ =
-            build_cli_tracing_subscriber(tracing::Level::INFO, ansi, std::io::stderr).try_init();
+        let _ = build_cli_tracing_subscriber(level, ansi, std::io::stderr).try_init();
     }
     let env_token = std::env::var("WPMULTI_ADMIN_TOKEN")
         .ok()
@@ -219,7 +223,10 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             json,
             timeout,
         } => {
-            cmd_probe(config, dir, json, timeout).await?;
+            let results = cmd_probe(config, dir, json, timeout).await?;
+            if !json && !results.is_empty() && results.iter().all(|r| !r.healthy) {
+                return Err("All probed tunnels failed".into());
+            }
             Ok(())
         }
         Commands::Disable {

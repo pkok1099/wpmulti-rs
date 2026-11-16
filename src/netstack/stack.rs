@@ -593,6 +593,11 @@ impl VirtualNetworkStack {
             .await
     }
 
+    /// Verify actual data-plane egress through the tunnel via an uncached in-tunnel DNS probe.
+    pub async fn probe_egress(&self, timeout: StdDuration) -> Result<(), io::Error> {
+        self.dns_resolver.probe_egress(self, timeout).await
+    }
+
     /// Cleanly shutdown the virtual network stack and stop the reactor.
     pub async fn close(&self) {
         let wakers = {

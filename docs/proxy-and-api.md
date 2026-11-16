@@ -79,6 +79,10 @@ bind = "127.0.0.1:9090"
 | `GET` | `/tunnels/<id>` | Detailed summary for a single tunnel. |
 | `POST` | `/tunnels/<id>/activate` | Manually wake/resume a tunnel. |
 | `POST` | `/tunnels/<id>/suspend` | Manually suspend a tunnel (`deactivate` alias also supported). |
+| `POST` | `/tunnels/<id>/disable` | Disable a tunnel (suspends it and excludes it from routing until enabled). |
+| `POST` | `/tunnels/<id>/enable` | Re-enable a previously disabled tunnel. |
+| `POST` | `/tunnels/batch/disable` | Disable tunnels by JSON `{"target": "<id\|1\|1-200\|all>"}`. |
+| `POST` | `/tunnels/batch/enable` | Re-enable tunnels by JSON `{"target": "<id\|1\|1-200\|all>"}`. |
 | `POST` | `/reload` | Hot-reload `.conf` files from `config_dir` without restarting active tunnels. |
 | `GET` | `/metrics` | Prometheus text exposition metrics. |
 

@@ -162,9 +162,6 @@ impl GuardedTunnelTarget {
                 Ok(ips) => {
                     tunnel.stats.record_handshake(now_unix_secs());
                     trial_resolved.store(true, Ordering::Relaxed);
-                    if let Some(h) = &health {
-                        h.record_success();
-                    }
                     Ok(ips)
                 }
                 Err(e) => {
@@ -172,7 +169,17 @@ impl GuardedTunnelTarget {
                     if let Some(h) = &health {
                         h.record_failure(threshold, cooldown);
                     }
-                    Err(e)
+                    let err = if e.kind() == io::ErrorKind::TimedOut
+                        && tunnel.stats.last_handshake.load(Ordering::Relaxed) == 0
+                    {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "WireGuard handshake not yet established (peer unreachable or timed out)",
+                        )
+                    } else {
+                        e
+                    };
+                    Err(err)
                 }
             }
         })
@@ -216,7 +223,17 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
                     if let Some(h) = &health {
                         h.record_failure(threshold, cooldown);
                     }
-                    Err(e)
+                    let err = if e.kind() == io::ErrorKind::TimedOut
+                        && tunnel.stats.last_handshake.load(Ordering::Relaxed) == 0
+                    {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "WireGuard handshake not yet established (peer unreachable or timed out)",
+                        )
+                    } else {
+                        e
+                    };
+                    Err(err)
                 }
             }
         })
@@ -250,7 +267,17 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
                     if let Some(h) = &health {
                         h.record_failure(threshold, cooldown);
                     }
-                    Err(e)
+                    let err = if e.kind() == io::ErrorKind::TimedOut
+                        && tunnel.stats.last_handshake.load(Ordering::Relaxed) == 0
+                    {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "WireGuard handshake not yet established (peer unreachable or timed out)",
+                        )
+                    } else {
+                        e
+                    };
+                    Err(err)
                 }
             }
         })
@@ -270,6 +297,10 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
     ) -> crate::proxy::router::ResolveAllFut<'a> {
         let mode = self.tunnel.netstack.effective_ip_mode();
         self.resolve_all_in_tunnel_with_mode(domain, mode)
+    }
+
+    fn tunnel_id(&self) -> Option<&str> {
+        Some(self.guard.tunnel_id())
     }
 
     fn connect_timeout(&self) -> Duration {

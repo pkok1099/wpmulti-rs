@@ -24,8 +24,8 @@ probe_timeout = "5s"                # active probe handshake timeout
 
 [per_tunnel]
 enabled = true
-base_socks5_port = 11000            # SOCKS5 ports: 11000 + index
-base_http_port = 30000              # HTTP ports:   30000 + index
+base_socks5_port = 10000            # SOCKS5 ports: 10000 + index
+base_http_port = 20000              # HTTP ports:   20000 + index
 
 # Optional explicit port overrides per tunnel ID:
 # [per_tunnel.overrides.wgcf-001]

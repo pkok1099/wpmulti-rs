@@ -457,14 +457,26 @@ impl ActiveProber {
                     .await;
             match probe_res {
                 Ok(Ok(())) => {
-                    entry_ref.health.record_success();
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
                     entry_ref.stats.record_handshake(now);
-                    succeeded = true;
-                    break;
+                    match active_clone.netstack.probe_egress(timeout).await {
+                        Ok(()) => {
+                            entry_ref.health.record_success();
+                            succeeded = true;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Active probe egress check failed (attempt {}/{}): {}",
+                                attempt + 1,
+                                MAX_PROBE_ATTEMPTS,
+                                e
+                            );
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::debug!(

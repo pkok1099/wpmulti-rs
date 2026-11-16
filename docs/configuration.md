@@ -52,7 +52,7 @@ allow_anonymous = true
 pool = "all"
 
 [admin]
-enabled = false
+enabled = true
 bind = "127.0.0.1:9090"
 # auth_token = "my-bearer-token"    # optional Bearer token for Admin API
 

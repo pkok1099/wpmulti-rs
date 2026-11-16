@@ -13,9 +13,8 @@ use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proxy::router::{
-    DynStream, ProxyTunnelTarget, TunnelRouter, TunnelSelector, connect_validated_addrs,
+    DynStream, RouterConnectError, TargetAddr, TunnelRouter, TunnelSelector, connect_via_router,
     is_forbidden_destination_ip, is_valid_target_domain, parse_domain_ip_literal,
-    resolve_and_validate_domain,
 };
 
 const MAX_HEADER_SIZE: usize = 16384;
@@ -674,7 +673,6 @@ async fn forward_request_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         upstream_write.flush().await?;
     }
-    let _ = upstream_write.shutdown().await;
     Ok(())
 }
 
@@ -755,57 +753,77 @@ async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
     port: u16,
 ) -> io::Result<DynStream> {
     let literal_ip = validate_target_host_before_routing(stream, host).await?;
+    let target = literal_ip.map_or_else(
+        || TargetAddr::Domain(host.to_string(), port),
+        |ip| TargetAddr::Ip(SocketAddr::new(ip, port)),
+    );
 
-    let target_tunnel = match router.select_tunnel(selector).await {
-        Ok(t) => t,
-        Err(e) => {
-            send_response(stream, "502 Bad Gateway", "text/plain", b"Bad Gateway").await?;
-            return Err(e);
-        }
-    };
-
-    let connect_res = if let Some(ip) = literal_ip {
-        target_tunnel.tcp_connect(SocketAddr::new(ip, port)).await
-    } else {
-        let ips = match resolve_and_validate_domain(target_tunnel.as_ref(), host).await {
-            Ok(ips) => ips,
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                send_response(
-                    stream,
-                    "403 Forbidden",
-                    "text/plain",
-                    b"Forbidden Destination",
-                )
-                .await?;
-                return Err(e);
-            }
-            Err(e) => {
-                send_response(
-                    stream,
-                    "502 Bad Gateway",
-                    "text/plain",
-                    b"DNS Resolution Failed",
-                )
-                .await?;
-                return Err(e);
-            }
-        };
-        connect_validated_addrs(target_tunnel.as_ref(), &ips, port).await
-    };
-
-    match connect_res {
+    match connect_via_router(router, selector, &target).await {
         Ok(s) => Ok(s),
-        Err(e) => {
+        Err(RouterConnectError::SelectTunnel(e)) => {
+            let msg = format!("Bad Gateway: {e}\n");
+            send_response(stream, "502 Bad Gateway", "text/plain", msg.as_bytes()).await?;
+            Err(e)
+        }
+        Err(RouterConnectError::ForbiddenDestination(e)) => {
             send_response(
                 stream,
-                "502 Bad Gateway",
+                "403 Forbidden",
                 "text/plain",
-                b"Connection Failed",
+                b"Forbidden Destination\n",
             )
             .await?;
             Err(e)
         }
+        Err(RouterConnectError::DnsResolution(e)) => {
+            let msg = format!("DNS Resolution Failed: {e}\n");
+            send_response(stream, "502 Bad Gateway", "text/plain", msg.as_bytes()).await?;
+            Err(e)
+        }
+        Err(RouterConnectError::TcpConnect(e)) => {
+            let msg = format!("Connection Failed: {e}\n");
+            send_response(stream, "502 Bad Gateway", "text/plain", msg.as_bytes()).await?;
+            Err(e)
+        }
     }
+}
+
+async fn forward_upstream_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    mut upstream_read: R,
+    mut client_write: W,
+) -> io::Result<()> {
+    let mut first_buf = [0u8; 4096];
+    let first_n = match upstream_read.read(&mut first_buf).await {
+        Ok(0) => {
+            let _ = send_response(
+                &mut client_write,
+                "502 Bad Gateway",
+                "text/plain",
+                b"Empty Upstream Response",
+            )
+            .await;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream closed without sending response",
+            ));
+        }
+        Ok(n) => n,
+        Err(e) => {
+            let _ = send_response(
+                &mut client_write,
+                "502 Bad Gateway",
+                "text/plain",
+                b"Upstream Read Failed",
+            )
+            .await;
+            return Err(e);
+        }
+    };
+    if let Some(slice) = first_buf.get(..first_n) {
+        client_write.write_all(slice).await?;
+    }
+    tokio::io::copy(&mut upstream_read, &mut client_write).await?;
+    client_write.flush().await
 }
 
 /// Executes RFC 9110 Forward Proxy request forwarding for absolute URIs.
@@ -860,11 +878,29 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
     let req_buf = build_forward_request_head(&req, &path, synthesized_host.as_deref());
 
     // Forward request line and headers to destination server
-    tunnel_stream.write_all(req_buf.as_bytes()).await?;
-    tunnel_stream.flush().await?;
+    if let Err(e) = tunnel_stream.write_all(req_buf.as_bytes()).await {
+        let _ = send_response(
+            &mut stream,
+            "502 Bad Gateway",
+            "text/plain",
+            b"Upstream Write Failed",
+        )
+        .await;
+        return Err(e);
+    }
+    if let Err(e) = tunnel_stream.flush().await {
+        let _ = send_response(
+            &mut stream,
+            "502 Bad Gateway",
+            "text/plain",
+            b"Upstream Flush Failed",
+        )
+        .await;
+        return Err(e);
+    }
 
-    let (client_read, mut client_write) = tokio::io::split(stream);
-    let (mut upstream_read, mut upstream_write) = tokio::io::split(tunnel_stream);
+    let (client_read, client_write) = tokio::io::split(stream);
+    let (upstream_read, mut upstream_write) = tokio::io::split(tunnel_stream);
 
     let req_fut = forward_request_body(
         client_read,
@@ -873,10 +909,7 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
         content_length,
         is_chunked,
     );
-    let resp_fut = async {
-        tokio::io::copy(&mut upstream_read, &mut client_write).await?;
-        client_write.flush().await
-    };
+    let resp_fut = forward_upstream_response(upstream_read, client_write);
 
     tokio::try_join!(req_fut, resp_fut)?;
 

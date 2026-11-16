@@ -2044,3 +2044,160 @@ async fn test_socks5_prefers_user_pass_over_no_auth_when_anonymous_allowed() {
     assert_eq!(ok_status, Some(0x00));
     assert_eq!(g2.tcp_conns.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn test_http_forward_empty_upstream_returns_502() {
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((sock, _)) = upstream_listener.accept().await {
+            drop(sock);
+        }
+    });
+
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "direct",
+        Arc::new(DirectTunnelTarget) as Arc<dyn ProxyTunnelTarget>,
+        None,
+    ));
+    let (mut client, server) = tokio::io::duplex(4096);
+    let server_task = tokio::spawn(async move { handle_http(server, router).await });
+
+    let req = format!(
+        "GET http://{}/ HTTP/1.1\r\nHost: {}\r\n\r\n",
+        upstream_addr, upstream_addr
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    let mut resp = Vec::new();
+    client.read_to_end(&mut resp).await.unwrap();
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("HTTP/1.1 502 Bad Gateway"),
+        "expected 502 Bad Gateway on empty upstream response, got: {resp_str:?}"
+    );
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn test_pool_round_robin_failover_on_dead_tunnel() {
+    struct DeadTunnelTarget;
+
+    impl ProxyTunnelTarget for DeadTunnelTarget {
+        fn tcp_connect<'a>(
+            &'a self,
+            _dst: SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
+            Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "simulated dead tunnel",
+                ))
+            })
+        }
+
+        fn udp_bind(&self, _local_port: u16) -> crate::proxy::router::UdpBindFut<'_> {
+            Box::pin(async { Err(io::Error::new(io::ErrorKind::TimedOut, "dead")) })
+        }
+
+        fn resolve_in_tunnel<'a>(
+            &'a self,
+            _domain: &'a str,
+        ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
+            Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "simulated dead DNS",
+                ))
+            })
+        }
+
+        fn tunnel_id(&self) -> Option<&str> {
+            Some("wgcf-dead")
+        }
+    }
+
+    let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = echo_listener.accept().await {
+            let mut buf = [0u8; 32];
+            if let Ok(n) = sock.read(&mut buf).await {
+                let _ = sock.write_all(&buf[..n]).await;
+            }
+        }
+    });
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel("wgcf-dead", Arc::new(DeadTunnelTarget));
+    let ok_target = Arc::new(MockTunnelTarget::new("wgcf-ok"));
+    pool.add_tunnel(
+        "wgcf-ok",
+        Arc::clone(&ok_target) as Arc<dyn ProxyTunnelTarget>,
+    );
+
+    let (mut client, server) = tokio::io::duplex(4096);
+    let router: Arc<dyn TunnelRouter> = pool;
+    let server_task = tokio::spawn(async move { handle_socks5(server, router).await });
+
+    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method_resp = [0u8; 2];
+    client.read_exact(&mut method_resp).await.unwrap();
+    assert_eq!(method_resp, [0x05, 0x00]);
+
+    let ip_octets = match echo_addr.ip() {
+        IpAddr::V4(v4) => v4.octets(),
+        IpAddr::V6(_) => unreachable!(),
+    };
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    req.extend_from_slice(&ip_octets);
+    req.extend_from_slice(&echo_addr.port().to_be_bytes());
+    client.write_all(&req).await.unwrap();
+
+    let mut rep = [0u8; 10];
+    client.read_exact(&mut rep).await.unwrap();
+    assert_eq!(rep[1], 0x00, "expected failover to wgcf-ok to succeed");
+
+    client.write_all(b"ping").await.unwrap();
+    let mut echo = [0u8; 4];
+    client.read_exact(&mut echo).await.unwrap();
+    assert_eq!(&echo, b"ping");
+    assert_eq!(ok_target.tcp_conns.load(Ordering::SeqCst), 1);
+
+    drop(client);
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn test_socks5_selector_username_with_empty_password_allowed_when_anonymous() {
+    let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let accept_task = tokio::spawn(async move {
+        while let Ok((sock, _)) = echo_listener.accept().await {
+            drop(sock);
+        }
+    });
+
+    for mode in [AuthMode::None, AuthMode::PerTunnel] {
+        let t1 = Arc::new(MockTunnelTarget::new("wgcf-001"));
+        let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true).with_auth(mode, None));
+        pool.add_tunnel("wgcf-001", Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>);
+
+        let (chosen, status) = perform_socks5_greeting_and_auth(
+            pool,
+            &[METHOD_NO_AUTH, METHOD_USER_PASS],
+            Some(("round-robin", "")),
+            echo_addr,
+        )
+        .await;
+        assert_eq!(chosen, METHOD_USER_PASS);
+        assert_eq!(
+            status,
+            Some(0x00),
+            "expected round-robin@ with empty password to succeed for {mode:?}"
+        );
+        assert_eq!(t1.tcp_conns.load(Ordering::SeqCst), 1);
+    }
+
+    accept_task.abort();
+}

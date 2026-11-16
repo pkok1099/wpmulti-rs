@@ -60,7 +60,12 @@ impl AdminServer {
             ));
         }
         let _ = self.shutdown_tx.send(false);
-        let listener = TcpListener::bind(self.bind_addr).await?;
+        let listener = TcpListener::bind(self.bind_addr).await.map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to bind Admin API on {}: {e}", self.bind_addr),
+            )
+        })?;
         let local_addr = listener.local_addr()?;
 
         let manager = Arc::clone(&self.manager);

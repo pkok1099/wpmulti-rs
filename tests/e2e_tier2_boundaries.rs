@@ -783,8 +783,14 @@ async fn test_f9_bnd_port_already_in_use_error() {
     );
     let supervisor = ListenerSupervisor::new();
 
-    let res = supervisor.start_all(&config, &registry, &lifecycle).await;
-    assert!(res.is_err());
+    let started = supervisor
+        .start_all(&config, &registry, &lifecycle)
+        .await
+        .unwrap();
+    assert_eq!(started.len(), 1);
+    assert_ne!(started[0].address.port(), occupied_port);
+    supervisor.stop().await;
+    lifecycle.stop().await;
     drop(listener);
 }
 

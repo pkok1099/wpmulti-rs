@@ -877,6 +877,94 @@ impl MainConfig {
         Ok(())
     }
 
+    fn ips_overlap(a: IpAddr, b: IpAddr) -> bool {
+        a == b || (a.is_ipv4() == b.is_ipv4() && (a.is_unspecified() || b.is_unspecified()))
+    }
+
+    fn validate_port_conflicts(&self) -> Result<(), ConfigError> {
+        for (i, a) in self.shared_listeners.iter().enumerate() {
+            let port_a = a.bind.port();
+            if port_a == 0 {
+                continue;
+            }
+            for b in self.shared_listeners.iter().skip(i + 1) {
+                if b.bind.port() == port_a && Self::ips_overlap(a.bind.ip(), b.bind.ip()) {
+                    return Err(ConfigError::Validation(format!(
+                        "shared_listener '{}' ({}) conflicts with shared_listener '{}' ({})",
+                        a.name, a.bind, b.name, b.bind
+                    )));
+                }
+            }
+            if self.admin.enabled
+                && self.admin.bind.port() == port_a
+                && Self::ips_overlap(a.bind.ip(), self.admin.bind.ip())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "shared_listener '{}' ({}) conflicts with admin.bind ({})",
+                    a.name, a.bind, self.admin.bind
+                )));
+            }
+        }
+
+        if !self.per_tunnel.enabled {
+            return Ok(());
+        }
+
+        let ded_ip = self.global.bind_address;
+        for (label, port_opt) in [
+            (
+                "per_tunnel.base_socks5_port",
+                self.per_tunnel.base_socks5_port,
+            ),
+            ("per_tunnel.base_http_port", self.per_tunnel.base_http_port),
+        ] {
+            let Some(port) = port_opt else {
+                continue;
+            };
+            self.check_dedicated_port_against_listeners(label, ded_ip, port)?;
+        }
+
+        for (id, ovr) in &self.per_tunnel.overrides {
+            for (kind, port_opt) in [
+                ("socks5_port", ovr.socks5_port),
+                ("http_port", ovr.http_port),
+            ] {
+                let Some(port) = port_opt else {
+                    continue;
+                };
+                let label = format!("per_tunnel.overrides.{id}.{kind}");
+                self.check_dedicated_port_against_listeners(&label, ded_ip, port)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_dedicated_port_against_listeners(
+        &self,
+        label: &str,
+        ded_ip: IpAddr,
+        port: u16,
+    ) -> Result<(), ConfigError> {
+        for shared in &self.shared_listeners {
+            if shared.bind.port() == port && Self::ips_overlap(ded_ip, shared.bind.ip()) {
+                return Err(ConfigError::Validation(format!(
+                    "{label} ({ded_ip}:{port}) conflicts with shared_listener '{}' ({})",
+                    shared.name, shared.bind
+                )));
+            }
+        }
+        if self.admin.enabled
+            && self.admin.bind.port() == port
+            && Self::ips_overlap(ded_ip, self.admin.bind.ip())
+        {
+            return Err(ConfigError::Validation(format!(
+                "{label} ({ded_ip}:{port}) conflicts with admin.bind ({})",
+                self.admin.bind
+            )));
+        }
+        Ok(())
+    }
+
     /// Perform comprehensive validation of configuration invariants.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.global.max_active_tunnels == 0 {
@@ -892,6 +980,7 @@ impl MainConfig {
 
         self.validate_shared_listeners()?;
         self.validate_per_tunnel()?;
+        self.validate_port_conflicts()?;
 
         if self.tui.refresh_rate_ms < 50 {
             return Err(ConfigError::Validation(

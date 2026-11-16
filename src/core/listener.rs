@@ -163,6 +163,104 @@ impl ListenerSupervisor {
         }
     }
 
+    async fn bind_dedicated_listener(
+        bind_address: IpAddr,
+        proto_label: &str,
+        tunnel_id: &str,
+        override_port: Option<u16>,
+        used_ports: &mut std::collections::HashSet<u16>,
+        next_port: &mut u16,
+    ) -> Result<Option<TcpListener>, CoreError> {
+        if let Some(port) = override_port {
+            let bind_addr = SocketAddr::new(bind_address, port);
+            return match TcpListener::bind(bind_addr).await {
+                Ok(l) => Ok(Some(l)),
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                    tracing::warn!(
+                        "Skipping dedicated {proto_label} listener for tunnel '{tunnel_id}' on {bind_addr}: {e} (port already in use)"
+                    );
+                    Ok(None)
+                }
+                Err(e) => Err(CoreError::ListenerError(format!(
+                    "failed to bind dedicated {proto_label} listener for tunnel '{tunnel_id}' on {bind_addr}: {e}"
+                ))),
+            };
+        }
+
+        while let Some(port) = Self::pick_free_dedicated_port(used_ports, next_port) {
+            let bind_addr = SocketAddr::new(bind_address, port);
+            match TcpListener::bind(bind_addr).await {
+                Ok(l) => return Ok(Some(l)),
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                    tracing::warn!(
+                        "Port {port} already in use for {proto_label} tunnel '{tunnel_id}', shifting to next free port"
+                    );
+                }
+                Err(e) => {
+                    return Err(CoreError::ListenerError(format!(
+                        "failed to bind dedicated {proto_label} listener for tunnel '{tunnel_id}' on {bind_addr}: {e}"
+                    )));
+                }
+            }
+        }
+
+        Err(CoreError::ListenerError(format!(
+            "no free {proto_label} port available for tunnel '{tunnel_id}'"
+        )))
+    }
+
+    fn register_dedicated_listener(
+        &self,
+        (listener, actual_addr): (TcpListener, SocketAddr),
+        entry: &Arc<crate::core::registry::TunnelEntry>,
+        per_tunnel: &PerTunnelSettings,
+        listener_type: ListenerType,
+        lifecycle: &Arc<LifecycleController>,
+    ) -> ActiveListenerInfo {
+        let proto_label = match listener_type {
+            ListenerType::Socks5 => "socks5",
+            ListenerType::Http => "http",
+        };
+        if listener_type == ListenerType::Socks5 || entry.assigned_port.read().is_none() {
+            entry.set_assigned_port(actual_addr.port());
+        }
+
+        let auth = per_tunnel
+            .overrides
+            .get(&entry.id)
+            .and_then(|o| o.password.as_ref())
+            .map(|p| (entry.id.clone(), p.clone()));
+
+        let router = Arc::new(DedicatedTunnelRouter::new(
+            entry.id.clone(),
+            Arc::clone(lifecycle),
+            auth,
+        ));
+
+        let info = ActiveListenerInfo {
+            name: format!("dedicated-{proto_label}-{}", entry.id),
+            address: actual_addr,
+            listener_type,
+            is_shared: false,
+            tunnel_id: Some(entry.id.clone()),
+        };
+
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        let task = tokio::spawn(run_listener_loop(
+            listener,
+            router,
+            listener_type,
+            shutdown_rx,
+            Arc::clone(&self.drain_timeout_ms),
+        ));
+
+        self.handles.lock().push(ListenerHandle {
+            info: info.clone(),
+            task,
+        });
+        info
+    }
+
     async fn start_dedicated_protocol_listeners(
         &self,
         entries: &[Arc<crate::core::registry::TunnelEntry>],
@@ -210,70 +308,41 @@ impl ListenerSupervisor {
                         ListenerType::Socks5 => o.socks5_port,
                         ListenerType::Http => o.http_port,
                     });
-            let port = if let Some(p) = override_port {
-                p
-            } else {
-                let Some(p) = Self::pick_free_dedicated_port(&mut used_ports, &mut next_port)
-                else {
+            let listener = match Self::bind_dedicated_listener(
+                bind_address,
+                proto_label,
+                &entry.id,
+                override_port,
+                &mut used_ports,
+                &mut next_port,
+            )
+            .await
+            {
+                Ok(Some(l)) => l,
+                Ok(None) => continue,
+                Err(e) => {
                     self.rollback_dedicated_batch(&started, entries);
-                    return Err(CoreError::ListenerError(format!(
-                        "no free {proto_label} port available for tunnel '{}'",
-                        entry.id
-                    )));
-                };
-                p
+                    return Err(e);
+                }
             };
-
-            let bind_addr = SocketAddr::new(bind_address, port);
-            let listener = match TcpListener::bind(bind_addr).await {
-                Ok(l) => l,
+            let actual_addr = match listener.local_addr() {
+                Ok(addr) => addr,
                 Err(e) => {
                     self.rollback_dedicated_batch(&started, entries);
                     return Err(CoreError::ListenerError(format!(
-                        "failed to bind dedicated {proto_label} listener for tunnel '{}' on {bind_addr}: {e:?}",
+                        "failed to query local_addr for {proto_label} tunnel '{}': {e}",
                         entry.id
                     )));
                 }
             };
-            let actual_addr = listener.local_addr().unwrap_or(bind_addr);
 
-            if listener_type == ListenerType::Socks5 || entry.assigned_port.read().is_none() {
-                entry.set_assigned_port(actual_addr.port());
-            }
-
-            let auth = per_tunnel
-                .overrides
-                .get(&entry.id)
-                .and_then(|o| o.password.as_ref())
-                .map(|p| (entry.id.clone(), p.clone()));
-
-            let router = Arc::new(DedicatedTunnelRouter::new(
-                entry.id.clone(),
-                Arc::clone(lifecycle),
-                auth,
-            ));
-
-            let info = ActiveListenerInfo {
-                name: format!("dedicated-{proto_label}-{}", entry.id),
-                address: actual_addr,
+            let info = self.register_dedicated_listener(
+                (listener, actual_addr),
+                entry,
+                per_tunnel,
                 listener_type,
-                is_shared: false,
-                tunnel_id: Some(entry.id.clone()),
-            };
-
-            let shutdown_rx = self.shutdown_tx.subscribe();
-            let task = tokio::spawn(run_listener_loop(
-                listener,
-                router,
-                listener_type,
-                shutdown_rx,
-                Arc::clone(&self.drain_timeout_ms),
-            ));
-
-            self.handles.lock().push(ListenerHandle {
-                info: info.clone(),
-                task,
-            });
+                lifecycle,
+            );
             started.push(info);
         }
 

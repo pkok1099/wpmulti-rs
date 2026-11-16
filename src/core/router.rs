@@ -484,6 +484,7 @@ impl TunnelRouter for MultiTenantRouter {
                     {
                         Ok(TunnelSelector::parse(user))
                     }
+                    None if self.allow_anonymous => Ok(TunnelSelector::parse(user)),
                     _ => Err(ProxyAuthError::InvalidCredentials),
                 },
             },
@@ -512,6 +513,7 @@ impl TunnelRouter for MultiTenantRouter {
                         {
                             Ok(selector)
                         }
+                        None if self.allow_anonymous => Ok(selector),
                         _ => Err(ProxyAuthError::InvalidCredentials),
                     }
                 }
@@ -744,6 +746,10 @@ impl ProxyTunnelTarget for IpFilteredTunnelTarget {
 
     fn connect_timeout(&self) -> Duration {
         self.inner.connect_timeout()
+    }
+
+    fn tunnel_id(&self) -> Option<&str> {
+        self.inner.tunnel_id()
     }
 }
 

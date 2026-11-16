@@ -1438,3 +1438,63 @@ async fn test_router_registry_keyword_least_conn_and_all_unhealthy() {
 
     lifecycle.stop().await;
 }
+
+#[tokio::test]
+async fn test_dedicated_listeners_shift_and_skip_on_port_conflict() {
+    use crate::config::PerTunnelSettings;
+    use crate::config::toml_config::TunnelPortOverride;
+
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy_port = occupied.local_addr().unwrap().port();
+
+    let registry = Arc::new(TunnelRegistry::new());
+    for id in ["t-skip", "t-ok"] {
+        registry
+            .register(TunnelEntry::new(
+                id,
+                make_test_tunnel_config(id),
+                LifecycleMode::Lazy,
+            ))
+            .unwrap();
+    }
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let supervisor = ListenerSupervisor::new();
+
+    // Explicit override on busy_port skips "t-skip" and shifts/starts "t-ok" without aborting.
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "t-skip".to_string(),
+        TunnelPortOverride {
+            socks5_port: Some(busy_port),
+            http_port: None,
+            password: None,
+        },
+    );
+    let settings = PerTunnelSettings {
+        enabled: true,
+        base_socks5_port: Some(busy_port),
+        base_http_port: None,
+        overrides,
+    };
+    let started = supervisor
+        .start_dedicated_listeners(
+            &settings,
+            "127.0.0.1".parse().unwrap(),
+            &registry,
+            &lifecycle,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].tunnel_id.as_deref(), Some("t-ok"));
+    assert_ne!(started[0].address.port(), busy_port);
+
+    supervisor.stop().await;
+    lifecycle.stop().await;
+    drop(occupied);
+}

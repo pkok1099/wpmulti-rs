@@ -393,7 +393,7 @@ impl InTunnelDnsResolver {
             has_configured_dns,
             dns_servers: RwLock::new(servers),
             cache: DnsLruCache::new(2048),
-            timeout: Duration::from_millis(1500),
+            timeout: Duration::from_secs(2),
             max_retries: 2,
             prefer_ipv6: std::sync::atomic::AtomicBool::new(false),
             ip_mode: std::sync::atomic::AtomicU8::new(0),
@@ -523,7 +523,77 @@ impl InTunnelDnsResolver {
             return Ok(ips);
         }
 
-        // Filter DNS servers by active IpMode; fall back to well-known servers of that family
+        let servers = self.effective_servers(mode);
+
+        // Query tunnel DNS servers strictly inside the WireGuard tunnel
+        let mut last_err = io::Error::new(io::ErrorKind::TimedOut, "DNS resolution timed out");
+        let dns_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+
+        'servers: for &server in &servers {
+            for retry in 0..self.max_retries {
+                let Some(remaining) =
+                    dns_deadline.checked_duration_since(tokio::time::Instant::now())
+                else {
+                    break 'servers;
+                };
+                if remaining.is_zero() {
+                    break 'servers;
+                }
+                match tokio::time::timeout(
+                    remaining,
+                    self.query_server(stack, trimmed, server, mode),
+                )
+                .await
+                {
+                    Ok(Ok((ips, ttl))) => {
+                        self.cache.insert(&cache_key, ips.clone(), ttl);
+                        return Ok(ips);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            "DNS query to {} attempt {} failed: {}",
+                            server,
+                            retry + 1,
+                            e
+                        );
+                        let is_definitive = e.kind() == io::ErrorKind::NotFound;
+                        last_err = e;
+                        if is_definitive {
+                            break;
+                        }
+                        if retry + 1 < self.max_retries {
+                            tokio::time::sleep(Duration::from_millis(50 * (retry as u64 + 1)))
+                                .await;
+                        }
+                    }
+                    Err(_) => {
+                        last_err = io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out");
+                        break 'servers;
+                    }
+                }
+            }
+        }
+
+        let is_transport_err = matches!(
+            last_err.kind(),
+            io::ErrorKind::TimedOut
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::HostUnreachable
+        );
+        if strategy == crate::config::toml_config::DnsStrategy::TunnelFirst
+            && is_transport_err
+            && let Ok(ips) = self.resolve_via_host(trimmed, mode, prefer_v6).await
+        {
+            self.cache.insert(&cache_key, ips.clone(), 60);
+            return Ok(ips);
+        }
+
+        Err(last_err)
+    }
+
+    fn effective_servers(&self, mode: crate::config::IpMode) -> Vec<SocketAddr> {
         let mut servers: Vec<SocketAddr> = self
             .dns_servers
             .read()
@@ -551,47 +621,41 @@ impl InTunnelDnsResolver {
                 crate::config::IpMode::DualStack => {}
             }
         }
+        servers
+    }
 
-        // Query tunnel DNS servers strictly inside the WireGuard tunnel
-        let mut last_err = io::Error::new(io::ErrorKind::TimedOut, "DNS resolution timed out");
-
-        for &server in &servers {
-            for retry in 0..self.max_retries {
-                match self.query_server(stack, trimmed, server, mode).await {
-                    Ok((ips, ttl)) => {
-                        self.cache.insert(&cache_key, ips.clone(), ttl);
-                        return Ok(ips);
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "DNS query to {} attempt {} failed: {}",
-                            server,
-                            retry + 1,
-                            e
-                        );
-                        last_err = e;
-                    }
+    /// Perform an uncached in-tunnel DNS query to verify actual data-plane egress.
+    pub async fn probe_egress(
+        &self,
+        stack: &VirtualNetworkStack,
+        timeout: Duration,
+    ) -> Result<(), io::Error> {
+        let mode = self.ip_mode();
+        let servers = self.effective_servers(mode);
+        let Some(&server) = servers.first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no in-tunnel DNS server available for egress probe",
+            ));
+        };
+        let qtype = match mode {
+            crate::config::IpMode::Ipv4Only => QueryType::A,
+            crate::config::IpMode::Ipv6Only => QueryType::AAAA,
+            crate::config::IpMode::DualStack => {
+                if server.is_ipv6() || self.prefer_ipv6.load(Ordering::Relaxed) {
+                    QueryType::AAAA
+                } else {
+                    QueryType::A
                 }
             }
-        }
-
-        let is_transport_err = matches!(
-            last_err.kind(),
-            io::ErrorKind::TimedOut
-                | io::ErrorKind::ConnectionRefused
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::NetworkUnreachable
-                | io::ErrorKind::HostUnreachable
-        );
-        if strategy == crate::config::toml_config::DnsStrategy::TunnelFirst
-            && is_transport_err
-            && let Ok(ips) = self.resolve_via_host(trimmed, mode, prefer_v6).await
-        {
-            self.cache.insert(&cache_key, ips.clone(), 60);
-            return Ok(ips);
-        }
-
-        Err(last_err)
+        };
+        tokio::time::timeout(
+            timeout,
+            self.query_record(stack, "one.one.one.one", server, qtype),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "egress DNS probe timed out"))??;
+        Ok(())
     }
 
     /// Resolve a domain via the host OS resolver, filtering by `IpMode` and sorting by `prefer_ipv6`.
