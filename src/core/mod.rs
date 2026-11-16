@@ -381,19 +381,29 @@ impl TunnelManager {
         Ok(())
     }
 
-    /// Stop the tunnel manager: terminates listeners, stops active prober, stops idle teardown,
-    /// and cleanly closes all running and suspended tunnels.
-    pub async fn stop(&self) -> Result<(), CoreError> {
-        // 1. Stop all proxy listeners
-        self.listeners.stop().await;
+    /// Stop the tunnel manager: stops accepting new connections, stops background workers,
+    /// drains active connections up to `drain_timeout`, and cleanly closes all tunnels.
+    pub async fn stop_with_drain_timeout(&self, drain_timeout: Duration) -> Result<(), CoreError> {
+        // 1. Stop accepting new proxy connections immediately
+        self.listeners.begin_shutdown(drain_timeout);
 
-        // 2. Stop active prober
+        // 2. Stop background workers before draining/closing tunnels so they cannot re-activate
         self.prober.stop().await;
+        self.lifecycle.stop_background_tasks().await;
 
-        // 3. Stop lifecycle controller and cleanly shut down all tunnels
-        self.lifecycle.stop().await;
+        // 3. Drain active proxy sessions within bounded timeout, then abort lingering ones
+        self.listeners.drain(drain_timeout).await;
+
+        // 4. Cleanly close all tunnels and wake netstack reactors/wakers
+        self.lifecycle.close_all_tunnels().await;
 
         Ok(())
+    }
+
+    /// Stop the tunnel manager with the default bounded drain timeout (500ms).
+    pub async fn stop(&self) -> Result<(), CoreError> {
+        self.stop_with_drain_timeout(Duration::from_millis(500))
+            .await
     }
 
     /// Returns the total number of tunnels registered in memory.

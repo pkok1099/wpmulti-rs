@@ -529,6 +529,7 @@ impl LifecycleController {
         if handle_lock.is_some() {
             return;
         }
+        let _ = self.shutdown_tx.send(false);
 
         let controller = Arc::clone(self);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -556,18 +557,26 @@ impl LifecycleController {
         *handle_lock = Some(handle);
     }
 
-    /// Stop the background idle teardown task and cleanly close all tunnels.
-    pub async fn stop(&self) {
+    /// Stop the background idle teardown task without closing tunnels yet.
+    pub async fn stop_background_tasks(&self) {
         let _ = self.shutdown_tx.send(true);
         let handle = self.teardown_handle.lock().take();
         if let Some(h) = handle {
             let _ = h.await;
         }
+    }
 
-        // Cleanly close all tunnels and terminate their netstack reactors
+    /// Cleanly close all active and suspended tunnels in the registry and await reactor teardown.
+    pub async fn close_all_tunnels(&self) {
         for entry in self.registry.all_entries() {
             let _ = self.close_tunnel(&entry.id).await;
         }
+    }
+
+    /// Stop the background idle teardown task and cleanly close all tunnels.
+    pub async fn stop(&self) {
+        self.stop_background_tasks().await;
+        self.close_all_tunnels().await;
     }
 
     /// Cleanly close a tunnel: terminates its smoltcp reactor task and suspends its WireGuard device.

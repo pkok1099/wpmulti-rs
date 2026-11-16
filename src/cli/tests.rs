@@ -208,3 +208,88 @@ fn test_cli_parse_disable_enable() {
         other => panic!("expected Enable, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn test_graceful_shutdown_orders_stop_and_bounds_hanging_connections() {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::api::AdminServer;
+    use crate::cli::commands::graceful_shutdown;
+    use crate::config::{
+        LifecycleMode, ListenerType, MainConfig, SharedListenerSettings, TunnelConfig,
+        load_tunnel_config_from_str,
+    };
+    use crate::core::{TunnelManager, TunnelState};
+
+    let free_port = {
+        let std_l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        std_l.local_addr().unwrap().port()
+    };
+    let proxy_bind: SocketAddr = format!("127.0.0.1:{free_port}").parse().unwrap();
+
+    let mut cfg = MainConfig::default();
+    cfg.per_tunnel.enabled = false;
+    cfg.lifecycle.mode = LifecycleMode::Eager;
+    cfg.health_check.probe_interval = Duration::from_millis(50);
+    cfg.health_check.probe_timeout = Duration::from_secs(5);
+    cfg.shared_listeners.push(SharedListenerSettings {
+        name: "shutdown-socks5".to_string(),
+        listener_type: ListenerType::Socks5,
+        bind: proxy_bind,
+        auth_mode: crate::config::AuthMode::None,
+        global_password: None,
+        default_strategy: crate::config::PoolStrategy::RoundRobin,
+        allow_anonymous: true,
+        pool: crate::config::TunnelPoolSelection::All,
+        ip_mode: None,
+    });
+
+    let wg_conf = r#"
+[Interface]
+PrivateKey = 0OaUaQd4uJq5m8eN8uJq5m8eN8uJq5m8eN8uJq5m8eM=
+Address = 172.16.0.2/32
+
+[Peer]
+PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+Endpoint = 192.0.2.1:51820
+AllowedIPs = 0.0.0.0/0
+"#;
+    let tunnel: TunnelConfig = load_tunnel_config_from_str("graceful-tun", wg_conf).unwrap();
+    let manager = Arc::new(TunnelManager::new(cfg, vec![tunnel]).unwrap());
+
+    let admin_server = AdminServer::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&manager), None);
+    let admin_addr = admin_server.start().await.unwrap();
+    manager.start().await.unwrap();
+
+    // Give ActiveProber a tick to start probing the unreachable peer
+    tokio::time::sleep(Duration::from_millis(70)).await;
+
+    // Hold open stalled connections on both proxy listener and Admin API
+    let _stalled_proxy = tokio::net::TcpStream::connect(proxy_bind).await.unwrap();
+    let _stalled_admin = tokio::net::TcpStream::connect(admin_addr).await.unwrap();
+
+    let drain_timeout = Duration::from_millis(150);
+    let t0 = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        graceful_shutdown(&manager, Some(&admin_server), drain_timeout),
+    )
+    .await
+    .expect("graceful_shutdown must complete within bounded timeout");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed >= drain_timeout.saturating_sub(Duration::from_millis(30)),
+        "expected bounded drain window before aborting stalled clients (elapsed: {elapsed:?})"
+    );
+
+    // Listeners and Admin API must refuse new connections immediately
+    assert!(tokio::net::TcpStream::connect(proxy_bind).await.is_err());
+    assert!(tokio::net::TcpStream::connect(admin_addr).await.is_err());
+
+    // Tunnel & netstack must be cleanly closed and dormant
+    let entry = manager.registry().get("graceful-tun").unwrap();
+    assert_eq!(*entry.state.read(), TunnelState::Dormant);
+    assert!(entry.active.read().is_none());
+}

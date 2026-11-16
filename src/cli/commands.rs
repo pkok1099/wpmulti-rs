@@ -44,6 +44,99 @@ fn init_logging(
     }
 }
 
+const DEFAULT_DAEMON_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ShutdownSignalGuard {
+    absorber: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ShutdownSignalGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.absorber.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Wait for `SIGINT` (Ctrl+C) or `SIGTERM` (Unix), keeping signal handlers registered during
+/// teardown so a second signal cannot panic, deadlock, or trigger abrupt OS termination.
+async fn wait_for_shutdown_signal() -> std::io::Result<ShutdownSignalGuard> {
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                res?;
+                tracing::info!("SIGINT received. Starting graceful shutdown...");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received. Starting graceful shutdown...");
+            }
+        }
+        let absorber = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::debug!("Ignoring duplicate SIGINT during graceful drain");
+                    }
+                    _ = sigterm.recv() => {
+                        tracing::debug!("Ignoring duplicate SIGTERM during graceful drain");
+                    }
+                }
+            }
+        });
+        Ok(ShutdownSignalGuard {
+            absorber: Some(absorber),
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        tracing::info!("SIGINT received. Starting graceful shutdown...");
+        let absorber = tokio::spawn(async {
+            while tokio::signal::ctrl_c().await.is_ok() {
+                tracing::debug!("Ignoring duplicate SIGINT during graceful drain");
+            }
+        });
+        Ok(ShutdownSignalGuard {
+            absorber: Some(absorber),
+        })
+    }
+}
+
+/// Deterministic 4-phase graceful shutdown coordinator across listeners, Admin API, workers, and tunnels.
+pub async fn graceful_shutdown(
+    manager: &TunnelManager,
+    admin_server: Option<&AdminServer>,
+    drain_timeout: Duration,
+) {
+    // 1. Immediately stop accepting new connections on Admin API and all proxy listeners
+    if let Some(srv) = admin_server {
+        srv.begin_shutdown(drain_timeout);
+    }
+    manager.listeners().begin_shutdown(drain_timeout);
+
+    // 2. Stop background workers (ActiveProber & idle reaper) before draining/closing tunnels
+    manager.prober().stop().await;
+    manager.lifecycle().stop_background_tasks().await;
+
+    // 3. Drain active proxy & admin connections concurrently with bounded timeout
+    if let Some(srv) = admin_server {
+        tokio::join!(
+            manager.listeners().drain(drain_timeout),
+            srv.drain(drain_timeout),
+        );
+    } else {
+        manager.listeners().drain(drain_timeout).await;
+    }
+
+    // 4. Close all tunnels, wake parked stack wakers, and await reactor tasks
+    manager.lifecycle().close_all_tunnels().await;
+}
+
 /// Execute the `wpmulti run` command: starts multi-tunnel daemon and optional TUI.
 pub async fn cmd_run(
     config_path: Option<PathBuf>,
@@ -97,10 +190,10 @@ pub async fn cmd_run(
         None
     };
 
-    manager
-        .start()
-        .await
-        .map_err(|e| format!("Failed to start TunnelManager: {e}"))?;
+    if let Err(e) = manager.start().await {
+        graceful_shutdown(&manager, admin_server.as_ref(), Duration::from_secs(1)).await;
+        return Err(format!("Failed to start TunnelManager: {e}").into());
+    }
     tracing::info!(
         "wpmulti daemon started successfully with {} tunnels",
         total_tunnels
@@ -112,7 +205,7 @@ pub async fn cmd_run(
         &config,
         tui_log_buffer,
         saved_config_path,
-        admin_server,
+        admin_server.as_ref(),
     )
     .await?;
 
@@ -126,7 +219,7 @@ async fn run_tui_or_wait(
     config: &MainConfig,
     tui_log_buffer: Option<crate::tui::TuiLogBuffer>,
     saved_config_path: Option<PathBuf>,
-    admin_server: Option<AdminServer>,
+    admin_server: Option<&AdminServer>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if tui_mode {
         let mut app = TuiApp::new(
@@ -142,23 +235,17 @@ async fn run_tui_or_wait(
         let tui_res = run_terminal_tui(app, config.tui.refresh_rate_ms).await;
         if let Err(e) = tui_res {
             tracing::error!("TUI exited with error: {e}");
-            let _ = manager.stop().await;
-            if let Some(srv) = admin_server {
-                srv.stop().await;
-            }
+            graceful_shutdown(manager, admin_server, DEFAULT_DAEMON_DRAIN_TIMEOUT).await;
             return Err(e.into());
         }
         tracing::info!("TUI exited. Stopping daemon...");
+        graceful_shutdown(manager, admin_server, DEFAULT_DAEMON_DRAIN_TIMEOUT).await;
     } else {
-        tracing::info!("Daemon running. Press Ctrl+C to terminate.");
-        tokio::signal::ctrl_c().await?;
-        tracing::info!("Shutdown signal received. Stopping daemon...");
+        tracing::info!("Daemon running. Send SIGINT or SIGTERM to terminate.");
+        let _signal_guard = wait_for_shutdown_signal().await?;
+        graceful_shutdown(manager, admin_server, DEFAULT_DAEMON_DRAIN_TIMEOUT).await;
     }
 
-    let _ = manager.stop().await;
-    if let Some(srv) = admin_server {
-        srv.stop().await;
-    }
     Ok(())
 }
 
@@ -302,13 +389,15 @@ fn probe_error_result(
     }
 }
 
-async fn build_probe_peers(config: &TunnelConfig) -> Vec<gotatun::device::Peer> {
+async fn build_probe_peers(config: &TunnelConfig, timeout: Duration) -> Vec<gotatun::device::Peer> {
     let mut peers = Vec::with_capacity(config.peers.len());
     for p_cfg in &config.peers {
         let mut peer = gotatun::device::Peer::new(p_cfg.public_key);
         if let Ok(addr) = p_cfg.endpoint.parse::<SocketAddr>() {
             peer.endpoint = Some(addr);
-        } else if let Ok(mut addrs) = tokio::net::lookup_host(&p_cfg.endpoint).await {
+        } else if let Ok(Ok(mut addrs)) =
+            tokio::time::timeout(timeout, tokio::net::lookup_host(&p_cfg.endpoint)).await
+        {
             peer.endpoint = addrs.next();
         }
         peer.allowed_ips = p_cfg.allowed_ips.clone();
@@ -341,7 +430,7 @@ pub async fn run_probe_single(
 
     let (bridge, bridge_tx, bridge_rx) =
         VirtualTunBridge::new(config.interface.mtu, DEFAULT_CHANNEL_CAPACITY);
-    let peers = build_probe_peers(config).await;
+    let peers = build_probe_peers(config, timeout).await;
 
     let mut builder = gotatun::device::DeviceBuilder::new()
         .with_default_udp()

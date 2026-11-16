@@ -6,6 +6,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -47,7 +48,8 @@ struct ListenerHandle {
 pub struct ListenerSupervisor {
     shutdown_tx: watch::Sender<bool>,
     handles: Mutex<Vec<ListenerHandle>>,
-    started: std::sync::atomic::AtomicBool,
+    started: AtomicBool,
+    drain_timeout_ms: Arc<AtomicU64>,
 }
 
 impl Default for ListenerSupervisor {
@@ -63,13 +65,14 @@ impl ListenerSupervisor {
         Self {
             shutdown_tx,
             handles: Mutex::new(Vec::new()),
-            started: std::sync::atomic::AtomicBool::new(false),
+            started: AtomicBool::new(false),
+            drain_timeout_ms: Arc::new(AtomicU64::new(500)),
         }
     }
 
     /// Return whether `start_all` has been invoked on this supervisor.
     pub fn is_started(&self) -> bool {
-        self.started.load(std::sync::atomic::Ordering::Relaxed)
+        self.started.load(Ordering::Relaxed)
     }
 
     /// Start all listeners configured in [`MainConfig`].
@@ -79,6 +82,7 @@ impl ListenerSupervisor {
         registry: &Arc<TunnelRegistry>,
         lifecycle: &Arc<LifecycleController>,
     ) -> Result<Vec<ActiveListenerInfo>, CoreError> {
+        let _ = self.shutdown_tx.send(false);
         let mut started = Vec::new();
 
         // 1. Start dedicated per-tunnel listeners if enabled
@@ -122,8 +126,7 @@ impl ListenerSupervisor {
             started.push(info);
         }
 
-        self.started
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.started.store(true, Ordering::Relaxed);
         Ok(started)
     }
 
@@ -264,6 +267,7 @@ impl ListenerSupervisor {
                 router,
                 listener_type,
                 shutdown_rx,
+                Arc::clone(&self.drain_timeout_ms),
             ));
 
             self.handles.lock().push(ListenerHandle {
@@ -299,8 +303,7 @@ impl ListenerSupervisor {
                 }
             }
             if handles.is_empty() {
-                self.started
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.started.store(false, Ordering::Relaxed);
             }
             drop(handles);
         }
@@ -434,6 +437,7 @@ impl ListenerSupervisor {
             router,
             settings.listener_type,
             shutdown_rx,
+            Arc::clone(&self.drain_timeout_ms),
         ));
 
         self.handles.lock().push(ListenerHandle {
@@ -513,6 +517,7 @@ impl ListenerSupervisor {
             router,
             listener_type,
             self.shutdown_tx.subscribe(),
+            Arc::clone(&self.drain_timeout_ms),
         ));
         self.handles.lock().push(ListenerHandle {
             info: info.clone(),
@@ -595,25 +600,56 @@ impl ListenerSupervisor {
         Ok(started)
     }
 
-    /// Gracefully stop and join all running listeners.
-    pub async fn stop(&self) {
-        self.started
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+    /// Signal all listeners to stop accepting new connections immediately while allowing
+    /// existing connections up to `drain_timeout` to finish.
+    pub fn begin_shutdown(&self, drain_timeout: Duration) {
+        self.started.store(false, Ordering::Relaxed);
+        let ms = drain_timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.drain_timeout_ms.store(ms, Ordering::Relaxed);
         let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Wait concurrently up to `drain_timeout` for all listener tasks and their active connections
+    /// to finish, then abort any remaining tasks.
+    pub async fn drain(&self, drain_timeout: Duration) {
         let handles = {
             let mut guard = self.handles.lock();
             std::mem::take(&mut *guard)
         };
-
-        for mut handle in handles {
-            if tokio::time::timeout(Duration::from_millis(500), &mut handle.task)
-                .await
-                .is_err()
-            {
-                handle.task.abort();
-                let _ = handle.task.await;
-            }
+        if handles.is_empty() {
+            return;
         }
+        let abort_handles: Vec<_> = handles.iter().map(|h| h.task.abort_handle()).collect();
+        let mut join_set = tokio::task::JoinSet::new();
+        for handle in handles {
+            join_set.spawn(async move {
+                let _ = handle.task.await;
+            });
+        }
+        if tokio::time::timeout(drain_timeout + Duration::from_millis(250), async {
+            while join_set.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            for ah in abort_handles {
+                ah.abort();
+            }
+            while join_set.join_next().await.is_some() {}
+        }
+    }
+
+    /// Gracefully stop and join all running listeners with the default drain timeout.
+    pub async fn stop(&self) {
+        let drain_timeout = Duration::from_millis(500);
+        self.begin_shutdown(drain_timeout);
+        self.drain(drain_timeout).await;
+    }
+
+    /// Gracefully stop and join all running listeners with an explicit drain timeout.
+    pub async fn stop_with_drain_timeout(&self, drain_timeout: Duration) {
+        self.begin_shutdown(drain_timeout);
+        self.drain(drain_timeout).await;
     }
 }
 
@@ -636,12 +672,32 @@ async fn acquire_listener_permit(
     }
 }
 
+async fn drain_client_tasks(client_tasks: &mut tokio::task::JoinSet<()>, drain_dur: Duration) {
+    if !client_tasks.is_empty() && !drain_dur.is_zero() {
+        let deadline = tokio::time::Instant::now() + drain_dur;
+        while !client_tasks.is_empty() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, client_tasks.join_next()).await {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
+
+    client_tasks.abort_all();
+    while client_tasks.join_next().await.is_some() {}
+}
+
 /// Core asynchronous accept loop for a TCP proxy listener.
 async fn run_listener_loop(
     listener: TcpListener,
     router: Arc<dyn TunnelRouter>,
     listener_type: ListenerType,
     mut shutdown_rx: watch::Receiver<bool>,
+    drain_timeout_ms: Arc<AtomicU64>,
 ) {
     let mut client_tasks = tokio::task::JoinSet::new();
     let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_LISTENER_CONNS));
@@ -700,6 +756,9 @@ async fn run_listener_loop(
         }
     }
 
-    client_tasks.abort_all();
-    while client_tasks.join_next().await.is_some() {}
+    // Stop accepting new connections immediately before draining active sessions.
+    drop(listener);
+
+    let drain_dur = Duration::from_millis(drain_timeout_ms.load(Ordering::Relaxed));
+    drain_client_tasks(&mut client_tasks, drain_dur).await;
 }

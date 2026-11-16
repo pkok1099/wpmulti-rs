@@ -282,10 +282,14 @@ impl ActiveProber {
 
             loop {
                 tokio::select! {
-                    _ = interval.tick() => {
-                        Self::probe_eager_tunnels(&registry, &settings).await;
-                    }
+                    biased;
                     _ = rx.changed() => {
+                        if *rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        Self::probe_eager_tunnels_with_shutdown(&registry, &settings, &mut rx).await;
                         if *rx.borrow() {
                             break;
                         }
@@ -304,6 +308,15 @@ impl ActiveProber {
     pub async fn probe_eager_tunnels(
         registry: &Arc<TunnelRegistry>,
         settings: &HealthCheckSettings,
+    ) {
+        let (_tx, mut rx) = watch::channel(false);
+        Self::probe_eager_tunnels_with_shutdown(registry, settings, &mut rx).await;
+    }
+
+    async fn probe_eager_tunnels_with_shutdown(
+        registry: &Arc<TunnelRegistry>,
+        settings: &HealthCheckSettings,
+        shutdown_rx: &mut watch::Receiver<bool>,
     ) {
         const MAX_CONCURRENT_PROBES: usize = 12;
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES));
@@ -331,8 +344,6 @@ impl ActiveProber {
                 };
 
                 let entry_ref = Arc::clone(&entry);
-                let health = Arc::clone(&entry.health);
-                let stats = Arc::clone(&entry.stats);
                 let threshold = settings.threshold;
                 let cooldown = settings.cooldown;
                 let timeout = settings.probe_timeout;
@@ -340,65 +351,98 @@ impl ActiveProber {
                 let sem_clone = Arc::clone(&sem);
 
                 set.spawn(async move {
-                    const MAX_PROBE_ATTEMPTS: usize = 3;
                     let Ok(_permit) = sem_clone.acquire_owned().await else {
                         return;
                     };
-                    if entry_ref.is_disabled()
-                        || *entry_ref.state.read() != crate::core::registry::TunnelState::Active
-                    {
-                        return;
-                    }
-                    let mut succeeded = false;
-                    for attempt in 0..MAX_PROBE_ATTEMPTS {
-                        let probe_res = tokio::time::timeout(
-                            timeout,
-                            active_clone.device.force_handshake(&peer_pubkey),
-                        )
-                        .await;
-                        match probe_res {
-                            Ok(Ok(())) => {
-                                health.record_success();
-                                let now = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
-                                stats.record_handshake(now);
-                                succeeded = true;
-                                break;
-                            }
-                            Ok(Err(e)) => {
-                                tracing::debug!(
-                                    "Active probe handshake failed (attempt {}/{}): {}",
-                                    attempt + 1,
-                                    MAX_PROBE_ATTEMPTS,
-                                    e
-                                );
-                            }
-                            Err(_) => {
-                                tracing::debug!(
-                                    "Active probe handshake timed out (attempt {}/{})",
-                                    attempt + 1,
-                                    MAX_PROBE_ATTEMPTS
-                                );
-                            }
-                        }
-                        if attempt + 1 < MAX_PROBE_ATTEMPTS {
-                            let backoff_ms = 200u64 << attempt; // 200ms, 400ms
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                        }
-                    }
-                    if !succeeded
-                        && !entry_ref.is_disabled()
-                        && *entry_ref.state.read() == crate::core::registry::TunnelState::Active
-                    {
-                        health.record_failure(threshold, cooldown);
-                    }
+                    Self::probe_single_tunnel(
+                        &entry_ref,
+                        &active_clone,
+                        peer_pubkey,
+                        timeout,
+                        threshold,
+                        cooldown,
+                    )
+                    .await;
                 });
             }
         }
 
-        while set.join_next().await.is_some() {}
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        set.abort_all();
+                        while set.join_next().await.is_some() {}
+                        break;
+                    }
+                }
+                res = set.join_next() => {
+                    if res.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn probe_single_tunnel(
+        entry_ref: &Arc<crate::core::registry::TunnelEntry>,
+        active_clone: &Arc<crate::core::registry::ActiveTunnel>,
+        peer_pubkey: x25519_dalek::PublicKey,
+        timeout: Duration,
+        threshold: usize,
+        cooldown: Duration,
+    ) {
+        const MAX_PROBE_ATTEMPTS: usize = 3;
+        if entry_ref.is_disabled()
+            || *entry_ref.state.read() != crate::core::registry::TunnelState::Active
+        {
+            return;
+        }
+        let mut succeeded = false;
+        for attempt in 0..MAX_PROBE_ATTEMPTS {
+            let probe_res =
+                tokio::time::timeout(timeout, active_clone.device.force_handshake(&peer_pubkey))
+                    .await;
+            match probe_res {
+                Ok(Ok(())) => {
+                    entry_ref.health.record_success();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    entry_ref.stats.record_handshake(now);
+                    succeeded = true;
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        "Active probe handshake failed (attempt {}/{}): {}",
+                        attempt + 1,
+                        MAX_PROBE_ATTEMPTS,
+                        e
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "Active probe handshake timed out (attempt {}/{})",
+                        attempt + 1,
+                        MAX_PROBE_ATTEMPTS
+                    );
+                }
+            }
+            if attempt + 1 < MAX_PROBE_ATTEMPTS {
+                let backoff_ms = 200u64 << attempt; // 200ms, 400ms
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+        if !succeeded
+            && !entry_ref.is_disabled()
+            && *entry_ref.state.read() == crate::core::registry::TunnelState::Active
+        {
+            entry_ref.health.record_failure(threshold, cooldown);
+        }
     }
 
     /// Stop the prober background task and wait for its clean shutdown.

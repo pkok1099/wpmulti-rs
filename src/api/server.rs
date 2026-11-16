@@ -2,7 +2,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +22,7 @@ pub struct AdminServer {
     auth_token: Option<String>,
     start_time: Instant,
     shutdown_tx: watch::Sender<bool>,
+    drain_timeout_ms: Arc<AtomicU64>,
     task_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -38,6 +40,7 @@ impl AdminServer {
             auth_token,
             start_time: Instant::now(),
             shutdown_tx,
+            drain_timeout_ms: Arc::new(AtomicU64::new(500)),
             task_handle: Mutex::new(None),
         }
     }
@@ -63,6 +66,7 @@ impl AdminServer {
         let manager = Arc::clone(&self.manager);
         let auth_token = self.auth_token.clone();
         let start_time = self.start_time;
+        let drain_timeout_ms = Arc::clone(&self.drain_timeout_ms);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         let task = tokio::spawn(async move {
@@ -106,13 +110,29 @@ impl AdminServer {
 
                                 if is_transient {
                                     tracing::warn!("Transient Admin HTTP accept error: {:?}; backing off", e);
-                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
                                 } else {
                                     tracing::debug!("Admin HTTP accept error: {:?}", e);
                                     break;
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            drop(listener);
+            let drain_dur = Duration::from_millis(drain_timeout_ms.load(Ordering::Relaxed));
+            if !client_tasks.is_empty() && !drain_dur.is_zero() {
+                let deadline = tokio::time::Instant::now() + drain_dur;
+                while !client_tasks.is_empty() {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, client_tasks.join_next()).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
                     }
                 }
             }
@@ -125,12 +145,19 @@ impl AdminServer {
         Ok(local_addr)
     }
 
-    /// Gracefully stop the administrative HTTP server.
-    pub async fn stop(&self) {
+    /// Signal the Admin API server to immediately stop accepting new connections.
+    pub fn begin_shutdown(&self, drain_timeout: Duration) {
+        let ms = drain_timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.drain_timeout_ms.store(ms, Ordering::Relaxed);
         let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Wait up to `drain_timeout` for in-flight Admin API requests to complete,
+    /// then abort any remaining handlers.
+    pub async fn drain(&self, drain_timeout: Duration) {
         let handle = self.task_handle.lock().take();
         if let Some(mut h) = handle
-            && tokio::time::timeout(std::time::Duration::from_secs(2), &mut h)
+            && tokio::time::timeout(drain_timeout + Duration::from_millis(250), &mut h)
                 .await
                 .is_err()
         {
@@ -138,12 +165,19 @@ impl AdminServer {
             let _ = h.await;
         }
     }
+
+    /// Gracefully stop the administrative HTTP server.
+    pub async fn stop(&self) {
+        let drain_timeout = Duration::from_millis(500);
+        self.begin_shutdown(drain_timeout);
+        self.drain(drain_timeout).await;
+    }
 }
 
 /// Maximum time allowed to read a single HTTP request from an Admin API client.
-const ADMIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const ADMIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum time allowed to write an HTTP response to an Admin API client.
-const ADMIN_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const ADMIN_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Handle a single incoming HTTP connection.
 fn parse_request_content_length(header_bytes: &[u8]) -> Result<usize, HttpResponse> {
