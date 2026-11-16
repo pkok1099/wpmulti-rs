@@ -34,36 +34,24 @@ pub struct MultiTenantRouter {
     global_password: Option<String>,
     per_tunnel_passwords: RwLock<std::collections::HashMap<String, String>>,
     allow_anonymous: bool,
-    ip_mode: IpMode,
+    listener_ip_mode: Option<IpMode>,
     rr_counter: AtomicUsize,
-    failure_threshold: usize,
-    cooldown_duration: Duration,
+    health_override: Option<(usize, Duration)>,
 }
 
 impl MultiTenantRouter {
     /// Create a new multi-tenant router from shared listener configuration.
+    ///
+    /// Tracks `lifecycle.health_check()` and `lifecycle.ip_mode()` dynamically for live updates.
     pub fn from_settings(
         settings: &SharedListenerSettings,
         lifecycle: Arc<LifecycleController>,
         registry: Arc<TunnelRegistry>,
     ) -> Arc<Self> {
-        Self::from_settings_with_health(settings, lifecycle, registry, 3, Duration::from_secs(30))
-    }
-
-    /// Create a new multi-tenant router from shared listener configuration with health parameters.
-    pub fn from_settings_with_health(
-        settings: &SharedListenerSettings,
-        lifecycle: Arc<LifecycleController>,
-        registry: Arc<TunnelRegistry>,
-        failure_threshold: usize,
-        cooldown_duration: Duration,
-    ) -> Arc<Self> {
         let allowed: Option<Arc<[String]>> = match &settings.pool {
             TunnelPoolSelection::All => None,
             TunnelPoolSelection::Selected(list) => Some(list.as_slice().into()),
         };
-        let ip_mode = IpMode::effective_with_global(settings.ip_mode, lifecycle.ip_mode())
-            .unwrap_or_else(|_| lifecycle.ip_mode());
 
         Arc::new(Self {
             lifecycle,
@@ -74,11 +62,22 @@ impl MultiTenantRouter {
             global_password: settings.global_password.clone(),
             per_tunnel_passwords: RwLock::new(std::collections::HashMap::new()),
             allow_anonymous: settings.allow_anonymous,
-            ip_mode,
+            listener_ip_mode: settings.ip_mode,
             rr_counter: AtomicUsize::new(0),
-            failure_threshold,
-            cooldown_duration,
+            health_override: None,
         })
+    }
+
+    /// Create a new multi-tenant router from shared listener configuration with explicit health parameters.
+    pub fn from_settings_with_health(
+        settings: &SharedListenerSettings,
+        lifecycle: Arc<LifecycleController>,
+        registry: Arc<TunnelRegistry>,
+        failure_threshold: usize,
+        cooldown_duration: Duration,
+    ) -> Arc<Self> {
+        Self::from_settings(settings, lifecycle, registry)
+            .with_health_settings(failure_threshold, cooldown_duration)
     }
 
     /// Construct a multi-tenant router with custom parameters.
@@ -88,7 +87,6 @@ impl MultiTenantRouter {
         default_strategy: PoolStrategy,
         allow_anonymous: bool,
     ) -> Arc<Self> {
-        let ip_mode = lifecycle.ip_mode();
         Arc::new(Self {
             lifecycle,
             registry,
@@ -98,22 +96,20 @@ impl MultiTenantRouter {
             global_password: None,
             per_tunnel_passwords: RwLock::new(std::collections::HashMap::new()),
             allow_anonymous,
-            ip_mode,
+            listener_ip_mode: None,
             rr_counter: AtomicUsize::new(0),
-            failure_threshold: 3,
-            cooldown_duration: Duration::from_secs(30),
+            health_override: None,
         })
     }
 
-    /// Configure health check parameters.
+    /// Configure explicit static health check parameters overriding [`LifecycleController`].
     pub fn with_health_settings(
         self: Arc<Self>,
         failure_threshold: usize,
         cooldown_duration: Duration,
     ) -> Arc<Self> {
         let mut router = Arc::try_unwrap(self).unwrap_or_else(|a| (*a).clone_shallow());
-        router.failure_threshold = failure_threshold;
-        router.cooldown_duration = cooldown_duration;
+        router.health_override = Some((failure_threshold, cooldown_duration));
         Arc::new(router)
     }
 
@@ -149,6 +145,16 @@ impl MultiTenantRouter {
         *allowed = list.map(|l| l.into_boxed_slice().into());
     }
 
+    fn effective_ip_mode(&self) -> io::Result<IpMode> {
+        IpMode::effective_with_global(self.listener_ip_mode, self.lifecycle.ip_mode())
+            .map_err(|msg| io::Error::new(io::ErrorKind::PermissionDenied, msg))
+    }
+
+    fn effective_health(&self) -> (usize, Duration) {
+        self.health_override
+            .unwrap_or_else(|| self.lifecycle.health_check())
+    }
+
     fn clone_shallow(&self) -> Self {
         Self {
             lifecycle: Arc::clone(&self.lifecycle),
@@ -159,10 +165,9 @@ impl MultiTenantRouter {
             global_password: self.global_password.clone(),
             per_tunnel_passwords: RwLock::new(self.per_tunnel_passwords.read().clone()),
             allow_anonymous: self.allow_anonymous,
-            ip_mode: self.ip_mode,
+            listener_ip_mode: self.listener_ip_mode,
             rr_counter: AtomicUsize::new(self.rr_counter.load(Ordering::Relaxed)),
-            failure_threshold: self.failure_threshold,
-            cooldown_duration: self.cooldown_duration,
+            health_override: self.health_override,
         }
     }
 
@@ -583,21 +588,17 @@ impl TunnelRouter for MultiTenantRouter {
             let health = entry.as_ref().map(|e| Arc::clone(&e.health));
 
             let guarded = if let Some(h) = health {
-                GuardedTunnelTarget::new_with_health(
-                    active_tunnel,
-                    guard,
-                    h,
-                    self.failure_threshold,
-                    self.cooldown_duration,
-                )
+                let (threshold, cooldown) = self.effective_health();
+                GuardedTunnelTarget::new_with_health(active_tunnel, guard, h, threshold, cooldown)
             } else {
                 GuardedTunnelTarget::new(active_tunnel, guard)
             };
 
-            let target: Arc<dyn ProxyTunnelTarget> = if self.ip_mode == IpMode::DualStack {
+            let ip_mode = self.effective_ip_mode()?;
+            let target: Arc<dyn ProxyTunnelTarget> = if ip_mode == IpMode::DualStack {
                 Arc::new(guarded)
             } else {
-                Arc::new(IpFilteredTunnelTarget::new(Arc::new(guarded), self.ip_mode))
+                Arc::new(IpFilteredTunnelTarget::new(Arc::new(guarded), ip_mode))
             };
             Ok(target)
         })

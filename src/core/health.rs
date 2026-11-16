@@ -242,6 +242,7 @@ impl TunnelHealthTracker {
 #[derive(Debug)]
 struct ProberTask {
     shutdown_tx: watch::Sender<bool>,
+    settings_tx: watch::Sender<HealthCheckSettings>,
     handle: JoinHandle<()>,
 }
 
@@ -251,6 +252,7 @@ struct ProberTask {
 #[derive(Debug)]
 pub struct ActiveProber {
     task: Mutex<Option<ProberTask>>,
+    live_settings: Arc<RwLock<HealthCheckSettings>>,
 }
 
 impl Default for ActiveProber {
@@ -261,10 +263,30 @@ impl Default for ActiveProber {
 
 impl ActiveProber {
     /// Create a new dormant active prober.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             task: Mutex::new(None),
+            live_settings: Arc::new(RwLock::new(HealthCheckSettings::default())),
         }
+    }
+
+    fn make_interval(probe_interval: Duration) -> tokio::time::Interval {
+        let mut interval = tokio::time::interval(probe_interval.max(Duration::from_millis(1)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval
+    }
+
+    /// Update active prober settings dynamically (applies to next wait cycle & probes).
+    pub fn update_settings(&self, settings: HealthCheckSettings) {
+        *self.live_settings.write() = settings.clone();
+        if let Some(t) = self.task.lock().as_ref() {
+            let _ = t.settings_tx.send(settings);
+        }
+    }
+
+    /// Return a snapshot of the prober's active health-check settings.
+    pub fn settings_snapshot(&self) -> HealthCheckSettings {
+        self.live_settings.read().clone()
     }
 
     /// Start the active prober background task.
@@ -273,35 +295,63 @@ impl ActiveProber {
         if guard.is_some() {
             return;
         }
-        let (tx, mut rx) = watch::channel(false);
+        let initial_interval = settings.probe_interval;
+        *self.live_settings.write() = settings.clone();
+        let (tx, shutdown_rx) = watch::channel(false);
+        let (settings_tx, settings_rx) = watch::channel(settings);
+        let live_settings = Arc::clone(&self.live_settings);
 
-        let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(settings.probe_interval);
-            // Skip the immediate initial tick to allow startup initialization
-            interval.tick().await;
-
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = rx.changed() => {
-                        if *rx.borrow() {
-                            break;
-                        }
-                    }
-                    _ = interval.tick() => {
-                        Self::probe_eager_tunnels_with_shutdown(&registry, &settings, &mut rx).await;
-                        if *rx.borrow() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        let handle = tokio::spawn(Self::run_prober_loop(
+            registry,
+            initial_interval,
+            live_settings,
+            shutdown_rx,
+            settings_rx,
+        ));
 
         *guard = Some(ProberTask {
             shutdown_tx: tx,
+            settings_tx,
             handle,
         });
+    }
+
+    async fn run_prober_loop(
+        registry: Arc<TunnelRegistry>,
+        initial_interval: Duration,
+        live_settings: Arc<RwLock<HealthCheckSettings>>,
+        mut shutdown_rx: watch::Receiver<bool>,
+        mut settings_rx: watch::Receiver<HealthCheckSettings>,
+    ) {
+        let mut interval = Self::make_interval(initial_interval);
+        // Skip the immediate initial tick to allow startup initialization
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                res = settings_rx.changed() => {
+                    if res.is_ok() {
+                        let next_interval = settings_rx.borrow_and_update().probe_interval;
+                        interval = Self::make_interval(next_interval);
+                        interval.tick().await;
+                    }
+                }
+                _ = interval.tick() => {
+                    let snapshot = live_settings.read().clone();
+                    Self::probe_eager_tunnels_with_shutdown(&registry, &snapshot, &mut shutdown_rx)
+                        .await;
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Run a single probe pass over all Eager tunnels with bounded concurrency.

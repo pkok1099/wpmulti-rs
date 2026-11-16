@@ -332,8 +332,11 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
     let uptime_secs = start_time.elapsed().as_secs();
 
+    let dynamic_token = manager.config_snapshot().admin.auth_token;
+    let effective_auth_token = dynamic_token.as_deref().or(auth_token);
+
     let response = match parse_http_request(&buf) {
-        Ok(req) => handle_admin_request(&req, &manager, auth_token, uptime_secs).await,
+        Ok(req) => handle_admin_request(&req, &manager, effective_auth_token, uptime_secs).await,
         Err(e) => HttpResponse::bad_request(&e),
     };
 

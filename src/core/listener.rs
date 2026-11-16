@@ -402,7 +402,7 @@ impl ListenerSupervisor {
         settings: &SharedListenerSettings,
         registry: &Arc<TunnelRegistry>,
         lifecycle: &Arc<LifecycleController>,
-        (failure_threshold, cooldown_duration): (usize, Duration),
+        _health: (usize, Duration),
         per_tunnel_passwords: std::collections::HashMap<String, String>,
     ) -> Result<ActiveListenerInfo, CoreError> {
         let bind_addr = settings.bind;
@@ -412,14 +412,9 @@ impl ListenerSupervisor {
             ))
         })?;
 
-        let router = MultiTenantRouter::from_settings_with_health(
-            settings,
-            Arc::clone(lifecycle),
-            Arc::clone(registry),
-            failure_threshold,
-            cooldown_duration,
-        )
-        .with_per_tunnel_passwords(per_tunnel_passwords);
+        let router =
+            MultiTenantRouter::from_settings(settings, Arc::clone(lifecycle), Arc::clone(registry))
+                .with_per_tunnel_passwords(per_tunnel_passwords);
 
         let actual_addr = listener.local_addr().unwrap_or(bind_addr);
 

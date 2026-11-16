@@ -30,6 +30,7 @@ const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 use crate::core::TunnelState;
 use crate::core::health::HealthStatus;
 use crate::tui::app::{TuiApp, TuiTab};
+use crate::tui::config_editor::{ConfigApplyScope, ConfigField};
 
 /// Format a byte count into a human-readable string (`B`, `KB`, `MB`, `GB`).
 pub fn format_bytes(bytes: u64) -> String {
@@ -612,6 +613,78 @@ fn draw_listeners_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     f.render_widget(table, area);
 }
 
+fn build_config_table_row<'a>(
+    app: &TuiApp,
+    cfg: &crate::config::MainConfig,
+    idx: usize,
+) -> Row<'a> {
+    let field = ConfigField::from_index(idx).unwrap_or(ConfigField::DisabledTunnels);
+    let scope = field.scope();
+    let scope_cell = match scope {
+        ConfigApplyScope::Live => Cell::from(scope.tag()).style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ConfigApplyScope::Restart => Cell::from(scope.tag()).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+
+    let val = field.display_value(cfg);
+    let is_modified = app
+        .config_saved_baseline
+        .as_ref()
+        .is_some_and(|saved| field.differs(saved, cfg));
+    let is_restart_pending = scope == ConfigApplyScope::Restart
+        && app
+            .config_startup_baseline
+            .as_ref()
+            .is_some_and(|start| field.differs(start, cfg));
+
+    let display_val = if idx == app.config_selected && app.config_editing.is_some() {
+        app.config_editing
+            .as_ref()
+            .map_or(val, |edit_buf| format!("{edit_buf}_"))
+    } else if is_modified {
+        format!("{val} *")
+    } else {
+        val
+    };
+
+    let val_style = if is_restart_pending {
+        Style::default().fg(Color::Yellow)
+    } else if is_modified {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+
+    let action = if field.is_cycle() {
+        "Enter/Spc:cyc"
+    } else {
+        "Enter: edit"
+    };
+
+    let row = Row::new(vec![
+        scope_cell,
+        Cell::from(field.key()),
+        Cell::from(sanitize_terminal_text(&display_val)).style(val_style),
+        Cell::from(action),
+    ]);
+    if idx == app.config_selected {
+        row.style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        row
+    }
+}
+
 fn draw_config_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     let Some(cfg) = &app.config_snapshot else {
         let block = Block::default()
@@ -624,14 +697,14 @@ fn draw_config_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         return;
     };
 
-    let header = Row::new(vec!["SETTING", "VALUE", "ACTION"]).style(
+    let header = Row::new(vec!["SCOPE", "SETTING", "VALUE", "ACTION"]).style(
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     );
 
     let visible = (area.height.saturating_sub(3) as usize).max(1);
-    let total = TuiApp::CONFIG_ROW_COUNT;
+    let total = ConfigField::ALL.len();
     let start = app
         .config_selected
         .saturating_sub(visible.saturating_sub(1))
@@ -639,52 +712,49 @@ fn draw_config_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
 
     let rows: Vec<Row<'_>> = (start..total)
         .take(visible)
-        .map(|idx| {
-            let (label, val, is_cycle) = TuiApp::config_row_display(cfg, idx);
-            let display_val = if idx == app.config_selected {
-                app.config_editing
-                    .as_ref()
-                    .map_or(val, |edit_buf| format!("{edit_buf}_"))
-            } else {
-                val
-            };
-            let action = if is_cycle {
-                "Enter/Space: cycle"
-            } else {
-                "Enter: edit"
-            };
-            let row = Row::new(vec![label.to_string(), display_val, action.to_string()]);
-            if idx == app.config_selected {
-                row.style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                row
-            }
-        })
+        .map(|idx| build_config_table_row(app, cfg, idx))
         .collect();
 
     let path_label = app.config_path.as_ref().map_or_else(
         || "remote/in-memory".to_string(),
         |p| p.display().to_string(),
     );
+    let diff = app.config_diff_vs_saved();
+    let pending_restart = app.config_pending_restart();
+    let unsaved = diff.live_changed.len() + diff.restart_changed.len();
+    let mut flags = Vec::new();
+    if unsaved > 0 {
+        flags.push(format!("{unsaved} unsaved"));
+    }
+    if !pending_restart.is_empty() {
+        flags.push(format!("{} restart pending", pending_restart.len()));
+    }
+    let title = if flags.is_empty() {
+        format!(
+            " Config ({path_label}) [{}/{} rows] ",
+            app.config_selected + 1,
+            total
+        )
+    } else {
+        format!(
+            " Config ({path_label}) [{}] [{}/{} rows] ",
+            flags.join(", "),
+            app.config_selected + 1,
+            total
+        )
+    };
 
     let table = Table::new(
         rows,
         [
+            Constraint::Length(10),
             Constraint::Min(28),
-            Constraint::Min(16),
-            Constraint::Length(20),
+            Constraint::Min(18),
+            Constraint::Length(14),
         ],
     )
     .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" Config ({path_label}) ")),
-    );
+    .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
 }
 
@@ -759,7 +829,7 @@ fn draw_footer(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         }
         TuiTab::Logs => "1-5/Tab:Tabs  j/k:Scroll  f:Filter Level  c:Clear  q:Quit",
         TuiTab::Listeners => "1-5/Tab:Tabs  j/k:Scroll  q:Quit",
-        TuiTab::Config => "1-5/Tab:Tabs  j/k:Select  Enter:Edit/Cycle  w:Save+Reload  q:Quit",
+        TuiTab::Config => "1-5/Tab:Tabs  j/k/PgUp/PgDn:Nav  Enter:Edit/Cycle  w:Save+Apply  q:Quit",
         TuiTab::Probe => "1-5/Tab:Tabs  p:Probe Selected  P:Probe All  j/k:Scroll  q:Quit",
     };
 
@@ -775,7 +845,7 @@ fn draw_footer(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
             Style::default().fg(Color::Yellow),
         )));
     } else if let Some((msg, at)) = &app.status_message
-        && at.elapsed() < Duration::from_secs(5)
+        && at.elapsed() < Duration::from_secs(8)
     {
         lines.push(Line::from(Span::styled(
             format!(">>> {}", sanitize_terminal_text(msg)),
@@ -895,13 +965,13 @@ pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Resu
     let _ = app.refresh().await;
     let mut last_refresh = Instant::now();
     let mut last_anim = Instant::now();
-    let refresh_interval = Duration::from_millis(refresh_rate_ms.max(100));
 
     #[cfg(unix)]
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
 
     while app.running {
+        let refresh_interval = app.effective_refresh_interval(refresh_rate_ms);
         if last_anim.elapsed() >= Duration::from_millis(100) {
             app.anim_tick = app.anim_tick.wrapping_add(1);
             last_anim = Instant::now();
@@ -1184,13 +1254,22 @@ const fn handle_listeners_tab_key(app: &mut TuiApp, key: TuiKey) {
 }
 
 async fn handle_config_tab_key(app: &mut TuiApp, key: TuiKey) {
+    let last_idx = TuiApp::CONFIG_ROW_COUNT.saturating_sub(1);
     match key {
         TuiKey::Up | TuiKey::Char('k') => {
             app.config_selected = app.config_selected.saturating_sub(1);
         }
-        TuiKey::Down | TuiKey::Char('j') if app.config_selected + 1 < TuiApp::CONFIG_ROW_COUNT => {
+        TuiKey::Down | TuiKey::Char('j') if app.config_selected < last_idx => {
             app.config_selected += 1;
         }
+        TuiKey::PageUp => {
+            app.config_selected = app.config_selected.saturating_sub(10);
+        }
+        TuiKey::PageDown => {
+            app.config_selected = (app.config_selected + 10).min(last_idx);
+        }
+        TuiKey::Home => app.config_selected = 0,
+        TuiKey::End => app.config_selected = last_idx,
         TuiKey::Enter | TuiKey::Char(' ') => {
             if let Err(e) = app.activate_config_row().await {
                 app.set_status(format!("Config error: {e}"));
@@ -1205,10 +1284,6 @@ async fn handle_config_tab_key(app: &mut TuiApp, key: TuiKey) {
         | TuiKey::Down
         | TuiKey::Left
         | TuiKey::Right
-        | TuiKey::PageUp
-        | TuiKey::PageDown
-        | TuiKey::Home
-        | TuiKey::End
         | TuiKey::Backspace
         | TuiKey::Tab
         | TuiKey::Esc => {}

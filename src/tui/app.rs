@@ -7,9 +7,12 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::toml_config::{DnsStrategy, LogLevel};
-use crate::config::{IpMode, LifecycleMode, MainConfig, TuiSortField, parse_duration_str};
+use crate::config::{MainConfig, TuiSortField};
 use crate::core::{ActiveListenerInfo, ReloadReport, TunnelManager, TunnelState, TunnelSummary};
+use crate::tui::config_editor::{
+    ConfigApplyScope, ConfigDiffSummary, ConfigField, ConfigSaveReport, diff_config_scopes,
+    format_save_status,
+};
 use crate::tui::logs::TuiLogBuffer;
 
 /// Active tab in the nyx-style multi-tab TUI.
@@ -77,7 +80,7 @@ pub struct TuiProbeResult {
 }
 
 /// Number of editable runtime configuration rows in the Config tab.
-pub const CONFIG_ROW_COUNT: usize = 15;
+pub const CONFIG_ROW_COUNT: usize = ConfigField::ALL.len();
 
 /// Data source powering the TUI dashboard: either an in-process manager or a remote Admin API.
 #[derive(Clone)]
@@ -105,7 +108,7 @@ impl std::fmt::Debug for TuiDataSource {
     }
 }
 
-/// Validate that a string contains no HTTP control characters, whitespace, or path separators.
+/// Validate that a URL path segment contains no HTTP control characters, whitespace, or delimiters.
 fn validate_http_token_or_segment(val: &str, field: &str) -> Result<(), String> {
     if val.is_empty()
         || val == "."
@@ -117,6 +120,19 @@ fn validate_http_token_or_segment(val: &str, field: &str) -> Result<(), String> 
         return Err(format!(
             "Invalid {field} (contains control characters, whitespace, or path delimiters)"
         ));
+    }
+    Ok(())
+}
+
+/// Validate an HTTP request target path (must begin with `/`, contain no whitespace/controls/traversal).
+fn validate_http_request_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/')
+        || path.contains("..")
+        || path
+            .bytes()
+            .any(|b| b <= 0x20 || b == 0x7f || matches!(b, b'\\' | b'?' | b'#'))
+    {
+        return Err("Invalid request path".to_string());
     }
     Ok(())
 }
@@ -163,7 +179,7 @@ pub(crate) async fn admin_http_request_with_body(
 ) -> Result<Vec<u8>, String> {
     const MAX_ADMIN_RESP_BYTES: u64 = 8 * 1024 * 1024;
     let host_port = parse_admin_http_url(admin_url)?;
-    validate_http_token_or_segment(path, "request path")?;
+    validate_http_request_path(path)?;
     if let Some(tok) = auth_token
         && tok.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
     {
@@ -415,7 +431,8 @@ impl TuiDataSource {
     pub async fn apply_config(&self, cfg: &MainConfig) -> Result<(), String> {
         match self {
             Self::InProcess(mgr) => mgr
-                .update_runtime_config(cfg.clone())
+                .apply_runtime_config(cfg.clone())
+                .await
                 .map_err(|e| e.to_string()),
             Self::Remote {
                 admin_url,
@@ -433,6 +450,18 @@ impl TuiDataSource {
                 .await?;
                 Ok(())
             }
+        }
+    }
+
+    /// Return `true` when connected via the remote HTTP Admin API.
+    pub const fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote { .. })
+    }
+
+    /// Update the remote Admin API bearer token after an explicit token rotation.
+    pub fn set_remote_auth_token(&mut self, next: Option<String>) {
+        if let Self::Remote { auth_token, .. } = self {
+            *auth_token = next;
         }
     }
 
@@ -548,9 +577,12 @@ pub struct TuiApp {
     pub listener_scroll: usize,
     // Config tab state
     pub config_snapshot: Option<MainConfig>,
+    pub config_startup_baseline: Option<MainConfig>,
+    pub config_saved_baseline: Option<MainConfig>,
     pub config_path: Option<PathBuf>,
     pub config_selected: usize,
     pub config_editing: Option<String>,
+    pub config_refresh_rate_ms: u64,
     // Probe tab state
     pub probe_results: Vec<TuiProbeResult>,
     pub probe_scroll: usize,
@@ -563,6 +595,13 @@ pub struct TuiApp {
 impl TuiApp {
     /// Construct a new [`TuiApp`] with the given data source and initial sort field.
     pub fn new(data_source: TuiDataSource, sort_field: TuiSortField) -> Self {
+        let initial_cfg = match &data_source {
+            TuiDataSource::InProcess(mgr) => Some(mgr.config_snapshot()),
+            TuiDataSource::Remote { .. } => None,
+        };
+        let initial_refresh = initial_cfg
+            .as_ref()
+            .map_or(500, |cfg| cfg.tui.refresh_rate_ms);
         Self {
             data_source,
             active_tab: TuiTab::Tunnels,
@@ -589,10 +628,13 @@ impl TuiApp {
             log_level_filter: None,
             listeners: Vec::new(),
             listener_scroll: 0,
-            config_snapshot: None,
+            config_snapshot: initial_cfg.clone(),
+            config_startup_baseline: initial_cfg.clone(),
+            config_saved_baseline: initial_cfg,
             config_path: None,
             config_selected: 0,
             config_editing: None,
+            config_refresh_rate_ms: initial_refresh,
             probe_results: Vec::new(),
             probe_scroll: 0,
             anim_tick: 0,
@@ -655,148 +697,102 @@ impl TuiApp {
     }
 
     /// Total number of configuration rows displayed in the Config tab.
-    pub const CONFIG_ROW_COUNT: usize = 15;
+    pub const CONFIG_ROW_COUNT: usize = ConfigField::ALL.len();
 
     /// Return `(label, current_value, is_cycle_toggle)` for a Config tab row.
     pub fn config_row_display(cfg: &MainConfig, idx: usize) -> (&'static str, String, bool) {
-        match idx {
-            0 => (
-                "global.log_level",
-                format!("{:?}", cfg.global.log_level).to_lowercase(),
-                true,
-            ),
-            1 => (
-                "global.ip_mode",
-                format!("{:?}", cfg.global.ip_mode).to_lowercase(),
-                true,
-            ),
-            2 => (
-                "global.dns_strategy",
-                format!("{:?}", cfg.global.dns_strategy).to_lowercase(),
-                true,
-            ),
-            3 => (
-                "global.dns_preference",
-                format!("{:?}", cfg.global.dns_preference).to_lowercase(),
-                true,
-            ),
-            4 => (
-                "global.dns_fallback",
-                cfg.global.dns_fallback.to_string(),
-                false,
-            ),
-            5 => (
-                "global.max_active_tunnels",
-                cfg.global.max_active_tunnels.to_string(),
-                false,
-            ),
-            6 => (
-                "lifecycle.mode",
-                format!("{:?}", cfg.lifecycle.mode).to_lowercase(),
-                true,
-            ),
-            7 => (
-                "lifecycle.idle_timeout",
-                format!("{}s", cfg.lifecycle.idle_timeout.as_secs()),
-                false,
-            ),
-            8 => (
-                "lifecycle.handshake_timeout",
-                format!("{}s", cfg.lifecycle.handshake_timeout.as_secs()),
-                false,
-            ),
-            9 => (
-                "health_check.probe_interval",
-                format!("{}s", cfg.health_check.probe_interval.as_secs()),
-                false,
-            ),
-            10 => (
-                "health_check.probe_timeout",
-                format!("{}s", cfg.health_check.probe_timeout.as_secs()),
-                false,
-            ),
-            11 => (
-                "health_check.threshold",
-                cfg.health_check.threshold.to_string(),
-                false,
-            ),
-            12 => (
-                "health_check.cooldown",
-                format!("{}s", cfg.health_check.cooldown.as_secs()),
-                false,
-            ),
-            13 => (
-                "per_tunnel.enabled",
-                cfg.per_tunnel.enabled.to_string(),
-                true,
-            ),
-            _ => (
-                "tui.refresh_rate_ms",
-                cfg.tui.refresh_rate_ms.to_string(),
-                false,
-            ),
+        let Some(field) = ConfigField::from_index(idx) else {
+            return ("unknown", String::new(), false);
+        };
+        (field.key(), field.display_value(cfg), field.is_cycle())
+    }
+
+    /// Synchronize live TUI presentation settings (`tui.refresh_rate_ms`, `tui.default_sort`).
+    pub fn sync_tui_settings(&mut self, cfg: &MainConfig) {
+        self.config_refresh_rate_ms = cfg.tui.refresh_rate_ms;
+        if self.sort_field != cfg.tui.default_sort {
+            self.sort_field = cfg.tui.default_sort;
+            self.apply_filter_and_sort();
         }
+    }
+
+    /// Current effective dashboard polling interval, reacting live to `tui.refresh_rate_ms`.
+    pub fn effective_refresh_interval(&self, default_ms: u64) -> Duration {
+        let ms = self
+            .config_snapshot
+            .as_ref()
+            .map_or(default_ms, |c| c.tui.refresh_rate_ms)
+            .max(50);
+        Duration::from_millis(ms)
+    }
+
+    /// Compute changed `[LIVE]` and `[RESTART]` fields relative to the last saved baseline.
+    pub fn config_diff_vs_saved(&self) -> ConfigDiffSummary {
+        let Some(cfg) = &self.config_snapshot else {
+            return ConfigDiffSummary::default();
+        };
+        let baseline = self.config_saved_baseline.as_ref().unwrap_or(cfg);
+        diff_config_scopes(baseline, cfg)
+    }
+
+    /// List `[RESTART]` fields that currently differ from the daemon's startup configuration.
+    pub fn config_pending_restart(&self) -> Vec<&'static str> {
+        let Some(cfg) = &self.config_snapshot else {
+            return Vec::new();
+        };
+        let startup = self.config_startup_baseline.as_ref().unwrap_or(cfg);
+        diff_config_scopes(startup, cfg).restart_changed
+    }
+
+    async fn commit_mutated_config(
+        &mut self,
+        field: ConfigField,
+        cfg: MainConfig,
+    ) -> Result<(), String> {
+        if !self.data_source.is_remote() {
+            cfg.validate()
+                .map_err(|e| format!("Validation failed for {}: {e}", field.key()))?;
+        }
+        self.data_source.apply_config(&cfg).await?;
+        if field == ConfigField::AdminAuthToken
+            && let Some(tok) = &cfg.admin.auth_token
+            && !crate::config::is_redacted_secret_placeholder(tok)
+        {
+            self.data_source.set_remote_auth_token(Some(tok.clone()));
+        }
+        let val = field.display_value(&cfg);
+        self.sync_tui_settings(&cfg);
+        self.config_snapshot = Some(cfg);
+        let msg = match field.scope() {
+            ConfigApplyScope::Live => format!(
+                "Applied [LIVE] {} = {val} (press 'w' to save to disk)",
+                field.key()
+            ),
+            ConfigApplyScope::Restart => format!(
+                "Staged [RESTART] {} = {val} (press 'w' to save; daemon restart required)",
+                field.key()
+            ),
+        };
+        self.set_status(msg);
+        Ok(())
     }
 
     /// Either cycle a toggle/enum config field immediately or start inline text editing.
     pub async fn activate_config_row(&mut self) -> Result<(), String> {
         let Some(mut cfg) = self.config_snapshot.clone() else {
-            self.config_snapshot = self.data_source.fetch_config().await.ok();
+            if let Ok(fetched) = self.data_source.fetch_config().await {
+                self.set_loaded_config_baselines(&fetched);
+                self.config_snapshot = Some(fetched);
+            }
             return Ok(());
         };
-        let idx = self.config_selected;
-        match idx {
-            0 => {
-                cfg.global.log_level = match cfg.global.log_level {
-                    LogLevel::Trace => LogLevel::Debug,
-                    LogLevel::Debug => LogLevel::Info,
-                    LogLevel::Info => LogLevel::Warn,
-                    LogLevel::Warn => LogLevel::Error,
-                    LogLevel::Error => LogLevel::Trace,
-                };
-            }
-            1 => {
-                cfg.global.ip_mode = match cfg.global.ip_mode {
-                    IpMode::DualStack => IpMode::Ipv4Only,
-                    IpMode::Ipv4Only => IpMode::Ipv6Only,
-                    IpMode::Ipv6Only => IpMode::DualStack,
-                };
-            }
-            2 => {
-                cfg.global.dns_strategy = match cfg.global.dns_strategy {
-                    DnsStrategy::TunnelOnly => DnsStrategy::TunnelFirst,
-                    DnsStrategy::TunnelFirst => DnsStrategy::Host,
-                    DnsStrategy::Host => DnsStrategy::TunnelOnly,
-                };
-            }
-            3 => {
-                cfg.global.dns_preference = match cfg.global.dns_preference {
-                    crate::config::toml_config::DnsPreference::Ipv4First => {
-                        crate::config::toml_config::DnsPreference::Ipv6First
-                    }
-                    crate::config::toml_config::DnsPreference::Ipv6First => {
-                        crate::config::toml_config::DnsPreference::Ipv4First
-                    }
-                };
-            }
-            6 => {
-                cfg.lifecycle.mode = match cfg.lifecycle.mode {
-                    LifecycleMode::Lazy => LifecycleMode::Eager,
-                    LifecycleMode::Eager => LifecycleMode::Lazy,
-                };
-            }
-            13 => {
-                cfg.per_tunnel.enabled = !cfg.per_tunnel.enabled;
-            }
-            _ => {
-                let (_, val, _) = Self::config_row_display(&cfg, idx);
-                self.config_editing = Some(val);
-                return Ok(());
-            }
+        let Some(field) = ConfigField::from_index(self.config_selected) else {
+            return Ok(());
+        };
+        if field.cycle(&mut cfg) {
+            return self.commit_mutated_config(field, cfg).await;
         }
-        self.data_source.apply_config(&cfg).await?;
-        self.config_snapshot = Some(cfg);
-        self.set_status("Updated runtime configuration");
+        self.config_editing = Some(field.initial_edit_buffer(&cfg));
         Ok(())
     }
 
@@ -808,111 +804,76 @@ impl TuiApp {
         let Some(mut cfg) = self.config_snapshot.clone() else {
             return Err("Config snapshot not loaded".to_string());
         };
-        let trimmed = raw.trim();
-        match self.config_selected {
-            4 => {
-                let addr: std::net::SocketAddr = trimmed
-                    .parse()
-                    .map_err(|_| format!("Invalid socket address '{trimmed}'"))?;
-                cfg.global.dns_fallback = addr;
-            }
-            5 => {
-                let n: usize = trimmed
-                    .parse()
-                    .map_err(|_| format!("Invalid integer '{trimmed}'"))?;
-                cfg.global.max_active_tunnels = n;
-            }
-            7 => {
-                cfg.lifecycle.idle_timeout = parse_duration_str(trimmed)?;
-            }
-            8 => {
-                cfg.lifecycle.handshake_timeout = parse_duration_str(trimmed)?;
-            }
-            9 => {
-                cfg.health_check.probe_interval = parse_duration_str(trimmed)?;
-            }
-            10 => {
-                cfg.health_check.probe_timeout = parse_duration_str(trimmed)?;
-            }
-            11 => {
-                let n: usize = trimmed
-                    .parse()
-                    .map_err(|_| format!("Invalid integer '{trimmed}'"))?;
-                cfg.health_check.threshold = n;
-            }
-            12 => {
-                cfg.health_check.cooldown = parse_duration_str(trimmed)?;
-            }
-            14 => {
-                let ms: u64 = trimmed
-                    .parse()
-                    .map_err(|_| format!("Invalid integer '{trimmed}'"))?;
-                cfg.tui.refresh_rate_ms = ms;
-            }
-            _ => {}
-        }
-        self.data_source.apply_config(&cfg).await?;
-        self.config_snapshot = Some(cfg);
-        self.set_status("Applied runtime config change");
-        Ok(())
+        let Some(field) = ConfigField::from_index(self.config_selected) else {
+            return Err("Invalid config field index".to_string());
+        };
+        field.apply_text_with_mode(&mut cfg, &raw, self.data_source.is_remote())?;
+        self.commit_mutated_config(field, cfg).await
     }
 
-    /// Persist `config_snapshot` to `config_path` (if set) and trigger `reload()`.
-    pub async fn save_config_and_reload(&mut self) -> Result<(), String> {
-        let saved_to_disk =
-            if let (Some(cfg), Some(path)) = (&self.config_snapshot, &self.config_path) {
-                let serialized = toml::to_string_pretty(cfg)
-                    .map_err(|e| format!("Failed to serialize TOML: {e}"))?;
-                let parent = path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| std::path::Path::new("."));
-                let suffix: u64 = rand::random();
-                let tmp_name = format!(
-                    ".{}.{suffix:016x}.tmp",
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("wpmulti.toml")
-                );
-                let tmp_path = parent.join(tmp_name);
-                {
-                    use std::io::Write;
-                    let mut opts = std::fs::OpenOptions::new();
-                    opts.write(true).create_new(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        opts.mode(0o600);
-                    }
-                    let mut f = opts.open(&tmp_path).map_err(|e| {
-                        format!("Failed to create temp file '{}': {}", tmp_path.display(), e)
-                    })?;
-                    if let Err(e) = f
-                        .write_all(serialized.as_bytes())
-                        .and_then(|()| f.sync_all())
-                    {
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return Err(format!("Failed to write '{}': {}", tmp_path.display(), e));
-                    }
-                }
-                std::fs::rename(&tmp_path, path).map_err(|e| {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    format!("Failed to rename config to '{}': {}", path.display(), e)
-                })?;
-                true
-            } else {
-                false
-            };
-        let rep = self.data_source.reload().await?;
-        let prefix = if saved_to_disk {
-            "Saved & reloaded"
-        } else {
-            "Reloaded (disk save only in local --tui mode)"
+    fn set_loaded_config_baselines(&mut self, cfg: &MainConfig) {
+        if self.config_startup_baseline.is_none() {
+            self.config_startup_baseline = Some(cfg.clone());
+        }
+        if self.config_saved_baseline.is_none() {
+            self.config_saved_baseline = Some(cfg.clone());
+        }
+        self.sync_tui_settings(cfg);
+    }
+
+    /// Validate, persist `config_snapshot` to `config_path`, apply runtime settings,
+    /// reload `.conf` tunnels, and return a structured [`ConfigSaveReport`].
+    pub async fn save_config_and_reload_with_report(&mut self) -> Result<ConfigSaveReport, String> {
+        let Some(cfg) = self.config_snapshot.clone() else {
+            return Err("Config snapshot not loaded".to_string());
         };
-        self.set_status(format!(
-            "{prefix}: +{} -{} ~{} ({} total)",
-            rep.added, rep.removed, rep.updated, rep.total
-        ));
+        if !self.data_source.is_remote() || self.config_path.is_some() {
+            cfg.validate()
+                .map_err(|e| format!("Config validation failed: {e}"))?;
+        }
+
+        let saved_to_disk = if let Some(path) = &self.config_path {
+            let serialized = toml::to_string_pretty(&cfg)
+                .map_err(|e| format!("Failed to serialize TOML: {e}"))?;
+            crate::core::write_config_atomically(path, &serialized)
+                .await
+                .map_err(|e| format!("Failed to write '{}': {e}", path.display()))?;
+            true
+        } else {
+            false
+        };
+
+        self.data_source.apply_config(&cfg).await?;
+        self.sync_tui_settings(&cfg);
+        let reload_report = self.data_source.reload().await?;
+
+        let live_applied = self
+            .config_saved_baseline
+            .as_ref()
+            .map_or_else(Vec::new, |saved| {
+                diff_config_scopes(saved, &cfg).live_changed
+            });
+        let restart_pending = self
+            .config_startup_baseline
+            .as_ref()
+            .map_or_else(Vec::new, |start| {
+                diff_config_scopes(start, &cfg).restart_changed
+            });
+        self.config_saved_baseline = Some(cfg);
+
+        let report = ConfigSaveReport {
+            saved_to_disk,
+            live_applied,
+            restart_pending,
+            reload_report,
+        };
+        self.set_status(format_save_status(&report));
+        Ok(report)
+    }
+
+    /// Persist `config_snapshot` to `config_path` (if set), apply runtime settings, and reload.
+    pub async fn save_config_and_reload(&mut self) -> Result<(), String> {
+        let _report = self.save_config_and_reload_with_report().await?;
         Ok(())
     }
 
@@ -1199,6 +1160,7 @@ impl TuiApp {
             && self.config_snapshot.is_none()
             && let Ok(cfg) = self.data_source.fetch_config().await
         {
+            self.set_loaded_config_baselines(&cfg);
             self.config_snapshot = Some(cfg);
         }
         Ok(())
@@ -1230,7 +1192,21 @@ impl TuiApp {
         }
     }
 
-    /// Trigger hot-reload of configurations.
+    fn sync_disabled_tunnels_from_manager(&mut self) {
+        if let TuiDataSource::InProcess(mgr) = &self.data_source {
+            let disabled = mgr.config_snapshot().disabled_tunnels;
+            if let Some(cfg) = &mut self.config_snapshot {
+                cfg.disabled_tunnels.clone_from(&disabled);
+            }
+            if let Some(cfg) = &mut self.config_saved_baseline {
+                cfg.disabled_tunnels.clone_from(&disabled);
+            }
+            if let Some(cfg) = &mut self.config_startup_baseline {
+                cfg.disabled_tunnels = disabled;
+            }
+        }
+    }
+
     /// Toggle enable/disable on the currently selected tunnel.
     pub async fn toggle_selected_disabled(&mut self) -> Result<(), String> {
         let Some(t) = self.selected_tunnel().cloned() else {
@@ -1240,6 +1216,7 @@ impl TuiApp {
         self.data_source
             .set_tunnels_disabled(&t.id, next_disabled)
             .await?;
+        self.sync_disabled_tunnels_from_manager();
         let action = if next_disabled { "Disabled" } else { "Enabled" };
         self.set_status(format!("{} '{}'", action, t.id));
         let _ = self.refresh().await;
@@ -1267,6 +1244,7 @@ impl TuiApp {
             .data_source
             .set_tunnels_disabled(target, disabled)
             .await?;
+        self.sync_disabled_tunnels_from_manager();
         let action = if disabled { "Disabled" } else { "Enabled" };
         self.set_status(format!("{action} {count} tunnel(s) ({target})"));
         let _ = self.refresh().await;

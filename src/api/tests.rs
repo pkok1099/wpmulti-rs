@@ -697,3 +697,272 @@ async fn test_admin_server_rejects_oversized_headers() {
 
     server.stop().await;
 }
+
+async fn tcp_http_exchange(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&[u8]>,
+) -> (u16, String) {
+    let mut client = TcpStream::connect(addr).await.expect("tcp connect");
+    let mut raw = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n");
+    if let Some(tok) = token {
+        raw.push_str(&format!("Authorization: Bearer {tok}\r\n"));
+    }
+    if let Some(payload) = body {
+        raw.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            payload.len()
+        ));
+    }
+    raw.push_str("Connection: close\r\n\r\n");
+    client.write_all(raw.as_bytes()).await.expect("write head");
+    if let Some(payload) = body {
+        client.write_all(payload).await.expect("write body");
+    }
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.expect("read response");
+    let text = String::from_utf8(buf).expect("utf8 response");
+    let (head, resp_body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status, resp_body.to_string())
+}
+
+fn build_secret_test_config(conf_dir: &std::path::Path) -> MainConfig {
+    use crate::config::{
+        AuthMode, ListenerType, PoolStrategy, SharedListenerSettings, TunnelPoolSelection,
+        TunnelPortOverride,
+    };
+
+    let mut cfg = MainConfig::default();
+    cfg.global.config_dir = conf_dir.to_path_buf();
+    cfg.per_tunnel.enabled = false;
+    cfg.admin.enabled = true;
+    cfg.admin.bind = "0.0.0.0:9090".parse().expect("bind");
+    cfg.admin.auth_token = Some("adm-secret-01".to_string());
+    cfg.shared_listeners = vec![
+        SharedListenerSettings {
+            name: "s5-a".to_string(),
+            listener_type: ListenerType::Socks5,
+            bind: "127.0.0.1:10801".parse().expect("bind1"),
+            auth_mode: AuthMode::Global,
+            global_password: Some("s5a-pass".to_string()),
+            default_strategy: PoolStrategy::RoundRobin,
+            allow_anonymous: false,
+            pool: TunnelPoolSelection::All,
+            ip_mode: None,
+        },
+        SharedListenerSettings {
+            name: "http-b".to_string(),
+            listener_type: ListenerType::Http,
+            bind: "127.0.0.1:18082".parse().expect("bind2"),
+            auth_mode: AuthMode::PerTunnel,
+            global_password: Some("httpb-pass".to_string()),
+            default_strategy: PoolStrategy::Random,
+            allow_anonymous: true,
+            pool: TunnelPoolSelection::All,
+            ip_mode: None,
+        },
+    ];
+    cfg.per_tunnel.overrides.insert(
+        "wg-1".to_string(),
+        TunnelPortOverride {
+            socks5_port: Some(11001),
+            http_port: None,
+            password: Some("ov1-pass".to_string()),
+        },
+    );
+    cfg.per_tunnel.overrides.insert(
+        "wg-2".to_string(),
+        TunnelPortOverride {
+            socks5_port: Some(11002),
+            http_port: None,
+            password: Some("ov2-pass".to_string()),
+        },
+    );
+    cfg
+}
+
+#[tokio::test]
+async fn test_post_config_preserves_placeholder_secrets_reorders_and_persists_toml() {
+    let temp = tempfile::TempDir::new().expect("temp");
+    let toml_path = temp.path().join("wpmulti.toml");
+    let cfg = build_secret_test_config(temp.path());
+    std::fs::write(&toml_path, toml::to_string_pretty(&cfg).expect("toml")).expect("write");
+
+    let manager = Arc::new(TunnelManager::new(cfg, Vec::new()).expect("mgr"));
+    manager.set_config_path(toml_path.clone());
+    let server = AdminServer::new(
+        "127.0.0.1:0".parse().expect("addr"),
+        Arc::clone(&manager),
+        Some("adm-secret-01".to_string()),
+    );
+    let addr = server.start().await.expect("start admin");
+
+    let (status, get_body) =
+        tcp_http_exchange(addr, "GET", "/config", Some("adm-secret-01"), None).await;
+    assert_eq!(status, 200);
+    for secret in [
+        "adm-secret-01",
+        "s5a-pass",
+        "httpb-pass",
+        "ov1-pass",
+        "ov2-pass",
+    ] {
+        assert!(!get_body.contains(secret));
+    }
+
+    let mut payload: MainConfig = serde_json::from_str(&get_body).expect("json");
+    payload.global.max_active_tunnels = 88;
+    payload.admin.auth_token = Some("[REDACTED]".to_string());
+    payload.shared_listeners.reverse();
+    payload.shared_listeners[0].global_password = Some("[SET]".to_string());
+    payload.shared_listeners[1].bind = "127.0.0.1:10809".parse().expect("rebind");
+    payload.shared_listeners[1].global_password = Some("[KEEP]".to_string());
+    payload
+        .per_tunnel
+        .overrides
+        .get_mut("wg-1")
+        .expect("wg1")
+        .password = Some("[REDACTED]".to_string());
+    payload
+        .per_tunnel
+        .overrides
+        .get_mut("wg-2")
+        .expect("wg2")
+        .password = Some("***REDACTED***".to_string());
+
+    let body = serde_json::to_vec(&payload).expect("encode");
+    let (post_status, _) =
+        tcp_http_exchange(addr, "POST", "/config", Some("adm-secret-01"), Some(&body)).await;
+    assert_eq!(post_status, 200);
+
+    for snapshot in [
+        manager.config_snapshot(),
+        MainConfig::from_file(&toml_path).expect("reload disk toml"),
+    ] {
+        assert_eq!(snapshot.global.max_active_tunnels, 88);
+        assert_eq!(snapshot.admin.auth_token.as_deref(), Some("adm-secret-01"));
+        assert_eq!(snapshot.shared_listeners[0].name, "http-b");
+        assert_eq!(
+            snapshot.shared_listeners[0].global_password.as_deref(),
+            Some("httpb-pass")
+        );
+        assert_eq!(snapshot.shared_listeners[1].name, "s5-a");
+        assert_eq!(snapshot.shared_listeners[1].bind.port(), 10809);
+        assert_eq!(
+            snapshot.shared_listeners[1].global_password.as_deref(),
+            Some("s5a-pass")
+        );
+        assert_eq!(
+            snapshot.per_tunnel.overrides["wg-1"].password.as_deref(),
+            Some("ov1-pass")
+        );
+        assert_eq!(
+            snapshot.per_tunnel.overrides["wg-2"].password.as_deref(),
+            Some("ov2-pass")
+        );
+    }
+
+    assert_eq!(
+        tcp_http_exchange(addr, "GET", "/status", Some("adm-secret-01"), None)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        tcp_http_exchange(addr, "GET", "/status", Some("[REDACTED]"), None)
+            .await
+            .0,
+        401
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn test_post_config_validates_post_merge_and_rotates_new_secrets() {
+    let temp = tempfile::TempDir::new().expect("temp");
+    let toml_path = temp.path().join("wpmulti.toml");
+
+    // Non-loopback bind without prior secret must fail validation after placeholder merges to None
+    let no_secret_mgr = Arc::new(TunnelManager::new(MainConfig::default(), Vec::new()).expect("m"));
+    let mut bad_payload = MainConfig::default();
+    bad_payload.admin.enabled = true;
+    bad_payload.admin.bind = "0.0.0.0:9091".parse().expect("bind");
+    bad_payload.admin.auth_token = Some("[REDACTED]".to_string());
+    let req_bad = HttpRequest {
+        method: "POST".to_string(),
+        path: "/config".to_string(),
+        query: None,
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: serde_json::to_vec(&bad_payload).expect("json"),
+    };
+    let resp_bad = handle_admin_request(&req_bad, &no_secret_mgr, None, 10).await;
+    assert_eq!(resp_bad.status, 400);
+
+    // Explicitly sending new secrets updates both runtime and disk .toml
+    let cfg = build_secret_test_config(temp.path());
+    std::fs::write(&toml_path, toml::to_string_pretty(&cfg).expect("toml")).expect("write");
+    let manager = Arc::new(TunnelManager::new(cfg, Vec::new()).expect("mgr"));
+    manager.set_config_path(toml_path.clone());
+    let server = AdminServer::new(
+        "127.0.0.1:0".parse().expect("addr"),
+        Arc::clone(&manager),
+        Some("adm-secret-01".to_string()),
+    );
+    let addr = server.start().await.expect("start admin");
+
+    let mut rotated = manager.config_snapshot();
+    rotated.admin.auth_token = Some("new-adm-tok-99".to_string());
+    rotated.shared_listeners[0].global_password = Some("new-s5a-pass".to_string());
+    rotated
+        .per_tunnel
+        .overrides
+        .get_mut("wg-1")
+        .expect("wg1")
+        .password = Some("new-ov1-pass".to_string());
+
+    let (post_status, _) = tcp_http_exchange(
+        addr,
+        "POST",
+        "/config",
+        Some("adm-secret-01"),
+        Some(&serde_json::to_vec(&rotated).expect("json")),
+    )
+    .await;
+    assert_eq!(post_status, 200);
+
+    for snap in [
+        manager.config_snapshot(),
+        MainConfig::from_file(&toml_path).expect("reload disk"),
+    ] {
+        assert_eq!(snap.admin.auth_token.as_deref(), Some("new-adm-tok-99"));
+        assert_eq!(
+            snap.shared_listeners[0].global_password.as_deref(),
+            Some("new-s5a-pass")
+        );
+        assert_eq!(
+            snap.per_tunnel.overrides["wg-1"].password.as_deref(),
+            Some("new-ov1-pass")
+        );
+    }
+    assert_eq!(
+        tcp_http_exchange(addr, "GET", "/status", Some("adm-secret-01"), None)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        tcp_http_exchange(addr, "GET", "/status", Some("new-adm-tok-99"), None)
+            .await
+            .0,
+        200
+    );
+    server.stop().await;
+}

@@ -154,6 +154,11 @@ impl TunnelManager {
         *self.config_path.write() = Some(path);
     }
 
+    /// Return the configured `wpmulti.toml` path on disk, if any.
+    pub fn config_path(&self) -> Option<std::path::PathBuf> {
+        self.config_path.read().clone()
+    }
+
     /// Resolve a flexible tunnel target expression (`A`, `1`, `1-200`, `all`, or comma-separated)
     /// against alphabetically sorted tunnel IDs.
     pub fn resolve_tunnel_targets(&self, spec: &str) -> Result<Vec<String>, CoreError> {
@@ -285,12 +290,13 @@ impl TunnelManager {
         self.config.read().clone()
     }
 
-    /// Validate and apply updated runtime settings to the manager and lifecycle controller.
+    /// Validate and apply updated runtime settings synchronously across manager, lifecycle,
+    /// active prober, and currently active virtual network stacks.
     pub fn update_runtime_config(&self, new_cfg: MainConfig) -> Result<(), CoreError> {
         new_cfg.validate()?;
-        self.lifecycle.set_prefer_ipv6(
-            new_cfg.global.dns_preference == crate::config::toml_config::DnsPreference::Ipv6First,
-        );
+        let prefer_ipv6 =
+            new_cfg.global.dns_preference == crate::config::toml_config::DnsPreference::Ipv6First;
+        self.lifecycle.set_prefer_ipv6(prefer_ipv6);
         self.lifecycle.set_ip_mode(new_cfg.global.ip_mode);
         self.lifecycle
             .set_idle_timeout(new_cfg.lifecycle.idle_timeout);
@@ -304,8 +310,82 @@ impl TunnelManager {
             .set_max_active_tunnels(new_cfg.global.max_active_tunnels);
         self.lifecycle.set_dns_fallback(new_cfg.global.dns_fallback);
         self.lifecycle.set_dns_strategy(new_cfg.global.dns_strategy);
+        self.prober.update_settings(new_cfg.health_check.clone());
+
+        for entry in self.registry.all_entries() {
+            let disabled = new_cfg.disabled_tunnels.iter().any(|d| d == &entry.id);
+            entry.set_disabled(disabled);
+            let maybe_active = entry.active.read().clone();
+            if let Some(active) = maybe_active {
+                active.netstack.set_prefer_ipv6(prefer_ipv6);
+                active
+                    .netstack
+                    .set_dns_strategy(new_cfg.global.dns_strategy);
+                active
+                    .netstack
+                    .set_dns_fallback(new_cfg.global.dns_fallback);
+                active
+                    .netstack
+                    .set_connect_timeout(new_cfg.lifecycle.handshake_timeout);
+                active.netstack.set_ip_mode(new_cfg.global.ip_mode);
+            }
+        }
+
         *self.config.write() = new_cfg;
         Ok(())
+    }
+
+    /// Validate and apply updated runtime settings asynchronously, suspending newly disabled
+    /// tunnels and re-activating newly re-enabled eager tunnels.
+    pub async fn apply_runtime_config(&self, new_cfg: MainConfig) -> Result<(), CoreError> {
+        let prev_disabled: Vec<(String, bool)> = self
+            .registry
+            .all_entries()
+            .into_iter()
+            .map(|e| (e.id.clone(), e.is_disabled()))
+            .collect();
+        self.update_runtime_config(new_cfg)?;
+
+        for (id, was_disabled) in prev_disabled {
+            let Some(entry) = self.registry.get(&id) else {
+                continue;
+            };
+            let is_disabled = entry.is_disabled();
+            if is_disabled && *entry.state.read() == TunnelState::Active {
+                if let Err(e) = self.lifecycle.suspend_tunnel(&id).await {
+                    tracing::warn!("Failed to suspend newly disabled tunnel '{}': {}", id, e);
+                }
+            } else if was_disabled
+                && !is_disabled
+                && entry.lifecycle_mode == LifecycleMode::Eager
+                && self.listeners.is_started()
+                && let Err(e) = self.lifecycle.activate_tunnel(&id).await
+            {
+                tracing::warn!("Failed to activate re-enabled eager tunnel '{}': {}", id, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate, atomically write `new_cfg` to `config_path` (when configured),
+    /// and apply updated runtime settings cleanly.
+    pub async fn save_and_apply_runtime_config(
+        &self,
+        new_cfg: MainConfig,
+    ) -> Result<(), CoreError> {
+        new_cfg.validate()?;
+        let maybe_path = self.config_path.read().clone();
+        if let Some(path) = maybe_path {
+            let _write_guard = self.config_write_lock.lock().await;
+            let serialized = toml::to_string_pretty(&new_cfg)
+                .map_err(|e| CoreError::Other(format!("Failed to serialize TOML: {e}")))?;
+            write_config_atomically(&path, &serialized)
+                .await
+                .map_err(|e| {
+                    CoreError::Other(format!("Failed to write config '{}': {e}", path.display()))
+                })?;
+        }
+        self.apply_runtime_config(new_cfg).await
     }
 
     /// Start the tunnel manager: launches lifecycle idle teardown, boots eager tunnels,
@@ -576,7 +656,11 @@ impl TunnelManager {
     }
 }
 
-async fn write_config_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+/// Atomically serialize/write config contents to `path` via sibling temp file + `fsync` + `rename`.
+pub async fn write_config_atomically(
+    path: &std::path::Path,
+    contents: &str,
+) -> std::io::Result<()> {
     let path_owned = path.to_path_buf();
     let data = contents.to_owned();
     tokio::task::spawn_blocking(move || {

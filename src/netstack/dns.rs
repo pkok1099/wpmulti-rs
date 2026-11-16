@@ -344,10 +344,22 @@ impl DnsLruCache {
     }
 }
 
+/// Build the fallback DNS server list when a tunnel `.conf` omits `DNS`.
+fn build_fallback_servers(fallback: SocketAddr) -> Vec<SocketAddr> {
+    let mut servers = vec![fallback];
+    let default_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+    if fallback != default_v4 {
+        servers.push(default_v4);
+    }
+    servers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 53));
+    servers
+}
+
 /// In-tunnel DNS resolver guaranteeing zero host DNS leaks.
 #[derive(Debug)]
 pub struct InTunnelDnsResolver {
-    dns_servers: Vec<SocketAddr>,
+    has_configured_dns: bool,
+    dns_servers: RwLock<Vec<SocketAddr>>,
     cache: DnsLruCache,
     timeout: Duration,
     max_retries: usize,
@@ -367,21 +379,19 @@ impl InTunnelDnsResolver {
 
     /// Construct resolver from configured tunnel DNS addresses and an explicit fallback server.
     pub fn with_fallback(configured_dns: &[IpAddr], fallback: SocketAddr) -> Self {
-        let mut servers = Vec::new();
-        for &ip in configured_dns {
-            servers.push(SocketAddr::new(ip, 53));
-        }
-        if servers.is_empty() {
-            servers.push(fallback);
-            let default_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
-            if fallback != default_v4 {
-                servers.push(default_v4);
-            }
-            servers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 53));
-        }
+        let has_configured_dns = !configured_dns.is_empty();
+        let servers = if has_configured_dns {
+            configured_dns
+                .iter()
+                .map(|&ip| SocketAddr::new(ip, 53))
+                .collect()
+        } else {
+            build_fallback_servers(fallback)
+        };
 
         Self {
-            dns_servers: servers,
+            has_configured_dns,
+            dns_servers: RwLock::new(servers),
             cache: DnsLruCache::new(2048),
             timeout: Duration::from_millis(1500),
             max_retries: 2,
@@ -389,6 +399,18 @@ impl InTunnelDnsResolver {
             ip_mode: std::sync::atomic::AtomicU8::new(0),
             dns_strategy: std::sync::atomic::AtomicU8::new(0),
         }
+    }
+
+    /// Update the fallback DNS servers dynamically when the tunnel has no explicit `.conf` `DNS`.
+    pub fn set_dns_fallback(&self, fallback: SocketAddr) {
+        if !self.has_configured_dns {
+            *self.dns_servers.write() = build_fallback_servers(fallback);
+        }
+    }
+
+    /// Return the active upstream DNS server list.
+    pub fn dns_servers(&self) -> Vec<SocketAddr> {
+        self.dns_servers.read().clone()
     }
 
     /// Configure the DNS resolution strategy (`TunnelOnly`, `TunnelFirst`, `Host`).
@@ -413,6 +435,11 @@ impl InTunnelDnsResolver {
     /// Configure whether dual-stack domain resolution prefers IPv6 (`AAAA`) over IPv4 (`A`).
     pub fn set_prefer_ipv6(&self, prefer: bool) {
         self.prefer_ipv6.store(prefer, Ordering::Relaxed);
+    }
+
+    /// Return whether dual-stack domain resolution prefers IPv6 (`AAAA`).
+    pub fn prefer_ipv6(&self) -> bool {
+        self.prefer_ipv6.load(Ordering::Relaxed)
     }
 
     /// Configure strict IP family isolation mode (`DualStack`, `Ipv4Only`, `Ipv6Only`).
@@ -499,6 +526,7 @@ impl InTunnelDnsResolver {
         // Filter DNS servers by active IpMode; fall back to well-known servers of that family
         let mut servers: Vec<SocketAddr> = self
             .dns_servers
+            .read()
             .iter()
             .copied()
             .filter(|s| mode.allows_ip(s.ip()))

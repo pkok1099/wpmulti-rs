@@ -6,7 +6,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
 
 use parking_lot::Mutex;
@@ -93,7 +93,7 @@ pub struct VirtualNetworkStack {
     local_v6: Option<Ipv6Addr>,
     next_ephemeral_port: AtomicU16,
     dns_resolver: InTunnelDnsResolver,
-    connect_timeout: StdDuration,
+    connect_timeout_ms: AtomicU64,
 }
 
 fn configure_default_routes(
@@ -255,6 +255,7 @@ impl VirtualNetworkStack {
         resolver.set_ip_mode(effective_ip_mode);
         resolver.set_prefer_ipv6(prefer_ipv6);
         resolver.set_dns_strategy(dns_strategy);
+        let timeout_ms = (connect_timeout.as_millis().min(u128::from(u64::MAX)) as u64).max(1);
         Ok(Self {
             inner,
             notify,
@@ -264,7 +265,7 @@ impl VirtualNetworkStack {
             local_v6,
             next_ephemeral_port: AtomicU16::new(initial_port),
             dns_resolver: resolver,
-            connect_timeout,
+            connect_timeout_ms: AtomicU64::new(timeout_ms),
         })
     }
 
@@ -281,6 +282,32 @@ impl VirtualNetworkStack {
     /// Configure the DNS resolution strategy (`TunnelOnly`, `TunnelFirst`, `Host`).
     pub fn set_dns_strategy(&self, strategy: crate::config::toml_config::DnsStrategy) {
         self.dns_resolver.set_dns_strategy(strategy);
+    }
+
+    /// Configure the fallback DNS server used when the tunnel `.conf` omits `DNS`.
+    pub fn set_dns_fallback(&self, fallback: SocketAddr) {
+        self.dns_resolver.set_dns_fallback(fallback);
+    }
+
+    /// Update the active [`IpMode`] within the address families provisioned on this interface.
+    pub fn set_ip_mode(&self, mode: crate::config::IpMode) {
+        let effective = match (mode, self.local_v4.is_some(), self.local_v6.is_some()) {
+            (crate::config::IpMode::DualStack, true, false) => crate::config::IpMode::Ipv4Only,
+            (crate::config::IpMode::DualStack, false, true) => crate::config::IpMode::Ipv6Only,
+            _ => mode,
+        };
+        self.dns_resolver.set_ip_mode(effective);
+    }
+
+    /// Update the TCP connection handshake timeout dynamically.
+    pub fn set_connect_timeout(&self, timeout: StdDuration) {
+        let ms = (timeout.as_millis().min(u128::from(u64::MAX)) as u64).max(1);
+        self.connect_timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Return the configured TCP connection handshake timeout.
+    pub fn connect_timeout(&self) -> StdDuration {
+        StdDuration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed))
     }
 
     /// Access the wakeup notification handle.
@@ -394,7 +421,7 @@ impl VirtualNetworkStack {
         // Wait for connection handshake completion (with timeout)
         let connect_fut = wait_tcp_handshake(&self.inner, handle);
 
-        match tokio::time::timeout(self.connect_timeout, connect_fut).await {
+        match tokio::time::timeout(self.connect_timeout(), connect_fut).await {
             Ok(Ok(())) => {
                 guard.handle = None;
                 Ok(VirtualTcpStream::new(
@@ -473,6 +500,11 @@ impl VirtualNetworkStack {
             UDP_PAYLOAD_BUF_SIZE,
             UDP_PACKET_QUEUE_CAPACITY,
         )
+    }
+
+    /// Access the stack's in-tunnel DNS resolver.
+    pub const fn dns_resolver(&self) -> &InTunnelDnsResolver {
+        &self.dns_resolver
     }
 
     /// Effective IP mode supported by this stack's configured interface addresses.

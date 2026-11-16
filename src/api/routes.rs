@@ -518,16 +518,7 @@ pub async fn handle_admin_request(
             if !has_json_content_type(req) {
                 return HttpResponse::bad_request("Content-Type must be application/json");
             }
-            match serde_json::from_slice::<crate::config::MainConfig>(&req.body) {
-                Ok(mut new_cfg) => {
-                    preserve_config_secrets(&mut new_cfg, &manager.config_snapshot());
-                    match manager.update_runtime_config(new_cfg) {
-                        Ok(()) => HttpResponse::ok_json(&json!({ "status": "updated" })),
-                        Err(e) => HttpResponse::bad_request(&format!("Invalid config: {e}")),
-                    }
-                }
-                Err(e) => HttpResponse::bad_request(&format!("Invalid JSON config: {e}")),
-            }
+            handle_post_config(&req.body, manager).await
         }
         ("POST", "/reload") => match manager.reload().await {
             Ok(report) => HttpResponse::ok_json(&json!({
@@ -570,6 +561,25 @@ pub async fn handle_admin_request(
     }
 }
 
+async fn handle_post_config(body: &[u8], manager: &Arc<TunnelManager>) -> HttpResponse {
+    let mut new_cfg = match serde_json::from_slice::<crate::config::MainConfig>(body) {
+        Ok(cfg) => cfg,
+        Err(e) => return HttpResponse::bad_request(&format!("Invalid JSON config: {e}")),
+    };
+    preserve_config_secrets(&mut new_cfg, &manager.config_snapshot());
+    if let Err(e) = new_cfg.validate() {
+        return HttpResponse::bad_request(&format!("Invalid config: {e}"));
+    }
+    match manager.save_and_apply_runtime_config(new_cfg).await {
+        Ok(()) => HttpResponse::ok_json(&json!({ "status": "updated" })),
+        Err(CoreError::Config(e)) => HttpResponse::bad_request(&format!("Invalid config: {e}")),
+        Err(e) => {
+            tracing::error!("Admin API POST /config failed: {:?}", e);
+            HttpResponse::internal_error("Failed to save configuration")
+        }
+    }
+}
+
 fn redact_config_secrets(mut cfg: crate::config::MainConfig) -> crate::config::MainConfig {
     cfg.admin.auth_token = None;
     for l in &mut cfg.shared_listeners {
@@ -581,6 +591,27 @@ fn redact_config_secrets(mut cfg: crate::config::MainConfig) -> crate::config::M
     cfg
 }
 
+fn should_preserve_secret(incoming: Option<&str>) -> bool {
+    incoming.is_none_or(crate::config::is_redacted_secret_placeholder)
+}
+
+fn find_matching_listener<'a>(
+    listener: &crate::config::SharedListenerSettings,
+    existing: &'a [crate::config::SharedListenerSettings],
+) -> Option<&'a crate::config::SharedListenerSettings> {
+    existing
+        .iter()
+        .find(|p| p.name == listener.name && p.bind == listener.bind)
+        .or_else(|| existing.iter().find(|p| p.name == listener.name))
+        .or_else(|| {
+            let mut by_bind = existing.iter().filter(|p| p.bind == listener.bind);
+            match (by_bind.next(), by_bind.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        })
+}
+
 fn preserve_config_secrets(
     new_cfg: &mut crate::config::MainConfig,
     existing: &crate::config::MainConfig,
@@ -590,32 +621,25 @@ fn preserve_config_secrets(
         .global
         .config_dir
         .clone_from(&existing.global.config_dir);
-    if new_cfg
-        .admin
-        .auth_token
-        .as_deref()
-        .is_none_or(str::is_empty)
-    {
+    if should_preserve_secret(new_cfg.admin.auth_token.as_deref()) {
         new_cfg
             .admin
             .auth_token
             .clone_from(&existing.admin.auth_token);
     }
     for l in &mut new_cfg.shared_listeners {
-        if l.global_password.is_none()
-            && let Some(prev) = existing
-                .shared_listeners
-                .iter()
-                .find(|p| p.bind == l.bind && p.name == l.name)
-        {
-            l.global_password.clone_from(&prev.global_password);
+        if should_preserve_secret(l.global_password.as_deref()) {
+            l.global_password = find_matching_listener(l, &existing.shared_listeners)
+                .and_then(|prev| prev.global_password.clone());
         }
     }
     for (k, o) in &mut new_cfg.per_tunnel.overrides {
-        if o.password.is_none()
-            && let Some(prev) = existing.per_tunnel.overrides.get(k)
-        {
-            o.password.clone_from(&prev.password);
+        if should_preserve_secret(o.password.as_deref()) {
+            o.password = existing
+                .per_tunnel
+                .overrides
+                .get(k)
+                .and_then(|prev| prev.password.clone());
         }
     }
 }

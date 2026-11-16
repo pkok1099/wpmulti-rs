@@ -922,3 +922,16 @@ impl MainConfig {
         Ok(())
     }
 }
+
+/// Returns `true` when `val` is empty or matches a redaction sentinel placeholder
+/// (`[REDACTED]`, `[SET]`, `[KEEP]`, etc.) that must not overwrite stored secrets.
+pub fn is_redacted_secret_placeholder(val: &str) -> bool {
+    let trimmed = val.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("[REDACTED]")
+        || trimmed.eq_ignore_ascii_case("[SET]")
+        || trimmed.eq_ignore_ascii_case("[KEEP]")
+        || trimmed.eq_ignore_ascii_case("***REDACTED***")
+        || trimmed.eq_ignore_ascii_case("<redacted>")
+        || trimmed == "***"
+}
