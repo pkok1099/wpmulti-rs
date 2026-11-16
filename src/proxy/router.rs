@@ -826,6 +826,97 @@ pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Shared credential check for routers that resolve a [`TunnelSelector`]
+/// from optional SOCKS5/HTTP credentials.
+///
+/// [`MultiTenantRouter`](crate::core::router::MultiTenantRouter) and
+/// [`PoolRouter`] authenticate the same way; the only difference is how
+/// `AuthMode::None` without credentials behaves: a pool router always falls
+/// back to the default pool, while a multi-tenant router requires anonymous
+/// access to be enabled (see `none_without_credentials_ok`).
+#[derive(Debug)]
+pub struct AuthChecker<'a> {
+    /// Auth mode selecting which credentials are accepted.
+    pub auth_mode: AuthMode,
+    /// Optional global password accepted for any selector.
+    pub global_password: &'a Option<String>,
+    /// Per-tunnel password overrides, keyed by tunnel id.
+    pub per_tunnel_passwords: &'a RwLock<HashMap<String, String>>,
+    /// Whether requests without credentials may use the default pool.
+    pub allow_anonymous: bool,
+    /// When true, `AuthMode::None` without credentials always selects the
+    /// default pool instead of requiring anonymous access.
+    pub none_without_credentials_ok: bool,
+}
+
+impl AuthChecker<'_> {
+    /// Resolve `credentials` to a tunnel selector under this checker's config.
+    pub fn authenticate(
+        &self,
+        credentials: Option<(&str, &str)>,
+    ) -> Result<TunnelSelector, ProxyAuthError> {
+        match self.auth_mode {
+            AuthMode::None => match credentials {
+                Some((user, _pass)) => Ok(TunnelSelector::parse(user)),
+                None if self.none_without_credentials_ok => Ok(TunnelSelector::DefaultPool),
+                None => self.anonymous_or_required(),
+            },
+            AuthMode::Global => match credentials {
+                None => self.anonymous_or_required(),
+                Some((user, pass)) => self.check_global_password(user, pass),
+            },
+            AuthMode::PerTunnel => match credentials {
+                None => self.anonymous_or_required(),
+                Some((user, pass)) => {
+                    let selector = TunnelSelector::parse(user);
+                    self.per_tunnel_password(&selector).map_or_else(
+                        || self.check_global_password(user, pass),
+                        |tunnel_pass| {
+                            if constant_time_eq_str(pass, &tunnel_pass) {
+                                Ok(selector)
+                            } else {
+                                Err(ProxyAuthError::InvalidCredentials)
+                            }
+                        },
+                    )
+                }
+            },
+        }
+    }
+
+    /// `DefaultPool` when anonymous access is allowed, else auth is required.
+    const fn anonymous_or_required(&self) -> Result<TunnelSelector, ProxyAuthError> {
+        if self.allow_anonymous {
+            Ok(TunnelSelector::DefaultPool)
+        } else {
+            Err(ProxyAuthError::AuthRequired)
+        }
+    }
+
+    /// Check `pass` against the global password, falling back to anonymous access.
+    fn check_global_password(
+        &self,
+        user: &str,
+        pass: &str,
+    ) -> Result<TunnelSelector, ProxyAuthError> {
+        match self.global_password {
+            Some(expected_pass) if constant_time_eq_str(pass, expected_pass) => {
+                Ok(TunnelSelector::parse(user))
+            }
+            None if self.allow_anonymous => Ok(TunnelSelector::parse(user)),
+            _ => Err(ProxyAuthError::InvalidCredentials),
+        }
+    }
+
+    /// The configured per-tunnel password for a `ById` selector, if any.
+    fn per_tunnel_password(&self, selector: &TunnelSelector) -> Option<String> {
+        let TunnelSelector::ById(id) = selector else {
+            return None;
+        };
+        self.per_tunnel_passwords.read().get(id).cloned()
+    }
+}
+
 impl TunnelRouter for SingleTunnelRouter {
     fn authenticate(
         &self,
@@ -912,38 +1003,6 @@ impl PoolRouter {
         self
     }
 
-    /// `DefaultPool` when anonymous access is allowed, else auth is required.
-    const fn anonymous_or_required(&self) -> Result<TunnelSelector, ProxyAuthError> {
-        if self.allow_anonymous {
-            Ok(TunnelSelector::DefaultPool)
-        } else {
-            Err(ProxyAuthError::AuthRequired)
-        }
-    }
-
-    /// Check `pass` against the global password, falling back to anonymous access.
-    fn check_global_password(
-        &self,
-        user: &str,
-        pass: &str,
-    ) -> Result<TunnelSelector, ProxyAuthError> {
-        match &self.global_password {
-            Some(expected_pass) if constant_time_eq_str(pass, expected_pass) => {
-                Ok(TunnelSelector::parse(user))
-            }
-            None if self.allow_anonymous => Ok(TunnelSelector::parse(user)),
-            _ => Err(ProxyAuthError::InvalidCredentials),
-        }
-    }
-
-    /// The configured per-tunnel password for a `ById` selector, if any.
-    fn per_tunnel_password(&self, selector: &TunnelSelector) -> Option<String> {
-        let TunnelSelector::ById(id) = selector else {
-            return None;
-        };
-        self.per_tunnel_passwords.read().get(id).cloned()
-    }
-
     /// Register or update a per-tunnel password override.
     pub fn set_tunnel_password(&self, id: impl Into<String>, password: impl Into<String>) {
         self.per_tunnel_passwords
@@ -996,32 +1055,16 @@ impl TunnelRouter for PoolRouter {
         &self,
         credentials: Option<(&str, &str)>,
     ) -> Result<TunnelSelector, ProxyAuthError> {
-        match self.auth_mode {
-            AuthMode::None => match credentials {
-                Some((user, _pass)) => Ok(TunnelSelector::parse(user)),
-                None => Ok(TunnelSelector::DefaultPool),
-            },
-            AuthMode::Global => match credentials {
-                None => self.anonymous_or_required(),
-                Some((user, pass)) => self.check_global_password(user, pass),
-            },
-            AuthMode::PerTunnel => match credentials {
-                None => self.anonymous_or_required(),
-                Some((user, pass)) => {
-                    let selector = TunnelSelector::parse(user);
-                    self.per_tunnel_password(&selector).map_or_else(
-                        || self.check_global_password(user, pass),
-                        |tunnel_pass| {
-                            if constant_time_eq_str(pass, &tunnel_pass) {
-                                Ok(selector)
-                            } else {
-                                Err(ProxyAuthError::InvalidCredentials)
-                            }
-                        },
-                    )
-                }
-            },
+        AuthChecker {
+            auth_mode: self.auth_mode,
+            global_password: &self.global_password,
+            per_tunnel_passwords: &self.per_tunnel_passwords,
+            allow_anonymous: self.allow_anonymous,
+            // A pool router always falls back to the default pool when no
+            // credentials are given under `AuthMode::None`.
+            none_without_credentials_ok: true,
         }
+        .authenticate(credentials)
     }
 
     fn select_tunnel<'a>(

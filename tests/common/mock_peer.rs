@@ -612,53 +612,37 @@ impl MockIpEngine {
 
     fn build_tcp(&self, spec: TcpPacketSpec<'_>) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
-        match (spec.src, spec.dst) {
-            (SocketAddr::V4(s), SocketAddr::V4(d)) => {
-                let mut b = PacketBuilder::ipv4(s.ip().octets(), d.ip().octets(), 64).tcp(
-                    s.port(),
-                    d.port(),
-                    spec.seq,
-                    65535,
-                );
-                if spec.syn {
-                    b = b.syn();
-                }
-                if let Some(ack) = spec.ack {
-                    b = b.ack(ack);
-                }
-                if spec.fin {
-                    b = b.fin();
-                }
-                if spec.psh {
-                    b = b.psh();
-                }
-                buf.reserve(b.size(spec.payload.len()));
-                b.write(&mut buf, spec.payload).ok()?;
-            }
-            (SocketAddr::V6(s), SocketAddr::V6(d)) => {
-                let mut b = PacketBuilder::ipv6(s.ip().octets(), d.ip().octets(), 64).tcp(
-                    s.port(),
-                    d.port(),
-                    spec.seq,
-                    65535,
-                );
-                if spec.syn {
-                    b = b.syn();
-                }
-                if let Some(ack) = spec.ack {
-                    b = b.ack(ack);
-                }
-                if spec.fin {
-                    b = b.fin();
-                }
-                if spec.psh {
-                    b = b.psh();
-                }
-                buf.reserve(b.size(spec.payload.len()));
-                b.write(&mut buf, spec.payload).ok()?;
-            }
+        // Both builders produce the same `PacketBuilderStep<TcpHeader>`, so
+        // the IP version only selects the step; flags apply once below.
+        let mut b = match (spec.src, spec.dst) {
+            (SocketAddr::V4(s), SocketAddr::V4(d)) => PacketBuilder::ipv4(
+                s.ip().octets(),
+                d.ip().octets(),
+                64,
+            )
+            .tcp(s.port(), d.port(), spec.seq, 65535),
+            (SocketAddr::V6(s), SocketAddr::V6(d)) => PacketBuilder::ipv6(
+                s.ip().octets(),
+                d.ip().octets(),
+                64,
+            )
+            .tcp(s.port(), d.port(), spec.seq, 65535),
             _ => return None,
+        };
+        if spec.syn {
+            b = b.syn();
         }
+        if let Some(ack) = spec.ack {
+            b = b.ack(ack);
+        }
+        if spec.fin {
+            b = b.fin();
+        }
+        if spec.psh {
+            b = b.psh();
+        }
+        buf.reserve(b.size(spec.payload.len()));
+        b.write(&mut buf, spec.payload).ok()?;
         Some(buf)
     }
 

@@ -18,6 +18,7 @@ use parking_lot::RwLock;
 use crate::config::{AuthMode, IpMode, PoolStrategy, SharedListenerSettings, TunnelPoolSelection};
 use crate::core::lifecycle::{GuardedTunnelTarget, LifecycleController};
 use crate::core::registry::{TunnelEntry, TunnelRegistry};
+use crate::proxy::router::AuthChecker;
 use crate::proxy::{
     DynStream, PoolKeyword, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket, TunnelRouter,
     TunnelSelector,
@@ -143,40 +144,6 @@ impl MultiTenantRouter {
     pub fn set_allowed_tunnels(&self, list: Option<Vec<String>>) {
         let mut allowed = self.allowed_tunnels.write();
         *allowed = list.map(|l| l.into_boxed_slice().into());
-    }
-
-    /// `DefaultPool` when anonymous access is allowed, else auth is required.
-    const fn anonymous_or_required(&self) -> Result<TunnelSelector, ProxyAuthError> {
-        if self.allow_anonymous {
-            Ok(TunnelSelector::DefaultPool)
-        } else {
-            Err(ProxyAuthError::AuthRequired)
-        }
-    }
-
-    /// Check `pass` against the global password, falling back to anonymous access.
-    fn check_global_password(
-        &self,
-        user: &str,
-        pass: &str,
-    ) -> Result<TunnelSelector, ProxyAuthError> {
-        match &self.global_password {
-            Some(expected_pass)
-                if crate::proxy::router::constant_time_eq_str(pass, expected_pass) =>
-            {
-                Ok(TunnelSelector::parse(user))
-            }
-            None if self.allow_anonymous => Ok(TunnelSelector::parse(user)),
-            _ => Err(ProxyAuthError::InvalidCredentials),
-        }
-    }
-
-    /// The configured per-tunnel password for a `ById` selector, if any.
-    fn per_tunnel_password(&self, selector: &TunnelSelector) -> Option<String> {
-        let TunnelSelector::ById(id) = selector else {
-            return None;
-        };
-        self.per_tunnel_passwords.read().get(id).cloned()
     }
 
     fn effective_ip_mode(&self) -> io::Result<IpMode> {
@@ -494,32 +461,16 @@ impl TunnelRouter for MultiTenantRouter {
         &self,
         credentials: Option<(&str, &str)>,
     ) -> Result<TunnelSelector, ProxyAuthError> {
-        match self.auth_mode {
-            AuthMode::None => match credentials {
-                Some((user, _pass)) => Ok(TunnelSelector::parse(user)),
-                None => self.anonymous_or_required(),
-            },
-            AuthMode::Global => match credentials {
-                None => self.anonymous_or_required(),
-                Some((user, pass)) => self.check_global_password(user, pass),
-            },
-            AuthMode::PerTunnel => match credentials {
-                None => self.anonymous_or_required(),
-                Some((user, pass)) => {
-                    let selector = TunnelSelector::parse(user);
-                    self.per_tunnel_password(&selector).map_or_else(
-                        || self.check_global_password(user, pass),
-                        |tunnel_pass| {
-                            if crate::proxy::router::constant_time_eq_str(pass, &tunnel_pass) {
-                                Ok(selector)
-                            } else {
-                                Err(ProxyAuthError::InvalidCredentials)
-                            }
-                        },
-                    )
-                }
-            },
+        AuthChecker {
+            auth_mode: self.auth_mode,
+            global_password: &self.global_password,
+            per_tunnel_passwords: &self.per_tunnel_passwords,
+            allow_anonymous: self.allow_anonymous,
+            // Without credentials under `AuthMode::None`, anonymous access
+            // must be enabled; otherwise auth is required.
+            none_without_credentials_ok: false,
         }
+        .authenticate(credentials)
     }
 
     fn select_tunnel<'a>(
