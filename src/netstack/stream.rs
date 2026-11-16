@@ -405,7 +405,6 @@ pub struct VirtualUdpSocket {
     pub(crate) inner: Arc<Mutex<StackInner>>,
     pub(crate) notify: Arc<Notify>,
     pub(crate) local_port: u16,
-    pub(crate) ip_mode: crate::config::IpMode,
 }
 
 impl VirtualUdpSocket {
@@ -415,20 +414,17 @@ impl VirtualUdpSocket {
         inner: Arc<Mutex<StackInner>>,
         notify: Arc<Notify>,
         local_port: u16,
-        ip_mode: crate::config::IpMode,
     ) -> Self {
         Self {
             handle,
             inner,
             notify,
             local_port,
-            ip_mode,
         }
     }
 
     /// Send a UDP datagram to the specified destination.
     pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> Result<usize, io::Error> {
-        self.ip_mode.check_ip(target.ip(), "UDP destination")?;
         let endpoint = to_smoltcp_endpoint(target);
         std::future::poll_fn(|cx| {
             let mut inner = self.inner.lock();
@@ -437,6 +433,12 @@ impl VirtualUdpSocket {
                     io::ErrorKind::BrokenPipe,
                     "network stack is shut down",
                 )));
+            }
+            if let Err(err) = inner
+                .effective_ip_mode
+                .check_ip(target.ip(), "UDP destination")
+            {
+                return Poll::Ready(Err(err));
             }
             if !inner.sockets.iter().any(|(h, _)| h == self.handle) {
                 return Poll::Ready(Err(io::Error::new(

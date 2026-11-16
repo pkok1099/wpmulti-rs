@@ -1044,3 +1044,142 @@ async fn test_shutdown_wakers_bounded_and_cleaned_on_socket_drop() {
 
     stack.close().await;
 }
+
+async fn drain_one_ip_packet(
+    ip_recv: &mut BridgeIpRecv,
+    pool: &mut gotatun::packet::PacketBufPool<4096>,
+) {
+    use gotatun::tun::IpRecv;
+    let _ = ip_recv.recv(pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_stack_live_ip_mode_widening_and_narrowing() {
+    let config = make_test_config("10.2.0.2/32", Some("fd00:1::2/128"));
+    let (bridge, mut ip_send, mut ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack =
+        VirtualNetworkStack::new_with_mode(&config, bridge, crate::config::IpMode::Ipv6Only, false)
+            .unwrap();
+
+    assert_eq!(stack.local_v4(), None);
+    assert_eq!(stack.local_v6(), Some("fd00:1::2".parse().unwrap()));
+    assert_eq!(stack.effective_ip_mode(), crate::config::IpMode::Ipv6Only);
+
+    let v4_tcp_dst = SocketAddr::from(([93, 184, 216, 34], 80));
+    let v4_udp_dst = SocketAddr::from(([1, 1, 1, 1], 53));
+    assert_eq!(
+        stack.tcp_connect(v4_tcp_dst).await.unwrap_err().kind(),
+        std::io::ErrorKind::AddrNotAvailable
+    );
+    let udp_sock = stack.udp_bind(0).unwrap();
+    assert_eq!(
+        udp_sock
+            .send_to(b"blocked", v4_udp_dst)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrNotAvailable
+    );
+
+    // Widen live to DualStack: IPv4 address, default route, DNS mode, and open UDP sockets update.
+    stack.set_ip_mode(crate::config::IpMode::DualStack);
+    assert_eq!(stack.local_v4(), Some(Ipv4Addr::new(10, 2, 0, 2)));
+    assert_eq!(stack.effective_ip_mode(), crate::config::IpMode::DualStack);
+    {
+        let inner = stack.inner().lock();
+        assert!(inner.iface.routes().get_default_ipv4_route().is_some());
+        assert!(inner.iface.routes().get_default_ipv6_route().is_some());
+    }
+    assert_eq!(udp_sock.send_to(b"ok", v4_udp_dst).await.unwrap(), 2);
+
+    let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+    let peer_task = tokio::spawn(async move {
+        drain_one_ip_packet(&mut ip_recv, &mut pool).await;
+        let syn_pkt = recv_ipv4_tcp(&mut ip_recv, &mut pool).await;
+        assert!(syn_pkt.syn);
+        send_ipv4_tcp_ack(
+            &mut ip_send,
+            &mut pool,
+            TcpReplySpec {
+                src_ip: syn_pkt.dst_ip,
+                dst_ip: syn_pkt.src_ip,
+                src_port: syn_pkt.dst_port,
+                dst_port: syn_pkt.src_port,
+                seq: 7000,
+                ack: syn_pkt.seq + 1,
+                syn: true,
+                fin: false,
+                payload: &[],
+            },
+        )
+        .await;
+    });
+
+    let stream = tokio::time::timeout(Duration::from_secs(2), stack.tcp_connect(v4_tcp_dst))
+        .await
+        .expect("v4 connect after live DualStack widening should complete")
+        .expect("v4 connect should succeed after widening");
+    assert_eq!(
+        stream.local_addr().ip(),
+        IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2))
+    );
+    drop(stream);
+    peer_task.await.unwrap();
+
+    // Narrow back live to Ipv6Only: IPv4 address/route removed and IPv4 traffic blocked again.
+    stack.set_ip_mode(crate::config::IpMode::Ipv6Only);
+    assert_eq!(stack.local_v4(), None);
+    assert_eq!(stack.effective_ip_mode(), crate::config::IpMode::Ipv6Only);
+    assert!(
+        stack
+            .inner()
+            .lock()
+            .iface
+            .routes()
+            .get_default_ipv4_route()
+            .is_none()
+    );
+    assert_eq!(
+        stack.tcp_connect(v4_tcp_dst).await.unwrap_err().kind(),
+        std::io::ErrorKind::AddrNotAvailable
+    );
+    assert_eq!(
+        udp_sock
+            .send_to(b"blocked2", v4_udp_dst)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrNotAvailable
+    );
+
+    stack.close().await;
+}
+
+#[tokio::test]
+async fn test_stack_live_ip_mode_clamps_single_stack_on_widening() {
+    let v6_only_cfg = WgInterfaceConfig {
+        private_key: StaticSecret::from([42u8; 32]),
+        addresses: vec!["fd00::4/128".parse().unwrap()],
+        dns: vec!["2606:4700:4700::1111".parse().unwrap()],
+        listen_port: None,
+        mtu: 1420,
+    };
+    let (bridge, _send, _recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack = VirtualNetworkStack::new_with_mode(
+        &v6_only_cfg,
+        bridge,
+        crate::config::IpMode::Ipv6Only,
+        false,
+    )
+    .unwrap();
+
+    stack.set_ip_mode(crate::config::IpMode::DualStack);
+    assert_eq!(stack.effective_ip_mode(), crate::config::IpMode::Ipv6Only);
+    assert_eq!(stack.local_v4(), None);
+    assert_eq!(
+        stack.local_v6(),
+        Some("fd00::4".parse::<Ipv6Addr>().unwrap())
+    );
+
+    stack.close().await;
+}

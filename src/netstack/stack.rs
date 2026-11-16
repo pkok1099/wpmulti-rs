@@ -55,6 +55,9 @@ pub struct StackInner {
     pub shutdown: bool,
     pub shutdown_wakers:
         std::collections::HashMap<smoltcp::iface::SocketHandle, [Option<std::task::Waker>; 2]>,
+    pub local_v4: Option<Ipv4Addr>,
+    pub local_v6: Option<Ipv6Addr>,
+    pub effective_ip_mode: crate::config::IpMode,
 }
 
 /// Register a waker to be notified when the network stack shuts down (bounded by active sockets).
@@ -89,11 +92,22 @@ pub struct VirtualNetworkStack {
     notify: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
     reactor_handle: Mutex<Option<JoinHandle<()>>>,
-    local_v4: Option<Ipv4Addr>,
-    local_v6: Option<Ipv6Addr>,
+    configured_addresses: Vec<ipnetwork::IpNetwork>,
     next_ephemeral_port: AtomicU16,
     dns_resolver: InTunnelDnsResolver,
     connect_timeout_ms: AtomicU64,
+}
+
+const fn compute_effective_ip_mode(
+    mode: crate::config::IpMode,
+    has_v4: bool,
+    has_v6: bool,
+) -> crate::config::IpMode {
+    match (mode, has_v4, has_v6) {
+        (crate::config::IpMode::DualStack, true, false) => crate::config::IpMode::Ipv4Only,
+        (crate::config::IpMode::DualStack, false, true) => crate::config::IpMode::Ipv6Only,
+        _ => mode,
+    }
 }
 
 fn configure_default_routes(
@@ -101,6 +115,7 @@ fn configure_default_routes(
     local_v4: Option<Ipv4Addr>,
     local_v6: Option<Ipv6Addr>,
 ) -> io::Result<()> {
+    let _ = iface.routes_mut().remove_default_ipv4_route();
     if let Some(v4_ip) = local_v4 {
         let octets = v4_ip.octets();
         let gateway = if octets[3] == 1 {
@@ -114,6 +129,7 @@ fn configure_default_routes(
             .map_err(|e| io::Error::other(format!("add default ipv4 route failed: {e:?}")))?;
     }
 
+    let _ = iface.routes_mut().remove_default_ipv6_route();
     if let Some(v6_ip) = local_v6 {
         let default_gw = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         let gateway = if v6_ip == default_gw {
@@ -127,6 +143,71 @@ fn configure_default_routes(
             .map_err(|e| io::Error::other(format!("add default ipv6 route failed: {e:?}")))?;
     }
     Ok(())
+}
+
+fn apply_iface_ip_mode(
+    iface: &mut Interface,
+    addresses: &[ipnetwork::IpNetwork],
+    ip_mode: crate::config::IpMode,
+) -> io::Result<(crate::config::IpMode, Option<Ipv4Addr>, Option<Ipv6Addr>)> {
+    let mut local_v4 = None;
+    let mut local_v6 = None;
+
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs.clear();
+        for net in addresses {
+            match net {
+                ipnetwork::IpNetwork::V4(v4) if ip_mode != crate::config::IpMode::Ipv6Only => {
+                    let cidr = IpCidr::Ipv4(Ipv4Cidr::new(v4.ip(), v4.prefix()));
+                    if ip_addrs.push(cidr).is_err() {
+                        tracing::warn!(
+                            "Failed to add IPv4 address {}: interface address list full",
+                            v4
+                        );
+                    } else if local_v4.is_none() {
+                        local_v4 = Some(v4.ip());
+                    }
+                }
+                ipnetwork::IpNetwork::V6(v6) if ip_mode != crate::config::IpMode::Ipv4Only => {
+                    let cidr = IpCidr::Ipv6(Ipv6Cidr::new(v6.ip(), v6.prefix()));
+                    if ip_addrs.push(cidr).is_err() {
+                        tracing::warn!(
+                            "Failed to add IPv6 address {}: interface address list full",
+                            v6
+                        );
+                    } else if local_v6.is_none() {
+                        local_v6 = Some(v6.ip());
+                    }
+                }
+                ipnetwork::IpNetwork::V4(_) | ipnetwork::IpNetwork::V6(_) => {}
+            }
+        }
+    });
+
+    configure_default_routes(iface, local_v4, local_v6)?;
+    let effective = compute_effective_ip_mode(ip_mode, local_v4.is_some(), local_v6.is_some());
+    Ok((effective, local_v4, local_v6))
+}
+
+fn select_local_ip(
+    dst: SocketAddr,
+    local_v4: Option<Ipv4Addr>,
+    local_v6: Option<Ipv6Addr>,
+) -> io::Result<IpAddr> {
+    match dst {
+        SocketAddr::V4(_) => Ok(IpAddr::V4(local_v4.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "interface does not have an IPv4 address configured",
+            )
+        })?)),
+        SocketAddr::V6(_) => Ok(IpAddr::V6(local_v6.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "interface does not have an IPv6 address configured",
+            )
+        })?)),
+    }
 }
 
 impl VirtualNetworkStack {
@@ -174,10 +255,7 @@ impl VirtualNetworkStack {
 
         let mut iface = Interface::new(iface_config, &mut bridge, SmolInstant::now());
 
-        // 2. Configure IP addresses filtered by IpMode
-        let mut local_v4 = None;
-        let mut local_v6 = None;
-
+        // 2. Configure IP addresses and point-to-point default routes filtered by IpMode
         if config.addresses.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -185,37 +263,8 @@ impl VirtualNetworkStack {
             ));
         }
 
-        iface.update_ip_addrs(|ip_addrs| {
-            for net in &config.addresses {
-                match net {
-                    ipnetwork::IpNetwork::V4(v4) if ip_mode != crate::config::IpMode::Ipv6Only => {
-                        let smol_addr = v4.ip();
-                        let cidr = IpCidr::Ipv4(Ipv4Cidr::new(smol_addr, v4.prefix()));
-                        if ip_addrs.push(cidr).is_err() {
-                            tracing::warn!(
-                                "Failed to add IPv4 address {}: interface address list full",
-                                v4
-                            );
-                        } else if local_v4.is_none() {
-                            local_v4 = Some(v4.ip());
-                        }
-                    }
-                    ipnetwork::IpNetwork::V6(v6) if ip_mode != crate::config::IpMode::Ipv4Only => {
-                        let smol_addr = v6.ip();
-                        let cidr = IpCidr::Ipv6(Ipv6Cidr::new(smol_addr, v6.prefix()));
-                        if ip_addrs.push(cidr).is_err() {
-                            tracing::warn!(
-                                "Failed to add IPv6 address {}: interface address list full",
-                                v6
-                            );
-                        } else if local_v6.is_none() {
-                            local_v6 = Some(v6.ip());
-                        }
-                    }
-                    ipnetwork::IpNetwork::V4(_) | ipnetwork::IpNetwork::V6(_) => {}
-                }
-            }
-        });
+        let (effective_ip_mode, local_v4, local_v6) =
+            apply_iface_ip_mode(&mut iface, &config.addresses, ip_mode)?;
 
         if local_v4.is_none() && local_v6.is_none() {
             return Err(io::Error::new(
@@ -224,10 +273,7 @@ impl VirtualNetworkStack {
             ));
         }
 
-        // 3. Configure point-to-point default routes
-        configure_default_routes(&mut iface, local_v4, local_v6)?;
-
-        // 4. Initialize SocketSet with owned storage
+        // 3. Initialize SocketSet with owned storage
         let sockets = SocketSet::new(vec![]);
         let inner = Arc::new(Mutex::new(StackInner {
             iface,
@@ -235,9 +281,12 @@ impl VirtualNetworkStack {
             pending_reap: Vec::new(),
             shutdown: false,
             shutdown_wakers: std::collections::HashMap::new(),
+            local_v4,
+            local_v6,
+            effective_ip_mode,
         }));
 
-        // 5. Spawn background reactor event loop
+        // 4. Spawn background reactor event loop
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let reactor_inner = Arc::clone(&inner);
         let reactor_notify = Arc::clone(&notify);
@@ -246,11 +295,6 @@ impl VirtualNetworkStack {
         });
 
         let initial_port = 49152 + (rand::random::<u16>() % 1000);
-        let effective_ip_mode = match (ip_mode, local_v4.is_some(), local_v6.is_some()) {
-            (crate::config::IpMode::DualStack, true, false) => crate::config::IpMode::Ipv4Only,
-            (crate::config::IpMode::DualStack, false, true) => crate::config::IpMode::Ipv6Only,
-            _ => ip_mode,
-        };
         let resolver = InTunnelDnsResolver::with_fallback(&config.dns, dns_fallback);
         resolver.set_ip_mode(effective_ip_mode);
         resolver.set_prefer_ipv6(prefer_ipv6);
@@ -261,8 +305,7 @@ impl VirtualNetworkStack {
             notify,
             shutdown_tx,
             reactor_handle: Mutex::new(Some(reactor_handle)),
-            local_v4,
-            local_v6,
+            configured_addresses: config.addresses.clone(),
             next_ephemeral_port: AtomicU16::new(initial_port),
             dns_resolver: resolver,
             connect_timeout_ms: AtomicU64::new(timeout_ms),
@@ -291,12 +334,20 @@ impl VirtualNetworkStack {
 
     /// Update the active [`IpMode`] within the address families provisioned on this interface.
     pub fn set_ip_mode(&self, mode: crate::config::IpMode) {
-        let effective = match (mode, self.local_v4.is_some(), self.local_v6.is_some()) {
-            (crate::config::IpMode::DualStack, true, false) => crate::config::IpMode::Ipv4Only,
-            (crate::config::IpMode::DualStack, false, true) => crate::config::IpMode::Ipv6Only,
-            _ => mode,
-        };
-        self.dns_resolver.set_ip_mode(effective);
+        let mut inner = self.inner.lock();
+        match apply_iface_ip_mode(&mut inner.iface, &self.configured_addresses, mode) {
+            Ok((effective, local_v4, local_v6)) => {
+                inner.local_v4 = local_v4;
+                inner.local_v6 = local_v6;
+                inner.effective_ip_mode = effective;
+                drop(inner);
+                self.dns_resolver.set_ip_mode(effective);
+                self.notify.notify_one();
+            }
+            Err(e) => {
+                tracing::warn!("Failed to apply live ip_mode {mode:?}: {e}");
+            }
+        }
     }
 
     /// Update the TCP connection handshake timeout dynamically.
@@ -315,14 +366,14 @@ impl VirtualNetworkStack {
         &self.notify
     }
 
-    /// Primary configured IPv4 address, if any.
-    pub const fn local_v4(&self) -> Option<Ipv4Addr> {
-        self.local_v4
+    /// Primary active IPv4 address for the current `IpMode`, if any.
+    pub fn local_v4(&self) -> Option<Ipv4Addr> {
+        self.inner.lock().local_v4
     }
 
-    /// Primary configured IPv6 address, if any.
-    pub const fn local_v6(&self) -> Option<Ipv6Addr> {
-        self.local_v6
+    /// Primary active IPv6 address for the current `IpMode`, if any.
+    pub fn local_v6(&self) -> Option<Ipv6Addr> {
+        self.inner.lock().local_v6
     }
 
     /// Allocate the next local ephemeral port in range [49152..=65535].
@@ -359,21 +410,8 @@ impl VirtualNetworkStack {
 
     /// Initiate an asynchronous TCP connection to the destination address.
     pub async fn tcp_connect(&self, dst: SocketAddr) -> Result<VirtualTcpStream, io::Error> {
-        // Validate protocol compatibility
-        let local_ip = match dst {
-            SocketAddr::V4(_) => IpAddr::V4(self.local_v4.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "interface does not have an IPv4 address configured",
-                )
-            })?),
-            SocketAddr::V6(_) => IpAddr::V6(self.local_v6.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "interface does not have an IPv6 address configured",
-                )
-            })?),
-        };
+        // Pre-validate protocol compatibility before allocating socket buffers.
+        let _ = select_local_ip(dst, self.local_v4(), self.local_v6())?;
 
         // Allocate socket buffers
         let rx_buf = TcpSocketBuffer::new(vec![0u8; TCP_RX_BUF_SIZE]);
@@ -387,7 +425,7 @@ impl VirtualNetworkStack {
         let remote_endpoint: IpEndpoint = to_smoltcp_endpoint(dst);
 
         // Initiate connection under lock with collision-free ephemeral port
-        let (handle, local_port) = {
+        let (handle, local_port, local_ip) = {
             let mut inner = self.inner.lock();
             if inner.shutdown {
                 return Err(io::Error::new(
@@ -395,6 +433,7 @@ impl VirtualNetworkStack {
                     "network stack is shut down",
                 ));
             }
+            let local_ip = select_local_ip(dst, inner.local_v4, inner.local_v6)?;
             if inner.sockets.iter().count() >= MAX_ACTIVE_SOCKETS {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -406,7 +445,7 @@ impl VirtualNetworkStack {
             socket
                 .connect(cx, remote_endpoint, port)
                 .map_err(|e| io::Error::other(format!("tcp connect failed: {e:?}")))?;
-            (inner.sockets.add(socket), port)
+            (inner.sockets.add(socket), port, local_ip)
         };
         let mut guard = ConnectSocketGuard {
             inner: Arc::clone(&self.inner),
@@ -488,7 +527,6 @@ impl VirtualNetworkStack {
             Arc::clone(&self.inner),
             Arc::clone(&self.notify),
             port,
-            self.dns_resolver.ip_mode(),
         ))
     }
 
