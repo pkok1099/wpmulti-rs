@@ -20,9 +20,9 @@
     clippy::type_complexity,
     clippy::wildcard_enum_match_arm,
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
+    clippy::print_stdout
 )]
+#![warn(clippy::too_many_lines, clippy::cognitive_complexity)]
 
 use std::collections::HashMap;
 use std::io::Cursor;

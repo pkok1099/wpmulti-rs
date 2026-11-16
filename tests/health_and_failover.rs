@@ -11,10 +11,9 @@
     clippy::large_futures,
     clippy::type_complexity,
     clippy::wildcard_enum_match_arm,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
+    clippy::too_many_arguments
 )]
+#![warn(clippy::too_many_lines, clippy::cognitive_complexity)]
 
 use std::collections::HashMap;
 use std::fs;
@@ -65,6 +64,17 @@ fn make_test_tunnel_config(id: &str, endpoint: &str) -> TunnelConfig {
 // Test 1: Passive Circuit Breaker Tripping, Cooldown, and Half-Open Trial
 // =============================================================================
 
+fn assert_tracker_state(
+    tracker: &TunnelHealthTracker,
+    expected_status: HealthStatus,
+    expected_failures: usize,
+    expected_routable: bool,
+) {
+    assert_eq!(tracker.current_status(), expected_status);
+    assert_eq!(tracker.consecutive_failures(), expected_failures);
+    assert_eq!(tracker.is_routable(), expected_routable);
+}
+
 #[test]
 fn test_circuit_breaker_passive_lifecycle() {
     let tracker = TunnelHealthTracker::new();
@@ -72,27 +82,19 @@ fn test_circuit_breaker_passive_lifecycle() {
     let cooldown = Duration::from_millis(50);
 
     // Initial state: Healthy and routable
-    assert_eq!(tracker.current_status(), HealthStatus::Healthy);
-    assert!(tracker.is_routable());
-    assert_eq!(tracker.consecutive_failures(), 0);
+    assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
     assert_eq!(tracker.cooldown_remaining_secs(), 0);
 
     // Failure 1 & 2: below threshold -> remains Healthy
     tracker.record_failure(threshold, cooldown);
-    assert_eq!(tracker.consecutive_failures(), 1);
-    assert_eq!(tracker.current_status(), HealthStatus::Healthy);
-    assert!(tracker.is_routable());
+    assert_tracker_state(&tracker, HealthStatus::Healthy, 1, true);
 
     tracker.record_failure(threshold, cooldown);
-    assert_eq!(tracker.consecutive_failures(), 2);
-    assert_eq!(tracker.current_status(), HealthStatus::Healthy);
-    assert!(tracker.is_routable());
+    assert_tracker_state(&tracker, HealthStatus::Healthy, 2, true);
 
     // Failure 3: reaches threshold -> trips to Unhealthy
     tracker.record_failure(threshold, cooldown);
-    assert_eq!(tracker.consecutive_failures(), 3);
-    assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
-    assert!(!tracker.is_routable());
+    assert_tracker_state(&tracker, HealthStatus::Unhealthy, 3, false);
 
     // While cooling down: remains not routable
     assert!(!tracker.is_routable());
@@ -106,10 +108,8 @@ fn test_circuit_breaker_passive_lifecycle() {
 
     // Successful trial resets circuit breaker to Healthy
     tracker.record_success();
-    assert_eq!(tracker.current_status(), HealthStatus::Healthy);
-    assert_eq!(tracker.consecutive_failures(), 0);
+    assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
     assert_eq!(tracker.cooldown_remaining_secs(), 0);
-    assert!(tracker.is_routable());
 }
 
 #[test]

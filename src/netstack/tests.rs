@@ -636,6 +636,87 @@ async fn test_tcp_stream_connect_unaddressable() {
     stack.close().await;
 }
 
+struct CapturedIpv4Tcp {
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    syn: bool,
+    ack: bool,
+    payload: Vec<u8>,
+}
+
+struct TcpReplySpec<'a> {
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    syn: bool,
+    fin: bool,
+    payload: &'a [u8],
+}
+
+async fn recv_ipv4_tcp(
+    ip_recv: &mut BridgeIpRecv,
+    pool: &mut gotatun::packet::PacketBufPool<4096>,
+) -> CapturedIpv4Tcp {
+    use gotatun::tun::IpRecv;
+    use zerocopy::IntoBytes;
+
+    let mut packets = ip_recv.recv(pool).await.unwrap();
+    let pkt = packets.next().unwrap();
+    let raw = (*pkt).as_bytes().to_vec();
+    drop(packets);
+
+    let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
+    let (src_ip, dst_ip) = match parsed.net.unwrap() {
+        etherparse::NetSlice::Ipv4(ip) => (ip.header().source(), ip.header().destination()),
+        _ => panic!("expected ipv4 tcp"),
+    };
+    let etherparse::TransportSlice::Tcp(tcp_hdr) = parsed.transport.unwrap() else {
+        panic!("expected ipv4 tcp");
+    };
+
+    CapturedIpv4Tcp {
+        src_ip,
+        dst_ip,
+        src_port: tcp_hdr.source_port(),
+        dst_port: tcp_hdr.destination_port(),
+        seq: tcp_hdr.sequence_number(),
+        syn: tcp_hdr.syn(),
+        ack: tcp_hdr.ack(),
+        payload: tcp_hdr.payload().to_vec(),
+    }
+}
+
+async fn send_ipv4_tcp_ack(
+    ip_send: &mut crate::netstack::bridge::BridgeIpSend,
+    pool: &mut gotatun::packet::PacketBufPool<4096>,
+    spec: TcpReplySpec<'_>,
+) {
+    let mut builder = PacketBuilder::ipv4(spec.src_ip, spec.dst_ip, 64)
+        .tcp(spec.src_port, spec.dst_port, spec.seq, 65535)
+        .ack(spec.ack);
+    if spec.syn {
+        builder = builder.syn();
+    }
+    if spec.fin {
+        builder = builder.fin();
+    }
+
+    let mut raw = Vec::new();
+    builder.write(&mut raw, spec.payload).unwrap();
+
+    let mut reply_pkt = pool.get();
+    reply_pkt.truncate(raw.len());
+    reply_pkt.copy_from_slice(&raw);
+    let ip_reply = reply_pkt.try_into_ip().unwrap();
+    ip_send.send(ip_reply).await.unwrap();
+}
+
 #[tokio::test]
 async fn test_tcp_stream_handshake_and_exchange() {
     let config = make_test_config("10.2.0.2/32", None);
@@ -643,116 +724,77 @@ async fn test_tcp_stream_handshake_and_exchange() {
     let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
 
     let dst = SocketAddr::from(([93, 184, 216, 34], 80));
-
     let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
 
     // Spawn mock peer task to drive TCP state machine over tunnel bridge
     let peer_task = tokio::spawn(async move {
-        use gotatun::tun::{IpRecv, IpSend};
-        use zerocopy::IntoBytes;
-
         // 1. Receive SYN packet
-        let mut packets = ip_recv.recv(&mut pool).await.unwrap();
-        let pkt = packets.next().unwrap();
-        let raw = (*pkt).as_bytes().to_vec();
-        drop(packets);
-
-        let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
-        let (src_ip, dst_ip) = match parsed.net.unwrap() {
-            etherparse::NetSlice::Ipv4(ip) => (ip.header().source(), ip.header().destination()),
-            _ => panic!("expected ipv4 tcp"),
-        };
-        let etherparse::TransportSlice::Tcp(tcp_hdr) = parsed.transport.unwrap() else {
-            panic!("expected ipv4 tcp");
-        };
-
-        assert!(tcp_hdr.syn());
-        let client_isn = tcp_hdr.sequence_number();
+        let syn_pkt = recv_ipv4_tcp(&mut ip_recv, &mut pool).await;
+        assert!(syn_pkt.syn);
         let server_isn = 50000u32;
 
         // 2. Reply with SYN-ACK
-        let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64)
-            .tcp(
-                tcp_hdr.destination_port(),
-                tcp_hdr.source_port(),
-                server_isn,
-                65535,
-            )
-            .syn()
-            .ack(client_isn + 1);
-
-        let mut syn_ack_raw = Vec::new();
-        builder.write(&mut syn_ack_raw, &[]).unwrap();
-
-        let mut reply_pkt = pool.get();
-        reply_pkt.truncate(syn_ack_raw.len());
-        reply_pkt.copy_from_slice(&syn_ack_raw);
-        let ip_reply = reply_pkt.try_into_ip().unwrap();
-        ip_send.send(ip_reply).await.unwrap();
+        send_ipv4_tcp_ack(
+            &mut ip_send,
+            &mut pool,
+            TcpReplySpec {
+                src_ip: syn_pkt.dst_ip,
+                dst_ip: syn_pkt.src_ip,
+                src_port: syn_pkt.dst_port,
+                dst_port: syn_pkt.src_port,
+                seq: server_isn,
+                ack: syn_pkt.seq + 1,
+                syn: true,
+                fin: false,
+                payload: &[],
+            },
+        )
+        .await;
 
         // 3. Receive ACK (completes handshake)
-        let mut packets = ip_recv.recv(&mut pool).await.unwrap();
-        let pkt = packets.next().unwrap();
-        let raw = (*pkt).as_bytes().to_vec();
-        drop(packets);
-
-        let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
-        let etherparse::TransportSlice::Tcp(tcp_hdr) = parsed.transport.unwrap() else {
-            panic!("expected tcp");
-        };
-        assert!(tcp_hdr.ack());
+        let ack_pkt = recv_ipv4_tcp(&mut ip_recv, &mut pool).await;
+        assert!(ack_pkt.ack);
 
         // 4. Receive client data (b"PING_DATA")
-        let mut packets = ip_recv.recv(&mut pool).await.unwrap();
-        let pkt = packets.next().unwrap();
-        let raw = (*pkt).as_bytes().to_vec();
-        drop(packets);
-
-        let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
-        let etherparse::TransportSlice::Tcp(tcp_hdr) = parsed.transport.unwrap() else {
-            panic!("expected tcp");
-        };
-        let payload_len = tcp_hdr.payload().len() as u32;
-        assert_eq!(tcp_hdr.payload(), b"PING_DATA");
+        let data_pkt = recv_ipv4_tcp(&mut ip_recv, &mut pool).await;
+        let payload_len = data_pkt.payload.len() as u32;
+        assert_eq!(data_pkt.payload, b"PING_DATA");
 
         // 5. Send server data (b"PONG_DATA") + ACK
-        let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64)
-            .tcp(
-                tcp_hdr.destination_port(),
-                tcp_hdr.source_port(),
-                server_isn + 1,
-                65535,
-            )
-            .ack(tcp_hdr.sequence_number() + payload_len);
-
-        let mut data_raw = Vec::new();
-        builder.write(&mut data_raw, b"PONG_DATA").unwrap();
-
-        let mut reply_pkt = pool.get();
-        reply_pkt.truncate(data_raw.len());
-        reply_pkt.copy_from_slice(&data_raw);
-        let ip_reply = reply_pkt.try_into_ip().unwrap();
-        ip_send.send(ip_reply).await.unwrap();
+        send_ipv4_tcp_ack(
+            &mut ip_send,
+            &mut pool,
+            TcpReplySpec {
+                src_ip: data_pkt.dst_ip,
+                dst_ip: data_pkt.src_ip,
+                src_port: data_pkt.dst_port,
+                dst_port: data_pkt.src_port,
+                seq: server_isn + 1,
+                ack: data_pkt.seq + payload_len,
+                syn: false,
+                fin: false,
+                payload: b"PONG_DATA",
+            },
+        )
+        .await;
 
         // 6. Send FIN to signal EOF
-        let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64)
-            .tcp(
-                tcp_hdr.destination_port(),
-                tcp_hdr.source_port(),
-                server_isn + 1 + 9, // + len("PONG_DATA")
-                65535,
-            )
-            .fin()
-            .ack(tcp_hdr.sequence_number() + payload_len);
-
-        let mut fin_raw = Vec::new();
-        builder.write(&mut fin_raw, &[]).unwrap();
-
-        let mut reply_pkt = pool.get();
-        reply_pkt.truncate(fin_raw.len());
-        reply_pkt.copy_from_slice(&fin_raw);
-        let ip_reply = reply_pkt.try_into_ip().unwrap();
-        ip_send.send(ip_reply).await.unwrap();
+        send_ipv4_tcp_ack(
+            &mut ip_send,
+            &mut pool,
+            TcpReplySpec {
+                src_ip: data_pkt.dst_ip,
+                dst_ip: data_pkt.src_ip,
+                src_port: data_pkt.dst_port,
+                dst_port: data_pkt.src_port,
+                seq: server_isn + 1 + 9, // + len("PONG_DATA")
+                ack: data_pkt.seq + payload_len,
+                syn: false,
+                fin: true,
+                payload: &[],
+            },
+        )
+        .await;
     });
 
     // Client: initiate TCP connect

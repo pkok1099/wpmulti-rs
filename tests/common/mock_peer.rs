@@ -154,6 +154,173 @@ impl Drop for MockWireGuardPeer {
     }
 }
 
+struct MockPeerContext {
+    socket: UdpSocket,
+    server_private: x25519::StaticSecret,
+    server_public: x25519::PublicKey,
+    preshared_key: Option<[u8; 32]>,
+    index_table: IndexTable,
+    rate_limiter: Arc<RateLimiter>,
+    sessions: Arc<RwLock<HashMap<u32, Arc<Mutex<PeerSession>>>>>,
+    ip_engine: Arc<Mutex<MockIpEngine>>,
+    stats: Arc<MockPeerStats>,
+    controls: Arc<MockPeerControls>,
+}
+
+impl MockPeerContext {
+    async fn handle_packet(&self, packet: &[u8], src_addr: SocketAddr) {
+        if packet.len() < 4 {
+            return;
+        }
+        match packet[0] {
+            // Type 1: WgHandshakeInit (148 bytes)
+            1 if packet.len() == 148 => self.handle_handshake_init(packet, src_addr).await,
+            // Type 4: WgData (>= 32 bytes)
+            4 if packet.len() >= 32 => self.handle_data_packet(packet, src_addr).await,
+            _ => {}
+        }
+    }
+
+    async fn handle_handshake_init(&self, packet: &[u8], src_addr: SocketAddr) {
+        self.stats
+            .handshakes_received
+            .fetch_add(1, Ordering::Relaxed);
+        if self.controls.drop_handshakes.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let raw_packet = Packet::copy_from(packet);
+        let init_kind = match raw_packet.try_into_wg() {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::debug!("Failed to convert packet to WgKind: {e}");
+                return;
+            }
+        };
+        let WgKind::HandshakeInit(init_packet) = init_kind else {
+            return;
+        };
+        let hh = match parse_handshake_anon(&self.server_private, &self.server_public, &init_packet)
+        {
+            Ok(hh) => hh,
+            Err(e) => {
+                tracing::debug!("Failed to parse handshake anon: {e:?}");
+                return;
+            }
+        };
+
+        let peer_pub = x25519::PublicKey::from(hh.peer_static_public);
+        let mut tunn = Tunn::new(
+            self.server_private.clone(),
+            peer_pub,
+            self.preshared_key,
+            None,
+            self.index_table.clone(),
+            self.rate_limiter.clone(),
+        );
+
+        if let TunnResult::WriteToNetwork(WgKind::HandshakeResp(resp)) =
+            tunn.handle_incoming_packet(WgKind::HandshakeInit(init_packet))
+        {
+            let local_idx = resp.sender_idx.get();
+            let resp_bytes = (*resp).as_bytes();
+            if self.socket.send_to(resp_bytes, src_addr).await.is_ok() {
+                self.stats
+                    .handshakes_completed
+                    .fetch_add(1, Ordering::Relaxed);
+                let mut w = self.sessions.write().await;
+                w.insert(
+                    local_idx,
+                    Arc::new(Mutex::new(PeerSession {
+                        tunn,
+                        peer_addr: src_addr,
+                        peer_pub: hh.peer_static_public,
+                        peer_idx: hh.peer_index,
+                        last_seen: Instant::now(),
+                    })),
+                );
+            }
+        }
+    }
+
+    async fn handle_data_packet(&self, packet: &[u8], src_addr: SocketAddr) {
+        self.stats
+            .data_packets_received
+            .fetch_add(1, Ordering::Relaxed);
+        if self.controls.drop_data.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let receiver_idx = u32::from_le_bytes(packet[4..8].try_into().unwrap());
+        let session_arc = {
+            let r = self.sessions.read().await;
+            r.get(&receiver_idx).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            tracing::trace!("Session not found for receiver_idx {receiver_idx}");
+            return;
+        };
+
+        let mut session = session_arc.lock().await;
+        session.peer_addr = src_addr;
+        session.last_seen = Instant::now();
+
+        let raw_packet = Packet::copy_from(packet);
+        let data_kind = match raw_packet.try_into_wg() {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::trace!("Failed to parse data packet: {e}");
+                return;
+            }
+        };
+        let WgKind::Data(data_packet) = data_kind else {
+            return;
+        };
+
+        match session
+            .tunn
+            .handle_incoming_packet(WgKind::Data(data_packet))
+        {
+            TunnResult::WriteToTunnel(ip_packet) => {
+                if ip_packet.is_empty() {
+                    self.stats
+                        .keepalives_received
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                let reply_bytes = {
+                    let mut engine = self.ip_engine.lock().await;
+                    engine.process_packet(ip_packet.as_ref(), &self.controls)
+                };
+                if let Some(reply) = reply_bytes {
+                    let pkt = Packet::copy_from(reply.as_slice());
+                    if let Ok(encap) = session.tunn.encapsulate_with_session(pkt) {
+                        let encap_bytes = encap.into_bytes();
+                        let _ = self
+                            .socket
+                            .send_to(encap_bytes.as_ref(), session.peer_addr)
+                            .await;
+                    }
+                }
+            }
+            TunnResult::WriteToNetwork(pkt) => {
+                let network_bytes = wg_kind_to_bytes(pkt);
+                let _ = self.socket.send_to(&network_bytes, session.peer_addr).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn wg_kind_to_bytes(pkt: WgKind) -> Vec<u8> {
+    match pkt {
+        WgKind::HandshakeInit(p) => (*p).as_bytes().to_vec(),
+        WgKind::HandshakeResp(p) => (*p).as_bytes().to_vec(),
+        WgKind::CookieReply(p) => (*p).as_bytes().to_vec(),
+        WgKind::Data(p) => p.into_bytes().as_ref().to_vec(),
+    }
+}
+
 async fn run_mock_peer_loop(
     socket: UdpSocket,
     server_private: x25519::StaticSecret,
@@ -163,15 +330,24 @@ async fn run_mock_peer_loop(
     controls: Arc<MockPeerControls>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let index_table = IndexTable::from_os_rng();
     let rate_limiter = Arc::new(RateLimiter::new(&server_public, 1000));
-    let sessions: Arc<RwLock<HashMap<u32, Arc<Mutex<PeerSession>>>>> =
-        Arc::new(RwLock::new(HashMap::new()));
     let ip_engine = Arc::new(Mutex::new(MockIpEngine::new(
         Ipv4Addr::new(10, 0, 0, 1),
         "2606:4700:4700::1111".parse().unwrap(),
         Arc::clone(&stats),
     )));
+    let ctx = MockPeerContext {
+        socket,
+        server_private,
+        server_public,
+        preshared_key,
+        index_table: IndexTable::from_os_rng(),
+        rate_limiter,
+        sessions: Arc::new(RwLock::new(HashMap::new())),
+        ip_engine,
+        stats,
+        controls,
+    };
 
     let mut buf = vec![0u8; 65536];
 
@@ -182,156 +358,28 @@ async fn run_mock_peer_loop(
                     break;
                 }
             }
-            res = socket.recv_from(&mut buf) => {
-                let (len, src_addr) = match res {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!("Mock peer UDP recv error: {e}");
-                        continue;
-                    }
-                };
-
-                if len < 4 {
-                    continue;
-                }
-                let packet_type = buf[0];
-
-                match packet_type {
-                    // Type 1: WgHandshakeInit (148 bytes)
-                    1 if len == 148 => {
-                        stats.handshakes_received.fetch_add(1, Ordering::Relaxed);
-                        if controls.drop_handshakes.load(Ordering::Relaxed) {
-                            continue;
-                        }
-
-                        let raw_packet = Packet::copy_from(&buf[..len]);
-                        let init_kind = match raw_packet.try_into_wg() {
-                            Ok(k) => k,
-                            Err(e) => {
-                                tracing::debug!("Failed to convert packet to WgKind: {e}");
-                                continue;
-                            }
-                        };
-
-                        let init_packet = match init_kind {
-                            WgKind::HandshakeInit(p) => p,
-                            _ => continue,
-                        };
-
-                        let hh = match parse_handshake_anon(&server_private, &server_public, &init_packet) {
-                            Ok(hh) => hh,
-                            Err(e) => {
-                                tracing::debug!("Failed to parse handshake anon: {e:?}");
-                                continue;
-                            }
-                        };
-
-                        let peer_pub = x25519::PublicKey::from(hh.peer_static_public);
-                        let mut tunn = Tunn::new(
-                            server_private.clone(),
-                            peer_pub,
-                            preshared_key,
-                            None,
-                            index_table.clone(),
-                            rate_limiter.clone(),
-                        );
-
-                        if let TunnResult::WriteToNetwork(WgKind::HandshakeResp(resp)) =
-                            tunn.handle_incoming_packet(WgKind::HandshakeInit(init_packet))
-                        {
-                            let local_idx = resp.sender_idx.get();
-                            let resp_bytes = (*resp).as_bytes();
-                            if socket.send_to(resp_bytes, src_addr).await.is_ok() {
-                                stats.handshakes_completed.fetch_add(1, Ordering::Relaxed);
-                                let mut w = sessions.write().await;
-                                w.insert(
-                                    local_idx,
-                                    Arc::new(Mutex::new(PeerSession {
-                                        tunn,
-                                        peer_addr: src_addr,
-                                        peer_pub: hh.peer_static_public,
-                                        peer_idx: hh.peer_index,
-                                        last_seen: Instant::now(),
-                                    })),
-                                );
-                            }
-                        }
-                    }
-
-                    // Type 4: WgData (>= 32 bytes)
-                    4 if len >= 32 => {
-                        stats.data_packets_received.fetch_add(1, Ordering::Relaxed);
-                        if controls.drop_data.load(Ordering::Relaxed) {
-                            continue;
-                        }
-
-                        let receiver_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                        let session_arc = {
-                            let r = sessions.read().await;
-                            r.get(&receiver_idx).cloned()
-                        };
-
-                        let Some(session_arc) = session_arc else {
-                            tracing::trace!("Session not found for receiver_idx {receiver_idx}");
-                            continue;
-                        };
-
-                        let mut session = session_arc.lock().await;
-                        session.peer_addr = src_addr;
-                        session.last_seen = Instant::now();
-
-                        let raw_packet = Packet::copy_from(&buf[..len]);
-                        let data_kind = match raw_packet.try_into_wg() {
-                            Ok(k) => k,
-                            Err(e) => {
-                                tracing::trace!("Failed to parse data packet: {e}");
-                                continue;
-                            }
-                        };
-
-                        let data_packet = match data_kind {
-                            WgKind::Data(d) => d,
-                            _ => continue,
-                        };
-
-                        match session.tunn.handle_incoming_packet(WgKind::Data(data_packet)) {
-                            TunnResult::WriteToTunnel(ip_packet) => {
-                                if ip_packet.is_empty() {
-                                    stats.keepalives_received.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-
-                                let reply_bytes = {
-                                    let mut engine = ip_engine.lock().await;
-                                    engine.process_packet(ip_packet.as_ref(), &controls)
-                                };
-
-                                if let Some(reply) = reply_bytes {
-                                    let pkt = Packet::copy_from(reply.as_slice());
-                                    if let Ok(encap) = session.tunn.encapsulate_with_session(pkt) {
-                                        let encap_bytes = encap.into_bytes();
-                                        let _ = socket.send_to(encap_bytes.as_ref(), session.peer_addr).await;
-                                    }
-                                }
-                            }
-                            TunnResult::WriteToNetwork(pkt) => {
-                                let network_bytes = match pkt {
-                                    WgKind::HandshakeInit(p) => (*p).as_bytes().to_vec(),
-                                    WgKind::HandshakeResp(p) => (*p).as_bytes().to_vec(),
-                                    WgKind::CookieReply(p) => (*p).as_bytes().to_vec(),
-                                    WgKind::Data(p) => p.into_bytes().as_ref().to_vec(),
-                                };
-                                let _ = socket.send_to(&network_bytes, session.peer_addr).await;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    _ => {}
+            res = ctx.socket.recv_from(&mut buf) => {
+                match res {
+                    Ok((len, src_addr)) => ctx.handle_packet(&buf[..len], src_addr).await,
+                    Err(e) => tracing::warn!("Mock peer UDP recv error: {e}"),
                 }
             }
         }
     }
+}
+
+fn strip_wg_padding(ip_bytes: &[u8]) -> &[u8] {
+    // Strip trailing WireGuard 16-byte padding using IPv4 total_len / IPv6 payload_len
+    let true_len = match ip_bytes[0] >> 4 {
+        4 if ip_bytes.len() >= 20 => {
+            (u16::from_be_bytes([ip_bytes[2], ip_bytes[3]]) as usize).min(ip_bytes.len())
+        }
+        6 if ip_bytes.len() >= 40 => {
+            (40 + u16::from_be_bytes([ip_bytes[4], ip_bytes[5]]) as usize).min(ip_bytes.len())
+        }
+        _ => ip_bytes.len(),
+    };
+    &ip_bytes[..true_len]
 }
 
 struct TcpConnState {
@@ -364,141 +412,144 @@ impl MockIpEngine {
         if ip_bytes.is_empty() {
             return None;
         }
-        // Strip trailing WireGuard 16-byte padding using IPv4 total_len / IPv6 payload_len
-        let true_len = match ip_bytes[0] >> 4 {
-            4 if ip_bytes.len() >= 20 => {
-                (u16::from_be_bytes([ip_bytes[2], ip_bytes[3]]) as usize).min(ip_bytes.len())
-            }
-            6 if ip_bytes.len() >= 40 => {
-                (40 + u16::from_be_bytes([ip_bytes[4], ip_bytes[5]]) as usize).min(ip_bytes.len())
-            }
-            _ => ip_bytes.len(),
-        };
-        let sliced = SlicedPacket::from_ip(&ip_bytes[..true_len]).ok()?;
+        let sliced = SlicedPacket::from_ip(strip_wg_padding(ip_bytes)).ok()?;
+        let (src_ip, dst_ip) = self.extract_ip_endpoints(sliced.net?)?;
 
-        let (src_ip, dst_ip) = match sliced.net? {
+        match sliced.transport? {
+            TransportSlice::Tcp(tcp) => self.process_tcp_packet(src_ip, dst_ip, &tcp),
+            TransportSlice::Udp(udp) => self.process_udp_packet(src_ip, dst_ip, &udp, controls),
+            _ => None,
+        }
+    }
+
+    fn extract_ip_endpoints(&self, net: etherparse::NetSlice<'_>) -> Option<(IpAddr, IpAddr)> {
+        match net {
             etherparse::NetSlice::Ipv4(v4) => {
                 self.stats.ipv4_packets.fetch_add(1, Ordering::Relaxed);
-                (
+                Some((
                     IpAddr::V4(v4.header().source_addr()),
                     IpAddr::V4(v4.header().destination_addr()),
-                )
+                ))
             }
             etherparse::NetSlice::Ipv6(v6) => {
                 self.stats.ipv6_packets.fetch_add(1, Ordering::Relaxed);
-                (
+                Some((
                     IpAddr::V6(v6.header().source_addr()),
                     IpAddr::V6(v6.header().destination_addr()),
-                )
-            }
-            _ => return None,
-        };
-
-        match sliced.transport? {
-            TransportSlice::Tcp(tcp) => {
-                let src_port = tcp.source_port();
-                let dst_port = tcp.destination_port();
-                let key = (src_ip, src_port, dst_ip, dst_port);
-
-                if tcp.syn() && !tcp.ack() {
-                    self.stats.tcp_syn_received.fetch_add(1, Ordering::Relaxed);
-                    let server_isn: u32 = rand::random();
-                    let client_seq = tcp.sequence_number().wrapping_add(1);
-                    self.tcp_conns.insert(
-                        key,
-                        TcpConnState {
-                            server_seq: server_isn.wrapping_add(1),
-                            client_seq,
-                        },
-                    );
-
-                    // Synthesize SYN | ACK
-                    self.build_tcp(
-                        dst_ip,
-                        src_ip,
-                        dst_port,
-                        src_port,
-                        server_isn,
-                        client_seq,
-                        true,
-                        true,
-                        false,
-                        false,
-                        &[],
-                    )
-                } else if tcp.fin() {
-                    self.stats.tcp_closed.fetch_add(1, Ordering::Relaxed);
-                    let (server_seq, client_seq) = if let Some(st) = self.tcp_conns.remove(&key) {
-                        (st.server_seq, tcp.sequence_number().wrapping_add(1))
-                    } else {
-                        (1000, tcp.sequence_number().wrapping_add(1))
-                    };
-                    // Synthesize FIN | ACK
-                    self.build_tcp(
-                        dst_ip,
-                        src_ip,
-                        dst_port,
-                        src_port,
-                        server_seq,
-                        client_seq,
-                        false,
-                        true,
-                        true,
-                        false,
-                        &[],
-                    )
-                } else if tcp.rst() {
-                    self.tcp_conns.remove(&key);
-                    None
-                } else if !tcp.payload().is_empty() {
-                    let payload = tcp.payload();
-                    self.stats
-                        .tcp_bytes_echoed
-                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
-
-                    let (server_seq, client_seq) = if let Some(st) = self.tcp_conns.get_mut(&key) {
-                        let s = st.server_seq;
-                        st.client_seq = tcp.sequence_number().wrapping_add(payload.len() as u32);
-                        st.server_seq = s.wrapping_add(payload.len() as u32);
-                        (s, st.client_seq)
-                    } else {
-                        (
-                            1000,
-                            tcp.sequence_number().wrapping_add(payload.len() as u32),
-                        )
-                    };
-
-                    // TCP Echo: PSH | ACK
-                    self.build_tcp(
-                        dst_ip, src_ip, dst_port, src_port, server_seq, client_seq, false, true,
-                        false, true, payload,
-                    )
-                } else {
-                    None // Pure ACK
-                }
-            }
-
-            TransportSlice::Udp(udp) => {
-                let src_port = udp.source_port();
-                let dst_port = udp.destination_port();
-
-                if dst_port == 53 {
-                    // RFC 1035 DNS Query
-                    if controls.drop_dns.load(Ordering::Relaxed) {
-                        return None;
-                    }
-                    self.stats
-                        .dns_queries_answered
-                        .fetch_add(1, Ordering::Relaxed);
-                    let resp = self.handle_dns_query(udp.payload())?;
-                    self.build_udp(dst_ip, src_ip, dst_port, src_port, &resp)
-                } else {
-                    // UDP Echo
-                    self.stats.udp_echo_packets.fetch_add(1, Ordering::Relaxed);
-                    self.build_udp(dst_ip, src_ip, dst_port, src_port, udp.payload())
-                }
+                ))
             }
             _ => None,
+        }
+    }
+
+    fn process_tcp_packet(
+        &mut self,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        tcp: &etherparse::TcpSlice<'_>,
+    ) -> Option<Vec<u8>> {
+        let src_port = tcp.source_port();
+        let dst_port = tcp.destination_port();
+        let key = (src_ip, src_port, dst_ip, dst_port);
+
+        if tcp.syn() && !tcp.ack() {
+            self.stats.tcp_syn_received.fetch_add(1, Ordering::Relaxed);
+            let server_isn: u32 = rand::random();
+            let client_seq = tcp.sequence_number().wrapping_add(1);
+            self.tcp_conns.insert(
+                key,
+                TcpConnState {
+                    server_seq: server_isn.wrapping_add(1),
+                    client_seq,
+                },
+            );
+            return self.build_tcp(
+                dst_ip,
+                src_ip,
+                dst_port,
+                src_port,
+                server_isn,
+                client_seq,
+                true,
+                true,
+                false,
+                false,
+                &[],
+            );
+        }
+
+        if tcp.fin() {
+            self.stats.tcp_closed.fetch_add(1, Ordering::Relaxed);
+            let server_seq = self.tcp_conns.remove(&key).map_or(1000, |st| st.server_seq);
+            let client_seq = tcp.sequence_number().wrapping_add(1);
+            return self.build_tcp(
+                dst_ip,
+                src_ip,
+                dst_port,
+                src_port,
+                server_seq,
+                client_seq,
+                false,
+                true,
+                true,
+                false,
+                &[],
+            );
+        }
+
+        if tcp.rst() {
+            self.tcp_conns.remove(&key);
+            return None;
+        }
+
+        let payload = tcp.payload();
+        if payload.is_empty() {
+            return None;
+        }
+
+        self.stats
+            .tcp_bytes_echoed
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        let (server_seq, client_seq) = if let Some(st) = self.tcp_conns.get_mut(&key) {
+            let s = st.server_seq;
+            st.client_seq = tcp.sequence_number().wrapping_add(payload.len() as u32);
+            st.server_seq = s.wrapping_add(payload.len() as u32);
+            (s, st.client_seq)
+        } else {
+            (
+                1000,
+                tcp.sequence_number().wrapping_add(payload.len() as u32),
+            )
+        };
+
+        self.build_tcp(
+            dst_ip, src_ip, dst_port, src_port, server_seq, client_seq, false, true, false, true,
+            payload,
+        )
+    }
+
+    fn process_udp_packet(
+        &self,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        udp: &etherparse::UdpSlice<'_>,
+        controls: &MockPeerControls,
+    ) -> Option<Vec<u8>> {
+        let src_port = udp.source_port();
+        let dst_port = udp.destination_port();
+
+        if dst_port == 53 {
+            if controls.drop_dns.load(Ordering::Relaxed) {
+                return None;
+            }
+            self.stats
+                .dns_queries_answered
+                .fetch_add(1, Ordering::Relaxed);
+            let resp = self.handle_dns_query(udp.payload())?;
+            self.build_udp(dst_ip, src_ip, dst_port, src_port, &resp)
+        } else {
+            self.stats.udp_echo_packets.fetch_add(1, Ordering::Relaxed);
+            self.build_udp(dst_ip, src_ip, dst_port, src_port, udp.payload())
         }
     }
 

@@ -107,6 +107,7 @@ elided_lifetimes_in_paths = "warn"
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
 
 # pedantic noise allowances (keep safety & structure strict)
 missing_errors_doc = "allow"
@@ -118,14 +119,24 @@ cast_possible_truncation = "allow"
 cast_precision_loss = "allow"
 module_name_repetitions = "allow"
 
-# dipertahankan
+# code hygiene & complexity
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+too_many_lines = "warn"
 cognitive_complexity = "warn"
 trivially_copy_pass_by_ref = "warn"
 inefficient_to_string = "warn"
 implicit_clone = "warn"
+redundant_clone = "warn"
+large_types_passed_by_value = "warn"
+needless_pass_by_value = "warn"
+large_stack_arrays = "warn"
+large_stack_frames = "warn"
+format_push_string = "warn"
+rc_buffer = "warn"
+box_collection = "warn"
+significant_drop_tightening = "warn"
 
 # match / enum
 wildcard_in_or_patterns = "deny"
@@ -139,26 +150,21 @@ fn_params_excessive_bools = "warn"
 
 # async / lock
 await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
 large_futures = "warn"
 
-# anti-crash
+# anti-crash & destructor safety
 unwrap_used = "deny"
 expect_used = "warn"
 panic = "warn"
 indexing_slicing = "warn"
+exit = "deny"
+mem_forget = "warn"
+
+# TUI / logging hygiene
+print_stdout = "warn"
+print_stderr = "warn"
 
 # unsafe
 undocumented_unsafe_blocks = "deny"
 
-#misc
-nursery = { level = "warn", priority = -1 }
-
-redundant_clone = "warn"
-large_types_passed_by_value = "warn"
-needless_pass_by_value = "warn"
-large_stack_arrays = "warn"
-large_stack_frames = "warn"
-format_push_string = "warn"
-rc_buffer = "warn"
-box_collection = "warn"
-significant_drop_tightening = "warn"

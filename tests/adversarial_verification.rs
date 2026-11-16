@@ -11,10 +11,9 @@
     clippy::large_futures,
     clippy::type_complexity,
     clippy::wildcard_enum_match_arm,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
+    clippy::too_many_arguments
 )]
+#![warn(clippy::too_many_lines, clippy::cognitive_complexity)]
 
 mod common;
 

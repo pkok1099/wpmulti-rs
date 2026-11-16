@@ -1448,82 +1448,73 @@ fn test_fqdn_trailing_dot_parity_between_router_and_dns() {
     assert!(build_query(" example.com ", QueryType::A, 1).is_err());
 }
 
-#[tokio::test]
-async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
-    struct FallbackMockTarget {
-        dns_calls: AtomicUsize,
-        dialed_addrs: parking_lot::Mutex<Vec<SocketAddr>>,
-        ips: Vec<IpAddr>,
-    }
+struct FallbackMockTarget {
+    dns_calls: AtomicUsize,
+    dialed_addrs: parking_lot::Mutex<Vec<SocketAddr>>,
+    ips: Vec<IpAddr>,
+}
 
-    impl ProxyTunnelTarget for FallbackMockTarget {
-        fn tcp_connect<'a>(
-            &'a self,
-            dst: SocketAddr,
-        ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
-            self.dialed_addrs.lock().push(dst);
-            let first_ip = self.ips[0];
-            Box::pin(async move {
-                if dst.ip() == first_ip {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        "first IP unreachable",
-                    ));
-                }
-                let stream = TcpStream::connect(dst).await?;
-                Ok(Box::new(stream) as DynStream)
-            })
-        }
-
-        fn udp_bind<'a>(
-            &'a self,
-            _local_port: u16,
-        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>>
-        {
-            Box::pin(async { Err(io::Error::other("unused")) })
-        }
-
-        fn resolve_in_tunnel<'a>(
-            &'a self,
-            _domain: &'a str,
-        ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
-            Box::pin(async {
-                panic!(
-                    "resolve_in_tunnel must not be called; zero-TOCTOU uses resolve_all_in_tunnel once"
-                )
-            })
-        }
-
-        fn resolve_all_in_tunnel<'a>(
-            &'a self,
-            _domain: &'a str,
-        ) -> crate::proxy::router::ResolveAllFut<'a> {
-            self.dns_calls.fetch_add(1, Ordering::SeqCst);
-            let ips = self.ips.clone();
-            Box::pin(async move { Ok(ips) })
+impl FallbackMockTarget {
+    fn new(ips: Vec<IpAddr>) -> Self {
+        Self {
+            dns_calls: AtomicUsize::new(0),
+            dialed_addrs: parking_lot::Mutex::new(Vec::new()),
+            ips,
         }
     }
+}
 
-    let echo_addr = spawn_echo_tcp_server().await;
-    let first_ip: IpAddr = "198.51.100.10".parse().unwrap();
-    let second_ip = echo_addr.ip();
+impl ProxyTunnelTarget for FallbackMockTarget {
+    fn tcp_connect<'a>(
+        &'a self,
+        dst: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
+        self.dialed_addrs.lock().push(dst);
+        let first_ip = self.ips[0];
+        Box::pin(async move {
+            if dst.ip() == first_ip {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "first IP unreachable",
+                ));
+            }
+            let stream = TcpStream::connect(dst).await?;
+            Ok(Box::new(stream) as DynStream)
+        })
+    }
 
-    let mock = Arc::new(FallbackMockTarget {
-        dns_calls: AtomicUsize::new(0),
-        dialed_addrs: parking_lot::Mutex::new(Vec::new()),
-        ips: vec![first_ip, second_ip],
-    });
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
-        "fallback-tun",
-        Arc::clone(&mock) as Arc<dyn ProxyTunnelTarget>,
-        None,
-    ));
+    fn udp_bind<'a>(
+        &'a self,
+        _local_port: u16,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
+        Box::pin(async { Err(io::Error::other("unused")) })
+    }
 
-    // 1. SOCKS5 CONNECT: single DNS lookup, fails first_ip, falls back to second_ip
+    fn resolve_in_tunnel<'a>(
+        &'a self,
+        _domain: &'a str,
+    ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
+        Box::pin(async {
+            panic!(
+                "resolve_in_tunnel must not be called; zero-TOCTOU uses resolve_all_in_tunnel once"
+            )
+        })
+    }
+
+    fn resolve_all_in_tunnel<'a>(
+        &'a self,
+        _domain: &'a str,
+    ) -> crate::proxy::router::ResolveAllFut<'a> {
+        self.dns_calls.fetch_add(1, Ordering::SeqCst);
+        let ips = self.ips.clone();
+        Box::pin(async move { Ok(ips) })
+    }
+}
+
+async fn assert_socks5_fallback_connect(router: Arc<dyn TunnelRouter>, domain: &[u8], port: u16) {
     let (mut client, server) = tokio::io::duplex(2048);
-    let r_s5 = Arc::clone(&router);
     tokio::spawn(async move {
-        let _ = handle_socks5(server, r_s5).await;
+        let _ = handle_socks5(server, router).await;
     });
     client
         .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
@@ -1532,7 +1523,6 @@ async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
     let mut g_resp = [0u8; 2];
     client.read_exact(&mut g_resp).await.unwrap();
 
-    let domain = b"multi-ip.example.com";
     let mut cmd = vec![
         SOCKS5_VERSION,
         CMD_CONNECT,
@@ -1541,7 +1531,7 @@ async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
         domain.len() as u8,
     ];
     cmd.extend_from_slice(domain);
-    cmd.extend_from_slice(&echo_addr.port().to_be_bytes());
+    cmd.extend_from_slice(&port.to_be_bytes());
     client.write_all(&cmd).await.unwrap();
 
     let mut reply_hdr = [0u8; 4];
@@ -1553,7 +1543,45 @@ async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
     let mut pong = [0u8; 4];
     client.read_exact(&mut pong).await.unwrap();
     assert_eq!(&pong, b"ping");
+}
 
+async fn assert_http_connect_fallback(router: Arc<dyn TunnelRouter>, port: u16) {
+    let (mut h_client, h_server) = tokio::io::duplex(2048);
+    tokio::spawn(async move {
+        let _ = handle_http(h_server, router).await;
+    });
+    let connect_req = format!(
+        "CONNECT multi-ip.example.com:{port} HTTP/1.1\r\nHost: multi-ip.example.com:{port}\r\n\r\n"
+    );
+    h_client.write_all(connect_req.as_bytes()).await.unwrap();
+    let (status, _, _, _) = read_http_headers_helper(&mut h_client).await.unwrap();
+    assert_eq!(status, 200);
+    h_client.write_all(b"http").await.unwrap();
+    let mut hpong = [0u8; 4];
+    h_client.read_exact(&mut hpong).await.unwrap();
+    assert_eq!(&hpong, b"http");
+}
+
+#[tokio::test]
+async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
+    let echo_addr = spawn_echo_tcp_server().await;
+    let first_ip: IpAddr = "198.51.100.10".parse().unwrap();
+    let second_ip = echo_addr.ip();
+
+    let mock = Arc::new(FallbackMockTarget::new(vec![first_ip, second_ip]));
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "fallback-tun",
+        Arc::clone(&mock) as Arc<dyn ProxyTunnelTarget>,
+        None,
+    ));
+
+    // 1. SOCKS5 CONNECT: single DNS lookup, fails first_ip, falls back to second_ip
+    assert_socks5_fallback_connect(
+        Arc::clone(&router),
+        b"multi-ip.example.com",
+        echo_addr.port(),
+    )
+    .await;
     assert_eq!(mock.dns_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         *mock.dialed_addrs.lock(),
@@ -1565,23 +1593,7 @@ async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
 
     // 2. HTTP CONNECT: single DNS lookup, fails first_ip, falls back to second_ip
     mock.dialed_addrs.lock().clear();
-    let (mut h_client, h_server) = tokio::io::duplex(2048);
-    let r_http = Arc::clone(&router);
-    tokio::spawn(async move {
-        let _ = handle_http(h_server, r_http).await;
-    });
-    let connect_req = format!(
-        "CONNECT multi-ip.example.com:{p} HTTP/1.1\r\nHost: multi-ip.example.com:{p}\r\n\r\n",
-        p = echo_addr.port()
-    );
-    h_client.write_all(connect_req.as_bytes()).await.unwrap();
-    let (status, _, _, _) = read_http_headers_helper(&mut h_client).await.unwrap();
-    assert_eq!(status, 200);
-    h_client.write_all(b"http").await.unwrap();
-    let mut hpong = [0u8; 4];
-    h_client.read_exact(&mut hpong).await.unwrap();
-    assert_eq!(&hpong, b"http");
-
+    assert_http_connect_fallback(Arc::clone(&router), echo_addr.port()).await;
     assert_eq!(mock.dns_calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         *mock.dialed_addrs.lock(),
@@ -1594,11 +1606,7 @@ async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
     // 3. HTTP forward proxy: single DNS lookup, fails first_ip, falls back to second_ip
     let http_srv = spawn_mock_http_server("multi_ip_http_ok").await;
     let first_http_ip: IpAddr = "198.51.100.11".parse().unwrap();
-    let mock_fwd = Arc::new(FallbackMockTarget {
-        dns_calls: AtomicUsize::new(0),
-        dialed_addrs: parking_lot::Mutex::new(Vec::new()),
-        ips: vec![first_http_ip, http_srv.ip()],
-    });
+    let mock_fwd = Arc::new(FallbackMockTarget::new(vec![first_http_ip, http_srv.ip()]));
     let r_fwd: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
         "fallback-fwd",
         Arc::clone(&mock_fwd) as Arc<dyn ProxyTunnelTarget>,

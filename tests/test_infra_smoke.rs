@@ -11,10 +11,9 @@
     clippy::large_futures,
     clippy::type_complexity,
     clippy::wildcard_enum_match_arm,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
+    clippy::too_many_arguments
 )]
+#![warn(clippy::too_many_lines, clippy::cognitive_complexity)]
 
 mod common;
 
@@ -42,30 +41,11 @@ use zerocopy::IntoBytes;
 // Test 1: Mock WireGuard Peer — Noise IK Handshake & L3 IP Engine
 // -----------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_mock_peer_handshake_and_l3_echo() {
-    let mock = MockWireGuardPeer::start_ephemeral()
-        .await
-        .expect("Failed to start ephemeral mock peer");
-    let peer_endpoint = mock.endpoint();
-    let peer_pubkey = mock.public_key();
-
-    // Setup client WireGuard tunnel using gotatun
-    let client_secret = x25519::StaticSecret::from(rand::random::<[u8; 32]>());
-    let mut client_tunn = Tunn::new(
-        client_secret,
-        x25519::PublicKey::from(peer_pubkey),
-        None,
-        None,
-        IndexTable::from_os_rng(),
-        Arc::new(RateLimiter::new(&x25519::PublicKey::from(peer_pubkey), 100)),
-    );
-
-    let client_socket = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind client UDP socket");
-
-    // Send Handshake Initiation
+async fn perform_mock_handshake(
+    client_tunn: &mut Tunn,
+    client_socket: &UdpSocket,
+    peer_endpoint: SocketAddr,
+) {
     let init = client_tunn
         .format_handshake_initiation(false)
         .expect("Failed to format handshake initiation");
@@ -75,20 +55,16 @@ async fn test_mock_peer_handshake_and_l3_echo() {
         .await
         .expect("Failed to send handshake init");
 
-    // Receive Handshake Response
     let mut resp_buf = vec![0u8; 1500];
     let (n, _) = client_socket
         .recv_from(&mut resp_buf)
         .await
         .expect("Failed to receive handshake resp");
-
     let resp_packet = Packet::copy_from(&resp_buf[..n])
         .try_into_wg()
         .expect("Failed to parse WG packet");
-    let tunn_res = client_tunn.handle_incoming_packet(resp_packet);
 
-    // Initial handshake response triggers a keepalive to complete handshake
-    if let TunnResult::WriteToNetwork(pkt) = tunn_res {
+    if let TunnResult::WriteToNetwork(pkt) = client_tunn.handle_incoming_packet(resp_packet) {
         let keepalive_bytes = match pkt {
             WgKind::Data(d) => d.into_bytes().as_ref().to_vec(),
             _ => panic!("Expected Data/Keepalive packet from client"),
@@ -98,68 +74,82 @@ async fn test_mock_peer_handshake_and_l3_echo() {
             .await
             .expect("Failed to send keepalive");
     }
+}
 
-    // Verify mock peer oracles
-    assert_eq!(mock.stats().handshakes_received.load(Ordering::SeqCst), 1);
-    assert_eq!(mock.stats().handshakes_completed.load(Ordering::SeqCst), 1);
+async fn exchange_tunnel_packet(
+    client_tunn: &mut Tunn,
+    client_socket: &UdpSocket,
+    peer_endpoint: SocketAddr,
+    ip_packet: &[u8],
+) -> Vec<u8> {
+    let encap = client_tunn
+        .encapsulate_with_session(Packet::copy_from(ip_packet))
+        .expect("Failed to encapsulate IP packet");
+    let encap_bytes = encap.into_bytes();
+    client_socket
+        .send_to(encap_bytes.as_ref(), peer_endpoint)
+        .await
+        .expect("Failed to send encap packet");
 
-    // --- Subtest: In-Tunnel UDP Echo ---
+    let mut resp_buf = vec![0u8; 1500];
+    let (n, _) = client_socket
+        .recv_from(&mut resp_buf)
+        .await
+        .expect("Failed to receive echo response");
+    let resp_wg = Packet::copy_from(&resp_buf[..n])
+        .try_into_wg()
+        .expect("Failed to parse WG response");
+
+    match client_tunn.handle_incoming_packet(resp_wg) {
+        TunnResult::WriteToTunnel(decrypted_ip) => decrypted_ip.as_ref().to_vec(),
+        other => panic!("Expected WriteToTunnel, got {:?}", other),
+    }
+}
+
+fn build_example_dns_query(tx_id: u16) -> Vec<u8> {
+    let mut dns_query = Vec::new();
+    dns_query.extend_from_slice(&tx_id.to_be_bytes());
+    dns_query.extend_from_slice(&0x0100u16.to_be_bytes());
+    dns_query.extend_from_slice(&1u16.to_be_bytes());
+    dns_query.extend_from_slice(&0u16.to_be_bytes());
+    dns_query.extend_from_slice(&0u16.to_be_bytes());
+    dns_query.extend_from_slice(&0u16.to_be_bytes());
+    dns_query.extend_from_slice(b"\x07example\x03com\x00");
+    dns_query.extend_from_slice(&1u16.to_be_bytes());
+    dns_query.extend_from_slice(&1u16.to_be_bytes());
+    dns_query
+}
+
+async fn verify_mock_udp_and_dns(
+    client_tunn: &mut Tunn,
+    client_socket: &UdpSocket,
+    peer_endpoint: SocketAddr,
+    mock: &MockWireGuardPeer,
+) {
     let client_ipv4 = Ipv4Addr::new(10, 0, 0, 2);
     let server_ipv4 = Ipv4Addr::new(10, 0, 0, 1);
-    let echo_payload = b"test_wireguard_udp_echo_payload";
 
+    // In-Tunnel UDP Echo
+    let echo_payload = b"test_wireguard_udp_echo_payload";
     let mut udp_pkt_buf = Vec::new();
     let b = PacketBuilder::ipv4(client_ipv4.octets(), server_ipv4.octets(), 64).udp(12345, 9999);
     udp_pkt_buf.reserve(b.size(echo_payload.len()));
     b.write(&mut udp_pkt_buf, echo_payload)
         .expect("Failed to build UDP packet");
 
-    let encap = client_tunn
-        .encapsulate_with_session(Packet::copy_from(udp_pkt_buf.as_slice()))
-        .expect("Failed to encapsulate UDP packet");
-    let encap_bytes = encap.into_bytes();
-    client_socket
-        .send_to(encap_bytes.as_ref(), peer_endpoint)
-        .await
-        .expect("Failed to send encap UDP");
-
-    // Receive echoed UDP packet from mock peer
-    let (n, _) = client_socket
-        .recv_from(&mut resp_buf)
-        .await
-        .expect("Failed to receive echo response");
-    let echo_wg = Packet::copy_from(&resp_buf[..n])
-        .try_into_wg()
-        .expect("Failed to parse echoed WG packet");
-
-    match client_tunn.handle_incoming_packet(echo_wg) {
-        TunnResult::WriteToTunnel(decrypted_ip) => {
-            let sliced = etherparse::SlicedPacket::from_ip(decrypted_ip.as_ref())
-                .expect("Failed to slice decrypted IP packet");
-            let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
-                panic!("Expected UDP transport");
-            };
-            assert_eq!(udp.payload(), echo_payload);
-        }
-        other => panic!("Expected WriteToTunnel from echoed UDP, got {:?}", other),
-    }
-
+    let decrypted_udp =
+        exchange_tunnel_packet(client_tunn, client_socket, peer_endpoint, &udp_pkt_buf).await;
+    let sliced = etherparse::SlicedPacket::from_ip(&decrypted_udp)
+        .expect("Failed to slice decrypted IP packet");
+    let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
+        panic!("Expected UDP transport");
+    };
+    assert_eq!(udp.payload(), echo_payload);
     assert!(mock.stats().udp_echo_packets.load(Ordering::SeqCst) >= 1);
     assert!(mock.stats().ipv4_packets.load(Ordering::SeqCst) >= 1);
 
-    // --- Subtest: In-Tunnel RFC 1035 UDP DNS Query on Port 53 ---
-    let mut dns_query = Vec::new();
-    dns_query.extend_from_slice(&0x1234u16.to_be_bytes()); // TxID
-    dns_query.extend_from_slice(&0x0100u16.to_be_bytes()); // Flags: Standard query, recursion desired
-    dns_query.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT: 1
-    dns_query.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT: 0
-    dns_query.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT: 0
-    dns_query.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT: 0
-    // QNAME: \x07example\x03com\x00
-    dns_query.extend_from_slice(b"\x07example\x03com\x00");
-    dns_query.extend_from_slice(&1u16.to_be_bytes()); // QTYPE: A (1)
-    dns_query.extend_from_slice(&1u16.to_be_bytes()); // QCLASS: IN (1)
-
+    // In-Tunnel RFC 1035 UDP DNS Query on Port 53
+    let dns_query = build_example_dns_query(0x1234);
     let mut dns_ip_buf = Vec::new();
     let b_dns = PacketBuilder::ipv4(client_ipv4.octets(), server_ipv4.octets(), 64).udp(54321, 53);
     dns_ip_buf.reserve(b_dns.size(dns_query.len()));
@@ -167,43 +157,30 @@ async fn test_mock_peer_handshake_and_l3_echo() {
         .write(&mut dns_ip_buf, &dns_query)
         .expect("Failed to build DNS packet");
 
-    let encap_dns = client_tunn
-        .encapsulate_with_session(Packet::copy_from(dns_ip_buf.as_slice()))
-        .expect("Failed to encapsulate DNS packet");
-    let encap_dns_bytes = encap_dns.into_bytes();
-    client_socket
-        .send_to(encap_dns_bytes.as_ref(), peer_endpoint)
-        .await
-        .expect("Failed to send encap DNS");
-
-    let (n, _) = client_socket
-        .recv_from(&mut resp_buf)
-        .await
-        .expect("Failed to receive DNS response");
-    let dns_wg = Packet::copy_from(&resp_buf[..n])
-        .try_into_wg()
-        .expect("Failed to parse DNS WG packet");
-
-    match client_tunn.handle_incoming_packet(dns_wg) {
-        TunnResult::WriteToTunnel(decrypted_ip) => {
-            let sliced = etherparse::SlicedPacket::from_ip(decrypted_ip.as_ref())
-                .expect("Failed to slice decrypted DNS packet");
-            let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
-                panic!("Expected UDP transport");
-            };
-            let dns_payload = udp.payload();
-            assert!(dns_payload.len() >= 12);
-            assert_eq!(&dns_payload[0..2], &0x1234u16.to_be_bytes()); // TxID matches
-            let flags = u16::from_be_bytes([dns_payload[2], dns_payload[3]]);
-            assert_eq!(flags, 0x8180); // Response, NoError
-            assert_eq!(u16::from_be_bytes([dns_payload[6], dns_payload[7]]), 1); // ANCOUNT: 1
-        }
-        other => panic!("Expected WriteToTunnel from DNS, got {:?}", other),
-    }
-
+    let decrypted_dns =
+        exchange_tunnel_packet(client_tunn, client_socket, peer_endpoint, &dns_ip_buf).await;
+    let sliced_dns = etherparse::SlicedPacket::from_ip(&decrypted_dns)
+        .expect("Failed to slice decrypted DNS packet");
+    let Some(etherparse::TransportSlice::Udp(udp_dns)) = sliced_dns.transport else {
+        panic!("Expected UDP transport");
+    };
+    let dns_payload = udp_dns.payload();
+    assert!(dns_payload.len() >= 12);
+    assert_eq!(&dns_payload[0..2], &0x1234u16.to_be_bytes());
+    assert_eq!(u16::from_be_bytes([dns_payload[2], dns_payload[3]]), 0x8180);
+    assert_eq!(u16::from_be_bytes([dns_payload[6], dns_payload[7]]), 1);
     assert_eq!(mock.stats().dns_queries_answered.load(Ordering::SeqCst), 1);
+}
 
-    // --- Subtest: In-Tunnel TCP SYN & Echo ---
+async fn verify_mock_tcp_echo(
+    client_tunn: &mut Tunn,
+    client_socket: &UdpSocket,
+    peer_endpoint: SocketAddr,
+    mock: &MockWireGuardPeer,
+) {
+    let client_ipv4 = Ipv4Addr::new(10, 0, 0, 2);
+    let server_ipv4 = Ipv4Addr::new(10, 0, 0, 1);
+
     let mut syn_buf = Vec::new();
     let b_syn = PacketBuilder::ipv4(client_ipv4.octets(), server_ipv4.octets(), 64)
         .tcp(23456, 8080, 100, 65535)
@@ -211,40 +188,19 @@ async fn test_mock_peer_handshake_and_l3_echo() {
     syn_buf.reserve(b_syn.size(0));
     b_syn.write(&mut syn_buf, &[]).expect("Failed to build SYN");
 
-    let encap_syn = client_tunn
-        .encapsulate_with_session(Packet::copy_from(syn_buf.as_slice()))
-        .expect("Failed to encapsulate SYN");
-    let encap_syn_bytes = encap_syn.into_bytes();
-    client_socket
-        .send_to(encap_syn_bytes.as_ref(), peer_endpoint)
-        .await
-        .expect("Failed to send SYN");
-
-    let (n, _) = client_socket
-        .recv_from(&mut resp_buf)
-        .await
-        .expect("Failed to receive SYN/ACK");
-    let synack_wg = Packet::copy_from(&resp_buf[..n])
-        .try_into_wg()
-        .expect("Failed to parse SYN/ACK");
-
-    let server_isn = match client_tunn.handle_incoming_packet(synack_wg) {
-        TunnResult::WriteToTunnel(decrypted_ip) => {
-            let sliced = etherparse::SlicedPacket::from_ip(decrypted_ip.as_ref())
-                .expect("Failed to slice decrypted SYN/ACK");
-            if let Some(etherparse::TransportSlice::Tcp(tcp)) = sliced.transport {
-                assert!(tcp.syn() && tcp.ack());
-                assert_eq!(tcp.acknowledgment_number(), 101); // 100 + 1
-                tcp.sequence_number()
-            } else {
-                panic!("Expected TCP slice in SYN/ACK");
-            }
-        }
-        other => panic!("Expected WriteToTunnel from SYN/ACK, got {:?}", other),
+    let synack_ip =
+        exchange_tunnel_packet(client_tunn, client_socket, peer_endpoint, &syn_buf).await;
+    let sliced =
+        etherparse::SlicedPacket::from_ip(&synack_ip).expect("Failed to slice decrypted SYN/ACK");
+    let server_isn = if let Some(etherparse::TransportSlice::Tcp(tcp)) = sliced.transport {
+        assert!(tcp.syn() && tcp.ack());
+        assert_eq!(tcp.acknowledgment_number(), 101);
+        tcp.sequence_number()
+    } else {
+        panic!("Expected TCP slice in SYN/ACK");
     };
     assert_eq!(mock.stats().tcp_syn_received.load(Ordering::SeqCst), 1);
 
-    // Send TCP Data: PSH | ACK
     let tcp_payload = b"hello_in_tunnel_tcp_echo";
     let mut data_buf = Vec::new();
     let b_data = PacketBuilder::ipv4(client_ipv4.octets(), server_ipv4.octets(), 64)
@@ -256,51 +212,70 @@ async fn test_mock_peer_handshake_and_l3_echo() {
         .write(&mut data_buf, tcp_payload)
         .expect("Failed to build TCP Data");
 
-    let encap_data = client_tunn
-        .encapsulate_with_session(Packet::copy_from(data_buf.as_slice()))
-        .expect("Failed to encapsulate TCP Data");
-    let encap_data_bytes = encap_data.into_bytes();
-    client_socket
-        .send_to(encap_data_bytes.as_ref(), peer_endpoint)
-        .await
-        .expect("Failed to send TCP Data");
-
-    let (n, _) = client_socket
-        .recv_from(&mut resp_buf)
-        .await
-        .expect("Failed to receive TCP Echo");
-    let echo_wg = Packet::copy_from(&resp_buf[..n])
-        .try_into_wg()
-        .expect("Failed to parse TCP Echo");
-
-    match client_tunn.handle_incoming_packet(echo_wg) {
-        TunnResult::WriteToTunnel(decrypted_ip) => {
-            let sliced = etherparse::SlicedPacket::from_ip(decrypted_ip.as_ref())
-                .expect("Failed to slice decrypted TCP Echo");
-            let Some(etherparse::TransportSlice::Tcp(tcp)) = sliced.transport else {
-                panic!("Expected TCP transport");
-            };
-            assert_eq!(tcp.payload(), tcp_payload);
-        }
-        other => panic!("Expected WriteToTunnel from TCP Echo, got {:?}", other),
-    }
-
+    let tcp_echo_ip =
+        exchange_tunnel_packet(client_tunn, client_socket, peer_endpoint, &data_buf).await;
+    let sliced_echo = etherparse::SlicedPacket::from_ip(&tcp_echo_ip)
+        .expect("Failed to slice decrypted TCP Echo");
+    let Some(etherparse::TransportSlice::Tcp(tcp)) = sliced_echo.transport else {
+        panic!("Expected TCP transport");
+    };
+    assert_eq!(tcp.payload(), tcp_payload);
     assert_eq!(
         mock.stats().tcp_bytes_echoed.load(Ordering::SeqCst),
         tcp_payload.len() as u64
     );
+}
 
-    // --- Subtest: In-Tunnel IPv6 UDP Echo ---
+#[tokio::test]
+async fn test_mock_peer_handshake_and_l3_echo() {
+    let mock = MockWireGuardPeer::start_ephemeral()
+        .await
+        .expect("Failed to start ephemeral mock peer");
+    let peer_endpoint = mock.endpoint();
+    let peer_pubkey = mock.public_key();
+
+    let client_secret = x25519::StaticSecret::from(rand::random::<[u8; 32]>());
+    let mut client_tunn = Tunn::new(
+        client_secret,
+        x25519::PublicKey::from(peer_pubkey),
+        None,
+        None,
+        IndexTable::from_os_rng(),
+        Arc::new(RateLimiter::new(&x25519::PublicKey::from(peer_pubkey), 100)),
+    );
+    let client_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind client UDP socket");
+
+    perform_mock_handshake(&mut client_tunn, &client_socket, peer_endpoint).await;
+    assert_eq!(mock.stats().handshakes_received.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.stats().handshakes_completed.load(Ordering::SeqCst), 1);
+
+    verify_mock_udp_and_dns(&mut client_tunn, &client_socket, peer_endpoint, &mock).await;
+    verify_mock_tcp_echo(&mut client_tunn, &client_socket, peer_endpoint, &mock).await;
+
+    // In-Tunnel IPv6 UDP Echo
     let client_ipv6: Ipv6Addr = "fd00::2".parse().unwrap();
     let server_ipv6: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
     let echo_v6_payload = b"ipv6_test_payload";
-
     let mut udp_v6_buf = Vec::new();
     let b_v6 = PacketBuilder::ipv6(client_ipv6.octets(), server_ipv6.octets(), 64).udp(12346, 9998);
     udp_v6_buf.reserve(b_v6.size(echo_v6_payload.len()));
     b_v6.write(&mut udp_v6_buf, echo_v6_payload)
         .expect("Failed to build IPv6 UDP packet");
 
+    let decrypted_v6 =
+        exchange_tunnel_packet(&mut client_tunn, &client_socket, peer_endpoint, &udp_v6_buf).await;
+    let sliced_v6 = etherparse::SlicedPacket::from_ip(&decrypted_v6)
+        .expect("Failed to slice decrypted IPv6 packet");
+    let Some(etherparse::TransportSlice::Udp(udp_v6)) = sliced_v6.transport else {
+        panic!("Expected UDP transport");
+    };
+    assert_eq!(udp_v6.payload(), echo_v6_payload);
+    assert_eq!(mock.stats().ipv6_packets.load(Ordering::SeqCst), 1);
+
+    // Fault-Injection Control (drop_data)
+    mock.controls().drop_data.store(true, Ordering::SeqCst);
     let encap_v6 = client_tunn
         .encapsulate_with_session(Packet::copy_from(udp_v6_buf.as_slice()))
         .expect("Failed to encapsulate IPv6 UDP packet");
@@ -308,39 +283,9 @@ async fn test_mock_peer_handshake_and_l3_echo() {
     client_socket
         .send_to(encap_v6_bytes.as_ref(), peer_endpoint)
         .await
-        .expect("Failed to send encap IPv6 UDP");
-
-    let (n, _) = client_socket
-        .recv_from(&mut resp_buf)
-        .await
-        .expect("Failed to receive IPv6 echo response");
-    let echo_v6_wg = Packet::copy_from(&resp_buf[..n])
-        .try_into_wg()
-        .expect("Failed to parse echoed IPv6 WG packet");
-
-    match client_tunn.handle_incoming_packet(echo_v6_wg) {
-        TunnResult::WriteToTunnel(decrypted_ip) => {
-            let sliced = etherparse::SlicedPacket::from_ip(decrypted_ip.as_ref())
-                .expect("Failed to slice decrypted IPv6 packet");
-            let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
-                panic!("Expected UDP transport");
-            };
-            assert_eq!(udp.payload(), echo_v6_payload);
-        }
-        other => panic!(
-            "Expected WriteToTunnel from echoed IPv6 UDP, got {:?}",
-            other
-        ),
-    }
-    assert_eq!(mock.stats().ipv6_packets.load(Ordering::SeqCst), 1);
-
-    // --- Subtest: Fault-Injection Control (drop_data) ---
-    mock.controls().drop_data.store(true, Ordering::SeqCst);
-    client_socket
-        .send_to(encap_v6_bytes.as_ref(), peer_endpoint)
-        .await
         .expect("Failed to send encap data");
 
+    let mut resp_buf = vec![0u8; 1500];
     let timeout_res = tokio::time::timeout(
         Duration::from_millis(80),
         client_socket.recv_from(&mut resp_buf),

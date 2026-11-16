@@ -11,11 +11,10 @@
         clippy::wildcard_enum_match_arm,
         clippy::large_futures,
         clippy::type_complexity,
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        clippy::cognitive_complexity
+        clippy::too_many_arguments
     )
 )]
+#![cfg_attr(test, warn(clippy::too_many_lines, clippy::cognitive_complexity))]
 
 pub mod api;
 pub mod cli;

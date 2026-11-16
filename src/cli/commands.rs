@@ -1,6 +1,7 @@
 //! Command handlers for the `wpmulti` CLI.
 
 use std::fs;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -281,8 +282,10 @@ pub fn cmd_validate(
     };
 
     let count = tunnels.len();
-    println!("Configuration valid.");
-    println!(
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "Configuration valid.");
+    let _ = writeln!(
+        out,
         "Found {} valid WireGuard tunnel configuration(s) in '{}'.",
         count,
         config.global.config_dir.display()
@@ -303,7 +306,11 @@ pub async fn cmd_status(
     let val: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| format!("Failed to parse JSON response: {e}"))?;
 
-    println!("{}", serde_json::to_string_pretty(&val)?);
+    let _ = writeln!(
+        std::io::stdout().lock(),
+        "{}",
+        serde_json::to_string_pretty(&val)?
+    );
     Ok(val)
 }
 
@@ -349,7 +356,10 @@ pub async fn cmd_toggle_tunnels(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let action = if disabled { "Disabled" } else { "Enabled" };
-    println!("{action} {count} tunnel(s) matching '{target}'.");
+    let _ = writeln!(
+        std::io::stdout().lock(),
+        "{action} {count} tunnel(s) matching '{target}'."
+    );
     Ok(())
 }
 
@@ -551,7 +561,10 @@ pub async fn cmd_probe(
     };
 
     if configs_with_path.is_empty() {
-        println!("No tunnel configurations found to probe.");
+        let _ = writeln!(
+            std::io::stdout().lock(),
+            "No tunnel configurations found to probe."
+        );
         return Ok(Vec::new());
     }
 
@@ -578,7 +591,11 @@ pub async fn cmd_probe(
     let results: Vec<ProbeResult> = indexed_results.into_iter().map(|(_, r)| r).collect();
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        let _ = writeln!(
+            std::io::stdout().lock(),
+            "{}",
+            serde_json::to_string_pretty(&results)?
+        );
     } else {
         print_probe_table(&results);
     }
@@ -587,13 +604,17 @@ pub async fn cmd_probe(
 }
 
 fn print_probe_table(results: &[ProbeResult]) {
-    println!(
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(
+        out,
         "┌──────────┬──────────────────────┬─────────────┬────────────────┬────────────────────────┐"
     );
-    println!(
+    let _ = writeln!(
+        out,
         "│ STATUS   │ CONFIG               │ RTT         │ EXIT IP        │ ENDPOINT               │"
     );
-    println!(
+    let _ = writeln!(
+        out,
         "├──────────┼──────────────────────┼─────────────┼────────────────┼────────────────────────┤"
     );
 
@@ -619,7 +640,8 @@ fn print_probe_table(results: &[ProbeResult]) {
         let clean_exit: String = exit_ip.chars().filter(|c| !c.is_control()).collect();
         let clean_ep: String = r.endpoint.chars().filter(|c| !c.is_control()).collect();
 
-        println!(
+        let _ = writeln!(
+            out,
             "│ {:<8} │ {:<20} │ {:<11} │ {:<14} │ {:<22} │",
             status,
             truncate_str(&clean_id, 20),
@@ -629,10 +651,12 @@ fn print_probe_table(results: &[ProbeResult]) {
         );
     }
 
-    println!(
+    let _ = writeln!(
+        out,
         "└──────────┴──────────────────────┴─────────────┴────────────────┴────────────────────────┘"
     );
-    println!(
+    let _ = writeln!(
+        out,
         "Probe completed: {} passed, {} failed (total {}).",
         passed,
         failed,
