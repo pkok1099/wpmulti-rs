@@ -21,6 +21,7 @@ fn escape_prometheus_label(val: &str) -> String {
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
+            c if c.is_ascii_control() => out.push(' '),
             other => out.push(other),
         }
     }

@@ -57,6 +57,14 @@ pub fn load_tunnel_config_from_file<P: AsRef<Path>>(path: P) -> Result<TunnelCon
         })?
         .to_string();
 
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.len() > MAX_WG_CONF_BYTES {
+        return Err(ConfigError::WgConf(format!(
+            "File '{}' exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_WG_CONF_BYTES
+        )));
+    }
     let content = std::fs::read_to_string(path)?;
     load_tunnel_config_from_str(id, &content)
 }

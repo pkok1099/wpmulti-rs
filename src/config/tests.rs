@@ -603,3 +603,77 @@ fn test_admin_non_loopback_requires_auth_token() {
         "non-loopback admin.bind with auth_token must pass validation"
     );
 }
+
+#[test]
+fn test_wg_conf_mtu_bounds_duplicate_keys_oversized_and_secret_redaction() {
+    use crate::config::wg_conf::{MAX_WG_CONF_SIZE, MIN_WG_MTU, WgConfError};
+
+    // 1. MTU = 0 or < MIN_WG_MTU (68) must be rejected; MTU = 68 and 65535 accepted
+    for bad_mtu in ["0", "67"] {
+        let conf = format!(
+            "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.2/32\nMTU = {bad_mtu}\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\n"
+        );
+        assert!(
+            matches!(parse_wg_conf(&conf), Err(WgConfError::InvalidMtu { .. })),
+            "MTU {bad_mtu} must be rejected"
+        );
+    }
+    for ok_mtu in [MIN_WG_MTU, 65535] {
+        let conf = format!(
+            "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.2/32\nMTU = {ok_mtu}\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\n"
+        );
+        let (iface, _) = parse_wg_conf(&conf).expect("valid boundary MTU must parse");
+        assert_eq!(iface.mtu, ok_mtu);
+    }
+
+    // 2. Duplicate critical keys must be rejected deterministically
+    let dup_priv = format!(
+        "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\n"
+    );
+    assert!(matches!(
+        parse_wg_conf(&dup_priv),
+        Err(WgConfError::DuplicateKey {
+            key: "PrivateKey",
+            ..
+        })
+    ));
+    let dup_ep = format!(
+        "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\nEndpoint = 1.1.1.2:51820\n"
+    );
+    assert!(matches!(
+        parse_wg_conf(&dup_ep),
+        Err(WgConfError::DuplicateKey {
+            key: "Endpoint",
+            ..
+        })
+    ));
+
+    // 3. Oversized input (> MAX_WG_CONF_SIZE) must be rejected
+    let huge = "#".repeat(MAX_WG_CONF_SIZE + 1);
+    assert!(matches!(
+        parse_wg_conf(&huge),
+        Err(WgConfError::InputTooLarge { .. })
+    ));
+
+    // 4. Secret redaction in Debug output and parse errors
+    let psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let valid_with_psk = format!(
+        "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nPresharedKey = {psk}\nEndpoint = 1.1.1.1:51820\n"
+    );
+    let tunnel = load_tunnel_config_from_str("redact-test", &valid_with_psk).unwrap();
+    let dbg_str = format!("{tunnel:?}");
+    assert!(!dbg_str.contains(VALID_PRIVATE_KEY));
+    assert!(!dbg_str.contains(psk));
+    assert!(dbg_str.contains("[REDACTED]"));
+
+    let malformed_secret_line = format!("PrivateKey {VALID_PRIVATE_KEY}\n[Interface]\n");
+    let err_msg = parse_wg_conf(&malformed_secret_line)
+        .unwrap_err()
+        .to_string();
+    assert!(!err_msg.contains(VALID_PRIVATE_KEY));
+    assert!(err_msg.contains("[REDACTED SECRET LINE]"));
+
+    let bare_long_secret = format!("{VALID_PRIVATE_KEY}\n[Interface]\n");
+    let err_msg2 = parse_wg_conf(&bare_long_secret).unwrap_err().to_string();
+    assert!(!err_msg2.contains(VALID_PRIVATE_KEY));
+}

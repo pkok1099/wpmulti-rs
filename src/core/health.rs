@@ -310,8 +310,13 @@ impl ActiveProber {
         let mut set = tokio::task::JoinSet::new();
 
         for entry in registry.all_entries() {
-            // STRICTLY SKIP LAZY OR DISABLED TUNNELS to guarantee 0% idle CPU and 0 sockets
-            if entry.lifecycle_mode != LifecycleMode::Eager || entry.is_disabled() {
+            // STRICTLY SKIP LAZY, DISABLED, OR NON-ACTIVE TUNNELS
+            if entry.lifecycle_mode != LifecycleMode::Eager
+                || entry.is_disabled()
+                || *entry.state.read() != crate::core::registry::TunnelState::Active
+                || (entry.health.current_status() == HealthStatus::HalfOpen
+                    && !entry.health.can_route())
+            {
                 continue;
             }
 
@@ -325,6 +330,7 @@ impl ActiveProber {
                     }
                 };
 
+                let entry_ref = Arc::clone(&entry);
                 let health = Arc::clone(&entry.health);
                 let stats = Arc::clone(&entry.stats);
                 let threshold = settings.threshold;
@@ -338,6 +344,11 @@ impl ActiveProber {
                     let Ok(_permit) = sem_clone.acquire_owned().await else {
                         return;
                     };
+                    if entry_ref.is_disabled()
+                        || *entry_ref.state.read() != crate::core::registry::TunnelState::Active
+                    {
+                        return;
+                    }
                     let mut succeeded = false;
                     for attempt in 0..MAX_PROBE_ATTEMPTS {
                         let probe_res = tokio::time::timeout(
@@ -377,7 +388,10 @@ impl ActiveProber {
                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         }
                     }
-                    if !succeeded {
+                    if !succeeded
+                        && !entry_ref.is_disabled()
+                        && *entry_ref.state.read() == crate::core::registry::TunnelState::Active
+                    {
                         health.record_failure(threshold, cooldown);
                     }
                 });

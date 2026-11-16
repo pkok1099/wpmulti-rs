@@ -40,22 +40,39 @@ pub const DEFAULT_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 /// Maximum concurrent sockets in `SocketSet` to prevent unbounded buffer allocation.
 pub const MAX_ACTIVE_SOCKETS: usize = 4096;
 
+/// Waker slot index for per-socket shutdown wakeup notifications.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WakerSlot {
+    Recv = 0,
+    Send = 1,
+}
+
 /// Shared inner network stack state protected by a fast synchronous mutex.
 pub struct StackInner {
     pub iface: Interface,
     pub sockets: SocketSet<'static>,
     pub pending_reap: Vec<smoltcp::iface::SocketHandle>,
     pub shutdown: bool,
-    pub shutdown_wakers: Vec<std::task::Waker>,
+    pub shutdown_wakers:
+        std::collections::HashMap<smoltcp::iface::SocketHandle, [Option<std::task::Waker>; 2]>,
 }
 
-/// Register a waker to be notified when the network stack shuts down.
+/// Register a waker to be notified when the network stack shuts down (bounded by active sockets).
 pub(crate) fn register_shutdown_waker(
-    wakers: &mut Vec<std::task::Waker>,
+    wakers: &mut std::collections::HashMap<
+        smoltcp::iface::SocketHandle,
+        [Option<std::task::Waker>; 2],
+    >,
+    handle: smoltcp::iface::SocketHandle,
+    slot: WakerSlot,
     waker: &std::task::Waker,
 ) {
-    if !wakers.iter().any(|w| w.will_wake(waker)) {
-        wakers.push(waker.clone());
+    let entry = wakers.entry(handle).or_insert([None, None]);
+    let idx = slot as usize;
+    if let Some(target) = entry.get_mut(idx)
+        && !target.as_ref().is_some_and(|w| w.will_wake(waker))
+    {
+        *target = Some(waker.clone());
     }
 }
 
@@ -217,7 +234,7 @@ impl VirtualNetworkStack {
             sockets,
             pending_reap: Vec::new(),
             shutdown: false,
-            shutdown_wakers: Vec::new(),
+            shutdown_wakers: std::collections::HashMap::new(),
         }));
 
         // 5. Spawn background reactor event loop
@@ -513,8 +530,10 @@ impl VirtualNetworkStack {
             inner.shutdown = true;
             std::mem::take(&mut inner.shutdown_wakers)
         };
-        for waker in wakers {
-            waker.wake();
+        for pair in wakers.into_values() {
+            for waker in pair.into_iter().flatten() {
+                waker.wake();
+            }
         }
         let _ = self.shutdown_tx.send(true);
         self.notify.notify_one();
@@ -533,8 +552,10 @@ impl Drop for VirtualNetworkStack {
             inner.shutdown = true;
             std::mem::take(&mut inner.shutdown_wakers)
         };
-        for waker in wakers {
-            waker.wake();
+        for pair in wakers.into_values() {
+            for waker in pair.into_iter().flatten() {
+                waker.wake();
+            }
         }
         let _ = self.shutdown_tx.send(true);
         self.notify.notify_one();
@@ -564,12 +585,19 @@ async fn wait_tcp_handshake(
                 "tcp socket handle not found in socket set",
             )));
         }
-        let sock = inner.sockets.get_mut::<TcpSocket<'_>>(handle);
-        let poll_res = match sock.state() {
+        let poll_res = match inner.sockets.get_mut::<TcpSocket<'_>>(handle).state() {
             tcp::State::Established => std::task::Poll::Ready(Ok(())),
             tcp::State::SynSent => {
-                sock.register_send_waker(cx.waker());
-                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                inner
+                    .sockets
+                    .get_mut::<TcpSocket<'_>>(handle)
+                    .register_send_waker(cx.waker());
+                register_shutdown_waker(
+                    &mut inner.shutdown_wakers,
+                    handle,
+                    WakerSlot::Send,
+                    cx.waker(),
+                );
                 std::task::Poll::Pending
             }
             tcp::State::Closed => std::task::Poll::Ready(Err(io::Error::new(
@@ -667,6 +695,7 @@ async fn run_reactor(
                 iface,
                 sockets,
                 pending_reap,
+                shutdown_wakers,
                 ..
             } = &mut *guard;
             let _ = iface.poll(now, &mut device, sockets);
@@ -675,6 +704,7 @@ async fn run_reactor(
                 for handle in pending_reap.drain(..) {
                     let exists = sockets.iter().any(|(h, _)| h == handle);
                     if !exists {
+                        shutdown_wakers.remove(&handle);
                         continue;
                     }
                     let can_remove = match sockets.get::<smoltcp::socket::Socket<'_>>(handle) {
@@ -685,6 +715,7 @@ async fn run_reactor(
                     };
                     if can_remove {
                         sockets.remove(handle);
+                        shutdown_wakers.remove(&handle);
                     } else {
                         still_pending.push(handle);
                     }
@@ -728,6 +759,7 @@ impl Drop for ConnectSocketGuard {
                     sock.abort();
                     inner.sockets.remove(h);
                 }
+                inner.shutdown_wakers.remove(&h);
             }
             self.notify.notify_one();
         }

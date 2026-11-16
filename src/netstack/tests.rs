@@ -953,3 +953,52 @@ fn test_dns_build_query_rejects_control_chars_and_whitespace() {
         Err(DnsError::InvalidDomain(_))
     ));
 }
+
+#[tokio::test]
+async fn test_bridge_recv_skips_malformed_packet_and_recovers() {
+    let (mut bridge, _ip_send, mut ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 16);
+    let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+
+    use smoltcp::phy::{Device, TxToken};
+    let now = smoltcp::time::Instant::now();
+
+    // Inject malformed 3-byte packet first
+    let tx_bad = bridge.transmit(now).unwrap();
+    tx_bad.consume(3, |buf| buf.copy_from_slice(&[0x45, 0x00, 0x00]));
+
+    // Inject valid IPv4 UDP packet second
+    let builder = PacketBuilder::ipv4([10, 2, 0, 2], [1, 1, 1, 1], 64).udp(4567, 53);
+    let mut raw_good = Vec::new();
+    builder.write(&mut raw_good, b"OK").unwrap();
+    let tx_good = bridge.transmit(now).unwrap();
+    tx_good.consume(raw_good.len(), |buf| buf.copy_from_slice(&raw_good));
+
+    use gotatun::tun::IpRecv;
+    let mut packets = ip_recv.recv(&mut pool).await.unwrap();
+    let pkt = packets
+        .next()
+        .expect("valid packet after malformed skipped");
+    use zerocopy::IntoBytes;
+    assert_eq!((*pkt).as_bytes(), &raw_good[..]);
+}
+
+#[tokio::test]
+async fn test_shutdown_wakers_bounded_and_cleaned_on_socket_drop() {
+    let config = make_test_config("10.2.0.5/32", None);
+    let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
+
+    for _ in 0..10 {
+        let udp = stack.udp_bind(0).unwrap();
+        let mut recv_buf = [0u8; 32];
+        let fut = udp.recv_from(&mut recv_buf);
+        let _ = tokio::time::timeout(Duration::from_millis(5), fut).await;
+        drop(udp);
+        assert!(
+            stack.inner().lock().shutdown_wakers.is_empty(),
+            "shutdown_wakers must be cleaned when socket drops"
+        );
+    }
+
+    stack.close().await;
+}

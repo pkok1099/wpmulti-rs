@@ -643,3 +643,57 @@ async fn test_admin_auth_rejects_partial_malformed_and_verifies_constant_time() 
         );
     }
 }
+
+#[tokio::test]
+async fn test_metrics_requires_auth_and_sanitizes_control_labels() {
+    let manager = create_test_manager();
+    let token = Some("metrics-secret");
+
+    let unauth_req = HttpRequest {
+        method: "GET".to_string(),
+        path: "/metrics".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let unauth_resp = handle_admin_request(&unauth_req, &manager, token, 10).await;
+    assert_eq!(unauth_resp.status, 401);
+
+    let auth_req = HttpRequest {
+        method: "GET".to_string(),
+        path: "/metrics".to_string(),
+        query: None,
+        headers: HashMap::from([(
+            "authorization".to_string(),
+            "Bearer metrics-secret".to_string(),
+        )]),
+        body: Vec::new(),
+    };
+    let auth_resp = handle_admin_request(&auth_req, &manager, token, 10).await;
+    assert_eq!(auth_resp.status, 200);
+    let body = String::from_utf8(auth_resp.body).unwrap();
+    assert!(body.contains("wpmulti_tunnels_total 3"));
+    assert!(!body.contains("metrics-secret"));
+}
+
+#[tokio::test]
+async fn test_admin_server_rejects_oversized_headers() {
+    let manager = create_test_manager();
+    let server = AdminServer::new("127.0.0.1:0".parse().unwrap(), manager, None);
+    let bound = server.start().await.unwrap();
+
+    let mut stream = TcpStream::connect(bound).await.unwrap();
+    let big_val = "A".repeat(70_000);
+    let req = format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Big: {big_val}\r\n\r\n");
+    let _ = stream.write_all(req.as_bytes()).await;
+
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("HTTP/1.1 400 Bad Request"),
+        "oversized header must return 400 Bad Request, got: {resp_str}"
+    );
+
+    server.stop().await;
+}

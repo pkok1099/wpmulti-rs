@@ -8,7 +8,13 @@ use base64::prelude::*;
 use ipnetwork::IpNetwork;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::atomic::{Ordering, compiler_fence};
 use x25519_dalek::{PublicKey, StaticSecret};
+
+/// Maximum permitted WireGuard `.conf` input size (1 MiB).
+pub const MAX_WG_CONF_SIZE: usize = 1024 * 1024;
+/// Minimum valid WireGuard IP MTU (RFC 791 IPv4 minimum).
+pub const MIN_WG_MTU: u16 = 68;
 
 /// Complete parsed WireGuard configuration.
 #[derive(Clone)]
@@ -35,10 +41,21 @@ impl std::str::FromStr for WgConfig {
     }
 }
 
+fn read_wg_conf_bounded(path: &Path) -> Result<String, WgConfError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.len() > MAX_WG_CONF_SIZE as u64 {
+        return Err(WgConfError::InputTooLarge {
+            size: usize::try_from(meta.len()).unwrap_or(usize::MAX),
+            max: MAX_WG_CONF_SIZE,
+        });
+    }
+    std::fs::read_to_string(path).map_err(WgConfError::from)
+}
+
 impl WgConfig {
     /// Parse configuration from a filesystem path.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, WgConfError> {
-        let content = std::fs::read_to_string(path)?;
+        let content = read_wg_conf_bounded(path.as_ref())?;
         content.parse()
     }
 }
@@ -95,6 +112,16 @@ pub struct WgPeerConfig {
     pub preshared_key: Option<[u8; 32]>,
     /// Optional NAT keepalive interval in seconds.
     pub persistent_keepalive: Option<u16>,
+}
+
+impl Drop for WgPeerConfig {
+    fn drop(&mut self) {
+        if let Some(ref mut psk) = self.preshared_key {
+            psk.fill(0);
+            compiler_fence(Ordering::SeqCst);
+        }
+        self.preshared_key = None;
+    }
 }
 
 impl std::fmt::Debug for WgPeerConfig {
@@ -193,6 +220,15 @@ pub enum WgConfError {
 
     #[error("no peers configured in WireGuard configuration")]
     NoPeers,
+
+    #[error("WireGuard configuration size ({size} bytes) exceeds maximum allowed ({max} bytes)")]
+    InputTooLarge { size: usize, max: usize },
+
+    #[error("line {line_number}: duplicate '{key}' directive in section")]
+    DuplicateKey {
+        line_number: usize,
+        key: &'static str,
+    },
 }
 
 #[derive(Default)]
@@ -201,6 +237,7 @@ struct InterfaceBuilder {
     addresses: Vec<IpNetwork>,
     dns: Vec<IpAddr>,
     listen_port: Option<u16>,
+    has_listen_port: bool,
     mtu: Option<u16>,
 }
 
@@ -249,7 +286,7 @@ fn decode_32byte_key(
     field: &'static str,
 ) -> Result<[u8; 32], WgConfError> {
     let trimmed = val.trim();
-    let bytes = match BASE64_STANDARD.decode(trimmed) {
+    let mut bytes = match BASE64_STANDARD.decode(trimmed) {
         Ok(b) => b,
         Err(_) if trimmed.len() == 43 => base64::engine::general_purpose::STANDARD_NO_PAD
             .decode(trimmed)
@@ -268,16 +305,21 @@ fn decode_32byte_key(
     };
 
     if bytes.len() != 32 {
+        let actual = bytes.len();
+        bytes.fill(0);
+        compiler_fence(Ordering::SeqCst);
         return Err(WgConfError::InvalidKeyLength {
             line_number,
             field,
             expected: 32,
-            actual: bytes.len(),
+            actual,
         });
     }
 
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes);
+    bytes.fill(0);
+    compiler_fence(Ordering::SeqCst);
     Ok(key)
 }
 
@@ -333,24 +375,19 @@ fn parse_cidr(s: &str, line_number: usize, field: &'static str) -> Result<IpNetw
 
 /// Validate endpoint format: `<host>:<port>`.
 fn validate_endpoint(endpoint: &str, line_number: usize) -> Result<(), WgConfError> {
-    let (_host, port_str) = if endpoint.starts_with('[') {
-        let closing = endpoint
-            .find(']')
-            .ok_or_else(|| WgConfError::InvalidEndpoint {
-                line_number,
-                value: endpoint.to_string(),
-                reason: "unclosed bracket in IPv6 endpoint",
-            })?;
-        let host = &endpoint[1..closing];
-        let rest = &endpoint[closing + 1..];
-        if !rest.starts_with(':') {
+    let (_host, port_str) = if let Some(after_open) = endpoint.strip_prefix('[') {
+        let Some((host, port_str)) = after_open.split_once("]:") else {
+            let reason = if after_open.contains(']') {
+                "missing ':' and port after bracket in IPv6 endpoint"
+            } else {
+                "unclosed bracket in IPv6 endpoint"
+            };
             return Err(WgConfError::InvalidEndpoint {
                 line_number,
                 value: endpoint.to_string(),
-                reason: "missing ':' and port after bracket in IPv6 endpoint",
+                reason,
             });
-        }
-        let port_str = &rest[1..];
+        };
         if host.parse::<std::net::Ipv6Addr>().is_err() {
             return Err(WgConfError::InvalidEndpoint {
                 line_number,
@@ -415,8 +452,16 @@ fn apply_interface_kv(
 ) -> Result<(), WgConfError> {
     match key.to_ascii_lowercase().as_str() {
         "privatekey" => {
-            let key_bytes = decode_32byte_key(val, line_number, "PrivateKey")?;
+            if iface.private_key.is_some() {
+                return Err(WgConfError::DuplicateKey {
+                    line_number,
+                    key: "PrivateKey",
+                });
+            }
+            let mut key_bytes = decode_32byte_key(val, line_number, "PrivateKey")?;
             iface.private_key = Some(StaticSecret::from(key_bytes));
+            key_bytes.fill(0);
+            compiler_fence(Ordering::SeqCst);
         }
         "address" => {
             for token in val.split(',').map(str::trim).filter(|t| !t.is_empty()) {
@@ -435,19 +480,32 @@ fn apply_interface_kv(
             }
         }
         "listenport" if !val.is_empty() => {
+            if iface.has_listen_port {
+                return Err(WgConfError::DuplicateKey {
+                    line_number,
+                    key: "ListenPort",
+                });
+            }
             let port: u16 = val.parse().map_err(|_| WgConfError::InvalidPort {
                 line_number,
                 field: "ListenPort",
                 value: val.to_string(),
             })?;
+            iface.has_listen_port = true;
             iface.listen_port = if port == 0 { None } else { Some(port) };
         }
         "mtu" => {
+            if iface.mtu.is_some() {
+                return Err(WgConfError::DuplicateKey {
+                    line_number,
+                    key: "MTU",
+                });
+            }
             let mtu: u16 = val.parse().map_err(|_| WgConfError::InvalidMtu {
                 line_number,
                 value: val.to_string(),
             })?;
-            if mtu == 0 {
+            if mtu < MIN_WG_MTU {
                 return Err(WgConfError::InvalidMtu {
                     line_number,
                     value: val.to_string(),
@@ -477,10 +535,22 @@ fn apply_peer_kv(
 ) -> Result<(), WgConfError> {
     match key.to_ascii_lowercase().as_str() {
         "publickey" => {
+            if peer.public_key.is_some() {
+                return Err(WgConfError::DuplicateKey {
+                    line_number,
+                    key: "PublicKey",
+                });
+            }
             let key_bytes = decode_32byte_key(val, line_number, "PublicKey")?;
             peer.public_key = Some(PublicKey::from(key_bytes));
         }
         "endpoint" => {
+            if peer.endpoint.is_some() {
+                return Err(WgConfError::DuplicateKey {
+                    line_number,
+                    key: "Endpoint",
+                });
+            }
             validate_endpoint(val, line_number)?;
             peer.endpoint = Some(val.to_string());
         }
@@ -491,10 +561,22 @@ fn apply_peer_kv(
             }
         }
         "presharedkey" => {
+            if peer.preshared_key.is_some() {
+                return Err(WgConfError::DuplicateKey {
+                    line_number,
+                    key: "PresharedKey",
+                });
+            }
             let key_bytes = decode_32byte_key(val, line_number, "PresharedKey")?;
             peer.preshared_key = Some(key_bytes);
         }
         "persistentkeepalive" => {
+            if peer.persistent_keepalive.is_some() {
+                return Err(WgConfError::DuplicateKey {
+                    line_number,
+                    key: "PersistentKeepalive",
+                });
+            }
             let keepalive: u16 = val.parse().map_err(|_| WgConfError::InvalidKeepalive {
                 line_number,
                 value: val.to_string(),
@@ -508,82 +590,26 @@ fn apply_peer_kv(
     Ok(())
 }
 
-/// Parse a WireGuard configuration file from a string slice.
-/// Returns the parsed `WgInterfaceConfig` and list of `WgPeerConfig`.
-pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConfig>), WgConfError> {
-    let mut iface_builder: Option<InterfaceBuilder> = None;
-    let mut peer_builders: Vec<PeerBuilder> = Vec::new();
-    let mut current_section = CurrentSection::None;
-
-    for (idx, raw_line) in content.lines().enumerate() {
-        let line_number = idx + 1;
-        let line = strip_comment(raw_line);
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.starts_with('[') && line.ends_with(']') {
-            let header = line[1..line.len() - 1].trim();
-            if header.eq_ignore_ascii_case("interface") {
-                if iface_builder.is_some() {
-                    return Err(WgConfError::DuplicateInterface { line_number });
-                }
-                iface_builder = Some(InterfaceBuilder::default());
-                current_section = CurrentSection::Interface;
-            } else if header.eq_ignore_ascii_case("peer") {
-                peer_builders.push(PeerBuilder {
-                    line_number,
-                    ..Default::default()
-                });
-                current_section = CurrentSection::Peer(peer_builders.len() - 1);
-            } else {
-                return Err(WgConfError::UnknownSection {
-                    line_number,
-                    section: header.to_string(),
-                });
-            }
-            continue;
-        }
-
-        let redact_if_secret = |raw: &str| -> String {
-            let lower = raw.to_ascii_lowercase();
-            if lower.contains("privatekey") || lower.contains("presharedkey") {
-                "[REDACTED SECRET LINE]".to_string()
-            } else {
-                raw.to_string()
-            }
-        };
-
-        let Some((k, v)) = line.split_once('=') else {
-            return Err(WgConfError::MalformedLine {
-                line_number,
-                line: redact_if_secret(line),
-            });
-        };
-        let (key, val) = (k.trim(), v.trim());
-
-        match current_section {
-            CurrentSection::None => {
-                return Err(WgConfError::MissingSectionHeader {
-                    line_number,
-                    line: redact_if_secret(line),
-                });
-            }
-            CurrentSection::Interface => {
-                let Some(iface) = iface_builder.as_mut() else {
-                    return Err(WgConfError::MissingInterface);
-                };
-                apply_interface_kv(iface, key, val, line_number)?;
-            }
-            CurrentSection::Peer(idx) => {
-                let Some(peer) = peer_builders.get_mut(idx) else {
-                    return Err(WgConfError::MissingInterface);
-                };
-                apply_peer_kv(peer, key, val, line_number)?;
-            }
-        }
+fn redact_if_secret(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("private")
+        || lower.contains("preshared")
+        || lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("password")
+        || lower.contains("key")
+        || raw.len() >= 32
+    {
+        "[REDACTED SECRET LINE]".to_string()
+    } else {
+        raw.to_string()
     }
+}
 
+fn finalize_wg_config(
+    iface_builder: Option<InterfaceBuilder>,
+    peer_builders: Vec<PeerBuilder>,
+) -> Result<(WgInterfaceConfig, Vec<WgPeerConfig>), WgConfError> {
     let iface = iface_builder.ok_or(WgConfError::MissingInterface)?;
     let private_key = iface.private_key.ok_or(WgConfError::MissingPrivateKey)?;
     let interface_config = WgInterfaceConfig {
@@ -617,10 +643,87 @@ pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConf
     Ok((interface_config, peers))
 }
 
+/// Parse a WireGuard configuration file from a string slice.
+/// Returns the parsed `WgInterfaceConfig` and list of `WgPeerConfig`.
+pub fn parse_wg_conf(content: &str) -> Result<(WgInterfaceConfig, Vec<WgPeerConfig>), WgConfError> {
+    if content.len() > MAX_WG_CONF_SIZE {
+        return Err(WgConfError::InputTooLarge {
+            size: content.len(),
+            max: MAX_WG_CONF_SIZE,
+        });
+    }
+
+    let mut iface_builder: Option<InterfaceBuilder> = None;
+    let mut peer_builders: Vec<PeerBuilder> = Vec::new();
+    let mut current_section = CurrentSection::None;
+
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_number = idx + 1;
+        let line = strip_comment(raw_line);
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(inner_header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let header = inner_header.trim();
+            if header.eq_ignore_ascii_case("interface") {
+                if iface_builder.is_some() {
+                    return Err(WgConfError::DuplicateInterface { line_number });
+                }
+                iface_builder = Some(InterfaceBuilder::default());
+                current_section = CurrentSection::Interface;
+            } else if header.eq_ignore_ascii_case("peer") {
+                peer_builders.push(PeerBuilder {
+                    line_number,
+                    ..Default::default()
+                });
+                current_section = CurrentSection::Peer(peer_builders.len() - 1);
+            } else {
+                return Err(WgConfError::UnknownSection {
+                    line_number,
+                    section: header.to_string(),
+                });
+            }
+            continue;
+        }
+
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(WgConfError::MalformedLine {
+                line_number,
+                line: redact_if_secret(line),
+            });
+        };
+        let (key, val) = (k.trim(), v.trim());
+
+        match current_section {
+            CurrentSection::None => {
+                return Err(WgConfError::MissingSectionHeader {
+                    line_number,
+                    line: redact_if_secret(line),
+                });
+            }
+            CurrentSection::Interface => {
+                let Some(iface) = iface_builder.as_mut() else {
+                    return Err(WgConfError::MissingInterface);
+                };
+                apply_interface_kv(iface, key, val, line_number)?;
+            }
+            CurrentSection::Peer(idx) => {
+                let Some(peer) = peer_builders.get_mut(idx) else {
+                    return Err(WgConfError::MissingInterface);
+                };
+                apply_peer_kv(peer, key, val, line_number)?;
+            }
+        }
+    }
+
+    finalize_wg_config(iface_builder, peer_builders)
+}
+
 /// Parse a WireGuard configuration file from a filesystem path.
 pub fn parse_wg_conf_file<P: AsRef<Path>>(
     path: P,
 ) -> Result<(WgInterfaceConfig, Vec<WgPeerConfig>), WgConfError> {
-    let content = std::fs::read_to_string(path.as_ref())?;
+    let content = read_wg_conf_bounded(path.as_ref())?;
     parse_wg_conf(&content)
 }

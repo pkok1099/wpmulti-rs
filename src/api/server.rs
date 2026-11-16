@@ -186,81 +186,103 @@ fn parse_request_content_length(header_bytes: &[u8]) -> Result<usize, HttpRespon
     Ok(parsed_len.unwrap_or(0))
 }
 
+async fn read_admin_request_bytes<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
+) -> Result<Vec<u8>, ()> {
+    const MAX_ADMIN_HEADER_BYTES: usize = 65536;
+    const MAX_ADMIN_BODY_BYTES: usize = 65536;
+    const MAX_ADMIN_TOTAL_BYTES: usize = MAX_ADMIN_HEADER_BYTES + MAX_ADMIN_BODY_BYTES;
+
+    let mut buf = Vec::with_capacity(4096);
+    let mut temp = [0u8; 1024];
+
+    loop {
+        let prev_len = buf.len();
+        let n = match stream.read(&mut temp).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return Err(()),
+        };
+        if let Some(chunk) = temp.get(..n) {
+            buf.extend_from_slice(chunk);
+        }
+
+        let search_start = prev_len.saturating_sub(3);
+        if let Some(rel_pos) = buf
+            .get(search_start..)
+            .and_then(|tail| tail.windows(4).position(|w| w == b"\r\n\r\n"))
+        {
+            let pos = search_start + rel_pos;
+            if pos + 4 > MAX_ADMIN_HEADER_BYTES {
+                let resp = HttpResponse::bad_request("Request header too large");
+                let _ = stream.write_all(&resp.to_bytes()).await;
+                return Err(());
+            }
+            let header_bytes = buf.get(..pos).unwrap_or_default();
+            let content_len = match parse_request_content_length(header_bytes) {
+                Ok(len) => len,
+                Err(resp) => {
+                    let _ = stream.write_all(&resp.to_bytes()).await;
+                    return Err(());
+                }
+            };
+
+            if content_len > MAX_ADMIN_BODY_BYTES {
+                let resp = HttpResponse::payload_too_large("Request body too large (max 64 KiB)");
+                let _ = stream.write_all(&resp.to_bytes()).await;
+                return Err(());
+            }
+
+            let required_total = pos + 4 + content_len;
+            if required_total > MAX_ADMIN_TOTAL_BYTES {
+                let resp = HttpResponse::payload_too_large("Request too large");
+                let _ = stream.write_all(&resp.to_bytes()).await;
+                return Err(());
+            }
+
+            while buf.len() < required_total {
+                let n = match stream.read(&mut temp).await {
+                    Ok(0) => {
+                        let resp = HttpResponse::bad_request("Truncated request body");
+                        let _ = stream.write_all(&resp.to_bytes()).await;
+                        return Err(());
+                    }
+                    Ok(n) => n,
+                    Err(_) => return Err(()),
+                };
+                if let Some(chunk) = temp.get(..n) {
+                    buf.extend_from_slice(chunk);
+                }
+                if buf.len() > MAX_ADMIN_TOTAL_BYTES {
+                    let resp = HttpResponse::payload_too_large("Request too large");
+                    let _ = stream.write_all(&resp.to_bytes()).await;
+                    return Err(());
+                }
+            }
+            buf.truncate(required_total);
+            break;
+        }
+
+        if buf.len() > MAX_ADMIN_HEADER_BYTES {
+            let resp = HttpResponse::bad_request("Request header too large");
+            let _ = stream.write_all(&resp.to_bytes()).await;
+            return Err(());
+        }
+    }
+    Ok(buf)
+}
+
 async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
     manager: Arc<TunnelManager>,
     auth_token: Option<&str>,
     start_time: Instant,
 ) {
-    let mut buf = Vec::with_capacity(4096);
-    let mut temp = [0u8; 1024];
-
     // Read headers until \r\n\r\n with overall read timeout (Slowloris protection)
-    let read_res = tokio::time::timeout(ADMIN_READ_TIMEOUT, async {
-        loop {
-            let n = match stream.read(&mut temp).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => return Err(()),
-            };
-            if let Some(chunk) = temp.get(..n) {
-                buf.extend_from_slice(chunk);
-            }
-
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let header_bytes = buf.get(..pos).unwrap_or_default();
-                let content_len = match parse_request_content_length(header_bytes) {
-                    Ok(len) => len,
-                    Err(resp) => {
-                        let _ = stream.write_all(&resp.to_bytes()).await;
-                        return Err(());
-                    }
-                };
-
-                if content_len > 65536 {
-                    let resp =
-                        HttpResponse::payload_too_large("Request body too large (max 64 KiB)");
-                    let _ = stream.write_all(&resp.to_bytes()).await;
-                    return Err(());
-                }
-
-                let required_total = pos + 4 + content_len;
-                if required_total > 131_072 {
-                    let resp = HttpResponse::payload_too_large("Request too large");
-                    let _ = stream.write_all(&resp.to_bytes()).await;
-                    return Err(());
-                }
-
-                while buf.len() < required_total {
-                    let n = match stream.read(&mut temp).await {
-                        Ok(0) => {
-                            let resp = HttpResponse::bad_request("Truncated request body");
-                            let _ = stream.write_all(&resp.to_bytes()).await;
-                            return Err(());
-                        }
-                        Ok(n) => n,
-                        Err(_) => return Err(()),
-                    };
-                    if let Some(chunk) = temp.get(..n) {
-                        buf.extend_from_slice(chunk);
-                    }
-                }
-                buf.truncate(required_total);
-                break;
-            }
-
-            if buf.len() > 65536 {
-                let resp = HttpResponse::bad_request("Request header too large");
-                let _ = stream.write_all(&resp.to_bytes()).await;
-                return Err(());
-            }
-        }
-        Ok(())
-    })
-    .await;
-
-    match read_res {
-        Ok(Ok(())) => {}
+    let buf = match tokio::time::timeout(ADMIN_READ_TIMEOUT, read_admin_request_bytes(&mut stream))
+        .await
+    {
+        Ok(Ok(buf)) => buf,
         Ok(Err(())) => return,
         Err(_) => {
             let resp = HttpResponse::bad_request("Request read timed out");
@@ -268,7 +290,7 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             let _ = stream.flush().await;
             return;
         }
-    }
+    };
 
     if buf.is_empty() {
         return;

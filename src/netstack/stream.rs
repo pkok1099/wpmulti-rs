@@ -17,7 +17,7 @@ use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint};
 use tokio::sync::Notify;
 
-use crate::netstack::stack::{StackInner, register_shutdown_waker};
+use crate::netstack::stack::{StackInner, WakerSlot, register_shutdown_waker};
 
 impl std::fmt::Debug for VirtualTcpStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -113,7 +113,12 @@ impl AsyncRead for VirtualTcpStream {
                 "tcp socket handle not found in socket set",
             )));
         }
-        let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
+        let StackInner {
+            sockets,
+            shutdown_wakers,
+            ..
+        } = &mut *inner;
+        let socket = sockets.get_mut::<tcp::Socket<'_>>(self.handle);
 
         match socket.state() {
             State::Established | State::CloseWait | State::FinWait1 | State::FinWait2 => {
@@ -137,7 +142,12 @@ impl AsyncRead for VirtualTcpStream {
                     Poll::Ready(Ok(()))
                 } else {
                     socket.register_recv_waker(cx.waker());
-                    register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                    register_shutdown_waker(
+                        shutdown_wakers,
+                        self.handle,
+                        WakerSlot::Recv,
+                        cx.waker(),
+                    );
                     Poll::Pending
                 }
             }
@@ -155,7 +165,7 @@ impl AsyncRead for VirtualTcpStream {
             }
             State::SynSent | State::SynReceived => {
                 socket.register_recv_waker(cx.waker());
-                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                register_shutdown_waker(shutdown_wakers, self.handle, WakerSlot::Recv, cx.waker());
                 Poll::Pending
             }
             State::Listen => Poll::Ready(Err(io::Error::new(
@@ -197,7 +207,12 @@ impl AsyncWrite for VirtualTcpStream {
                 "tcp socket handle not found in socket set",
             )));
         }
-        let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
+        let StackInner {
+            sockets,
+            shutdown_wakers,
+            ..
+        } = &mut *inner;
+        let socket = sockets.get_mut::<tcp::Socket<'_>>(self.handle);
 
         match socket.state() {
             State::Established | State::CloseWait => {
@@ -222,13 +237,18 @@ impl AsyncWrite for VirtualTcpStream {
                     }
                 } else {
                     socket.register_send_waker(cx.waker());
-                    register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                    register_shutdown_waker(
+                        shutdown_wakers,
+                        self.handle,
+                        WakerSlot::Send,
+                        cx.waker(),
+                    );
                     Poll::Pending
                 }
             }
             State::SynSent | State::SynReceived => {
                 socket.register_send_waker(cx.waker());
-                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                register_shutdown_waker(shutdown_wakers, self.handle, WakerSlot::Send, cx.waker());
                 Poll::Pending
             }
             State::FinWait1
@@ -266,7 +286,12 @@ impl AsyncWrite for VirtualTcpStream {
                 "tcp socket handle not found in socket set",
             )));
         }
-        let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
+        let StackInner {
+            sockets,
+            shutdown_wakers,
+            ..
+        } = &mut *inner;
+        let socket = sockets.get_mut::<tcp::Socket<'_>>(self.handle);
 
         let poll = match socket.state() {
             State::Established | State::CloseWait => {
@@ -274,13 +299,18 @@ impl AsyncWrite for VirtualTcpStream {
                     Poll::Ready(Ok(()))
                 } else {
                     socket.register_send_waker(cx.waker());
-                    register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                    register_shutdown_waker(
+                        shutdown_wakers,
+                        self.handle,
+                        WakerSlot::Send,
+                        cx.waker(),
+                    );
                     Poll::Pending
                 }
             }
             State::SynSent | State::SynReceived => {
                 socket.register_send_waker(cx.waker());
-                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                register_shutdown_waker(shutdown_wakers, self.handle, WakerSlot::Send, cx.waker());
                 Poll::Pending
             }
             State::Closed
@@ -314,20 +344,25 @@ impl AsyncWrite for VirtualTcpStream {
                 "tcp socket handle not found in socket set",
             )));
         }
-        let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
+        let StackInner {
+            sockets,
+            shutdown_wakers,
+            ..
+        } = &mut *inner;
+        let socket = sockets.get_mut::<tcp::Socket<'_>>(self.handle);
 
         match socket.state() {
             State::Established | State::CloseWait => {
                 socket.close();
                 socket.register_send_waker(cx.waker());
-                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                register_shutdown_waker(shutdown_wakers, self.handle, WakerSlot::Send, cx.waker());
                 drop(inner);
                 self.notify.notify_one();
                 Poll::Pending
             }
             State::FinWait1 | State::Closing | State::LastAck => {
                 socket.register_send_waker(cx.waker());
-                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                register_shutdown_waker(shutdown_wakers, self.handle, WakerSlot::Send, cx.waker());
                 Poll::Pending
             }
             State::FinWait2
@@ -353,6 +388,7 @@ impl Drop for VirtualTcpStream {
             let socket = inner.sockets.get_mut::<tcp::Socket<'_>>(self.handle);
             if shutdown || !socket.is_active() {
                 inner.sockets.remove(self.handle);
+                inner.shutdown_wakers.remove(&self.handle);
             } else {
                 socket.abort();
                 inner.pending_reap.push(self.handle);
@@ -408,7 +444,12 @@ impl VirtualUdpSocket {
                     "udp socket handle not found in socket set",
                 )));
             }
-            let socket = inner.sockets.get_mut::<udp::Socket<'_>>(self.handle);
+            let StackInner {
+                sockets,
+                shutdown_wakers,
+                ..
+            } = &mut *inner;
+            let socket = sockets.get_mut::<udp::Socket<'_>>(self.handle);
             if buf.len() > socket.payload_send_capacity() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -425,7 +466,12 @@ impl VirtualUdpSocket {
                     }
                     Err(udp::SendError::BufferFull) => {
                         socket.register_send_waker(cx.waker());
-                        register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                        register_shutdown_waker(
+                            shutdown_wakers,
+                            self.handle,
+                            WakerSlot::Send,
+                            cx.waker(),
+                        );
                         Poll::Pending
                     }
                     Err(udp::SendError::Unaddressable) => Poll::Ready(Err(io::Error::new(
@@ -435,7 +481,7 @@ impl VirtualUdpSocket {
                 }
             } else {
                 socket.register_send_waker(cx.waker());
-                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                register_shutdown_waker(shutdown_wakers, self.handle, WakerSlot::Send, cx.waker());
                 Poll::Pending
             }
         })
@@ -458,7 +504,12 @@ impl VirtualUdpSocket {
                     "udp socket handle not found in socket set",
                 )));
             }
-            let socket = inner.sockets.get_mut::<udp::Socket<'_>>(self.handle);
+            let StackInner {
+                sockets,
+                shutdown_wakers,
+                ..
+            } = &mut *inner;
+            let socket = sockets.get_mut::<udp::Socket<'_>>(self.handle);
 
             if socket.can_recv() {
                 match socket.recv_slice(buf) {
@@ -474,13 +525,18 @@ impl VirtualUdpSocket {
                     ))),
                     Err(udp::RecvError::Exhausted) => {
                         socket.register_recv_waker(cx.waker());
-                        register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                        register_shutdown_waker(
+                            shutdown_wakers,
+                            self.handle,
+                            WakerSlot::Recv,
+                            cx.waker(),
+                        );
                         Poll::Pending
                     }
                 }
             } else {
                 socket.register_recv_waker(cx.waker());
-                register_shutdown_waker(&mut inner.shutdown_wakers, cx.waker());
+                register_shutdown_waker(shutdown_wakers, self.handle, WakerSlot::Recv, cx.waker());
                 Poll::Pending
             }
         })
@@ -499,6 +555,7 @@ impl Drop for VirtualUdpSocket {
         let exists = inner.sockets.iter().any(|(h, _)| h == self.handle);
         if exists {
             inner.sockets.remove(self.handle);
+            inner.shutdown_wakers.remove(&self.handle);
             drop(inner);
             self.notify.notify_one();
         }

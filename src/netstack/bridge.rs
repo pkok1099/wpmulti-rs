@@ -217,8 +217,17 @@ impl TxToken for VirtualTunTxToken<'_> {
             .unwrap_or_else(|| Vec::with_capacity(len.max(1500)));
         buffer.resize(len, 0);
         let result = f(&mut buffer);
-        if let Err(e) = self.tx_sender.try_send(buffer) {
-            tracing::warn!("VirtualTunBridge TX channel full or closed: {e}");
+        if let Err(
+            mpsc::error::TrySendError::Full(returned) | mpsc::error::TrySendError::Closed(returned),
+        ) = self.tx_sender.try_send(buffer)
+        {
+            tracing::warn!("VirtualTunBridge TX channel full or closed; dropping outbound packet");
+            if returned.capacity() <= 65536 {
+                let mut pool = self.buf_pool.lock();
+                if pool.len() < 64 {
+                    pool.push(returned);
+                }
+            }
         }
         result
     }
@@ -257,20 +266,34 @@ impl IpRecv for BridgeIpRecv {
         &'a mut self,
         pool: &mut PacketBufPool,
     ) -> io::Result<impl Iterator<Item = Packet<Ip>> + Send + 'a> {
-        let first = self.tx_receiver.recv().await.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "VirtualTunBridge netstack tx channel closed",
-            )
-        })?;
-
         let mut packets = Vec::with_capacity(MAX_DRAIN_BATCH_SIZE);
-        packets.push(Self::to_packet_and_recycle(first, pool, &self.buf_pool)?);
+        loop {
+            let first = self.tx_receiver.recv().await.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "VirtualTunBridge netstack tx channel closed",
+                )
+            })?;
+            match Self::to_packet_and_recycle(first, pool, &self.buf_pool) {
+                Ok(pkt) => {
+                    packets.push(pkt);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("Dropping malformed outbound IP packet from smoltcp: {e}");
+                }
+            }
+        }
 
         // Opportunistic batch draining up to MAX_DRAIN_BATCH_SIZE
         while packets.len() < MAX_DRAIN_BATCH_SIZE {
             match self.tx_receiver.try_recv() {
-                Ok(next) => packets.push(Self::to_packet_and_recycle(next, pool, &self.buf_pool)?),
+                Ok(next) => match Self::to_packet_and_recycle(next, pool, &self.buf_pool) {
+                    Ok(pkt) => packets.push(pkt),
+                    Err(e) => {
+                        tracing::warn!("Dropping malformed outbound IP packet from smoltcp: {e}");
+                    }
+                },
                 Err(_) => break,
             }
         }
@@ -312,12 +335,13 @@ impl BridgeIpRecv {
         }
         pkt.truncate(raw.len());
         pkt.copy_from_slice(&raw);
-        raw.clear();
-        let mut p = buf_pool.lock();
-        if p.len() < 64 {
-            p.push(raw);
+        if raw.capacity() <= 65536 {
+            raw.clear();
+            let mut p = buf_pool.lock();
+            if p.len() < 64 {
+                p.push(raw);
+            }
         }
-        drop(p);
         pkt.try_into_ip().map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

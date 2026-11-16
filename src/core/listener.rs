@@ -145,6 +145,21 @@ impl ListenerSupervisor {
         None
     }
 
+    fn rollback_dedicated_batch(
+        &self,
+        started: &[ActiveListenerInfo],
+        entries: &[Arc<crate::core::registry::TunnelEntry>],
+    ) {
+        self.rollback_started_listeners(started, None);
+        for s in started {
+            if let Some(tid) = &s.tunnel_id
+                && let Some(e) = entries.iter().find(|e| &e.id == tid)
+            {
+                *e.assigned_port.write() = None;
+            }
+        }
+    }
+
     async fn start_dedicated_protocol_listeners(
         &self,
         entries: &[Arc<crate::core::registry::TunnelEntry>],
@@ -197,7 +212,7 @@ impl ListenerSupervisor {
             } else {
                 let Some(p) = Self::pick_free_dedicated_port(&mut used_ports, &mut next_port)
                 else {
-                    self.rollback_started_listeners(&started, None);
+                    self.rollback_dedicated_batch(&started, entries);
                     return Err(CoreError::ListenerError(format!(
                         "no free {proto_label} port available for tunnel '{}'",
                         entry.id
@@ -210,7 +225,7 @@ impl ListenerSupervisor {
             let listener = match TcpListener::bind(bind_addr).await {
                 Ok(l) => l,
                 Err(e) => {
-                    self.rollback_started_listeners(&started, None);
+                    self.rollback_dedicated_batch(&started, entries);
                     return Err(CoreError::ListenerError(format!(
                         "failed to bind dedicated {proto_label} listener for tunnel '{}' on {bind_addr}: {e:?}",
                         entry.id
@@ -520,16 +535,6 @@ impl ListenerSupervisor {
             handles.iter().map(|h| h.info.address.port()).collect()
         };
 
-        let pick_free_port = |base: u16, used: &mut std::collections::HashSet<u16>| -> u16 {
-            for offset in 0..=u16::MAX {
-                let candidate = base.wrapping_add(offset);
-                if candidate != 0 && used.insert(candidate) {
-                    return candidate;
-                }
-            }
-            base.max(1)
-        };
-
         let ovr = per_tunnel.overrides.get(&entry.id);
         let auth = ovr
             .and_then(|o| o.password.as_ref())
@@ -549,15 +554,23 @@ impl ListenerSupervisor {
         ];
 
         for (base_opt, override_port, listener_type) in specs {
-            let Some(base) = base_opt else {
+            let Some(mut next_port) = base_opt else {
                 continue;
             };
-            let port = match override_port {
-                Some(p) => {
-                    used_ports.insert(p);
-                    p
-                }
-                None => pick_free_port(base, &mut used_ports),
+            let port = if let Some(p) = override_port {
+                used_ports.insert(p);
+                p
+            } else {
+                let Some(p) = Self::pick_free_dedicated_port(&mut used_ports, &mut next_port)
+                else {
+                    self.rollback_started_listeners(&started, None);
+                    *entry.assigned_port.write() = None;
+                    return Err(CoreError::ListenerError(format!(
+                        "no free port available for tunnel '{}'",
+                        entry.id
+                    )));
+                };
+                p
             };
             let info = match self
                 .spawn_dedicated_listener(
@@ -572,6 +585,7 @@ impl ListenerSupervisor {
                 Ok(info) => info,
                 Err(e) => {
                     self.rollback_started_listeners(&started, None);
+                    *entry.assigned_port.write() = None;
                     return Err(e);
                 }
             };
