@@ -388,15 +388,51 @@ async fn test_socks5_connect_ipv4() {
 
 #[tokio::test]
 async fn test_socks5_connect_ipv6() {
-    let maybe_echo_addr = spawn_echo_tcp_server_ipv6().await;
-    let Some(echo_addr) = maybe_echo_addr else {
-        return; // IPv6 disabled on host; skip
-    };
-    let SocketAddr::V6(echo_v6) = echo_addr else {
-        unreachable!();
-    };
+    struct MockIpv6EchoTarget {
+        expected_dst: SocketAddr,
+    }
 
-    let target = Arc::new(DirectTunnelTarget);
+    impl ProxyTunnelTarget for MockIpv6EchoTarget {
+        fn tcp_connect<'a>(
+            &'a self,
+            dst: SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
+            let expected = self.expected_dst;
+            Box::pin(async move {
+                assert_eq!(dst, expected);
+                let (client_side, mut server_side) = tokio::io::duplex(2048);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = server_side.read(&mut buf).await
+                        && n > 0
+                    {
+                        let _ = server_side.write_all(&buf[..n]).await;
+                    }
+                });
+                Ok(Box::new(client_side) as DynStream)
+            })
+        }
+
+        fn udp_bind<'a>(
+            &'a self,
+            _local_port: u16,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>>
+        {
+            Box::pin(async { Err(io::Error::other("unused")) })
+        }
+
+        fn resolve_in_tunnel<'a>(
+            &'a self,
+            _domain: &'a str,
+        ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
+            Box::pin(async { Err(io::Error::other("unused")) })
+        }
+    }
+
+    let echo_v6: std::net::SocketAddrV6 = "[2606:4700:4700::1111]:443".parse().unwrap();
+    let target = Arc::new(MockIpv6EchoTarget {
+        expected_dst: SocketAddr::V6(echo_v6),
+    });
     let router: Arc<dyn TunnelRouter> =
         Arc::new(SingleTunnelRouter::new("test-tunnel-v6", target, None));
 
@@ -1112,4 +1148,480 @@ fn test_socks5_udp_rejects_empty_domain_and_zero_port() {
     // Port 0
     let zero_port = [0x00, 0x00, 0x00, 0x01, 1, 1, 1, 1, 0x00, 0x00, b'h', b'i'];
     assert!(parse_socks5_udp_packet(&zero_port).is_none());
+}
+
+#[tokio::test]
+async fn test_http_connect_blocks_ipv4_mapped_ipv6_ssrf() {
+    let target: Arc<dyn ProxyTunnelTarget> = Arc::new(DirectTunnelTarget);
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("test", target, None));
+
+    let (mut client, server) = tokio::io::duplex(2048);
+    tokio::spawn(async move {
+        let _ = handle_http(server, router).await;
+    });
+    client
+        .write_all(
+            b"CONNECT [::ffff:169.254.169.254]:80 HTTP/1.1\r\nHost: [::ffff:169.254.169.254]:80\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
+    assert_eq!(status, 403);
+}
+
+#[test]
+fn test_is_forbidden_destination_ip_parity_and_ipv6_ranges() {
+    use crate::proxy::router::is_forbidden_destination_ip;
+
+    let forbidden = [
+        "0.0.0.0",
+        "169.254.169.254",
+        "224.0.0.1",
+        "255.255.255.255",
+        "::",
+        "::1",
+        "fe80::1",
+        "fc00::1",
+        "fd12:3456:789a::1",
+        "ff02::1",
+        "::ffff:169.254.169.254",
+        "::ffff:0.0.0.0",
+        "::ffff:255.255.255.255",
+        "64:ff9b::169.254.169.254",
+        "64:ff9b::0.0.0.0",
+    ];
+    for s in forbidden {
+        let ip: IpAddr = s.parse().unwrap();
+        assert!(is_forbidden_destination_ip(ip), "{s} must be forbidden");
+    }
+
+    let allowed = [
+        "1.1.1.1",
+        "2606:4700:4700::1111",
+        "64:ff9b::1.1.1.1",
+        "::ffff:1.1.1.1",
+    ];
+    for s in allowed {
+        let ip: IpAddr = s.parse().unwrap();
+        assert!(!is_forbidden_destination_ip(ip), "{s} must be allowed");
+    }
+}
+
+async fn run_socks5_connect_expect_rep(
+    router: Arc<dyn TunnelRouter>,
+    atyp: u8,
+    addr_bytes: &[u8],
+    port: u16,
+    expected_rep: Option<u8>,
+) {
+    let (mut client, server) = tokio::io::duplex(2048);
+    tokio::spawn(async move {
+        let _ = handle_socks5(server, router).await;
+    });
+
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
+    let mut g_resp = [0u8; 2];
+    client.read_exact(&mut g_resp).await.unwrap();
+    assert_eq!(g_resp, [SOCKS5_VERSION, METHOD_NO_AUTH]);
+
+    let mut cmd = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00, atyp];
+    if atyp == ATYP_DOMAIN {
+        cmd.push(addr_bytes.len() as u8);
+    }
+    cmd.extend_from_slice(addr_bytes);
+    cmd.extend_from_slice(&port.to_be_bytes());
+    client.write_all(&cmd).await.unwrap();
+
+    let mut reply_hdr = [0u8; 4];
+    let res = client.read_exact(&mut reply_hdr).await;
+    match expected_rep {
+        Some(rep) => {
+            res.expect("expected SOCKS5 reply");
+            assert_eq!(reply_hdr[1], rep);
+        }
+        None => {
+            assert!(res.is_err(), "expected connection to close without reply");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_socks5_ssrf_blocks_ipv6_mapped_and_domain_literals() {
+    let mock_target = Arc::new(
+        MockTunnelTarget::new("ssrf-tun")
+            .with_dns("meta.internal", "169.254.169.254".parse().unwrap()),
+    );
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("ssrf-tun", mock_target, None));
+
+    // ATYP_IPV6 forbidden targets
+    for v6_str in [
+        "::ffff:169.254.169.254",
+        "fd00::1",
+        "fe80::1",
+        "::1",
+        "64:ff9b::169.254.169.254",
+    ] {
+        let v6: std::net::Ipv6Addr = v6_str.parse().unwrap();
+        run_socks5_connect_expect_rep(
+            Arc::clone(&router),
+            ATYP_IPV6,
+            &v6.octets(),
+            80,
+            Some(crate::proxy::socks5::REP_CONN_NOT_ALLOWED),
+        )
+        .await;
+    }
+
+    // ATYP_DOMAIN containing IP literals
+    for dom in ["::ffff:169.254.169.254", "[::1]", "169.254.169.254"] {
+        run_socks5_connect_expect_rep(
+            Arc::clone(&router),
+            ATYP_DOMAIN,
+            dom.as_bytes(),
+            80,
+            Some(crate::proxy::socks5::REP_CONN_NOT_ALLOWED),
+        )
+        .await;
+    }
+
+    // ATYP_DOMAIN resolving to forbidden IP via DNS
+    run_socks5_connect_expect_rep(
+        Arc::clone(&router),
+        ATYP_DOMAIN,
+        b"meta.internal",
+        80,
+        Some(crate::proxy::socks5::REP_CONN_NOT_ALLOWED),
+    )
+    .await;
+
+    // ATYP_DOMAIN with whitespace, control chars, or oversized label (>63)
+    run_socks5_connect_expect_rep(Arc::clone(&router), ATYP_DOMAIN, b"evil .com", 80, None).await;
+    run_socks5_connect_expect_rep(Arc::clone(&router), ATYP_DOMAIN, b"evil\n.com", 80, None).await;
+    let long_label = format!("{}.com", "a".repeat(64));
+    run_socks5_connect_expect_rep(
+        Arc::clone(&router),
+        ATYP_DOMAIN,
+        long_label.as_bytes(),
+        80,
+        None,
+    )
+    .await;
+}
+
+#[test]
+fn test_socks5_udp_parse_validates_domain_and_normalizes_ip_literals() {
+    // Whitespace in domain -> rejected
+    let mut pkt_ws = vec![0x00, 0x00, 0x00, ATYP_DOMAIN, 9];
+    pkt_ws.extend_from_slice(b"evil .com");
+    pkt_ws.extend_from_slice(&53u16.to_be_bytes());
+    pkt_ws.extend_from_slice(b"hi");
+    assert!(parse_socks5_udp_packet(&pkt_ws).is_none());
+
+    // Oversized label (>63) -> rejected
+    let bad_label = format!("{}.com", "a".repeat(64));
+    let mut pkt_lbl = vec![0x00, 0x00, 0x00, ATYP_DOMAIN, bad_label.len() as u8];
+    pkt_lbl.extend_from_slice(bad_label.as_bytes());
+    pkt_lbl.extend_from_slice(&53u16.to_be_bytes());
+    pkt_lbl.extend_from_slice(b"hi");
+    assert!(parse_socks5_udp_packet(&pkt_lbl).is_none());
+
+    // IP literal in ATYP_DOMAIN -> normalized to TargetAddr::Ip so SSRF filter catches it
+    let lit = b"[::ffff:169.254.169.254]";
+    let mut pkt_lit = vec![0x00, 0x00, 0x00, ATYP_DOMAIN, lit.len() as u8];
+    pkt_lit.extend_from_slice(lit);
+    pkt_lit.extend_from_slice(&80u16.to_be_bytes());
+    pkt_lit.extend_from_slice(b"hi");
+    let (target, payload) = parse_socks5_udp_packet(&pkt_lit).expect("ip literal parsed");
+    assert_eq!(payload, b"hi");
+    match target {
+        TargetAddr::Ip(addr) => {
+            assert!(crate::proxy::router::is_forbidden_destination_ip(addr.ip()));
+        }
+        TargetAddr::Domain(_, _) => panic!("expected TargetAddr::Ip for IP literal"),
+    }
+}
+
+#[tokio::test]
+async fn test_multi_ip_dns_fail_closed_in_socks5_and_http() {
+    struct MultiIpMockTarget {
+        ips: Vec<IpAddr>,
+    }
+
+    impl ProxyTunnelTarget for MultiIpMockTarget {
+        fn tcp_connect<'a>(
+            &'a self,
+            _dst: SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
+            Box::pin(async {
+                panic!("tcp_connect must NOT be called when DNS includes forbidden IP")
+            })
+        }
+
+        fn udp_bind<'a>(
+            &'a self,
+            _local_port: u16,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>>
+        {
+            Box::pin(async { Err(io::Error::other("unused")) })
+        }
+
+        fn resolve_in_tunnel<'a>(
+            &'a self,
+            _domain: &'a str,
+        ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
+            let first = self.ips[0];
+            Box::pin(async move { Ok(first) })
+        }
+
+        fn resolve_all_in_tunnel<'a>(
+            &'a self,
+            _domain: &'a str,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send + 'a>> {
+            let ips = self.ips.clone();
+            Box::pin(async move { Ok(ips) })
+        }
+    }
+
+    let mixed_target: Arc<dyn ProxyTunnelTarget> = Arc::new(MultiIpMockTarget {
+        ips: vec![
+            "1.1.1.1".parse().unwrap(),
+            "::ffff:169.254.169.254".parse().unwrap(),
+        ],
+    });
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("mixed-dns", mixed_target, None));
+
+    // 1. SOCKS5 CONNECT must reject fail-closed with REP_CONN_NOT_ALLOWED
+    run_socks5_connect_expect_rep(
+        Arc::clone(&router),
+        ATYP_DOMAIN,
+        b"mixed.example.com.",
+        80,
+        Some(crate::proxy::socks5::REP_CONN_NOT_ALLOWED),
+    )
+    .await;
+
+    // 2. HTTP CONNECT must reject fail-closed with 403 Forbidden
+    let (mut client, server) = tokio::io::duplex(2048);
+    let r_connect = Arc::clone(&router);
+    tokio::spawn(async move {
+        let _ = handle_http(server, r_connect).await;
+    });
+    client
+        .write_all(
+            b"CONNECT mixed.example.com.:443 HTTP/1.1\r\nHost: mixed.example.com.:443\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
+    assert_eq!(status, 403);
+
+    // 3. HTTP forward proxy must reject fail-closed with 403 Forbidden
+    let (mut client2, server2) = tokio::io::duplex(2048);
+    tokio::spawn(async move {
+        let _ = handle_http(server2, router).await;
+    });
+    client2
+        .write_all(b"GET http://mixed.example.com./ HTTP/1.1\r\nHost: mixed.example.com.\r\n\r\n")
+        .await
+        .unwrap();
+    let (status2, _, _, _) = read_http_headers_helper(&mut client2).await.unwrap();
+    assert_eq!(status2, 403);
+}
+
+#[test]
+fn test_fqdn_trailing_dot_parity_between_router_and_dns() {
+    use crate::netstack::dns::{QueryType, build_query};
+    use crate::proxy::router::is_valid_target_domain;
+
+    assert!(is_valid_target_domain("example.com."));
+    assert!(build_query("example.com.", QueryType::A, 1).is_ok());
+
+    assert!(!is_valid_target_domain("example.com.."));
+    assert!(build_query("example.com..", QueryType::A, 1).is_err());
+
+    assert!(!is_valid_target_domain(" example.com "));
+    assert!(build_query(" example.com ", QueryType::A, 1).is_err());
+}
+
+#[tokio::test]
+async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
+    struct FallbackMockTarget {
+        dns_calls: AtomicUsize,
+        dialed_addrs: parking_lot::Mutex<Vec<SocketAddr>>,
+        ips: Vec<IpAddr>,
+    }
+
+    impl ProxyTunnelTarget for FallbackMockTarget {
+        fn tcp_connect<'a>(
+            &'a self,
+            dst: SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
+            self.dialed_addrs.lock().push(dst);
+            let first_ip = self.ips[0];
+            Box::pin(async move {
+                if dst.ip() == first_ip {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "first IP unreachable",
+                    ));
+                }
+                let stream = TcpStream::connect(dst).await?;
+                Ok(Box::new(stream) as DynStream)
+            })
+        }
+
+        fn udp_bind<'a>(
+            &'a self,
+            _local_port: u16,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>>
+        {
+            Box::pin(async { Err(io::Error::other("unused")) })
+        }
+
+        fn resolve_in_tunnel<'a>(
+            &'a self,
+            _domain: &'a str,
+        ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
+            Box::pin(async {
+                panic!(
+                    "resolve_in_tunnel must not be called; zero-TOCTOU uses resolve_all_in_tunnel once"
+                )
+            })
+        }
+
+        fn resolve_all_in_tunnel<'a>(
+            &'a self,
+            _domain: &'a str,
+        ) -> crate::proxy::router::ResolveAllFut<'a> {
+            self.dns_calls.fetch_add(1, Ordering::SeqCst);
+            let ips = self.ips.clone();
+            Box::pin(async move { Ok(ips) })
+        }
+    }
+
+    let echo_addr = spawn_echo_tcp_server().await;
+    let first_ip: IpAddr = "198.51.100.10".parse().unwrap();
+    let second_ip = echo_addr.ip();
+
+    let mock = Arc::new(FallbackMockTarget {
+        dns_calls: AtomicUsize::new(0),
+        dialed_addrs: parking_lot::Mutex::new(Vec::new()),
+        ips: vec![first_ip, second_ip],
+    });
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "fallback-tun",
+        Arc::clone(&mock) as Arc<dyn ProxyTunnelTarget>,
+        None,
+    ));
+
+    // 1. SOCKS5 CONNECT: single DNS lookup, fails first_ip, falls back to second_ip
+    let (mut client, server) = tokio::io::duplex(2048);
+    let r_s5 = Arc::clone(&router);
+    tokio::spawn(async move {
+        let _ = handle_socks5(server, r_s5).await;
+    });
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
+    let mut g_resp = [0u8; 2];
+    client.read_exact(&mut g_resp).await.unwrap();
+
+    let domain = b"multi-ip.example.com";
+    let mut cmd = vec![
+        SOCKS5_VERSION,
+        CMD_CONNECT,
+        0x00,
+        ATYP_DOMAIN,
+        domain.len() as u8,
+    ];
+    cmd.extend_from_slice(domain);
+    cmd.extend_from_slice(&echo_addr.port().to_be_bytes());
+    client.write_all(&cmd).await.unwrap();
+
+    let mut reply_hdr = [0u8; 4];
+    client.read_exact(&mut reply_hdr).await.unwrap();
+    assert_eq!(reply_hdr[1], REP_SUCCESS);
+    let mut bnd = [0u8; 6];
+    client.read_exact(&mut bnd).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let mut pong = [0u8; 4];
+    client.read_exact(&mut pong).await.unwrap();
+    assert_eq!(&pong, b"ping");
+
+    assert_eq!(mock.dns_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *mock.dialed_addrs.lock(),
+        vec![
+            SocketAddr::new(first_ip, echo_addr.port()),
+            SocketAddr::new(second_ip, echo_addr.port()),
+        ]
+    );
+
+    // 2. HTTP CONNECT: single DNS lookup, fails first_ip, falls back to second_ip
+    mock.dialed_addrs.lock().clear();
+    let (mut h_client, h_server) = tokio::io::duplex(2048);
+    let r_http = Arc::clone(&router);
+    tokio::spawn(async move {
+        let _ = handle_http(h_server, r_http).await;
+    });
+    let connect_req = format!(
+        "CONNECT multi-ip.example.com:{p} HTTP/1.1\r\nHost: multi-ip.example.com:{p}\r\n\r\n",
+        p = echo_addr.port()
+    );
+    h_client.write_all(connect_req.as_bytes()).await.unwrap();
+    let (status, _, _, _) = read_http_headers_helper(&mut h_client).await.unwrap();
+    assert_eq!(status, 200);
+    h_client.write_all(b"http").await.unwrap();
+    let mut hpong = [0u8; 4];
+    h_client.read_exact(&mut hpong).await.unwrap();
+    assert_eq!(&hpong, b"http");
+
+    assert_eq!(mock.dns_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *mock.dialed_addrs.lock(),
+        vec![
+            SocketAddr::new(first_ip, echo_addr.port()),
+            SocketAddr::new(second_ip, echo_addr.port()),
+        ]
+    );
+
+    // 3. HTTP forward proxy: single DNS lookup, fails first_ip, falls back to second_ip
+    let http_srv = spawn_mock_http_server("multi_ip_http_ok").await;
+    let first_http_ip: IpAddr = "198.51.100.11".parse().unwrap();
+    let mock_fwd = Arc::new(FallbackMockTarget {
+        dns_calls: AtomicUsize::new(0),
+        dialed_addrs: parking_lot::Mutex::new(Vec::new()),
+        ips: vec![first_http_ip, http_srv.ip()],
+    });
+    let r_fwd: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "fallback-fwd",
+        Arc::clone(&mock_fwd) as Arc<dyn ProxyTunnelTarget>,
+        None,
+    ));
+    let (mut f_client, f_server) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let _ = handle_http(f_server, r_fwd).await;
+    });
+    let fwd_req = format!(
+        "GET http://multi-ip.example.com:{p}/test HTTP/1.1\r\nHost: multi-ip.example.com:{p}\r\n\r\n",
+        p = http_srv.port()
+    );
+    f_client.write_all(fwd_req.as_bytes()).await.unwrap();
+    let (f_status, _, _, f_body) = read_http_headers_helper(&mut f_client).await.unwrap();
+    assert_eq!(f_status, 200);
+    assert_eq!(String::from_utf8_lossy(&f_body), "multi_ip_http_ok");
+    assert_eq!(mock_fwd.dns_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *mock_fwd.dialed_addrs.lock(),
+        vec![
+            SocketAddr::new(first_http_ip, http_srv.port()),
+            SocketAddr::new(http_srv.ip(), http_srv.port()),
+        ]
+    );
 }

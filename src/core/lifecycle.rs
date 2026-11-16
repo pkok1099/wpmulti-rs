@@ -64,6 +64,17 @@ pub struct GuardedTunnelTarget {
     health: Option<Arc<TunnelHealthTracker>>,
     threshold: usize,
     cooldown: Duration,
+    trial_resolved: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for GuardedTunnelTarget {
+    fn drop(&mut self) {
+        if !self.trial_resolved.load(Ordering::Relaxed)
+            && let Some(h) = &self.health
+        {
+            h.release_trial_slot();
+        }
+    }
 }
 
 impl GuardedTunnelTarget {
@@ -75,6 +86,7 @@ impl GuardedTunnelTarget {
             health: None,
             threshold: 3,
             cooldown: Duration::from_secs(30),
+            trial_resolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -92,6 +104,7 @@ impl GuardedTunnelTarget {
             health: Some(health),
             threshold,
             cooldown,
+            trial_resolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -120,20 +133,42 @@ impl GuardedTunnelTarget {
         domain: &'a str,
         ip_mode: crate::config::IpMode,
     ) -> Pin<Box<dyn Future<Output = io::Result<std::net::IpAddr>> + Send + 'a>> {
+        let fut = self.resolve_all_in_tunnel_with_mode(domain, ip_mode);
+        Box::pin(async move {
+            let addrs = fut.await?;
+            addrs.into_iter().next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "no IP addresses found for domain")
+            })
+        })
+    }
+
+    /// Resolve a domain through the tunnel with an explicit [`IpMode`], returning all
+    /// candidate IP addresses while updating handshake stats and circuit-breaker health.
+    pub fn resolve_all_in_tunnel_with_mode<'a>(
+        &'a self,
+        domain: &'a str,
+        ip_mode: crate::config::IpMode,
+    ) -> crate::proxy::router::ResolveAllFut<'a> {
         let tunnel = Arc::clone(&self.tunnel);
         let health = self.health.clone();
         let threshold = self.threshold;
         let cooldown = self.cooldown;
+        let trial_resolved = Arc::clone(&self.trial_resolved);
         Box::pin(async move {
-            match tunnel.resolve_in_tunnel_with_mode(domain, ip_mode).await {
-                Ok(ip) => {
+            match tunnel
+                .resolve_all_in_tunnel_with_mode(domain, ip_mode)
+                .await
+            {
+                Ok(ips) => {
                     tunnel.stats.record_handshake(now_unix_secs());
+                    trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
                         h.record_success();
                     }
-                    Ok(ip)
+                    Ok(ips)
                 }
                 Err(e) => {
+                    trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
                         h.record_failure(threshold, cooldown);
                     }
@@ -161,10 +196,12 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         let health = self.health.clone();
         let threshold = self.threshold;
         let cooldown = self.cooldown;
+        let trial_resolved = Arc::clone(&self.trial_resolved);
         Box::pin(async move {
             match tunnel.tcp_connect(dst).await {
                 Ok(stream) => {
                     tunnel.stats.record_handshake(now_unix_secs());
+                    trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
                         h.record_success();
                     }
@@ -175,6 +212,7 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
                     Ok(guarded)
                 }
                 Err(e) => {
+                    trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
                         h.record_failure(threshold, cooldown);
                     }
@@ -193,9 +231,11 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         let health = self.health.clone();
         let threshold = self.threshold;
         let cooldown = self.cooldown;
+        let trial_resolved = Arc::clone(&self.trial_resolved);
         Box::pin(async move {
             match tunnel.udp_bind(local_port).await {
                 Ok(socket) => {
+                    trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
                         h.record_success();
                     }
@@ -206,6 +246,7 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
                     Ok(guarded)
                 }
                 Err(e) => {
+                    trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
                         h.record_failure(threshold, cooldown);
                     }
@@ -219,7 +260,16 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         &'a self,
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<std::net::IpAddr>> + Send + 'a>> {
-        self.resolve_in_tunnel_with_mode(domain, crate::config::IpMode::DualStack)
+        let mode = self.tunnel.netstack.effective_ip_mode();
+        self.resolve_in_tunnel_with_mode(domain, mode)
+    }
+
+    fn resolve_all_in_tunnel<'a>(
+        &'a self,
+        domain: &'a str,
+    ) -> crate::proxy::router::ResolveAllFut<'a> {
+        let mode = self.tunnel.netstack.effective_ip_mode();
+        self.resolve_all_in_tunnel_with_mode(domain, mode)
     }
 }
 

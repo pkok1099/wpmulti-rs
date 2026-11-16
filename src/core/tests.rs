@@ -1128,3 +1128,50 @@ async fn test_disabled_active_tunnel_is_suspended_and_eager_disabled_starts_clea
 
     manager.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_half_open_trial_slot_released_when_guarded_target_dropped_unused() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let entry = registry
+        .register(TunnelEntry::new(
+            "tun-halfopen",
+            make_test_tunnel_config("tun-halfopen"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    // Force Unhealthy with expired cooldown so is_routable() transitions to HalfOpen
+    entry.health.mark_unhealthy(Duration::from_millis(1));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(entry.health.is_routable());
+    assert_eq!(
+        entry.health.current_status(),
+        crate::core::HealthStatus::HalfOpen
+    );
+    assert!(
+        !entry.health.can_route(),
+        "trial_in_flight should block concurrent routing"
+    );
+
+    // Build an ActiveTunnel and wrap in GuardedTunnelTarget, then drop without calling tcp_connect/udp_bind
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let (active, guard) = lifecycle.get_or_activate("tun-halfopen").await.unwrap();
+    let guarded = crate::core::GuardedTunnelTarget::new_with_health(
+        active,
+        guard,
+        Arc::clone(&entry.health),
+        3,
+        Duration::from_secs(30),
+    );
+    drop(guarded);
+
+    assert!(
+        entry.health.can_route(),
+        "HalfOpen trial slot must be released when GuardedTunnelTarget is dropped unused"
+    );
+    lifecycle.stop().await;
+}

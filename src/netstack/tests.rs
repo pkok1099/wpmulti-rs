@@ -902,3 +902,54 @@ async fn test_stack_close_wakes_parked_udp_and_connect() {
         .unwrap();
     assert!(conn_res.is_err());
 }
+
+#[tokio::test]
+async fn test_dual_stack_clamps_effective_ip_mode_to_interface_addresses() {
+    let v4_only_cfg = make_test_config("10.2.0.4/32", None);
+    let (bridge1, _s1, _r1) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack_v4 = VirtualNetworkStack::new_with_mode(
+        &v4_only_cfg,
+        bridge1,
+        crate::config::IpMode::DualStack,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        stack_v4.effective_ip_mode(),
+        crate::config::IpMode::Ipv4Only
+    );
+    stack_v4.close().await;
+
+    let v6_only_cfg = WgInterfaceConfig {
+        private_key: StaticSecret::from([42u8; 32]),
+        addresses: vec!["fd00::4/128".parse().unwrap()],
+        dns: vec!["2606:4700:4700::1111".parse().unwrap()],
+        listen_port: None,
+        mtu: 1420,
+    };
+    let (bridge2, _s2, _r2) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack_v6 = VirtualNetworkStack::new_with_mode(
+        &v6_only_cfg,
+        bridge2,
+        crate::config::IpMode::DualStack,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        stack_v6.effective_ip_mode(),
+        crate::config::IpMode::Ipv6Only
+    );
+    stack_v6.close().await;
+}
+
+#[test]
+fn test_dns_build_query_rejects_control_chars_and_whitespace() {
+    assert!(matches!(
+        build_query("evil domain.com", QueryType::A, 1),
+        Err(DnsError::InvalidDomain(_))
+    ));
+    assert!(matches!(
+        build_query("evil\ndomain.com", QueryType::A, 1),
+        Err(DnsError::InvalidDomain(_))
+    ));
+}

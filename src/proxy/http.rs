@@ -12,18 +12,14 @@ use std::time::Duration;
 use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::proxy::router::{DynStream, ProxyTunnelTarget, TunnelRouter, TunnelSelector};
+use crate::proxy::router::{
+    DynStream, ProxyTunnelTarget, TunnelRouter, TunnelSelector, connect_validated_addrs,
+    is_forbidden_destination_ip, is_valid_target_domain, parse_domain_ip_literal,
+    resolve_and_validate_domain,
+};
 
 const MAX_HEADER_SIZE: usize = 16384;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Returns `true` if `ip` is an unsafe/forbidden proxy destination (unspecified or link-local).
-pub(crate) const fn is_forbidden_destination_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_unspecified() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80,
-    }
-}
 
 /// Parses authority-form string `host:port` or `[ipv6]:port`.
 pub fn parse_authority(authority: &str) -> Option<(String, u16)> {
@@ -227,7 +223,11 @@ fn parse_header_bytes_vec(header_bytes: &[u8]) -> io::Result<ParsedHttpHeadersVe
             "malformed request line",
         ));
     };
-    if method.is_empty() || uri.is_empty() || (version != "HTTP/1.1" && version != "HTTP/1.0") {
+    if method.is_empty()
+        || uri.is_empty()
+        || uri.chars().any(char::is_control)
+        || (version != "HTTP/1.1" && version != "HTTP/1.0")
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid method, URI, or HTTP version",
@@ -318,7 +318,8 @@ where
     let Ok(selector) = router.authenticate(cred_refs) else {
         let resp = "HTTP/1.1 407 Proxy Authentication Required\r\n\
                     Proxy-Authenticate: Basic realm=\"wpmulti\"\r\n\
-                    Content-Length: 0\r\n\r\n";
+                    Content-Length: 0\r\n\
+                    Connection: close\r\n\r\n";
         stream.write_all(resp.as_bytes()).await?;
         stream.flush().await?;
         return Ok(());
@@ -391,65 +392,8 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
         ));
     };
 
-    // Resolve tunnel target
-    let target_tunnel = match router.select_tunnel(selector).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("Failed to select tunnel for HTTP CONNECT: {:?}", e);
-            send_response(&mut stream, "502 Bad Gateway", "text/plain", b"Bad Gateway").await?;
-            return Err(e);
-        }
-    };
-
-    // Resolve destination IP address
-    let dst_addr = if let Ok(ip) = host.parse::<IpAddr>() {
-        SocketAddr::new(ip, port)
-    } else {
-        match target_tunnel.resolve_in_tunnel(&host).await {
-            Ok(ip) => SocketAddr::new(ip, port),
-            Err(e) => {
-                tracing::warn!("Failed to resolve host '{}' in tunnel: {:?}", host, e);
-                send_response(
-                    &mut stream,
-                    "502 Bad Gateway",
-                    "text/plain",
-                    b"DNS Resolution Failed",
-                )
-                .await?;
-                return Err(e);
-            }
-        }
-    };
-
-    if is_forbidden_destination_ip(dst_addr.ip()) {
-        send_response(
-            &mut stream,
-            "403 Forbidden",
-            "text/plain",
-            b"Forbidden Destination",
-        )
-        .await?;
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("blocked forbidden destination IP: {}", dst_addr.ip()),
-        ));
-    }
-
-    // Connect to target via tunnel connector
-    let mut tunnel_stream: DynStream = match target_tunnel.tcp_connect(dst_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("Failed to connect to target {}: {:?}", dst_addr, e);
-            send_response(
-                &mut stream,
-                "502 Bad Gateway",
-                "text/plain",
-                b"Connection Failed",
-            )
-            .await?;
-            return Err(e);
-        }
-    };
+    let mut tunnel_stream =
+        resolve_and_connect_http_target(&mut stream, &router, selector, &host, port).await?;
 
     // Respond 200 Connection Established
     stream
@@ -774,6 +718,35 @@ fn build_forward_request_head(
     req_buf
 }
 
+async fn validate_target_host_before_routing<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    host: &str,
+) -> io::Result<Option<IpAddr>> {
+    let literal_ip = parse_domain_ip_literal(host);
+    if let Some(ip) = literal_ip {
+        if is_forbidden_destination_ip(ip) {
+            send_response(
+                stream,
+                "403 Forbidden",
+                "text/plain",
+                b"Forbidden Destination",
+            )
+            .await?;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("blocked forbidden destination IP: {ip}"),
+            ));
+        }
+    } else if !is_valid_target_domain(host) {
+        send_response(stream, "400 Bad Request", "text/plain", b"Invalid Host").await?;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid domain in proxy target",
+        ));
+    }
+    Ok(literal_ip)
+}
+
 async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
     stream: &mut S,
     router: &Arc<dyn TunnelRouter>,
@@ -781,6 +754,8 @@ async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
     host: &str,
     port: u16,
 ) -> io::Result<DynStream> {
+    let literal_ip = validate_target_host_before_routing(stream, host).await?;
+
     let target_tunnel = match router.select_tunnel(selector).await {
         Ok(t) => t,
         Err(e) => {
@@ -789,11 +764,21 @@ async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
         }
     };
 
-    let dst_addr = if let Ok(ip) = host.parse::<IpAddr>() {
-        SocketAddr::new(ip, port)
+    let connect_res = if let Some(ip) = literal_ip {
+        target_tunnel.tcp_connect(SocketAddr::new(ip, port)).await
     } else {
-        match target_tunnel.resolve_in_tunnel(host).await {
-            Ok(ip) => SocketAddr::new(ip, port),
+        let ips = match resolve_and_validate_domain(target_tunnel.as_ref(), host).await {
+            Ok(ips) => ips,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                send_response(
+                    stream,
+                    "403 Forbidden",
+                    "text/plain",
+                    b"Forbidden Destination",
+                )
+                .await?;
+                return Err(e);
+            }
             Err(e) => {
                 send_response(
                     stream,
@@ -804,24 +789,11 @@ async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
                 .await?;
                 return Err(e);
             }
-        }
+        };
+        connect_validated_addrs(target_tunnel.as_ref(), &ips, port).await
     };
 
-    if is_forbidden_destination_ip(dst_addr.ip()) {
-        send_response(
-            stream,
-            "403 Forbidden",
-            "text/plain",
-            b"Forbidden Destination",
-        )
-        .await?;
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("blocked forbidden destination IP: {}", dst_addr.ip()),
-        ));
-    }
-
-    match target_tunnel.tcp_connect(dst_addr).await {
+    match connect_res {
         Ok(s) => Ok(s),
         Err(e) => {
             send_response(

@@ -595,3 +595,51 @@ fn test_admin_parse_http_request_rejects_bare_lf_and_duplicate_auth() {
         b"GET /health HTTP/1.1\r\nAuthorization: Bearer a\r\nAuthorization: Bearer b\r\n\r\n";
     assert!(crate::api::routes::parse_http_request(dup_auth).is_err());
 }
+
+#[tokio::test]
+async fn test_admin_auth_rejects_partial_malformed_and_verifies_constant_time() {
+    use crate::proxy::router::constant_time_eq_str;
+
+    assert!(constant_time_eq_str("secret-token-123", "secret-token-123"));
+    assert!(!constant_time_eq_str(
+        "secret-token-123",
+        "secret-token-124"
+    ));
+    assert!(!constant_time_eq_str("secret-token-123", "secret-token"));
+    assert!(!constant_time_eq_str("", "secret-token-123"));
+
+    let manager = create_test_manager();
+    let expected = Some("super-secret-token");
+
+    for bad_header in [
+        None,
+        Some(""),
+        Some("Bearer"),
+        Some("Bearer "),
+        Some("Bearer  super-secret-token"),
+        Some("Bearer super-secret-token "),
+        Some("Bearer\tsuper-secret-token"),
+        Some("Bearer super-secret-token\n"),
+        Some("Basic c3VwZXItc2VjcmV0LXRva2Vu"),
+        Some("Bearer super-secret-toke"),
+        Some("Bearer super-secret-token-extra"),
+        Some("Bearer super-secret-tokex"),
+    ] {
+        let mut headers = HashMap::new();
+        if let Some(val) = bad_header {
+            headers.insert("authorization".to_string(), val.to_string());
+        }
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/status".to_string(),
+            query: None,
+            headers,
+            body: Vec::new(),
+        };
+        let resp = handle_admin_request(&req, &manager, expected, 10).await;
+        assert_eq!(
+            resp.status, 401,
+            "bad auth header {bad_header:?} must return 401"
+        );
+    }
+}

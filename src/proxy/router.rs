@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,6 +16,76 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::{AuthMode, PoolStrategy};
 use crate::netstack::{VirtualNetworkStack, VirtualUdpSocket};
+
+/// Returns `true` if `v4` is a forbidden IPv4 destination (unspecified, link-local, multicast, or broadcast).
+pub(crate) const fn is_forbidden_ipv4(v4: Ipv4Addr) -> bool {
+    v4.is_unspecified() || v4.is_link_local() || v4.is_multicast() || v4.is_broadcast()
+}
+
+/// Returns `true` if `ip` is an unsafe/forbidden proxy destination:
+/// - IPv4: unspecified (`0.0.0.0/8`), link-local (`169.254.0.0/16`), multicast (`224.0.0.0/4`), broadcast (`255.255.255.255`).
+/// - IPv6: loopback (`::1`), unspecified (`::`), link-local (`fe80::/10`), Unique Local (`fc00::/7`),
+///   multicast (`ff00::/8`), IPv4-mapped IPv6 (`::ffff:0:0/96`), and NAT64 well-known prefix (`64:ff9b::/96`)
+///   when embedding a forbidden IPv4 address.
+pub(crate) const fn is_forbidden_destination_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_forbidden_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_ipv4(v4);
+            }
+            let segs = v6.segments();
+            // NAT64 well-known prefix 64:ff9b::/96
+            if segs[0] == 0x0064
+                && segs[1] == 0xff9b
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0
+            {
+                let o = v6.octets();
+                let embedded_v4 = Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+                return is_forbidden_ipv4(embedded_v4);
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (segs[0] & 0xffc0) == 0xfe80
+                || (segs[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// Parse an IP literal that may appear inside a domain/host field (e.g. `127.0.0.1`, `::1`, `[::1]`).
+pub(crate) fn parse_domain_ip_literal(host: &str) -> Option<IpAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+        && let Ok(v6) = inner.parse::<Ipv6Addr>()
+    {
+        return Some(IpAddr::V6(v6));
+    }
+    None
+}
+
+/// Validate a target domain name against DNS length limits and unsafe ASCII control/whitespace characters.
+pub(crate) fn is_valid_target_domain(domain: &str) -> bool {
+    if domain.is_empty()
+        || domain
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return false;
+    }
+    let clean = domain.strip_suffix('.').unwrap_or(domain);
+    if clean.is_empty() || clean.len() > 253 {
+        return false;
+    }
+    clean
+        .split('.')
+        .all(|label| !label.is_empty() && label.len() <= 63)
+}
 
 /// Target destination requested by a proxy client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +123,9 @@ pub type UdpBindFut<'a> =
 /// Future returned by [`TunnelRouter::select_tunnel`].
 pub type SelectTunnelFut<'a> =
     Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>>;
+
+/// Future returned by [`ProxyTunnelTarget::resolve_all_in_tunnel`].
+pub type ResolveAllFut<'a> = Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send + 'a>>;
 
 /// Trait abstracting a virtual or physical UDP socket used by proxy relays.
 pub trait ProxyUdpSocket: Send + Sync {
@@ -129,6 +202,54 @@ pub trait ProxyTunnelTarget: Send + Sync {
         &'a self,
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>>;
+
+    /// Resolve a domain name inside the tunnel, returning all candidate IP addresses.
+    fn resolve_all_in_tunnel<'a>(&'a self, domain: &'a str) -> ResolveAllFut<'a> {
+        Box::pin(async move { Ok(vec![self.resolve_in_tunnel(domain).await?]) })
+    }
+}
+
+/// Resolve `domain` via `tunnel` and fail-closed reject if ANY returned IP is forbidden.
+pub(crate) async fn resolve_and_validate_domain(
+    tunnel: &dyn ProxyTunnelTarget,
+    domain: &str,
+) -> io::Result<Vec<IpAddr>> {
+    let ips = tunnel.resolve_all_in_tunnel(domain).await?;
+    if ips.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no IP addresses resolved for '{domain}'"),
+        ));
+    }
+    if ips.iter().copied().any(is_forbidden_destination_ip) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("blocked forbidden destination IP in DNS response for '{domain}'"),
+        ));
+    }
+    Ok(ips)
+}
+
+/// Dial TCP sequentially over validated candidate `IpAddr`s on `port` without re-resolving DNS.
+pub(crate) async fn connect_validated_addrs(
+    tunnel: &dyn ProxyTunnelTarget,
+    ips: &[IpAddr],
+    port: u16,
+) -> io::Result<DynStream> {
+    let mut last_err = None;
+    for &ip in ips {
+        let dst_addr = SocketAddr::new(ip, port);
+        match tunnel.tcp_connect(dst_addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no candidate IP addresses to connect",
+        )
+    }))
 }
 
 impl ProxyTunnelTarget for VirtualNetworkStack {
@@ -159,6 +280,10 @@ impl ProxyTunnelTarget for VirtualNetworkStack {
     ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
         Box::pin(async move { self.resolve_in_tunnel(domain).await })
     }
+
+    fn resolve_all_in_tunnel<'a>(&'a self, domain: &'a str) -> ResolveAllFut<'a> {
+        Box::pin(async move { self.resolve_all_in_tunnel(domain).await })
+    }
 }
 
 impl<T: ProxyTunnelTarget + ?Sized> ProxyTunnelTarget for Arc<T> {
@@ -181,6 +306,10 @@ impl<T: ProxyTunnelTarget + ?Sized> ProxyTunnelTarget for Arc<T> {
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
         (**self).resolve_in_tunnel(domain)
+    }
+
+    fn resolve_all_in_tunnel<'a>(&'a self, domain: &'a str) -> ResolveAllFut<'a> {
+        (**self).resolve_all_in_tunnel(domain)
     }
 }
 
@@ -225,6 +354,27 @@ impl ProxyTunnelTarget for DirectTunnelTarget {
                 .next()
                 .map(|s| s.ip())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses found"))
+        })
+    }
+
+    fn resolve_all_in_tunnel<'a>(&'a self, domain: &'a str) -> ResolveAllFut<'a> {
+        Box::pin(async move {
+            if let Ok(ip) = domain.parse::<IpAddr>() {
+                return Ok(vec![ip]);
+            }
+            let host_port = format!("{domain}:0");
+            let ips: Vec<IpAddr> = tokio::net::lookup_host(&host_port)
+                .await?
+                .map(|s| s.ip())
+                .collect();
+            if ips.is_empty() {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no addresses found",
+                ))
+            } else {
+                Ok(ips)
+            }
         })
     }
 }

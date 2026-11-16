@@ -257,18 +257,6 @@ fn parse_query_params(query: Option<&str>) -> HashMap<String, String> {
     map
 }
 
-/// Constant-time byte slice comparison to prevent timing side-channels on bearer tokens.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let max_len = a.len().max(b.len());
-    let mut diff = a.len() ^ b.len();
-    for i in 0..max_len {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= usize::from(x ^ y);
-    }
-    diff == 0
-}
-
 fn is_authorized(req: &HttpRequest, auth_token: Option<&str>) -> bool {
     let Some(expected_token) = auth_token else {
         return true;
@@ -282,8 +270,15 @@ fn is_authorized(req: &HttpRequest, auth_token: Option<&str>) -> bool {
     let Some((scheme, token)) = h.split_once(' ') else {
         return false;
     };
-    scheme.eq_ignore_ascii_case("bearer")
-        && constant_time_eq(token.trim().as_bytes(), expected_token.as_bytes())
+    if !scheme.eq_ignore_ascii_case("bearer")
+        || token.is_empty()
+        || token
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return false;
+    }
+    crate::proxy::router::constant_time_eq_str(token, expected_token)
 }
 
 fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> HttpResponse {

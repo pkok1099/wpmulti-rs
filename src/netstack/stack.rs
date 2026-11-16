@@ -229,8 +229,13 @@ impl VirtualNetworkStack {
         });
 
         let initial_port = 49152 + (rand::random::<u16>() % 1000);
+        let effective_ip_mode = match (ip_mode, local_v4.is_some(), local_v6.is_some()) {
+            (crate::config::IpMode::DualStack, true, false) => crate::config::IpMode::Ipv4Only,
+            (crate::config::IpMode::DualStack, false, true) => crate::config::IpMode::Ipv6Only,
+            _ => ip_mode,
+        };
         let resolver = InTunnelDnsResolver::with_fallback(&config.dns, dns_fallback);
-        resolver.set_ip_mode(ip_mode);
+        resolver.set_ip_mode(effective_ip_mode);
         resolver.set_prefer_ipv6(prefer_ipv6);
         resolver.set_dns_strategy(dns_strategy);
         Ok(Self {
@@ -453,6 +458,11 @@ impl VirtualNetworkStack {
         )
     }
 
+    /// Effective IP mode supported by this stack's configured interface addresses.
+    pub fn effective_ip_mode(&self) -> crate::config::IpMode {
+        self.dns_resolver.ip_mode()
+    }
+
     /// Resolve a domain name inside the WireGuard tunnel.
     pub async fn resolve_in_tunnel(&self, domain: &str) -> Result<IpAddr, io::Error> {
         self.dns_resolver.resolve(self, domain).await
@@ -464,8 +474,35 @@ impl VirtualNetworkStack {
         domain: &str,
         mode: crate::config::IpMode,
     ) -> Result<IpAddr, io::Error> {
+        let effective = if mode == crate::config::IpMode::DualStack {
+            self.dns_resolver.ip_mode()
+        } else {
+            mode
+        };
         self.dns_resolver
-            .resolve_with_mode(self, domain, mode)
+            .resolve_with_mode(self, domain, effective)
+            .await
+    }
+
+    /// Resolve a domain name inside the WireGuard tunnel, returning all candidate IP addresses.
+    pub async fn resolve_all_in_tunnel(&self, domain: &str) -> Result<Vec<IpAddr>, io::Error> {
+        self.dns_resolver.resolve_all(self, domain).await
+    }
+
+    /// Resolve a domain name inside the WireGuard tunnel using an explicit [`IpMode`],
+    /// returning all candidate IP addresses.
+    pub async fn resolve_all_in_tunnel_with_mode(
+        &self,
+        domain: &str,
+        mode: crate::config::IpMode,
+    ) -> Result<Vec<IpAddr>, io::Error> {
+        let effective = if mode == crate::config::IpMode::DualStack {
+            self.dns_resolver.ip_mode()
+        } else {
+            mode
+        };
+        self.dns_resolver
+            .resolve_all_with_mode(self, domain, effective)
             .await
     }
 

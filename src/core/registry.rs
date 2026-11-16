@@ -174,6 +174,16 @@ impl ActiveTunnel {
     ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
         Box::pin(self.netstack.resolve_in_tunnel_with_mode(domain, mode))
     }
+
+    /// Resolve a domain name inside the tunnel under an explicit [`IpMode`],
+    /// returning all candidate IP addresses.
+    pub fn resolve_all_in_tunnel_with_mode<'a>(
+        &'a self,
+        domain: &'a str,
+        mode: crate::config::IpMode,
+    ) -> crate::proxy::router::ResolveAllFut<'a> {
+        Box::pin(self.netstack.resolve_all_in_tunnel_with_mode(domain, mode))
+    }
 }
 
 impl ProxyTunnelTarget for ActiveTunnel {
@@ -212,6 +222,13 @@ impl ProxyTunnelTarget for ActiveTunnel {
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
         self.netstack.resolve_in_tunnel(domain)
+    }
+
+    fn resolve_all_in_tunnel<'a>(
+        &'a self,
+        domain: &'a str,
+    ) -> crate::proxy::router::ResolveAllFut<'a> {
+        Box::pin(self.netstack.resolve_all_in_tunnel(domain))
     }
 }
 

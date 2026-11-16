@@ -722,6 +722,13 @@ impl MainConfig {
                     "admin.auth_token cannot be an empty string".into(),
                 ));
             }
+            if !self.admin.bind.ip().is_loopback()
+                && self.admin.auth_token.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(ConfigError::Validation(
+                    "admin.auth_token is required when admin.bind is not a loopback address".into(),
+                ));
+            }
             bound_addrs.push(self.admin.bind);
         }
 

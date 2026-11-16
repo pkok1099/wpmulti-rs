@@ -585,3 +585,21 @@ fn test_health_check_settings_and_validation() {
     cfg.health_check.probe_timeout = Duration::ZERO;
     assert!(cfg.validate().is_err());
 }
+
+#[test]
+fn test_admin_non_loopback_requires_auth_token() {
+    let mut cfg = MainConfig::default();
+    cfg.admin.enabled = true;
+    cfg.admin.bind = "0.0.0.0:9090".parse().unwrap();
+    cfg.admin.auth_token = None;
+    assert!(
+        cfg.validate().is_err(),
+        "non-loopback admin.bind without auth_token must fail validation"
+    );
+
+    cfg.admin.auth_token = Some("strong-secret-token".to_string());
+    assert!(
+        cfg.validate().is_ok(),
+        "non-loopback admin.bind with auth_token must pass validation"
+    );
+}

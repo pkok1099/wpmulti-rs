@@ -11,6 +11,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proxy::router::{
     DynStream, ProxyTunnelTarget, ProxyUdpSocket, TargetAddr, TunnelRouter, TunnelSelector,
+    connect_validated_addrs, is_forbidden_destination_ip, is_valid_target_domain,
+    parse_domain_ip_literal, resolve_and_validate_domain,
 };
 
 // SOCKS Protocol Versions
@@ -174,16 +176,19 @@ pub fn parse_socks5_udp_packet(buf: &[u8]) -> Option<(TargetAddr, &[u8])> {
             }
             let (domain_bytes, after_domain) = after_len.split_at_checked(len)?;
             let domain = String::from_utf8(domain_bytes.to_vec()).ok()?;
-            if domain.chars().any(char::is_control) {
-                return None;
-            }
             let (port_bytes, payload) = after_domain.split_at_checked(2)?;
             let port_octets: [u8; 2] = port_bytes.try_into().ok()?;
             let port = u16::from_be_bytes(port_octets);
             if port == 0 {
                 return None;
             }
-            (TargetAddr::Domain(domain, port), payload)
+            if let Some(ip) = parse_domain_ip_literal(&domain) {
+                (TargetAddr::Ip(SocketAddr::new(ip, port)), payload)
+            } else if is_valid_target_domain(&domain) {
+                (TargetAddr::Domain(domain, port), payload)
+            } else {
+                return None;
+            }
         }
         ATYP_IPV6 => {
             let (addr_bytes, after_addr) = rest.split_at_checked(16)?;
@@ -382,15 +387,19 @@ async fn read_socks5_command<S: AsyncRead + AsyncWrite + Unpin>(
             stream.read_exact(&mut dom_buf).await?;
             let domain = String::from_utf8(dom_buf)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid domain string"))?;
-            if domain.chars().any(char::is_control) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "control character in domain string",
-                ));
-            }
             let mut port_buf = [0u8; 2];
             stream.read_exact(&mut port_buf).await?;
-            TargetAddr::Domain(domain, u16::from_be_bytes(port_buf))
+            let port = u16::from_be_bytes(port_buf);
+            if let Some(ip) = parse_domain_ip_literal(&domain) {
+                TargetAddr::Ip(SocketAddr::new(ip, port))
+            } else if is_valid_target_domain(&domain) {
+                TargetAddr::Domain(domain, port)
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid domain name in SOCKS5 request",
+                ));
+            }
         }
         ATYP_IPV6 => {
             let mut buf = [0u8; 18];
@@ -483,6 +492,16 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> io::Result<()> {
     let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
 
+    if let TargetAddr::Ip(addr) = &target
+        && is_forbidden_destination_ip(addr.ip())
+    {
+        let _ = send_socks5_reply(&mut stream, REP_CONN_NOT_ALLOWED, dummy_addr).await;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("blocked forbidden destination IP: {}", addr.ip()),
+        ));
+    }
+
     // Resolve tunnel
     let target_tunnel = match router.select_tunnel(selector).await {
         Ok(t) => t,
@@ -493,31 +512,28 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
-    // Resolve target IP destination
-    let dst_addr = match target {
-        TargetAddr::Ip(addr) => addr,
+    // Connect to target via tunnel connector directly from validated SocketAddr(s) (zero TOCTOU)
+    let connect_res = match target {
+        TargetAddr::Ip(dst_addr) => target_tunnel.tcp_connect(dst_addr).await,
         TargetAddr::Domain(ref domain, port) => {
-            match target_tunnel.resolve_in_tunnel(domain).await {
-                Ok(ip) => SocketAddr::new(ip, port),
+            let ips = match resolve_and_validate_domain(target_tunnel.as_ref(), domain).await {
+                Ok(ips) => ips,
                 Err(e) => {
+                    let rep = if e.kind() == io::ErrorKind::PermissionDenied {
+                        REP_CONN_NOT_ALLOWED
+                    } else {
+                        REP_HOST_UNREACHABLE
+                    };
                     tracing::warn!("Failed to resolve target domain '{}': {:?}", domain, e);
-                    let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
+                    let _ = send_socks5_reply(&mut stream, rep, dummy_addr).await;
                     return Err(e);
                 }
-            }
+            };
+            connect_validated_addrs(target_tunnel.as_ref(), &ips, port).await
         }
     };
 
-    if crate::proxy::http::is_forbidden_destination_ip(dst_addr.ip()) {
-        let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("blocked forbidden destination IP: {}", dst_addr.ip()),
-        ));
-    }
-
-    // Connect to target via tunnel connector
-    let mut tunnel_stream: DynStream = match target_tunnel.tcp_connect(dst_addr).await {
+    let mut tunnel_stream: DynStream = match connect_res {
         Ok(s) => s,
         Err(e) => {
             // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; map all others to general failure.
@@ -635,7 +651,7 @@ struct UdpRelayCtx<'a> {
     virtual_udp: &'a dyn ProxyUdpSocket,
     target_tunnel: &'a Arc<dyn ProxyTunnelTarget>,
     dns_tasks: &'a mut tokio::task::JoinSet<()>,
-    dns_tx: &'a tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    dns_tx: &'a tokio::sync::mpsc::Sender<(Vec<SocketAddr>, Vec<u8>)>,
 }
 
 async fn forward_client_udp_datagram(
@@ -671,7 +687,7 @@ async fn forward_client_udp_datagram(
     }
     match target_addr {
         TargetAddr::Ip(addr) => {
-            if !crate::proxy::http::is_forbidden_destination_ip(addr.ip()) {
+            if !is_forbidden_destination_ip(addr.ip()) {
                 let _ = ctx.virtual_udp.send_to(payload, addr).await;
             }
         }
@@ -689,14 +705,16 @@ async fn forward_client_udp_datagram(
             ctx.dns_tasks.spawn(async move {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    tunnel.resolve_in_tunnel(&dom),
+                    resolve_and_validate_domain(tunnel.as_ref(), &dom),
                 )
                 .await
                 {
-                    Ok(Ok(ip)) => {
-                        if !crate::proxy::http::is_forbidden_destination_ip(ip) {
-                            let _ = tx.send((SocketAddr::new(ip, port), payload_owned)).await;
-                        }
+                    Ok(Ok(ips)) => {
+                        let addrs: Vec<SocketAddr> = ips
+                            .into_iter()
+                            .map(|ip| SocketAddr::new(ip, port))
+                            .collect();
+                        let _ = tx.send((addrs, payload_owned)).await;
                     }
                     Ok(Err(e)) => {
                         tracing::warn!("Failed to resolve UDP target domain '{}': {:?}", dom, e);
@@ -729,6 +747,18 @@ async fn forward_virtual_to_relay(
     }
 }
 
+async fn send_udp_to_validated_addrs(
+    virtual_udp: &dyn ProxyUdpSocket,
+    payload: &[u8],
+    addrs: &[SocketAddr],
+) {
+    for &target_sock in addrs {
+        if virtual_udp.send_to(payload, target_sock).await.is_ok() {
+            break;
+        }
+    }
+}
+
 /// Loops relaying UDP datagrams between client and tunnel until client TCP closes.
 async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
     control_stream: &mut S,
@@ -750,7 +780,7 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
     let mut out_pkt_buf = vec![0u8; 65536 + 32];
     let idle_timeout = std::time::Duration::from_mins(5);
     let mut dns_tasks = tokio::task::JoinSet::new();
-    let (dns_tx, mut dns_rx) = tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(64);
+    let (dns_tx, mut dns_rx) = tokio::sync::mpsc::channel::<(Vec<SocketAddr>, Vec<u8>)>(64);
 
     loop {
         while let Some(res) = dns_tasks.try_join_next() {
@@ -768,8 +798,8 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
                 }
             }
 
-            Some((target_sock, payload)) = dns_rx.recv() => {
-                let _ = virtual_udp.send_to(&payload, target_sock).await;
+            Some((target_socks, payload)) = dns_rx.recv() => {
+                send_udp_to_validated_addrs(virtual_udp.as_ref(), &payload, &target_socks).await;
             }
 
             relay_res = relay_socket.recv_from(&mut relay_buf) => {

@@ -550,7 +550,9 @@ impl TunnelRouter for MultiTenantRouter {
                         break;
                     }
                     Err(e) => {
-                        if let Some(entry) = self.registry.get(&target_id) {
+                        if !matches!(selector, TunnelSelector::ById(_))
+                            && let Some(entry) = self.registry.get(&target_id)
+                        {
                             entry.health.release_trial_slot();
                         }
                         tracing::warn!(
@@ -724,6 +726,14 @@ impl ProxyTunnelTarget for IpFilteredTunnelTarget {
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
         self.inner.resolve_in_tunnel_with_mode(domain, self.ip_mode)
+    }
+
+    fn resolve_all_in_tunnel<'a>(
+        &'a self,
+        domain: &'a str,
+    ) -> crate::proxy::router::ResolveAllFut<'a> {
+        self.inner
+            .resolve_all_in_tunnel_with_mode(domain, self.ip_mode)
     }
 }
 

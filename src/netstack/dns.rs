@@ -55,7 +55,12 @@ pub fn build_query(domain: &str, qtype: QueryType, id: u16) -> Result<Vec<u8>, D
     packet.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
 
     // Question: QNAME
-    let clean = domain.trim().trim_end_matches('.');
+    if domain.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(DnsError::InvalidDomain(
+            "domain contains whitespace or control characters",
+        ));
+    }
+    let clean = domain.strip_suffix('.').unwrap_or(domain);
     if clean.is_empty() {
         return Err(DnsError::InvalidDomain("empty domain"));
     }
