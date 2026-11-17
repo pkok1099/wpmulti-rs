@@ -377,13 +377,61 @@ async fn test_bridge_notify_liveness() {
         .expect("notify must trigger");
 }
 
-#[test]
-fn test_bridge_malformed_ip_rejection() {
-    let pool = gotatun::packet::PacketBufPool::<4096>::new(16);
-    // A packet shorter than 20 bytes is not a valid IP packet
-    let too_short = vec![0x45, 0x00, 0x00];
-    let res = BridgeIpRecv::to_packet_pub(&too_short, &pool);
-    assert!(res.is_err());
+#[tokio::test]
+async fn test_bridge_malformed_ip_rejection() {
+    let (mut bridge, _ip_send, mut ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 16);
+    let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+
+    // A packet shorter than 20 bytes is not a valid IP packet: it must be
+    // dropped by `recv` instead of delivered.
+    use smoltcp::phy::{Device, TxToken};
+    let now = smoltcp::time::Instant::now();
+    let tx_token = bridge.transmit(now).expect("must get tx token");
+    tx_token.consume(3, |buf| {
+        buf.copy_from_slice(&[0x45, 0x00, 0x00]);
+    });
+
+    // A valid packet sent after it must still arrive.
+    let builder = PacketBuilder::ipv4([10, 2, 0, 2], [1, 1, 1, 1], 64).udp(4567, 53);
+    let mut raw = Vec::new();
+    builder.write(&mut raw, b"DNSQUERY").unwrap();
+    let tx_token = bridge.transmit(now).expect("must get tx token");
+    tx_token.consume(raw.len(), |buf| {
+        buf.copy_from_slice(&raw);
+    });
+
+    use gotatun::tun::IpRecv;
+    let mut packets = ip_recv.recv(&mut pool).await.unwrap();
+    let pkt = packets.next().expect("valid packet must be received");
+    use zerocopy::IntoBytes;
+    assert_eq!((*pkt).as_bytes(), &raw[..]);
+    assert!(packets.next().is_none());
+}
+
+#[tokio::test]
+async fn test_bridge_tx_oversize_mtu() {
+    // MTU above the 4096-byte pool buffer: the TX token must grow its buffer
+    // and the full packet must still arrive intact.
+    let (mut bridge, _ip_send, mut ip_recv) = VirtualTunBridge::new(9000, 16);
+    let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+
+    let builder = PacketBuilder::ipv4([10, 2, 0, 2], [1, 1, 1, 1], 64).udp(4567, 53);
+    let mut raw = Vec::new();
+    builder.write(&mut raw, &[0xab; 4960]).unwrap();
+    assert!(raw.len() > 4096, "test packet must exceed the pool buffer");
+
+    use smoltcp::phy::{Device, TxToken};
+    let now = smoltcp::time::Instant::now();
+    let tx_token = bridge.transmit(now).expect("must get tx token");
+    tx_token.consume(raw.len(), |buf| {
+        buf.copy_from_slice(&raw);
+    });
+
+    use gotatun::tun::IpRecv;
+    let mut packets = ip_recv.recv(&mut pool).await.unwrap();
+    let pkt = packets.next().expect("oversize packet must be received");
+    use zerocopy::IntoBytes;
+    assert_eq!((*pkt).as_bytes(), &raw[..]);
 }
 
 // =========================================================================

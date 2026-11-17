@@ -4,7 +4,6 @@
 //! [`BridgeIpSend`] implementing [`gotatun::tun::IpSend`], and
 //! [`BridgeIpRecv`] implementing [`gotatun::tun::IpRecv`].
 
-use parking_lot::Mutex;
 use std::io;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
@@ -24,13 +23,19 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 /// Maximum batch size when draining outbound packets in `IpRecv::recv`.
 pub const MAX_DRAIN_BATCH_SIZE: usize = 16;
 
+/// Number of packet buffers retained by the bridge's own [`PacketBufPool`].
+///
+/// The pool only bounds *retained* buffers; [`PacketBufPool::get`] allocates a
+/// fresh buffer when the pool is empty, so this never blocks the TX path.
+const BRIDGE_PACKET_POOL_CAPACITY: usize = 64;
+
 /// Userspace virtual network device implementing [`smoltcp::phy::Device`].
 pub struct VirtualTunBridge {
     mtu: u16,
     rx_receiver: mpsc::Receiver<Packet<Ip>>,
-    tx_sender: mpsc::Sender<Vec<u8>>,
+    tx_sender: mpsc::Sender<Packet<[u8]>>,
     notify: Arc<Notify>,
-    buf_pool: Arc<Mutex<Vec<Vec<u8>>>>,
+    packet_pool: PacketBufPool,
 }
 
 impl std::fmt::Debug for VirtualTunBridge {
@@ -56,10 +61,9 @@ impl std::fmt::Debug for BridgeIpSend {
 
 /// Outbound handle passed to `gotatun` (`ip_rx`) implementing [`gotatun::tun::IpRecv`].
 pub struct BridgeIpRecv {
-    tx_receiver: mpsc::Receiver<Vec<u8>>,
+    tx_receiver: mpsc::Receiver<Packet<[u8]>>,
     mtu: MtuWatcher,
     notify: Arc<Notify>,
-    buf_pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl std::fmt::Debug for BridgeIpRecv {
@@ -80,14 +84,17 @@ impl VirtualTunBridge {
         let (rx_sender, rx_receiver) = mpsc::channel(cap);
         let (tx_sender, tx_receiver) = mpsc::channel(cap);
         let notify = Arc::new(Notify::new());
-        let buf_pool = Arc::new(Mutex::new(Vec::with_capacity(64)));
+        // The bridge owns its own pool: gotatun's pool is only handed to
+        // `IpRecv::recv`, so the TX token cannot draw from it. Buffers drawn
+        // here return to this pool on drop via `Packet`'s return-to-pool hook.
+        let packet_pool = PacketBufPool::new(BRIDGE_PACKET_POOL_CAPACITY);
 
         let bridge = Self {
             mtu,
             rx_receiver,
             tx_sender,
             notify: Arc::clone(&notify),
-            buf_pool: Arc::clone(&buf_pool),
+            packet_pool,
         };
 
         let ip_send = BridgeIpSend {
@@ -99,7 +106,6 @@ impl VirtualTunBridge {
             tx_receiver,
             mtu: MtuWatcher::new(mtu),
             notify,
-            buf_pool,
         };
 
         (bridge, ip_send, ip_recv)
@@ -151,7 +157,7 @@ impl Device for VirtualTunBridge {
                 let rx = VirtualTunRxToken { packet };
                 let tx = VirtualTunTxToken {
                     tx_sender: &self.tx_sender,
-                    buf_pool: &self.buf_pool,
+                    packet_pool: self.packet_pool.clone(),
                 };
                 Some((rx, tx))
             }
@@ -167,7 +173,7 @@ impl Device for VirtualTunBridge {
         if self.tx_sender.capacity() > 0 {
             Some(VirtualTunTxToken {
                 tx_sender: &self.tx_sender,
-                buf_pool: &self.buf_pool,
+                packet_pool: self.packet_pool.clone(),
             })
         } else {
             // Infallible token rule in smoltcp 0.14: return None to retain socket TX queue
@@ -199,10 +205,19 @@ impl RxToken for VirtualTunRxToken {
 }
 
 /// Token representing an outgoing transmission slot from smoltcp to WireGuard.
-#[derive(Debug)]
+///
+/// Holds a clone of the bridge's [`PacketBufPool`]; the buffer is drawn from
+/// the pool only when smoltcp actually calls `consume`, so a token that is
+/// dropped without being consumed costs nothing.
 pub struct VirtualTunTxToken<'a> {
-    tx_sender: &'a mpsc::Sender<Vec<u8>>,
-    buf_pool: &'a Mutex<Vec<Vec<u8>>>,
+    tx_sender: &'a mpsc::Sender<Packet<[u8]>>,
+    packet_pool: PacketBufPool,
+}
+
+impl std::fmt::Debug for VirtualTunTxToken<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtualTunTxToken").finish_non_exhaustive()
+    }
 }
 
 impl TxToken for VirtualTunTxToken<'_> {
@@ -210,24 +225,17 @@ impl TxToken for VirtualTunTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = self
-            .buf_pool
-            .lock()
-            .pop()
-            .unwrap_or_else(|| Vec::with_capacity(len.max(1500)));
-        buffer.resize(len, 0);
-        let result = f(&mut buffer);
-        if let Err(
-            mpsc::error::TrySendError::Full(returned) | mpsc::error::TrySendError::Closed(returned),
-        ) = self.tx_sender.try_send(buffer)
-        {
+        // Draw a pooled buffer and hand it straight to smoltcp: no zero-fill
+        // (smoltcp overwrites all `len` bytes) and no copy afterwards — the
+        // same `Packet` travels on to gotatun via `BridgeIpRecv`.
+        // `resize` only zero-fills when the packet exceeds the pool buffer
+        // (MTU > 4096): then the buffer detaches from the pool allocation and
+        // the pool keeps recycling its own buffer, as gotatun's pool does.
+        let mut packet = self.packet_pool.get();
+        packet.buf_mut().resize(len, 0);
+        let result = f(packet.buf_mut());
+        if self.tx_sender.try_send(packet).is_err() {
             tracing::warn!("VirtualTunBridge TX channel full or closed; dropping outbound packet");
-            if returned.capacity() <= 65536 {
-                let mut pool = self.buf_pool.lock();
-                if pool.len() < 64 {
-                    pool.push(returned);
-                }
-            }
         }
         result
     }
@@ -264,8 +272,12 @@ impl IpSend for BridgeIpSend {
 impl IpRecv for BridgeIpRecv {
     async fn recv<'a>(
         &'a mut self,
-        pool: &mut PacketBufPool,
+        _pool: &mut PacketBufPool,
     ) -> io::Result<impl Iterator<Item = Packet<Ip>> + Send + 'a> {
+        // The channel already carries pooled `Packet<[u8]>` from the bridge,
+        // so no copy is needed here: `try_into_ip` validates the header and
+        // reinterprets the same buffer. Gotatun's `pool` is unused by this
+        // implementation; the bridge recycles its own pool on packet drop.
         let mut packets = Vec::with_capacity(MAX_DRAIN_BATCH_SIZE);
         loop {
             let first = self.tx_receiver.recv().await.ok_or_else(|| {
@@ -274,7 +286,7 @@ impl IpRecv for BridgeIpRecv {
                     "VirtualTunBridge netstack tx channel closed",
                 )
             })?;
-            match Self::to_packet_and_recycle(first, pool, &self.buf_pool) {
+            match first.try_into_ip() {
                 Ok(pkt) => {
                     packets.push(pkt);
                     break;
@@ -288,7 +300,7 @@ impl IpRecv for BridgeIpRecv {
         // Opportunistic batch draining up to MAX_DRAIN_BATCH_SIZE
         while packets.len() < MAX_DRAIN_BATCH_SIZE {
             match self.tx_receiver.try_recv() {
-                Ok(next) => match Self::to_packet_and_recycle(next, pool, &self.buf_pool) {
+                Ok(next) => match next.try_into_ip() {
                     Ok(pkt) => packets.push(pkt),
                     Err(e) => {
                         tracing::warn!("Dropping malformed outbound IP packet from smoltcp: {e}");
@@ -306,70 +318,5 @@ impl IpRecv for BridgeIpRecv {
 
     fn mtu(&self) -> MtuWatcher {
         self.mtu.clone()
-    }
-}
-
-impl BridgeIpRecv {
-    /// Convert raw bytes from smoltcp into a pooled [`Packet<Ip>`].
-    #[inline]
-    pub fn to_packet_pub(raw: &[u8], pool: &PacketBufPool) -> io::Result<Packet<Ip>> {
-        Self::to_packet(raw, pool)
-    }
-
-    #[inline]
-    fn to_packet_and_recycle(
-        mut raw: Vec<u8>,
-        pool: &PacketBufPool,
-        buf_pool: &Arc<Mutex<Vec<Vec<u8>>>>,
-    ) -> io::Result<Packet<Ip>> {
-        let mut pkt = pool.get();
-        if raw.len() > pkt.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "IP packet length {} exceeds buffer pool capacity {}",
-                    raw.len(),
-                    pkt.len()
-                ),
-            ));
-        }
-        pkt.truncate(raw.len());
-        pkt.copy_from_slice(&raw);
-        if raw.capacity() <= 65536 {
-            raw.clear();
-            let mut p = buf_pool.lock();
-            if p.len() < 64 {
-                p.push(raw);
-            }
-        }
-        pkt.try_into_ip().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Malformed IP packet from smoltcp: {e}"),
-            )
-        })
-    }
-
-    #[inline]
-    fn to_packet(raw: &[u8], pool: &PacketBufPool) -> io::Result<Packet<Ip>> {
-        let mut pkt = pool.get();
-        if raw.len() > pkt.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "IP packet length {} exceeds buffer pool capacity {}",
-                    raw.len(),
-                    pkt.len()
-                ),
-            ));
-        }
-        pkt.truncate(raw.len());
-        pkt.copy_from_slice(raw);
-        pkt.try_into_ip().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Malformed IP packet from smoltcp: {e}"),
-            )
-        })
     }
 }
