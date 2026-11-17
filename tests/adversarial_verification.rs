@@ -208,7 +208,7 @@ async fn test_adv_socks5_http_high_concurrency_stress() {
                 _ => {
                     // Unknown tunnel ID: authenticate succeeds with ById, but select_tunnel must fail with NotFound
                     let sel = r.authenticate(Some(("unknown-tenant-99", "secret123")))?;
-                    let res = r.select_tunnel(&sel).await;
+                    let res = r.select_tunnel(&sel, None).await;
                     match res {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             Ok((req_id, "route_rejected", sel))
@@ -710,7 +710,14 @@ fn test_cli_probe_json_stdout_pure_and_logs_to_stderr() {
         .output()
         .expect("failed to execute wpmulti binary");
 
-    assert!(output.status.success(), "status={:?}", output.status);
+    // A probe whose tunnels all fail exits non-zero in every output mode
+    // (table and JSON alike), but stdout must still be a single parseable
+    // JSON array with logs kept on stderr.
+    assert!(
+        !output.status.success(),
+        "probe must exit non-zero when all tunnels fail, status={:?}",
+        output.status
+    );
     let stdout_str = String::from_utf8(output.stdout).unwrap();
     let stderr_str = String::from_utf8(output.stderr).unwrap();
 
@@ -726,4 +733,70 @@ fn test_cli_probe_json_stdout_pure_and_logs_to_stderr() {
         .expect("probe --json stdout must parse cleanly as single JSON array without log mixing");
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0].id, "probe-clean");
+}
+
+#[test]
+fn test_cli_top_without_terminal_reports_clear_error() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wpmulti"))
+        .args(["top", "--admin-url", "http://127.0.0.1:9090"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to execute wpmulti binary");
+    assert!(!output.status.success(), "top without a terminal must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("interactive terminal"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No such device or address"),
+        "cryptic OS error leaked through: {stderr}"
+    );
+    // main() prints errors via Display, never via Debug.
+    assert!(
+        !stderr.contains("Custom { kind"),
+        "Rust Debug wrapper leaked through: {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_probe_json_exit_code_matches_table_when_all_tunnels_fail() {
+    let env = TestEnvironment::new("probe-json-exit").expect("test env");
+    env.write_conf(
+        "probe-01.conf",
+        r#"
+[Interface]
+PrivateKey = 0OaUaQd4uJq5m8eN8uJq5m8eN8uJq5m8eN8uJq5m8eN8uJq5m8eM=
+Address = 172.16.0.2/32
+
+[Peer]
+PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+Endpoint = 192.0.2.1:51820
+AllowedIPs = 0.0.0.0/0
+"#,
+    )
+    .expect("write conf");
+    // Both output modes must exit non-zero when every tunnel fails, so a
+    // script cannot mistake a --json failure for success.
+    for json in [false, true] {
+        let mut args = vec![
+            "probe",
+            "-d",
+            env.conf_dir().to_str().expect("utf8"),
+            "--timeout",
+            "100ms",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_wpmulti"))
+            .args(&args)
+            .output()
+            .expect("failed to execute wpmulti binary");
+        assert!(
+            !output.status.success(),
+            "probe (json={json}) must exit non-zero when all tunnels fail; stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }

@@ -40,7 +40,7 @@ pub async fn run_socks5_listener(
         let (stream, peer_addr) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
-                tracing::warn!("SOCKS5 listener accept error: {:?}", e);
+                tracing::warn!("SOCKS5 listener accept error: {}", e);
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 continue;
             }
@@ -72,7 +72,7 @@ pub async fn run_http_listener(
         let (stream, peer_addr) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
-                tracing::warn!("HTTP listener accept error: {:?}", e);
+                tracing::warn!("HTTP listener accept error: {}", e);
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 continue;
             }

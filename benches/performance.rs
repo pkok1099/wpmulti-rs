@@ -256,7 +256,7 @@ async fn main() {
     // Measure candidate lookup + round-robin selection
     let start_router = Instant::now();
     for _ in 0..router_selections {
-        let _ = router.select_tunnel(&selector).await;
+        let _ = router.select_tunnel(&selector, None).await;
     }
     let elapsed_router = start_router.elapsed();
     let router_rate = router_selections as f64 / elapsed_router.as_secs_f64();

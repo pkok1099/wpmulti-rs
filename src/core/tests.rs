@@ -13,6 +13,7 @@ use crate::config::{
     TunnelConfig, TunnelPortOverride, WgInterfaceConfig, WgPeerConfig,
 };
 use crate::core::TunnelManager;
+use crate::core::health::{HealthStatus, TunnelHealthTracker};
 use crate::core::lifecycle::{LifecycleController, TunnelConnGuard};
 use crate::core::listener::ListenerSupervisor;
 use crate::core::registry::{TunnelEntry, TunnelRegistry, TunnelState, TunnelStats};
@@ -242,7 +243,7 @@ async fn test_shared_port_router_auth_and_strategies() {
 
     // Test 4: Select tunnel ById activates target
     let target = router
-        .select_tunnel(&ok_auth)
+        .select_tunnel(&ok_auth, None)
         .await
         .expect("select tunnel should succeed");
     assert!(registry.get("wgcf-tenant-01").unwrap().is_active());
@@ -250,7 +251,7 @@ async fn test_shared_port_router_auth_and_strategies() {
     // Test 5: Round-Robin Keyword cycling
     let sel_rr = TunnelSelector::ByKeyword(PoolKeyword::RoundRobin);
     for _ in 0..3 {
-        let _ = router.select_tunnel(&sel_rr).await.unwrap();
+        let _ = router.select_tunnel(&sel_rr, None).await.unwrap();
     }
     // Verify all 3 tunnels in pool were activated across the round-robin cycle
     assert_eq!(registry.active_count(), 3);
@@ -265,7 +266,7 @@ async fn test_shared_port_router_auth_and_strategies() {
     t3.stats.active_conns.store(0, Ordering::Relaxed);
 
     let sel_least = TunnelSelector::ByKeyword(PoolKeyword::LeastConn);
-    let least_target = router.select_tunnel(&sel_least).await.unwrap();
+    let least_target = router.select_tunnel(&sel_least, None).await.unwrap();
     // Guard created on t3 increments it to 1
     assert_eq!(t3.stats.active_conns.load(Ordering::Relaxed), 1);
 
@@ -330,6 +331,7 @@ async fn test_dedicated_and_shared_listeners() {
     let started = supervisor
         .start_dedicated_listeners(
             &per_tunnel,
+            None,
             "127.0.0.1".parse().unwrap(),
             &registry,
             &lifecycle,
@@ -562,7 +564,7 @@ async fn test_pool_isolation_rejects_unallowed_by_id() {
 
     // Attempt to select wgcf-pool-forbidden ById: must be rejected with NotFound
     let selector_forbidden = TunnelSelector::ById("wgcf-pool-forbidden".to_string());
-    let res = router.select_tunnel(&selector_forbidden).await;
+    let res = router.select_tunnel(&selector_forbidden, None).await;
     let Err(err) = res else {
         panic!("selecting unallowed tunnel ById must fail");
     };
@@ -575,7 +577,7 @@ async fn test_pool_isolation_rejects_unallowed_by_id() {
 
     // Selecting allowed tunnel ById must succeed
     let selector_allowed = TunnelSelector::ById("wgcf-pool-allowed".to_string());
-    let res_allowed = router.select_tunnel(&selector_allowed).await;
+    let res_allowed = router.select_tunnel(&selector_allowed, None).await;
     assert!(
         res_allowed.is_ok(),
         "selecting allowed tunnel ById must succeed"
@@ -686,6 +688,7 @@ async fn test_assigned_port_reflected_in_summary() {
     supervisor
         .start_dedicated_listeners(
             &per_tunnel,
+            None,
             "127.0.0.1".parse().unwrap(),
             &registry,
             &lifecycle,
@@ -795,6 +798,58 @@ async fn test_guarded_udp_socket_preserves_active_conns() {
     drop(socket);
     // Dropping socket releases the guard!
     assert_eq!(entry.stats.active_conns.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_udp_bind_does_not_mark_tunnel_healthy() {
+    use crate::proxy::ProxyTunnelTarget;
+
+    let registry = Arc::new(TunnelRegistry::new());
+    let cfg = make_test_tunnel_config("tun-udp-bind-health");
+    registry
+        .register(TunnelEntry::new(
+            "tun-udp-bind-health",
+            cfg,
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let (target, guard) = lifecycle
+        .get_or_activate("tun-udp-bind-health")
+        .await
+        .unwrap();
+
+    let tracker = Arc::new(TunnelHealthTracker::new());
+    let guarded_target = crate::core::lifecycle::GuardedTunnelTarget::new_with_health(
+        target,
+        guard,
+        Arc::clone(&tracker),
+        3,
+        Duration::from_secs(30),
+    );
+
+    // Binding a virtual UDP socket must not promote an unproven
+    // tunnel to Healthy: no packet has crossed the handshake.
+    let socket = guarded_target.udp_bind(0).await.unwrap();
+    drop(socket);
+    assert_eq!(tracker.current_status(), HealthStatus::Unknown);
+    assert_eq!(tracker.consecutive_failures(), 0);
+
+    // Nor must it rescue an Unhealthy tunnel or reset its failures.
+    tracker.record_failure(3, Duration::from_secs(30));
+    tracker.record_failure(3, Duration::from_secs(30));
+    tracker.record_failure(3, Duration::from_secs(30));
+    assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
+    assert_eq!(tracker.consecutive_failures(), 3);
+    let socket = guarded_target.udp_bind(0).await.unwrap();
+    drop(socket);
+    assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
+    assert_eq!(tracker.consecutive_failures(), 3);
 }
 
 #[tokio::test]
@@ -1056,12 +1111,161 @@ fn test_per_tunnel_auth_override_and_global_fallback() {
     );
 }
 
+/// Regression (audit run-1, `proxy.auth.per-tunnel-password-bypass-via-tag-selector`):
+/// in PerTunnel mode a tag selector must not open a password-protected
+/// tunnel with the global password. `authenticate` still accepts the
+/// global password provisionally (it cannot know which tunnel the tag
+/// resolves to); `select_tunnel` is the authoritative check and must
+/// reject it before activating the tunnel.
+#[tokio::test]
+async fn test_per_tunnel_tag_selector_rejects_global_password() {
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-premium-01",
+            make_test_tunnel_config("wgcf-premium-01"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-open-01",
+            make_test_tunnel_config("wgcf-open-01"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let mut passwords = std::collections::HashMap::new();
+    passwords.insert("wgcf-premium-01".to_string(), "premium-secret".to_string());
+
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        false,
+    )
+    .with_auth(AuthMode::PerTunnel, Some("global-secret".to_string()))
+    .with_per_tunnel_passwords(passwords);
+
+    // Auth-time acceptance is provisional: the tag resolves to the
+    // premium tunnel, whose own password is required.
+    let selector = router
+        .authenticate(Some(("tag:wgcf-premium-01", "global-secret")))
+        .expect("tag auth with the global password is provisionally accepted");
+    assert_eq!(
+        selector,
+        TunnelSelector::ByTag("wgcf-premium-01".to_string())
+    );
+
+    // Selection with the global password must fail before activation.
+    let Err(err) = router
+        .select_tunnel(&selector, Some(("tag:wgcf-premium-01", "global-secret")))
+        .await
+    else {
+        panic!("global password must not open the premium tunnel");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        err.to_string()
+            .contains("invalid proxy credentials for the selected tunnel"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !registry.get("wgcf-premium-01").unwrap().is_active(),
+        "rejected selection must not activate the tunnel"
+    );
+
+    // The tunnel's own password opens it.
+    let target = router
+        .select_tunnel(&selector, Some(("tag:wgcf-premium-01", "premium-secret")))
+        .await
+        .expect("tunnel password must open the premium tunnel");
+    assert_eq!(target.tunnel_id(), Some("wgcf-premium-01"));
+    assert!(
+        registry.get("wgcf-premium-01").unwrap().is_active(),
+        "accepted selection must activate the tunnel"
+    );
+    drop(target);
+
+    // Control: ById with the global password is rejected the same way.
+    let by_id = TunnelSelector::ById("wgcf-premium-01".to_string());
+    let Err(err) = router
+        .select_tunnel(&by_id, Some(("wgcf-premium-01", "global-secret")))
+        .await
+    else {
+        panic!("global password must not open the premium tunnel by id either");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+    // Control: the unprotected tunnel still accepts the global password.
+    let open_selector = TunnelSelector::ByTag("wgcf-open-01".to_string());
+    let open_target = router
+        .select_tunnel(&open_selector, Some(("tag:wgcf-open-01", "global-secret")))
+        .await
+        .expect("global password must open the unprotected tunnel");
+    assert_eq!(open_target.tunnel_id(), Some("wgcf-open-01"));
+    drop(open_target);
+}
+
+/// Same bypass, keyword selector: with only the protected tunnel in the
+/// pool, `auto` + the global password must fail and the tunnel's own
+/// password must succeed.
+#[tokio::test]
+async fn test_per_tunnel_keyword_selector_rejects_global_password() {
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-premium-01",
+            make_test_tunnel_config("wgcf-premium-01"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let mut passwords = std::collections::HashMap::new();
+    passwords.insert("wgcf-premium-01".to_string(), "premium-secret".to_string());
+
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        false,
+    )
+    .with_auth(AuthMode::PerTunnel, Some("global-secret".to_string()))
+    .with_per_tunnel_passwords(passwords);
+
+    let selector = TunnelSelector::ByKeyword(PoolKeyword::Auto);
+    let Err(err) = router
+        .select_tunnel(&selector, Some(("auto", "global-secret")))
+        .await
+    else {
+        panic!("global password must not open the premium tunnel via keyword");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+    let target = router
+        .select_tunnel(&selector, Some(("auto", "premium-secret")))
+        .await
+        .expect("tunnel password must open the premium tunnel via keyword");
+    assert_eq!(target.tunnel_id(), Some("wgcf-premium-01"));
+    drop(target);
+}
+
 #[test]
 fn test_health_tracker_half_open_single_trial_and_failure_rearms_cooldown() {
     use crate::core::health::{HealthStatus, TunnelHealthTracker};
     let tracker = TunnelHealthTracker::new();
     tracker.record_failure(2, Duration::from_millis(20));
-    assert_eq!(tracker.current_status(), HealthStatus::Healthy);
+    assert_eq!(tracker.current_status(), HealthStatus::Unknown);
     assert!(tracker.is_routable());
 
     tracker.record_failure(2, Duration::from_millis(20));
@@ -1129,6 +1333,95 @@ async fn test_disabled_active_tunnel_is_suspended_and_eager_disabled_starts_clea
     manager.stop().await.unwrap();
 }
 
+async fn disable_busy_tunnel_pending_flow(mode: LifecycleMode) {
+    // Shared by the Lazy and Eager legs below: disabling a busy tunnel
+    // must report pending (not success), refuse new connections, keep
+    // the live session running, and suspend once drained.
+    let mut config = MainConfig::default();
+    config.per_tunnel.enabled = false;
+    config.shared_listeners.clear();
+    config.lifecycle.mode = mode;
+
+    let manager = TunnelManager::new(config, vec![make_test_tunnel_config("busy-one")]).unwrap();
+    manager.start().await.unwrap();
+    manager.activate_tunnel("busy-one").await.unwrap();
+    let entry = manager.registry().get("busy-one").unwrap();
+    assert_eq!(*entry.state.read(), TunnelState::Active);
+    // Simulate one live session held by a proxy connection.
+    entry.stats.active_conns.store(1, Ordering::SeqCst);
+
+    manager
+        .set_tunnels_disabled("busy-one", true)
+        .await
+        .unwrap();
+    let entry = manager.registry().get("busy-one").unwrap();
+    assert!(entry.is_disabled());
+    assert!(
+        entry.is_disable_pending(),
+        "busy tunnel must stay disable-pending, not report plain success"
+    );
+    assert_eq!(*entry.state.read(), TunnelState::Active);
+
+    // New connections are refused while disabled...
+    assert!(manager.activate_tunnel("busy-one").await.is_err());
+
+    // ...but the live session keeps running until it drains.
+    entry.stats.active_conns.store(0, Ordering::SeqCst);
+    manager.lifecycle.check_idle_tunnels().await;
+    let entry = manager.registry().get("busy-one").unwrap();
+    assert_eq!(*entry.state.read(), TunnelState::Suspended);
+    assert!(!entry.is_disable_pending());
+
+    manager.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_disable_busy_lazy_tunnel_stays_pending_until_drained() {
+    disable_busy_tunnel_pending_flow(LifecycleMode::Lazy).await;
+}
+
+#[tokio::test]
+async fn test_disable_busy_eager_tunnel_stays_pending_until_drained() {
+    // The Eager leg: without the fix, check_idle_tunnels skipped Eager
+    // tunnels entirely, so a disabled eager tunnel stayed Active forever.
+    disable_busy_tunnel_pending_flow(LifecycleMode::Eager).await;
+}
+
+#[tokio::test]
+async fn test_reenable_clears_disable_pending() {
+    let mut config = MainConfig::default();
+    config.per_tunnel.enabled = false;
+    config.shared_listeners.clear();
+
+    let manager = TunnelManager::new(config, vec![make_test_tunnel_config("pending-one")]).unwrap();
+    manager.start().await.unwrap();
+    manager.activate_tunnel("pending-one").await.unwrap();
+    let entry = manager.registry().get("pending-one").unwrap();
+    entry.stats.active_conns.store(1, Ordering::SeqCst);
+
+    manager
+        .set_tunnels_disabled("pending-one", true)
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .registry()
+            .get("pending-one")
+            .unwrap()
+            .is_disable_pending()
+    );
+
+    manager
+        .set_tunnels_disabled("pending-one", false)
+        .await
+        .unwrap();
+    let entry = manager.registry().get("pending-one").unwrap();
+    assert!(!entry.is_disabled());
+    assert!(!entry.is_disable_pending());
+
+    manager.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn test_half_open_trial_slot_released_when_guarded_target_dropped_unused() {
     let registry = Arc::new(TunnelRegistry::new());
@@ -1174,6 +1467,246 @@ async fn test_half_open_trial_slot_released_when_guarded_target_dropped_unused()
         "HalfOpen trial slot must be released when GuardedTunnelTarget is dropped unused"
     );
     lifecycle.stop().await;
+}
+
+#[tokio::test]
+async fn test_half_open_trial_resolves_as_inconclusive_when_attempt_aborted() {
+    use crate::proxy::ProxyTunnelTarget;
+
+    let registry = Arc::new(TunnelRegistry::new());
+    let entry = registry
+        .register(TunnelEntry::new(
+            "tun-halfopen-abort",
+            make_test_tunnel_config("tun-halfopen-abort"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    // Force Unhealthy with expired cooldown so is_routable() transitions to HalfOpen
+    entry.health.mark_unhealthy(Duration::from_millis(1));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(entry.health.is_routable());
+    assert_eq!(
+        entry.health.current_status(),
+        crate::core::HealthStatus::HalfOpen
+    );
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let (active, guard) = lifecycle
+        .get_or_activate("tun-halfopen-abort")
+        .await
+        .unwrap();
+    let guarded = crate::core::GuardedTunnelTarget::new_with_health(
+        active,
+        guard,
+        Arc::clone(&entry.health),
+        3,
+        Duration::from_secs(30),
+    );
+
+    // An attempt cut off mid-flight (pool budget / candidate timeout)
+    // ended without a verdict about the tunnel — the destination may
+    // simply be slow — so it must not count as a failure (audit run-1,
+    // medium): the HalfOpen trial slot is released, status and failure
+    // count untouched, and the next request may trial the tunnel again.
+    guarded.note_attempt_aborted();
+    assert_eq!(
+        entry.health.current_status(),
+        crate::core::HealthStatus::HalfOpen
+    );
+    assert_eq!(entry.health.consecutive_failures(), 0);
+    assert_eq!(entry.health.cooldown_remaining_secs(), 0);
+    assert!(
+        entry.health.can_route(),
+        "aborted trial must release the slot for immediate retry, not re-arm the cooldown"
+    );
+
+    // Idempotent per target instance: a second abort note (budget abort
+    // after an inner per-candidate timeout) must not count twice.
+    guarded.note_attempt_aborted();
+    assert_eq!(entry.health.consecutive_failures(), 0);
+
+    drop(guarded);
+    lifecycle.stop().await;
+}
+
+#[test]
+fn test_destination_caused_error_classification() {
+    use crate::core::lifecycle::is_destination_caused_error;
+    use std::io::ErrorKind;
+
+    // Destination-caused, regardless of handshake history: a refused
+    // connection proves the tunnel carried the SYN; an unroutable
+    // address family or a nonexistent domain is a property of the request.
+    assert!(is_destination_caused_error(
+        ErrorKind::ConnectionRefused,
+        false
+    ));
+    assert!(is_destination_caused_error(
+        ErrorKind::AddrNotAvailable,
+        false
+    ));
+    assert!(is_destination_caused_error(ErrorKind::NotFound, false));
+    assert!(is_destination_caused_error(ErrorKind::InvalidInput, false));
+    // Timeout: only destination-caused when the peer has handshaked
+    // before (a blackholing destination); a timeout against a peer that
+    // never handshaked points at the peer itself.
+    assert!(is_destination_caused_error(ErrorKind::TimedOut, true));
+    assert!(!is_destination_caused_error(ErrorKind::TimedOut, false));
+    // Tunnel-side / unexpected: still a failure.
+    assert!(!is_destination_caused_error(ErrorKind::BrokenPipe, true));
+    assert!(!is_destination_caused_error(
+        ErrorKind::ConnectionReset,
+        true
+    ));
+    assert!(!is_destination_caused_error(
+        ErrorKind::NetworkUnreachable,
+        true
+    ));
+    assert!(!is_destination_caused_error(ErrorKind::Other, true));
+}
+
+#[tokio::test]
+async fn test_destination_caused_tcp_errors_do_not_trip_breaker() {
+    use crate::proxy::ProxyTunnelTarget;
+
+    let registry = Arc::new(TunnelRegistry::new());
+    // A v6-only tunnel: any IPv4 destination is unroutable before any
+    // handshake — the failure is the request's, not the tunnel's.
+    let mut cfg = make_test_tunnel_config("tun-v6-only");
+    cfg.interface.addresses = vec!["2606:4700:110:8751:5a4:5d1e:287e:46c4/128".parse().unwrap()];
+    registry
+        .register(TunnelEntry::new("tun-v6-only", cfg, LifecycleMode::Lazy))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let (target, guard) = lifecycle.get_or_activate("tun-v6-only").await.unwrap();
+    let tracker = Arc::new(TunnelHealthTracker::new());
+    let guarded = crate::core::lifecycle::GuardedTunnelTarget::new_with_health(
+        target,
+        guard,
+        Arc::clone(&tracker),
+        3,
+        Duration::from_secs(30),
+    );
+
+    // Three unroutable attempts must not trip the breaker (old behavior:
+    // Unhealthy after the third, with the pool refusing every client).
+    for _ in 0..3 {
+        let err = match guarded.tcp_connect("203.0.113.1:80".parse().unwrap()).await {
+            Ok(_) => panic!("v6-only tunnel must refuse IPv4"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrNotAvailable);
+    }
+    assert_eq!(tracker.current_status(), HealthStatus::Unknown);
+    assert_eq!(tracker.consecutive_failures(), 0);
+
+    // Nor must they drag down a healthy tunnel.
+    tracker.record_success();
+    assert_eq!(tracker.current_status(), HealthStatus::Healthy);
+    let err = match guarded.tcp_connect("203.0.113.1:80".parse().unwrap()).await {
+        Ok(_) => panic!("v6-only tunnel must refuse IPv4"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrNotAvailable);
+    assert_eq!(tracker.current_status(), HealthStatus::Healthy);
+    assert_eq!(tracker.consecutive_failures(), 0);
+
+    drop(guarded);
+    lifecycle.stop().await;
+}
+
+#[tokio::test]
+async fn test_dns_timeout_without_handshake_still_counts_as_failure() {
+    use crate::proxy::ProxyTunnelTarget;
+
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "tun-dns-timeout",
+            make_test_tunnel_config("tun-dns-timeout"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let (target, guard) = lifecycle.get_or_activate("tun-dns-timeout").await.unwrap();
+    let tracker = Arc::new(TunnelHealthTracker::new());
+    let guarded = crate::core::lifecycle::GuardedTunnelTarget::new_with_health(
+        target,
+        guard,
+        Arc::clone(&tracker),
+        3,
+        Duration::from_secs(30),
+    );
+
+    // Control leg: a DNS timeout against a peer that never handshaked is
+    // a tunnel-side failure, not a destination verdict — it must still
+    // count (the `.invalid` TLD never resolves, so no host fallback can
+    // rescue the attempt).
+    let err = guarded
+        .resolve_all_in_tunnel("nonexistent.invalid")
+        .await
+        .expect_err("in-tunnel DNS must time out without a peer");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(tracker.consecutive_failures(), 1);
+    assert_eq!(tracker.current_status(), HealthStatus::Unknown);
+
+    drop(guarded);
+    lifecycle.stop().await;
+}
+
+#[tokio::test]
+async fn test_disable_persists_without_destroying_comments() {
+    // The batch disable path used to rewrite wpmulti.toml from the
+    // parsed model (plain dump), silently destroying every comment —
+    // the same bug the POST /config path had before the merge helper.
+    // Disabling a tunnel must only change the disabled_tunnels value.
+    let temp = tempfile::TempDir::new().unwrap();
+    let cfg_path = temp.path().join("wpmulti.toml");
+    let cfg = MainConfig::default();
+    let commented = format!(
+        "# My production config - DO NOT EDIT BY HAND\n# Contact: ops team\n{}",
+        toml::to_string_pretty(&cfg).expect("serialize config")
+    );
+    std::fs::write(&cfg_path, &commented).unwrap();
+
+    let manager = TunnelManager::new(cfg, vec![make_test_tunnel_config("wgcf-001")]).unwrap();
+    manager.set_config_path(cfg_path.clone());
+    manager
+        .set_tunnels_disabled("wgcf-001", true)
+        .await
+        .unwrap();
+
+    let saved = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        saved.contains("# My production config - DO NOT EDIT BY HAND"),
+        "header comment lost:\n{saved}"
+    );
+    assert!(
+        saved.contains("# Contact: ops team"),
+        "contact comment lost:\n{saved}"
+    );
+    assert!(
+        saved.contains("disabled_tunnels = [\"wgcf-001\"]"),
+        "disable did not persist:\n{saved}"
+    );
+    let reparsed: MainConfig = toml::from_str(&saved).expect("saved file must parse");
+    assert_eq!(reparsed.disabled_tunnels, vec!["wgcf-001".to_string()]);
+    manager.stop().await.unwrap();
 }
 
 #[cfg(unix)]
@@ -1274,21 +1807,23 @@ async fn test_write_config_atomically_fallback_when_parent_dir_read_only() {
     );
 }
 
-async fn send_socks5_ipv6_connect(addr: SocketAddr) {
+/// Send a SOCKS5 CONNECT for an unresolvable domain through `addr` and
+/// assert the error reply. The in-tunnel DNS query times out (no live
+/// peer answers), which books a tunnel-side failure — unlike the old
+/// IPv6-connect generator, whose AddrNotAvailable (family mismatch) no
+/// longer counts as a failure since audit run-1 finding 2. Each call
+/// costs ~3s (the in-tunnel DNS deadline).
+async fn send_socks5_unresolvable_domain_connect(addr: SocketAddr) {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
     let mut method_resp = [0u8; 2];
     stream.read_exact(&mut method_resp).await.unwrap();
     assert_eq!(method_resp, [0x05, 0x00]);
 
-    // CONNECT [2001:db8::1]:80 (ATYP=0x04)
-    let mut req = vec![0x05, 0x01, 0x00, 0x04];
-    req.extend_from_slice(
-        &"2001:db8::1"
-            .parse::<std::net::Ipv6Addr>()
-            .unwrap()
-            .octets(),
-    );
+    // CONNECT nonexistent.invalid:80 (ATYP=0x03 domain)
+    let domain = b"nonexistent.invalid";
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+    req.extend_from_slice(domain);
     req.extend_from_slice(&80u16.to_be_bytes());
     stream.write_all(&req).await.unwrap();
 
@@ -1341,8 +1876,8 @@ async fn test_shared_listener_health_override_and_dynamic_lifecycle_tracking() {
         .await
         .unwrap();
 
-    // One IPv6 connect failure on IPv4-only tunnel trips threshold=1 immediately.
-    send_socks5_ipv6_connect(info1.address).await;
+    // One unresolvable-domain connect failure trips threshold=1 immediately.
+    send_socks5_unresolvable_domain_connect(info1.address).await;
     assert_eq!(entry.health.current_status(), HealthStatus::Unhealthy);
 
     // Dynamic listener without override tracks lifecycle.set_health_check(...) dynamically.
@@ -1353,9 +1888,9 @@ async fn test_shared_listener_health_override_and_dynamic_lifecycle_tracking() {
         .await
         .unwrap();
 
-    send_socks5_ipv6_connect(info2.address).await;
-    assert_eq!(entry.health.current_status(), HealthStatus::Healthy);
-    send_socks5_ipv6_connect(info2.address).await;
+    send_socks5_unresolvable_domain_connect(info2.address).await;
+    assert_eq!(entry.health.current_status(), HealthStatus::Unknown);
+    send_socks5_unresolvable_domain_connect(info2.address).await;
     assert_eq!(entry.health.current_status(), HealthStatus::Unhealthy);
 
     supervisor.stop().await;
@@ -1404,7 +1939,7 @@ async fn test_router_registry_keyword_least_conn_and_all_unhealthy() {
     );
 
     let _t = router
-        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::LeastConn))
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::LeastConn), None)
         .await
         .unwrap();
     assert_eq!(e2.stats.active_conns.load(Ordering::Relaxed), 2);
@@ -1415,7 +1950,7 @@ async fn test_router_registry_keyword_least_conn_and_all_unhealthy() {
     drop(_t);
     e2.health.mark_unhealthy(Duration::from_secs(60));
     let _t_rand = router
-        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::Random))
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::Random), None)
         .await
         .unwrap();
     assert_eq!(e1.stats.active_conns.load(Ordering::Relaxed), 6);
@@ -1430,7 +1965,7 @@ async fn test_router_registry_keyword_least_conn_and_all_unhealthy() {
     ] {
         assert!(
             router
-                .select_tunnel(&TunnelSelector::ByKeyword(kw))
+                .select_tunnel(&TunnelSelector::ByKeyword(kw), None)
                 .await
                 .is_err()
         );
@@ -1483,6 +2018,7 @@ async fn test_dedicated_listeners_shift_and_skip_on_port_conflict() {
     let started = supervisor
         .start_dedicated_listeners(
             &settings,
+            None,
             "127.0.0.1".parse().unwrap(),
             &registry,
             &lifecycle,
@@ -1497,4 +2033,143 @@ async fn test_dedicated_listeners_shift_and_skip_on_port_conflict() {
     supervisor.stop().await;
     lifecycle.stop().await;
     drop(occupied);
+}
+
+#[tokio::test]
+async fn test_dedicated_listener_requires_configured_global_password() {
+    // Audit run-1 (high): a dedicated port must enforce the configured
+    // global password when its tunnel has no own override password.
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-auth-01",
+            make_test_tunnel_config("wgcf-auth-01"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let supervisor = ListenerSupervisor::new();
+
+    let temp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = temp_listener.local_addr().unwrap().port();
+    drop(temp_listener);
+
+    let per_tunnel = PerTunnelSettings {
+        enabled: true,
+        base_socks5_port: Some(port),
+        base_http_port: None,
+        overrides: std::collections::HashMap::new(),
+    };
+    let started = supervisor
+        .start_dedicated_listeners(
+            &per_tunnel,
+            Some("s3cret"),
+            "127.0.0.1".parse().unwrap(),
+            &registry,
+            &lifecycle,
+        )
+        .await
+        .expect("dedicated listener should start");
+    assert_eq!(started.len(), 1);
+    let addr = started[0].address;
+
+    // No-auth greeting is refused: no acceptable method.
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(&[5, 1, 0]).await.unwrap();
+    let mut reply = [0u8; 2];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply, [5, 255]);
+
+    // USERPASS with the tunnel id + global password succeeds.
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(&[5, 1, 2]).await.unwrap();
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply, [5, 2]);
+    let mut auth_req = vec![1, 12];
+    auth_req.extend_from_slice(b"wgcf-auth-01");
+    auth_req.push(6);
+    auth_req.extend_from_slice(b"s3cret");
+    stream.write_all(&auth_req).await.unwrap();
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply, [1, 0]);
+
+    // Wrong password is rejected.
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(&[5, 1, 2]).await.unwrap();
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply, [5, 2]);
+    let mut auth_req = vec![1, 12];
+    auth_req.extend_from_slice(b"wgcf-auth-01");
+    auth_req.push(6);
+    auth_req.extend_from_slice(b"wrong1");
+    stream.write_all(&auth_req).await.unwrap();
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply, [1, 1]);
+
+    supervisor.stop().await;
+    lifecycle.stop().await;
+}
+
+#[tokio::test]
+async fn test_dedicated_listener_fails_closed_when_tunnel_has_no_password() {
+    // Audit run-1 (high): when a password is configured anywhere but a
+    // tunnel has neither an override nor a global fallback, its dedicated
+    // listener must not start unauthenticated.
+    let registry = Arc::new(TunnelRegistry::new());
+    for id in ["wgcf-locked-01", "wgcf-open-01"] {
+        registry
+            .register(TunnelEntry::new(
+                id,
+                make_test_tunnel_config(id),
+                LifecycleMode::Lazy,
+            ))
+            .unwrap();
+    }
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let supervisor = ListenerSupervisor::new();
+
+    let temp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = temp_listener.local_addr().unwrap().port();
+    drop(temp_listener);
+
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "wgcf-locked-01".to_string(),
+        TunnelPortOverride {
+            socks5_port: None,
+            http_port: None,
+            password: Some("l0cked".to_string()),
+        },
+    );
+    let per_tunnel = PerTunnelSettings {
+        enabled: true,
+        base_socks5_port: Some(port),
+        base_http_port: None,
+        overrides,
+    };
+    let err = supervisor
+        .start_dedicated_listeners(
+            &per_tunnel,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &registry,
+            &lifecycle,
+        )
+        .await
+        .expect_err("dedicated listener must fail closed for wgcf-open-01");
+    assert!(
+        err.to_string().contains("wgcf-open-01"),
+        "error must name the unprotected tunnel: {err}"
+    );
+
+    supervisor.stop().await;
+    lifecycle.stop().await;
 }

@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -184,6 +184,35 @@ fn test_wg_conf_invalid_cases() {
         "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.1/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\n"
     );
     assert!(load_tunnel_config_from_str("", &valid_conf).is_err());
+}
+
+#[test]
+fn test_wg_conf_invalid_base64_offset_points_at_first_bad_byte() {
+    // `!!!bad!!!` is 9 bytes long, so the base64 crate's trailing-byte
+    // check reports the last byte (offset 8) although the first bad
+    // byte is at offset 0.
+    let bad_first = "[Interface]\nPrivateKey = !!!bad!!!\nAddress = 10.0.0.1/32\n";
+    let err = load_tunnel_config_from_str("errb640", bad_first).unwrap_err();
+    assert!(
+        err.to_string().contains("offset 0."),
+        "expected offset 0, got: {err}"
+    );
+
+    // A bad byte in the middle keeps its true offset.
+    let bad_mid = "[Interface]\nPrivateKey = AAAA!AAA\nAddress = 10.0.0.1/32\n";
+    let err = load_tunnel_config_from_str("errb644", bad_mid).unwrap_err();
+    assert!(
+        err.to_string().contains("offset 4."),
+        "expected offset 4, got: {err}"
+    );
+
+    // Misplaced padding is the culprit at its own position.
+    let bad_pad = "[Interface]\nPrivateKey = AA=AAAAA\nAddress = 10.0.0.1/32\n";
+    let err = load_tunnel_config_from_str("errb642", bad_pad).unwrap_err();
+    assert!(
+        err.to_string().contains("offset 2."),
+        "expected offset 2, got: {err}"
+    );
 }
 
 // =========================================================================
@@ -386,6 +415,315 @@ fn test_toml_config_validation_failures() {
     assert!(MainConfig::from_toml_str(low_tui).is_err());
 }
 
+#[test]
+fn test_none_mode_password_is_rejected_and_dedicated_fallback() {
+    // Audit run-1 (low): auth_mode = "none" with a password configured is
+    // a fail-open — the password is never checked — so it must fail at load.
+    let none_with_password = r#"
+        [[shared_listener]]
+        name = "plain"
+        bind = "127.0.0.1:1080"
+        auth_mode = "none"
+        global_password = "s3cret"
+    "#;
+    let err = MainConfig::from_toml_str(none_with_password).expect_err("none + password must fail");
+    assert!(err.to_string().contains("none"), "{err}");
+
+    // Same listener without a password is fine.
+    let none_without_password = r#"
+        [[shared_listener]]
+        name = "plain"
+        bind = "127.0.0.1:1080"
+        auth_mode = "none"
+    "#;
+    assert!(MainConfig::from_toml_str(none_without_password).is_ok());
+
+    // Audit run-1 (high): dedicated listeners fall back to the single
+    // enforced global password.
+    let one_global = r#"
+        [[shared_listener]]
+        name = "shared"
+        bind = "127.0.0.1:1080"
+        auth_mode = "global"
+        global_password = "s3cret"
+    "#;
+    let cfg = MainConfig::from_toml_str(one_global).expect("one global password parses");
+    assert_eq!(cfg.dedicated_fallback_password().as_deref(), Some("s3cret"));
+
+    // Two listeners enforcing the same password still yield one fallback.
+    let same_password = r#"
+        [[shared_listener]]
+        name = "socks"
+        bind = "127.0.0.1:1080"
+        auth_mode = "global"
+        global_password = "s3cret"
+
+        [[shared_listener]]
+        name = "http"
+        bind = "127.0.0.1:8080"
+        auth_mode = "per_tunnel"
+        global_password = "s3cret"
+    "#;
+    let cfg = MainConfig::from_toml_str(same_password).expect("same password parses");
+    assert_eq!(cfg.dedicated_fallback_password().as_deref(), Some("s3cret"));
+
+    // Two listeners enforcing distinct passwords are ambiguous: a
+    // dedicated listener cannot choose one, so the config must fail.
+    let distinct_passwords = r#"
+        [[shared_listener]]
+        name = "socks"
+        bind = "127.0.0.1:1080"
+        auth_mode = "global"
+        global_password = "one"
+
+        [[shared_listener]]
+        name = "http"
+        bind = "127.0.0.1:8080"
+        auth_mode = "global"
+        global_password = "two"
+    "#;
+    assert!(MainConfig::from_toml_str(distinct_passwords).is_err());
+}
+
+#[test]
+fn test_toml_config_rejects_unknown_keys() {
+    // A misspelled key in [global] must fail loudly instead of being
+    // silently ignored — otherwise a user can spend hours wondering why
+    // their setting has no effect. The error names the bad key.
+    let typo = "[global]\nlog_leve = \"debug\"\n";
+    let err = MainConfig::from_toml_str(typo).expect_err("typo key must fail");
+    assert!(
+        err.to_string().contains("log_leve"),
+        "error must name the unknown key, got: {err}"
+    );
+
+    // An unknown top-level key fails the same way.
+    let unknown_top = "unknown_section = true\n";
+    let err = MainConfig::from_toml_str(unknown_top).expect_err("unknown key must fail");
+    assert!(
+        err.to_string().contains("unknown_section"),
+        "error must name the unknown key, got: {err}"
+    );
+
+    // An unknown key inside a section fails too.
+    let unknown_nested = "[health_check]\nprobe_intervall = 30\n";
+    let err = MainConfig::from_toml_str(unknown_nested).expect_err("unknown key must fail");
+    assert!(
+        err.to_string().contains("probe_intervall"),
+        "error must name the unknown key, got: {err}"
+    );
+
+    // A correctly spelled key still parses.
+    let ok = "[global]\nlog_level = \"debug\"\n";
+    MainConfig::from_toml_str(ok).expect("correct key must parse");
+}
+
+#[test]
+fn test_resolve_config_dir_keeps_bare_filename_verbatim() {
+    // `Path::parent` of a bare filename is `Some("")`, not `None`, so
+    // the resolver used to join it and silently normalize `./confs`
+    // to `confs` — a save then rewrote a value the user never touched.
+    // A TOML in the working directory keeps its `config_dir` verbatim;
+    // only a TOML in another directory resolves against that directory.
+    let mut cfg = MainConfig::default();
+    cfg.global.config_dir = PathBuf::from("./confs");
+    cfg.resolve_config_dir_against(std::path::Path::new("wpmulti.toml"));
+    assert_eq!(cfg.global.config_dir, PathBuf::from("./confs"));
+
+    let mut cfg = MainConfig::default();
+    cfg.global.config_dir = PathBuf::from("./confs");
+    cfg.resolve_config_dir_against(std::path::Path::new("sub/wpmulti.toml"));
+    assert_eq!(cfg.global.config_dir, PathBuf::from("sub/confs"));
+
+    let mut cfg = MainConfig::default();
+    cfg.global.config_dir = PathBuf::from("./confs");
+    cfg.resolve_config_dir_against(std::path::Path::new("/abs/wpmulti.toml"));
+    assert_eq!(cfg.global.config_dir, PathBuf::from("/abs/confs"));
+
+    let mut cfg = MainConfig::default();
+    cfg.global.config_dir = PathBuf::from("/etc/wpmulti/conf.d");
+    cfg.resolve_config_dir_against(std::path::Path::new("/abs/wpmulti.toml"));
+    assert_eq!(cfg.global.config_dir, PathBuf::from("/etc/wpmulti/conf.d"));
+}
+
+#[test]
+fn test_config_save_preserves_comments() {
+    // Saving a config used to rewrite the whole file from the parsed
+    // model, silently destroying every comment the user wrote in it.
+    // A save must overlay the new values onto the existing text: header
+    // warnings, section comments, and trailing per-key comments survive.
+    let existing = "\
+# My production config - DO NOT EDIT BY HAND
+# Contact: ops team, see ticket #1234
+disabled_tunnels = []  # tunnels go here when broken
+[global]
+config_dir = \"./confs\"  # where the wgcf files live
+log_level = \"info\"  # keep at info in prod
+";
+    let mut cfg = MainConfig::default();
+    cfg.global.config_dir = PathBuf::from("./confs");
+    cfg.disabled_tunnels = vec!["wgcf-001".to_string()];
+    let fresh = toml::to_string_pretty(&cfg).expect("serialize new config");
+
+    let merged =
+        merge_config_preserving_comments(existing, &fresh).expect("commented file must merge");
+    assert!(
+        merged.contains("# My production config - DO NOT EDIT BY HAND"),
+        "header comment lost:\n{merged}"
+    );
+    assert!(
+        merged.contains("# Contact: ops team, see ticket #1234"),
+        "contact comment lost:\n{merged}"
+    );
+    assert!(
+        merged.contains("# tunnels go here when broken"),
+        "trailing comment on disabled_tunnels lost:\n{merged}"
+    );
+    assert!(
+        merged.contains("# where the wgcf files live"),
+        "trailing comment on config_dir lost:\n{merged}"
+    );
+    assert!(
+        merged.contains("# keep at info in prod"),
+        "trailing comment on log_level lost:\n{merged}"
+    );
+    assert!(
+        merged.contains("disabled_tunnels = [\"wgcf-001\"]"),
+        "new disabled_tunnels value missing:\n{merged}"
+    );
+    let reparsed: MainConfig = toml::from_str(&merged).expect("merged text must parse");
+    assert_eq!(reparsed, cfg);
+}
+
+#[test]
+fn test_config_save_merge_drops_removed_listeners_and_unknown_keys() {
+    // Keys the new config no longer contains must leave the file, or
+    // the file drifts from the model (e.g. a listener removed via
+    // POST /config would come back on the next restart).
+    let existing = "\
+[[shared_listener]]
+name = \"shared-socks\"
+type = \"socks5\"
+bind = \"127.0.0.1:1080\"
+
+[[shared_listener]]
+name = \"shared-http\"
+type = \"http\"
+bind = \"127.0.0.1:8080\"
+
+mystery_key = true
+";
+    let cfg = MainConfig {
+        shared_listeners: vec![SharedListenerSettings {
+            name: "shared-socks".to_string(),
+            listener_type: ListenerType::Socks5,
+            bind: "127.0.0.1:1080".parse().expect("bind"),
+            auth_mode: AuthMode::Global,
+            global_password: None,
+            default_strategy: PoolStrategy::RoundRobin,
+            allow_anonymous: true,
+            pool: TunnelPoolSelection::All,
+            ip_mode: None,
+        }],
+        ..Default::default()
+    };
+    let fresh = toml::to_string_pretty(&cfg).expect("serialize new config");
+
+    let merged = merge_config_preserving_comments(existing, &fresh).expect("merge must succeed");
+    assert!(
+        !merged.contains("shared-http"),
+        "removed listener must leave the file:\n{merged}"
+    );
+    assert!(
+        !merged.contains("mystery_key"),
+        "unknown key must leave the file:\n{merged}"
+    );
+    let reparsed: MainConfig = toml::from_str(&merged).expect("merged text must parse");
+    assert_eq!(reparsed, cfg);
+}
+
+#[test]
+fn test_config_save_merge_falls_back_on_garbage() {
+    // Unparsable existing text must not break the save: the merge
+    // returns None and the caller uses the plain dump instead.
+    let cfg = MainConfig::default();
+    let fresh = toml::to_string_pretty(&cfg).expect("serialize new config");
+    assert!(
+        merge_config_preserving_comments("this is [[[ not toml", &fresh).is_none(),
+        "garbage existing text must refuse the merge"
+    );
+    assert!(
+        merge_config_preserving_comments("", &fresh).is_some(),
+        "empty existing text merges as a plain dump"
+    );
+}
+
+#[test]
+fn test_toml_config_rejects_unknown_tunnel_references() {
+    let known: HashSet<String> = ["wgcf-001".to_string(), "wgcf-002".to_string()]
+        .into_iter()
+        .collect();
+    let mut cfg = MainConfig::from_toml_str(
+        r#"
+        [[shared_listener]]
+        name = "shared-socks"
+        type = "socks5"
+        bind = "127.0.0.1:1080"
+        pool = ["wgcf-001"]
+        "#,
+    )
+    .expect("base config");
+    cfg.validate_tunnel_references(&known)
+        .expect("a config with only real references passes");
+
+    // One ghost in each of the four referencing fields; each error must
+    // name the ghost id and where it was referenced.
+    cfg.disabled_tunnels = vec!["wgcf-999".to_string()];
+    let err = cfg
+        .validate_tunnel_references(&known)
+        .expect_err("ghost disabled id must fail");
+    assert!(err.to_string().contains("wgcf-999"), "got: {err}");
+    assert!(err.to_string().contains("disabled_tunnels"), "got: {err}");
+    cfg.disabled_tunnels.clear();
+
+    cfg.lifecycle.eager_tunnels = vec!["wgcf-999".to_string()];
+    let err = cfg
+        .validate_tunnel_references(&known)
+        .expect_err("ghost eager id must fail");
+    assert!(
+        err.to_string().contains("lifecycle.eager_tunnels"),
+        "got: {err}"
+    );
+    cfg.lifecycle.eager_tunnels.clear();
+
+    cfg.per_tunnel
+        .overrides
+        .insert("wgcf-999".to_string(), TunnelPortOverride::default());
+    let err = cfg
+        .validate_tunnel_references(&known)
+        .expect_err("ghost override key must fail");
+    assert!(
+        err.to_string().contains("per_tunnel.overrides.wgcf-999"),
+        "got: {err}"
+    );
+    cfg.per_tunnel.overrides.clear();
+
+    cfg.shared_listeners[0].pool = TunnelPoolSelection::Selected(vec!["wgcf-999".to_string()]);
+    let err = cfg
+        .validate_tunnel_references(&known)
+        .expect_err("ghost pool id must fail");
+    assert!(err.to_string().contains("wgcf-999"), "got: {err}");
+    assert!(err.to_string().contains("shared_listener"), "got: {err}");
+
+    // A pool naming a real tunnel passes, and so does the "all" pool.
+    cfg.shared_listeners[0].pool = TunnelPoolSelection::Selected(vec!["wgcf-002".to_string()]);
+    cfg.validate_tunnel_references(&known)
+        .expect("real pool ids pass");
+    cfg.shared_listeners[0].pool = TunnelPoolSelection::All;
+    cfg.validate_tunnel_references(&known)
+        .expect("pool all passes");
+}
+
 // =========================================================================
 // 9. Cloned Config Simulation: 245 Identical wgcf Configs with Unique IDs
 // =========================================================================
@@ -471,6 +809,35 @@ fn test_load_tunnel_configs_from_dir_not_found() {
     let non_existent = PathBuf::from("/non/existent/wpmulti/dir");
     let res = load_tunnel_configs_from_dir(non_existent);
     assert!(matches!(res, Err(ConfigError::DirectoryNotFound(_))));
+}
+
+#[test]
+fn test_load_tunnel_configs_from_dir_reports_every_broken_file() {
+    // Loading used to stop at the first broken `.conf`, so a directory
+    // with several bad files only ever reported one of them and the user
+    // had to fix-and-rerun one file at a time.
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let dir_path = temp_dir.path();
+
+    let valid = format!(
+        "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\nAllowedIPs = 0.0.0.0/0\n"
+    );
+    let broken_a = valid.replace(VALID_PRIVATE_KEY, "!!!bad!!!");
+    let broken_b = valid.replace(VALID_PRIVATE_KEY, "AAAA!AAA");
+    std::fs::write(dir_path.join("a-broken.conf"), &broken_a).unwrap();
+    std::fs::write(dir_path.join("b-broken.conf"), &broken_b).unwrap();
+    std::fs::write(dir_path.join("c-good.conf"), &valid).unwrap();
+
+    let err = load_tunnel_configs_from_dir(dir_path).expect_err("two broken files must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("a-broken.conf") && msg.contains("b-broken.conf"),
+        "expected both broken files in one error, got: {msg}"
+    );
+    // Each failure keeps its own precise offset (round-11 fix), not a
+    // generic "multiple files failed".
+    assert!(msg.contains("offset 0"), "got: {msg}");
+    assert!(msg.contains("offset 4"), "got: {msg}");
 }
 
 // =========================================================================

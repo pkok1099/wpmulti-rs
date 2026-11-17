@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use tempfile::tempdir;
 
-use crate::cli::commands::cmd_validate;
+use crate::cli::commands::{admin_api_call_error, cmd_run, cmd_validate, discover_local_config_in};
 use crate::cli::{Cli, Commands};
 
 #[test]
@@ -124,6 +124,60 @@ AllowedIPs = 0.0.0.0/0
 
     let count = cmd_validate(None, Some(dir.path().to_path_buf())).expect("cmd_validate");
     assert_eq!(count, 1);
+}
+
+#[test]
+fn test_cli_validate_config_path_resolves_config_dir_against_toml() {
+    // A relative `config_dir` in the TOML file is resolved against the
+    // directory containing that TOML file, not the process working
+    // directory: `validate -c /some/dir/wpmulti.toml` used to fail with
+    // "Tunnel directory './my-confs' does not exist" when run from
+    // anywhere else, even though the directory sits next to the TOML.
+    let dir = tempdir().expect("tempdir");
+    let conf_dir = dir.path().join("my-confs");
+    fs::create_dir(&conf_dir).expect("create conf dir");
+    fs::write(
+        conf_dir.join("wgcf-01.conf"),
+        r#"
+[Interface]
+PrivateKey = 0OaUaQd4uJq5m8eN8uJq5m8eN8uJq5m8eN8uJq5m8eM=
+Address = 172.16.0.2/32
+
+[Peer]
+PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+Endpoint = 198.51.100.1:51820
+AllowedIPs = 0.0.0.0/0
+"#,
+    )
+    .expect("write wg conf");
+    let toml_path = dir.path().join("wpmulti.toml");
+    fs::write(&toml_path, "[global]\nconfig_dir = \"./my-confs\"\n").expect("write toml");
+
+    // The test process runs with its working directory at the repo root,
+    // which has no ./my-confs — only the TOML-relative resolution finds it.
+    let count = cmd_validate(Some(toml_path), None).expect("cmd_validate -c");
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_discover_local_config_finds_wpmulti_toml_in_dir() {
+    // `run` without `-c`/`-d` uses a `wpmulti.toml` in the working
+    // directory instead of the compiled-in defaults — but only when one
+    // is actually there.
+    let dir = tempdir().expect("tempdir");
+    assert_eq!(discover_local_config_in(dir.path()), None);
+
+    let toml_path = dir.path().join("wpmulti.toml");
+    fs::write(&toml_path, "[global]\n").expect("write toml");
+    assert_eq!(
+        discover_local_config_in(dir.path()),
+        Some(toml_path.clone())
+    );
+
+    // A differently-named file does not count.
+    let other = tempdir().expect("tempdir");
+    fs::write(other.path().join("wpmulti.toml.example"), "[global]\n").expect("write example");
+    assert_eq!(discover_local_config_in(other.path()), None);
 }
 
 #[test]
@@ -378,4 +432,113 @@ async fn test_cli_probe_empty_dir_json_returns_empty_results() {
         .await
         .unwrap();
     assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn test_cmd_run_refuses_zero_tunnels() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = cmd_run(None, Some(dir.path().to_path_buf()), false)
+        .await
+        .expect_err("run with 0 tunnels must fail");
+    assert!(err.to_string().contains("0 tunnels"), "error was: {err}");
+
+    // A missing tunnel directory refuses the same way.
+    let missing = dir.path().join("does-not-exist");
+    let err = cmd_run(None, Some(missing), false)
+        .await
+        .expect_err("run with missing dir must fail");
+    assert!(err.to_string().contains("0 tunnels"), "error was: {err}");
+}
+
+#[test]
+fn test_probe_table_prints_full_error_text() {
+    let long_error = "handshake failed: i/o error: Operation not permitted (os error 1) while contacting 203.0.113.1:51820";
+    let results = vec![super::ProbeResult {
+        id: "test-001".to_string(),
+        config_file: "test-001.conf".to_string(),
+        endpoint: "203.0.113.1:51820".to_string(),
+        healthy: false,
+        rtt_ms: None,
+        exit_ip: None,
+        error: Some(long_error.to_string()),
+    }];
+    let mut out = Vec::new();
+    super::commands::print_probe_table_to(&mut out, &results);
+    let text = String::from_utf8(out).expect("utf8");
+    // The fixed-width table truncates the error column; the full text must
+    // still appear below it so the failure can be diagnosed without --json.
+    assert!(
+        text.contains(long_error),
+        "full error missing from:\n{text}"
+    );
+    assert!(
+        text.contains("Failed probe errors"),
+        "details section missing from:\n{text}"
+    );
+}
+
+#[test]
+fn test_udp_blocked_hint_printed_only_for_permission_errors() {
+    let eperm = vec![super::ProbeResult {
+        id: "test-001".to_string(),
+        config_file: "test-001.conf".to_string(),
+        endpoint: "203.0.113.1:51820".to_string(),
+        healthy: false,
+        rtt_ms: None,
+        exit_ip: None,
+        error: Some(
+            "handshake failed: i/o error: Operation not permitted (os error 1)".to_string(),
+        ),
+    }];
+    let mut out = Vec::new();
+    super::commands::write_udp_blocked_hint(&mut out, &eperm);
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains("UDP appears to be blocked"),
+        "hint missing from:\n{text}"
+    );
+
+    // A timeout says nothing about the environment, so the hint stays silent.
+    let timeout = vec![super::ProbeResult {
+        id: "test-002".to_string(),
+        config_file: "test-002.conf".to_string(),
+        endpoint: "192.0.2.1:51820".to_string(),
+        healthy: false,
+        rtt_ms: None,
+        exit_ip: None,
+        error: Some("handshake timed out after 5s".to_string()),
+    }];
+    let mut out = Vec::new();
+    super::commands::write_udp_blocked_hint(&mut out, &timeout);
+    assert!(out.is_empty(), "hint must stay silent for timeouts");
+}
+
+#[test]
+fn test_admin_api_call_error_wording() {
+    // An HTTP status means the API was reached and refused the request:
+    // say so, instead of claiming the API could not be reached.
+    assert_eq!(
+        admin_api_call_error("HTTP 404: Tunnel target not found: wgcf-999".to_string()),
+        "Admin API returned HTTP 404: Tunnel target not found: wgcf-999"
+    );
+    // A connection error already names the Admin API: pass it through
+    // instead of wrapping it a second time.
+    assert_eq!(
+        admin_api_call_error(
+            "Failed to connect to Admin API at 'http://127.0.0.1:9090': Connection refused (os error 111)"
+                .to_string()
+        ),
+        "Failed to connect to Admin API at 'http://127.0.0.1:9090': Connection refused (os error 111)"
+    );
+    assert_eq!(
+        admin_api_call_error(
+            "Timed out connecting to Admin API at 'http://127.0.0.1:9090'".to_string()
+        ),
+        "Timed out connecting to Admin API at 'http://127.0.0.1:9090'"
+    );
+    // Anything else is a genuine reachability failure.
+    assert_eq!(
+        admin_api_call_error("boom".to_string()),
+        "Failed to reach Admin API: boom"
+    );
 }

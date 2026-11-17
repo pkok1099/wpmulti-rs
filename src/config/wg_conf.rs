@@ -279,6 +279,26 @@ pub fn strip_comment(line: &str) -> &str {
         .map_or_else(|| line.trim(), str::trim)
 }
 
+/// Position of the first byte that cannot appear in a standard-base64
+/// value at that spot, or `None` when every byte is a base64 symbol or
+/// trailing padding (`=` is only valid as the last one or two bytes,
+/// and only when everything after it is padding too).
+fn first_invalid_base64_byte(val: &str) -> Option<(usize, u8)> {
+    let bytes = val.as_bytes();
+    let len = bytes.len();
+    bytes.iter().enumerate().find_map(|(index, &byte)| {
+        let is_symbol = byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/';
+        let is_trailing_pad = byte == b'='
+            && index >= len.saturating_sub(2)
+            && bytes.iter().skip(index).all(|&c| c == b'=');
+        if is_symbol || is_trailing_pad {
+            None
+        } else {
+            Some((index, byte))
+        }
+    })
+}
+
 /// Decode a 32-byte Curve25519 key from Base64 (padded or unpadded).
 fn decode_32byte_key(
     val: &str,
@@ -286,6 +306,18 @@ fn decode_32byte_key(
     field: &'static str,
 ) -> Result<[u8; 32], WgConfError> {
     let trimmed = val.trim();
+    // Point the error at the first byte that is not a base64 symbol:
+    // the `base64` crate checks the trailing byte first when the input
+    // length leaves a 1-byte remainder (a newline convenience in its
+    // `complete_quads_len`), so `!!!bad!!!` is reported at offset 8
+    // although the first bad byte is at offset 0.
+    if let Some((index, byte)) = first_invalid_base64_byte(trimmed) {
+        return Err(WgConfError::InvalidBase64Key {
+            line_number,
+            field,
+            source: base64::DecodeError::InvalidByte(index, byte),
+        });
+    }
     let mut bytes = match BASE64_STANDARD.decode(trimmed) {
         Ok(b) => b,
         Err(_) if trimmed.len() == 43 => base64::engine::general_purpose::STANDARD_NO_PAD

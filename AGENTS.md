@@ -7,9 +7,20 @@ Always run after your final edit:
 ```bash
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
+cargo nextest run --locked --lib --bins --tests --no-fail-fast
 ```
 Never report checks as passing unless you ran them after your final edit and observed 0 errors, 0 warnings, and 0 test failures.
+
+Test runner notes:
+- Tests run with `cargo-nextest` (install the prebuilt binary from https://get.nexte.st or `cargo install cargo-nextest --locked`), not `cargo test`. Nextest runs each test in its own process and is fail-fast by default, so verification uses `--no-fail-fast` to report every failure like `cargo test` does.
+- Bench targets (`benches/performance.rs`) use a custom harness that prints its own banner instead of a test list, so nextest cannot list them: keep them out with `--lib --bins --tests` and run benchmarks with `cargo bench`.
+- There are currently no doctests; nextest does not run doctests, so if any are added they need a separate `cargo test --doc` run.
+
+Coverage (optional, informational only):
+```bash
+cargo llvm-cov nextest --locked --lib --bins --tests --no-fail-fast --summary-only
+```
+Requires the `llvm-tools` rustup component (`rustup component add llvm-tools-preview`) and `cargo-llvm-cov`. Coverage is a measurement, not a gate: never treat a coverage number as a substitute for the checks above.
 
 ## 2. Strict Lint & Code-Size Policy (`clippy.toml` + `Cargo.toml`)
 - **No panics in production code (`src/`)**:

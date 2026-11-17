@@ -233,6 +233,17 @@ pub trait ProxyTunnelTarget: Send + Sync {
     fn tunnel_id(&self) -> Option<&str> {
         None
     }
+
+    /// Record that an in-flight attempt through this target was aborted
+    /// before it could deliver a verdict — for example, cut off by the
+    /// pool failover budget or by a per-candidate connect timeout.
+    /// An aborted attempt counts as a failed attempt for
+    /// circuit-breaker purposes, so a `HalfOpen` trial resolves as a
+    /// failure (back to `Unhealthy` with a fresh cooldown) instead of
+    /// lingering undecided forever while every later request burns the
+    /// full budget again. The default implementation does nothing;
+    /// targets without health tracking keep it.
+    fn note_attempt_aborted(&self) {}
 }
 
 /// Filter out forbidden destination IPs and cap candidates at [`MAX_CANDIDATE_IPS`],
@@ -318,10 +329,14 @@ pub(crate) enum RouterConnectError {
 
 /// Select a tunnel (with failover across healthy pool tunnels on transient DNS/connect failures)
 /// and establish a validated TCP stream to `target`.
+///
+/// `credentials` are forwarded to [`TunnelRouter::select_tunnel`] so a
+/// router can verify them against the tunnel it finally selects.
 pub(crate) async fn connect_via_router(
     router: &Arc<dyn TunnelRouter>,
     selector: &TunnelSelector,
     target: &TargetAddr,
+    credentials: Option<(&str, &str)>,
 ) -> Result<DynStream, RouterConnectError> {
     let max_attempts = if matches!(selector, TunnelSelector::ById(_)) {
         1
@@ -336,9 +351,15 @@ pub(crate) async fn connect_via_router(
         if !within_failover_budget(attempt, failover_deadline) {
             break;
         }
-        let target_tunnel = match router.select_tunnel(selector).await {
+        let target_tunnel = match router.select_tunnel(selector, credentials).await {
             Ok(t) => t,
             Err(e) => {
+                // A credential failure is terminal and must not be masked
+                // by an earlier attempt's error: the client presented
+                // credentials the selected tunnel rejects.
+                if e.kind() == io::ErrorKind::PermissionDenied {
+                    return Err(RouterConnectError::SelectTunnel(e));
+                }
                 return Err(last_err.unwrap_or(RouterConnectError::SelectTunnel(e)));
             }
         };
@@ -364,9 +385,34 @@ pub(crate) async fn connect_via_router(
             {
                 res
             } else {
+                // The budget cut the attempt off mid-flight, so the
+                // attempt's future was dropped without delivering a
+                // verdict. Resolve the trial as a failure here: without
+                // this, a `HalfOpen` tunnel would keep its trial slot
+                // (released on drop, failure count frozen, no new
+                // cooldown) and every later pool request would burn
+                // the full budget again, forever, instead of ever
+                // reaching the fail-fast "no healthy tunnels" path.
+                target_tunnel.note_attempt_aborted();
+                // Keep the last attempt's error in the message so the
+                // failure is diagnosable from that line alone, instead
+                // of a bare "pool failover budget exceeded" with no
+                // hint which tunnel failed or why.
+                let cause = last_err.as_ref().map_or_else(
+                    || "no attempt completed".to_string(),
+                    |e| {
+                        let inner = match e {
+                            RouterConnectError::SelectTunnel(e)
+                            | RouterConnectError::ForbiddenDestination(e)
+                            | RouterConnectError::DnsResolution(e)
+                            | RouterConnectError::TcpConnect(e) => e,
+                        };
+                        format!("last error: {inner}")
+                    },
+                );
                 last_err = Some(RouterConnectError::TcpConnect(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "pool failover budget exceeded",
+                    format!("pool failover budget exceeded ({cause})"),
                 )));
                 break;
             }
@@ -475,6 +521,11 @@ pub(crate) async fn connect_validated_addrs_with_timeout(
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => last_err = Some(e),
             Err(_) => {
+                // The per-candidate timeout dropped the connect future
+                // mid-flight without a verdict; resolve it as a
+                // failure (see `note_attempt_aborted`) so a `HalfOpen`
+                // trial cannot linger undecided.
+                tunnel.note_attempt_aborted();
                 last_err = Some(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("connect attempt to {dst_addr} timed out after {attempt_timeout:?}"),
@@ -621,6 +672,10 @@ impl<T: ProxyTunnelTarget + ?Sized> ProxyTunnelTarget for Arc<T> {
     fn tunnel_id(&self) -> Option<&str> {
         (**self).tunnel_id()
     }
+
+    fn note_attempt_aborted(&self) {
+        (**self).note_attempt_aborted();
+    }
 }
 
 /// Direct host connector bypassing WireGuard tunnels (useful for loopback testing).
@@ -762,7 +817,21 @@ pub trait TunnelRouter: Send + Sync {
     ) -> Result<TunnelSelector, ProxyAuthError>;
 
     /// Resolve a [`TunnelSelector`] to an active [`ProxyTunnelTarget`].
-    fn select_tunnel<'a>(&'a self, selector: &'a TunnelSelector) -> SelectTunnelFut<'a>;
+    ///
+    /// `credentials` are the credentials the client presented at auth
+    /// time (the same pair passed to `authenticate`). A router that
+    /// enforces per-tunnel passwords verifies them here against the
+    /// password of the tunnel the selector finally resolves to, so a
+    /// selector that does not name a tunnel (tag, keyword, default pool)
+    /// cannot smuggle the global password into a password-protected
+    /// tunnel (audit run-1,
+    /// `proxy.auth.per-tunnel-password-bypass-via-tag-selector`).
+    /// Routers without per-tunnel passwords ignore the argument.
+    fn select_tunnel<'a>(
+        &'a self,
+        selector: &'a TunnelSelector,
+        credentials: Option<(&'a str, &'a str)>,
+    ) -> SelectTunnelFut<'a>;
 }
 
 impl<T: TunnelRouter + ?Sized> TunnelRouter for Arc<T> {
@@ -776,8 +845,9 @@ impl<T: TunnelRouter + ?Sized> TunnelRouter for Arc<T> {
     fn select_tunnel<'a>(
         &'a self,
         selector: &'a TunnelSelector,
+        credentials: Option<(&'a str, &'a str)>,
     ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>> {
-        (**self).select_tunnel(selector)
+        (**self).select_tunnel(selector, credentials)
     }
 }
 
@@ -941,7 +1011,11 @@ impl TunnelRouter for SingleTunnelRouter {
     fn select_tunnel<'a>(
         &'a self,
         _selector: &'a TunnelSelector,
+        _credentials: Option<(&'a str, &'a str)>,
     ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>> {
+        // A dedicated router serves one tunnel whose credentials were
+        // already verified by `authenticate`; there is nothing further
+        // to check at selection time.
         let target = Arc::clone(&self.target);
         Box::pin(async move { Ok(target) })
     }
@@ -1070,7 +1144,11 @@ impl TunnelRouter for PoolRouter {
     fn select_tunnel<'a>(
         &'a self,
         selector: &'a TunnelSelector,
+        _credentials: Option<(&'a str, &'a str)>,
     ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>> {
+        // Test-only router: its targets carry no per-tunnel passwords,
+        // so selection cannot enforce any. `authenticate` is the only
+        // credential gate here, as before.
         Box::pin(async move {
             match selector {
                 TunnelSelector::ById(id) => {

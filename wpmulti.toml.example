@@ -1,12 +1,17 @@
 # Example wpmulti configuration file
 # Copy to wpmulti.toml and run: wpmulti run -c wpmulti.toml
 
+# Tunnel IDs that start disabled (excluded from routing and probing).
+# `wpmulti disable <id>` / `wpmulti enable <id>` update this list.
+disabled_tunnels = []
+
 [global]
 config_dir = "./confs"
 bind_address = "127.0.0.1"
 log_level = "info"                  # trace | debug | info | warn | error
 dns_fallback = "1.1.1.1:53"
 dns_strategy = "tunnel_only"        # tunnel_only | tunnel_first | host
+dns_preference = "ipv4_first"       # ipv4_first | ipv6_first
 ip_mode = "dual_stack"              # dual_stack | ipv4_only | ipv6_only
 max_active_tunnels = 1000
 
@@ -39,7 +44,7 @@ bind = "127.0.0.1:1080"
 auth_mode = "per_tunnel"            # none | global | per_tunnel
 # global_password = "secret"
 default_strategy = "round-robin"    # round-robin | random | least-conn | fallback
-allow_anonymous = true
+allow_anonymous = true  # anonymous requests bypass global_password — set false to require it
 pool = "all"                        # "all" or ["wgcf-001", "wgcf-002"]
 # ip_mode = "ipv6_only"             # optional per-listener override when global ip_mode = "dual_stack"
 
@@ -49,7 +54,7 @@ type = "http"
 bind = "127.0.0.1:8080"
 auth_mode = "per_tunnel"
 default_strategy = "round-robin"
-allow_anonymous = true
+allow_anonymous = true  # anonymous requests bypass global_password — set false to require it
 pool = "all"
 
 [admin]

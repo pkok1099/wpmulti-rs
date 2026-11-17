@@ -5,8 +5,8 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -23,9 +23,9 @@ use crate::proxy::router::{
 };
 use crate::proxy::socks5::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, CMD_CONNECT, CMD_UDP_ASSOCIATE, METHOD_NO_ACCEPTABLE,
-    METHOD_NO_AUTH, METHOD_USER_PASS, REP_CONN_REFUSED, REP_HOST_UNREACHABLE, REP_SUCCESS,
-    RFC1929_VERSION, SOCKS5_VERSION, build_socks5_udp_packet, handle_socks5,
-    parse_socks5_udp_packet, send_socks5_reply,
+    METHOD_NO_AUTH, METHOD_USER_PASS, REP_CONN_REFUSED, REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE,
+    REP_NETWORK_UNREACHABLE, REP_SUCCESS, RFC1929_VERSION, SOCKS5_VERSION, build_socks5_udp_packet,
+    handle_socks5, parse_socks5_udp_packet, send_socks5_reply,
 };
 
 /// Mock tunnel target with configurable DNS resolution table and connection interception.
@@ -33,6 +33,9 @@ struct MockTunnelTarget {
     id: String,
     dns_table: RwLock<HashMap<String, IpAddr>>,
     tcp_conns: AtomicUsize,
+    fail_tcp_with: Option<io::ErrorKind>,
+    hang_tcp: bool,
+    aborted: Arc<AtomicBool>,
 }
 
 impl MockTunnelTarget {
@@ -41,6 +44,9 @@ impl MockTunnelTarget {
             id: id.to_string(),
             dns_table: RwLock::new(HashMap::new()),
             tcp_conns: AtomicUsize::new(0),
+            fail_tcp_with: None,
+            hang_tcp: false,
+            aborted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -52,6 +58,20 @@ impl MockTunnelTarget {
         self.dns_table.write().insert(domain.to_string(), ip);
         self
     }
+
+    fn with_tcp_failure(self, kind: io::ErrorKind) -> Self {
+        Self {
+            fail_tcp_with: Some(kind),
+            ..self
+        }
+    }
+
+    fn with_hanging_tcp(self) -> Self {
+        Self {
+            hang_tcp: true,
+            ..self
+        }
+    }
 }
 
 impl ProxyTunnelTarget for MockTunnelTarget {
@@ -60,6 +80,13 @@ impl ProxyTunnelTarget for MockTunnelTarget {
         dst: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
         self.tcp_conns.fetch_add(1, Ordering::SeqCst);
+        if self.hang_tcp {
+            // Never completes: the caller must time the attempt out.
+            return Box::pin(async move { std::future::pending::<io::Result<DynStream>>().await });
+        }
+        if let Some(kind) = self.fail_tcp_with {
+            return Box::pin(async move { Err(io::Error::new(kind, "mock tcp connect failed")) });
+        }
         Box::pin(async move {
             let stream = TcpStream::connect(dst).await?;
             Ok(Box::new(stream) as DynStream)
@@ -95,6 +122,10 @@ impl ProxyTunnelTarget for MockTunnelTarget {
                 ))
             }
         })
+    }
+
+    fn note_attempt_aborted(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
     }
 }
 
@@ -543,6 +574,297 @@ async fn test_socks5_connect_unreachable_target_returns_error() {
         reply_hdr[1] == REP_CONN_REFUSED || reply_hdr[1] == REP_HOST_UNREACHABLE,
         "Expected connection refused or host unreachable, got 0x{:02X}",
         reply_hdr[1]
+    );
+}
+
+#[tokio::test]
+async fn test_socks5_connect_unknown_tunnel_reports_general_failure() {
+    // A username naming a tunnel that does not exist fails selection, and
+    // the reply must be general failure (0x01) — not host unreachable
+    // (0x04) — so a client can tell a bad tunnel name apart from a tunnel
+    // whose handshake failed.
+    let t1 = Arc::new(MockTunnelTarget::new("wgcf-001"));
+    let pool = Arc::new(
+        PoolRouter::new(PoolStrategy::RoundRobin, true).with_auth(AuthMode::PerTunnel, None),
+    );
+    pool.add_tunnel("wgcf-001", Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>);
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (mut client, server) = tokio::io::duplex(2048);
+    tokio::spawn(async move {
+        let _ = handle_socks5(server, router).await;
+    });
+
+    // Greeting offering only username/password auth.
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_USER_PASS])
+        .await
+        .unwrap();
+    let mut g_resp = [0u8; 2];
+    client.read_exact(&mut g_resp).await.unwrap();
+    assert_eq!(g_resp, [SOCKS5_VERSION, METHOD_USER_PASS]);
+
+    // Authenticate as a tunnel that does not exist (no password set, so
+    // auth itself succeeds and selection fails at CONNECT).
+    let mut auth_req = vec![RFC1929_VERSION, 11];
+    auth_req.extend_from_slice(b"nonexistent");
+    auth_req.push(0);
+    client.write_all(&auth_req).await.unwrap();
+    let mut a_resp = [0u8; 2];
+    client.read_exact(&mut a_resp).await.unwrap();
+    assert_eq!(a_resp, [RFC1929_VERSION, 0x00]);
+
+    // CONNECT to any target; selection must fail before connecting.
+    let mut cmd = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00, ATYP_IPV4];
+    cmd.extend_from_slice(&[127, 0, 0, 1]);
+    cmd.extend_from_slice(&80u16.to_be_bytes());
+    client.write_all(&cmd).await.unwrap();
+
+    let mut reply_hdr = [0u8; 4];
+    client.read_exact(&mut reply_hdr).await.unwrap();
+    assert_eq!(reply_hdr[0], SOCKS5_VERSION);
+    assert_eq!(
+        reply_hdr[1], REP_GENERAL_FAILURE,
+        "unknown tunnel must report general failure, got 0x{:02X}",
+        reply_hdr[1]
+    );
+}
+
+#[tokio::test]
+async fn test_socks5_connect_timeout_reports_host_unreachable() {
+    // A tunnel whose TCP connect times out — the WireGuard handshake
+    // never completes — must report host unreachable (0x04), not TTL
+    // expired (0x06): the peer is unreachable, and TTL expiry never
+    // applies to this userspace stack. The reply code must be stable
+    // for the same failure (a DNS failure inside the tunnel already
+    // reports 0x04).
+    let t1 = Arc::new(MockTunnelTarget::new("wgcf-001").with_tcp_failure(io::ErrorKind::TimedOut));
+    let pool = Arc::new(
+        PoolRouter::new(PoolStrategy::RoundRobin, true).with_auth(AuthMode::PerTunnel, None),
+    );
+    pool.add_tunnel("wgcf-001", Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>);
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (mut client, server) = tokio::io::duplex(2048);
+    tokio::spawn(async move {
+        let _ = handle_socks5(server, router).await;
+    });
+
+    // Greeting offering only username/password auth.
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_USER_PASS])
+        .await
+        .unwrap();
+    let mut g_resp = [0u8; 2];
+    client.read_exact(&mut g_resp).await.unwrap();
+    assert_eq!(g_resp, [SOCKS5_VERSION, METHOD_USER_PASS]);
+
+    // Authenticate as the existing tunnel (no password set, so auth
+    // itself succeeds and the failure happens at CONNECT).
+    let mut auth_req = vec![RFC1929_VERSION, 8];
+    auth_req.extend_from_slice(b"wgcf-001");
+    auth_req.push(0);
+    client.write_all(&auth_req).await.unwrap();
+    let mut a_resp = [0u8; 2];
+    client.read_exact(&mut a_resp).await.unwrap();
+    assert_eq!(a_resp, [RFC1929_VERSION, 0x00]);
+
+    // CONNECT to an IP literal, so no DNS is involved and the failure
+    // comes from the TCP connect itself.
+    let mut cmd = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00, ATYP_IPV4];
+    cmd.extend_from_slice(&[93, 184, 216, 34]);
+    cmd.extend_from_slice(&80u16.to_be_bytes());
+    client.write_all(&cmd).await.unwrap();
+
+    let mut reply_hdr = [0u8; 4];
+    client.read_exact(&mut reply_hdr).await.unwrap();
+    assert_eq!(reply_hdr[0], SOCKS5_VERSION);
+    assert_eq!(
+        reply_hdr[1], REP_HOST_UNREACHABLE,
+        "timed-out connect must report host unreachable, got 0x{:02X}",
+        reply_hdr[1]
+    );
+}
+
+#[tokio::test]
+async fn test_socks5_connect_empty_pool_reports_network_unreachable() {
+    // A valid selector whose pool is empty — no tunnel is healthy right
+    // now — must report network unreachable (0x03), not general failure
+    // (0x01): 0x01 means "you mistyped the name", 0x03 means "all
+    // tunnels are down". The client can tell the two apart without the
+    // daemon log.
+    let pool = Arc::new(
+        PoolRouter::new(PoolStrategy::RoundRobin, true).with_auth(AuthMode::PerTunnel, None),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (mut client, server) = tokio::io::duplex(2048);
+    tokio::spawn(async move {
+        let _ = handle_socks5(server, router).await;
+    });
+
+    // Greeting offering only username/password auth.
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_USER_PASS])
+        .await
+        .unwrap();
+    let mut g_resp = [0u8; 2];
+    client.read_exact(&mut g_resp).await.unwrap();
+    assert_eq!(g_resp, [SOCKS5_VERSION, METHOD_USER_PASS]);
+
+    // Authenticate as the `round-robin` keyword (no password set, so
+    // auth itself succeeds and selection fails at CONNECT).
+    let mut auth_req = vec![RFC1929_VERSION, 11];
+    auth_req.extend_from_slice(b"round-robin");
+    auth_req.push(0);
+    client.write_all(&auth_req).await.unwrap();
+    let mut a_resp = [0u8; 2];
+    client.read_exact(&mut a_resp).await.unwrap();
+    assert_eq!(a_resp, [RFC1929_VERSION, 0x00]);
+
+    // CONNECT to an IP literal; selection must fail before connecting.
+    let mut cmd = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00, ATYP_IPV4];
+    cmd.extend_from_slice(&[93, 184, 216, 34]);
+    cmd.extend_from_slice(&80u16.to_be_bytes());
+    client.write_all(&cmd).await.unwrap();
+
+    let mut reply_hdr = [0u8; 4];
+    client.read_exact(&mut reply_hdr).await.unwrap();
+    assert_eq!(reply_hdr[0], SOCKS5_VERSION);
+    assert_eq!(
+        reply_hdr[1], REP_NETWORK_UNREACHABLE,
+        "empty pool must report network unreachable, got 0x{:02X}",
+        reply_hdr[1]
+    );
+}
+
+#[tokio::test]
+async fn test_http_connect_unknown_tunnel_returns_404() {
+    // Same distinction as the SOCKS5 test above, over HTTP CONNECT: a
+    // tunnel name that does not exist answers 404, while a tunnel that
+    // exists but cannot connect stays 502.
+    let t1 = Arc::new(MockTunnelTarget::new("wgcf-001"));
+    let pool = Arc::new(
+        PoolRouter::new(PoolStrategy::RoundRobin, true).with_auth(AuthMode::PerTunnel, None),
+    );
+    pool.add_tunnel("wgcf-001", Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>);
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (mut client, server) = tokio::io::duplex(4096);
+    let server_task = tokio::spawn(async move { handle_http(server, router).await });
+
+    // "nonexistent:" in base64; no password is set, so auth succeeds and
+    // selection fails at CONNECT.
+    let req = "CONNECT 192.0.2.1:80 HTTP/1.1\r\nHost: 192.0.2.1:80\r\nProxy-Authorization: Basic bm9uZXhpc3RlbnQ6\r\n\r\n";
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    let mut resp = Vec::new();
+    client.read_to_end(&mut resp).await.unwrap();
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("HTTP/1.1 404 Not Found"),
+        "expected 404 Not Found for unknown tunnel, got: {resp_str:?}"
+    );
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn test_http_connect_empty_pool_returns_503() {
+    // Same distinction as the SOCKS5 test above, over HTTP CONNECT: a
+    // valid selector whose pool is empty answers 503 (no healthy tunnel
+    // right now), while a bad name answers 404 and a dead tunnel 502.
+    let pool = Arc::new(
+        PoolRouter::new(PoolStrategy::RoundRobin, true).with_auth(AuthMode::PerTunnel, None),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (mut client, server) = tokio::io::duplex(4096);
+    let server_task = tokio::spawn(async move { handle_http(server, router).await });
+
+    // "round-robin:" in base64; no password is set, so auth succeeds and
+    // selection fails at CONNECT.
+    let req = "CONNECT 192.0.2.1:80 HTTP/1.1\r\nHost: 192.0.2.1:80\r\nProxy-Authorization: Basic cm91bmQtcm9iaW46\r\n\r\n";
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    let mut resp = Vec::new();
+    client.read_to_end(&mut resp).await.unwrap();
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "expected 503 Service Unavailable for empty pool, got: {resp_str:?}"
+    );
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn test_http_connect_empty_pool_logs_selection_failure() {
+    // Docs §4 promises the `no healthy tunnels available in pool`
+    // line for the pool-empty case; the HTTP path used to answer 503
+    // without leaving any daemon-side trace of it. This test router
+    // holds zero tunnels, so its selection error reads "no tunnels
+    // registered in pool" instead of the production router's
+    // "no healthy tunnels available in pool" — what matters here is
+    // that the HTTP path logs the selection failure at all, with the
+    // same WARN format as the SOCKS5 path.
+    #[derive(Clone)]
+    struct VecMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct VecWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for VecWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecMakeWriter {
+        type Writer = VecWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            VecWriter(Arc::clone(&self.0))
+        }
+    }
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let pool = Arc::new(
+        PoolRouter::new(PoolStrategy::RoundRobin, true).with_auth(AuthMode::PerTunnel, None),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (mut client, server) = tokio::io::duplex(4096);
+    let server_task = tokio::spawn(async move { handle_http(server, router).await });
+
+    let req = "CONNECT 192.0.2.1:80 HTTP/1.1\r\nHost: 192.0.2.1:80\r\nProxy-Authorization: Basic cm91bmQtcm9iaW46\r\n\r\n";
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    let mut resp = Vec::new();
+    client.read_to_end(&mut resp).await.unwrap();
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "expected 503 Service Unavailable for empty pool, got: {resp_str:?}"
+    );
+    let _ = server_task.await;
+
+    let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(
+        rendered.contains("Failed to select tunnel for ByKeyword(RoundRobin):"),
+        "expected the selection-failure WARN in the daemon log, got: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("no tunnels registered in pool"),
+        "expected the selection error in the daemon log, got: {rendered:?}"
     );
 }
 
@@ -999,7 +1321,7 @@ async fn test_pool_router_routing_and_round_robin() {
     // 1. Authenticate with username specifying explicit tunnel ID
     let sel1 = pool.authenticate(Some(("wgcf-001", "globalpass"))).unwrap();
     assert_eq!(sel1, TunnelSelector::ById("wgcf-001".to_string()));
-    let target1 = pool.select_tunnel(&sel1).await.unwrap();
+    let target1 = pool.select_tunnel(&sel1, None).await.unwrap();
     assert!(Arc::ptr_eq(
         &target1,
         &(Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>)
@@ -1011,15 +1333,15 @@ async fn test_pool_router_routing_and_round_robin() {
 
     // 3. Test round-robin cycling
     let t_first = pool
-        .select_tunnel(&TunnelSelector::DefaultPool)
+        .select_tunnel(&TunnelSelector::DefaultPool, None)
         .await
         .unwrap();
     let t_second = pool
-        .select_tunnel(&TunnelSelector::DefaultPool)
+        .select_tunnel(&TunnelSelector::DefaultPool, None)
         .await
         .unwrap();
     let t_third = pool
-        .select_tunnel(&TunnelSelector::DefaultPool)
+        .select_tunnel(&TunnelSelector::DefaultPool, None)
         .await
         .unwrap();
 
@@ -1821,6 +2143,70 @@ async fn test_connect_validated_addrs_all_blackhole_bounded_by_total_timeout() {
         "elapsed {elapsed:?} exceeded bounded total budget {total_budget:?}"
     );
     assert!(mock.dialed_addrs.lock().len() <= MAX_CANDIDATE_IPS);
+}
+
+#[tokio::test]
+async fn test_connect_validated_addrs_timeout_notes_attempt_aborted() {
+    use crate::proxy::router::connect_validated_addrs_with_timeout;
+
+    // A per-candidate timeout drops the connect future mid-flight
+    // without a verdict. The target must be told, so a `HalfOpen`
+    // trial resolves as a failure instead of lingering undecided.
+    let mock = MockTunnelTarget::new("hang-1").with_hanging_tcp();
+    let aborted = Arc::clone(&mock.aborted);
+    let ips: Vec<IpAddr> = vec!["198.51.100.1".parse().unwrap()];
+
+    let err = connect_validated_addrs_with_timeout(&mock, &ips, 80, Duration::from_millis(300))
+        .await
+        .err()
+        .expect("hanging candidate must time out");
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    assert!(
+        aborted.load(Ordering::SeqCst),
+        "per-candidate timeout must note the aborted attempt on the target"
+    );
+}
+
+#[tokio::test]
+async fn test_connect_via_router_budget_abort_notes_attempt_aborted() {
+    use crate::proxy::router::{RouterConnectError, connect_via_router};
+
+    // The pool failover budget (3.5s) cuts a hanging attempt off
+    // mid-flight. The target must be told, so a `HalfOpen` trial
+    // resolves as a failure and the next request can fail fast
+    // instead of burning the full budget again, forever.
+    let target = Arc::new(MockTunnelTarget::new("hang-1").with_hanging_tcp());
+    let aborted = Arc::clone(&target.aborted);
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new("hang-1", target, None));
+    let dst: SocketAddr = "203.0.113.1:80".parse().unwrap();
+
+    let start = tokio::time::Instant::now();
+    let err = connect_via_router(
+        &router,
+        &TunnelSelector::DefaultPool,
+        &TargetAddr::Ip(dst),
+        None,
+    )
+    .await
+    .err()
+    .expect("hanging pool attempt must fail on the budget");
+    let elapsed = start.elapsed();
+
+    let RouterConnectError::TcpConnect(e) = err else {
+        panic!("budget abort must surface as a TcpConnect error");
+    };
+    assert!(
+        e.to_string().contains("pool failover budget exceeded"),
+        "unexpected budget error: {e}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(3),
+        "budget abort must burn the full failover budget, took {elapsed:?}"
+    );
+    assert!(
+        aborted.load(Ordering::SeqCst),
+        "pool budget abort must note the aborted attempt on the target"
+    );
 }
 
 #[tokio::test]

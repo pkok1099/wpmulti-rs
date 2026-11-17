@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use serde::Deserialize;
+
 use crate::config::{MainConfig, TuiSortField};
 use crate::core::{ActiveListenerInfo, ReloadReport, TunnelManager, TunnelState, TunnelSummary};
 use crate::tui::config_editor::{
@@ -77,6 +79,14 @@ pub struct TuiProbeResult {
     pub ok: bool,
     pub rtt_ms: Option<u64>,
     pub message: String,
+}
+
+/// Response body of `POST /tunnels/{id}/probe` on the Admin API.
+#[derive(Debug, Deserialize)]
+struct AdminProbeResponse {
+    ok: bool,
+    rtt_ms: Option<u64>,
+    message: String,
 }
 
 /// Number of editable runtime configuration rows in the Config tab.
@@ -465,81 +475,53 @@ impl TuiDataSource {
         }
     }
 
-    /// Probe a single tunnel by activating it (and performing a handshake check when in-process).
+    /// Probe a single tunnel with a real WireGuard handshake check,
+    /// in-process or through the Admin API when remote. Activation
+    /// alone is not a probe result: a tunnel that activates but never
+    /// completes a handshake must report FAIL, not "Activated OK".
     pub async fn probe_tunnel(&self, id: &str, endpoint: &str) -> TuiProbeResult {
-        let start = Instant::now();
         match self {
-            Self::InProcess(mgr) => match mgr.activate_tunnel(id).await {
-                Ok(active) => {
-                    let probe_timeout = mgr.config_snapshot().health_check.probe_timeout;
-                    let peer_pubkey = mgr
-                        .registry()
-                        .get(id)
-                        .and_then(|entry| entry.config.read().peers.first().map(|p| p.public_key));
-                    match peer_pubkey {
-                        Some(pubkey) => {
-                            match tokio::time::timeout(
-                                probe_timeout,
-                                active.device.force_handshake(&pubkey),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => TuiProbeResult {
-                                    id: id.to_string(),
-                                    endpoint: endpoint.to_string(),
-                                    ok: true,
-                                    rtt_ms: Some(start.elapsed().as_millis() as u64),
-                                    message: "Handshake OK".to_string(),
-                                },
-                                Ok(Err(e)) => TuiProbeResult {
-                                    id: id.to_string(),
-                                    endpoint: endpoint.to_string(),
-                                    ok: false,
-                                    rtt_ms: None,
-                                    message: e.to_string(),
-                                },
-                                Err(_) => TuiProbeResult {
-                                    id: id.to_string(),
-                                    endpoint: endpoint.to_string(),
-                                    ok: false,
-                                    rtt_ms: None,
-                                    message: "Handshake timed out".to_string(),
-                                },
-                            }
-                        }
-                        None => TuiProbeResult {
-                            id: id.to_string(),
-                            endpoint: endpoint.to_string(),
-                            ok: false,
-                            rtt_ms: None,
-                            message: "No peer public key configured".to_string(),
-                        },
-                    }
+            Self::InProcess(mgr) => {
+                let outcome = mgr.probe_tunnel(id).await;
+                TuiProbeResult {
+                    id: id.to_string(),
+                    endpoint: endpoint.to_string(),
+                    ok: outcome.ok,
+                    rtt_ms: outcome.rtt_ms,
+                    message: outcome.message,
                 }
-                Err(e) => TuiProbeResult {
-                    id: id.to_string(),
-                    endpoint: endpoint.to_string(),
-                    ok: false,
-                    rtt_ms: None,
-                    message: e.to_string(),
-                },
-            },
-            Self::Remote { .. } => match self.activate_tunnel(id).await {
-                Ok(()) => TuiProbeResult {
-                    id: id.to_string(),
-                    endpoint: endpoint.to_string(),
-                    ok: true,
-                    rtt_ms: Some(start.elapsed().as_millis() as u64),
-                    message: "Activated OK".to_string(),
-                },
-                Err(e) => TuiProbeResult {
-                    id: id.to_string(),
-                    endpoint: endpoint.to_string(),
-                    ok: false,
-                    rtt_ms: None,
-                    message: e,
-                },
-            },
+            }
+            Self::Remote {
+                admin_url,
+                auth_token,
+            } => {
+                let outcome = async {
+                    validate_http_token_or_segment(id, "tunnel id")?;
+                    let path = format!("/tunnels/{id}/probe");
+                    let body =
+                        admin_http_request(admin_url, "POST", &path, auth_token.as_deref()).await?;
+                    let parsed: AdminProbeResponse = serde_json::from_slice(&body)
+                        .map_err(|e| format!("Failed to deserialize probe response: {e}"))?;
+                    Ok::<AdminProbeResponse, String>(parsed)
+                }
+                .await;
+                match outcome {
+                    Ok(parsed) => TuiProbeResult {
+                        id: id.to_string(),
+                        endpoint: endpoint.to_string(),
+                        ok: parsed.ok,
+                        rtt_ms: parsed.rtt_ms,
+                        message: parsed.message,
+                    },
+                    Err(e) => TuiProbeResult {
+                        id: id.to_string(),
+                        endpoint: endpoint.to_string(),
+                        ok: false,
+                        rtt_ms: None,
+                        message: e,
+                    },
+                }
+            }
         }
     }
 }
@@ -558,6 +540,11 @@ pub struct TuiApp {
     pub sort_field: TuiSortField,
     pub sort_ascending: bool,
     pub status_message: Option<(String, Instant)>,
+    /// Last data-source fetch failure, if any. A monitor must keep
+    /// retrying, but a dead data source must never look like an empty
+    /// daemon: while this is set the footer shows the error on every
+    /// tab until a fetch succeeds again.
+    pub data_source_error: Option<String>,
     pub running: bool,
     // Bandwidth sparkline state (bytes/sec samples)
     pub rx_rates: VecDeque<u64>,
@@ -570,6 +557,15 @@ pub struct TuiApp {
     // Live Logs tab state
     pub log_buffer: Option<TuiLogBuffer>,
     pub remote_logs: Vec<String>,
+    /// Last remote log line visible when `c` cleared the Logs tab.
+    /// The daemon keeps its own history and `GET /logs` re-fetches all
+    /// of it on every refresh, so without this the cleared lines came
+    /// straight back. `refresh()` drops everything up to and including
+    /// this line, so cleared lines stay gone and only lines logged
+    /// after the clear reappear. If the marker has rotated out of the
+    /// daemon's ring buffer, everything fetched is newer than it, so
+    /// nothing is dropped.
+    pub remote_logs_clear_marker: Option<String>,
     pub log_scroll: usize,
     pub log_level_filter: Option<String>,
     // Listeners tab state
@@ -614,6 +610,7 @@ impl TuiApp {
             sort_field,
             sort_ascending: true,
             status_message: None,
+            data_source_error: None,
             running: true,
             rx_rates: VecDeque::with_capacity(64),
             tx_rates: VecDeque::with_capacity(64),
@@ -624,6 +621,7 @@ impl TuiApp {
             last_sample_at: None,
             log_buffer: None,
             remote_logs: Vec::new(),
+            remote_logs_clear_marker: None,
             log_scroll: 0,
             log_level_filter: None,
             listeners: Vec::new(),
@@ -670,6 +668,42 @@ impl TuiApp {
     /// Cycle to the previous TUI tab.
     pub fn prev_tab(&mut self) {
         self.set_tab(self.active_tab.prev());
+    }
+
+    /// Clear the visible log buffer. In-process this clears the shared
+    /// buffer, so cleared lines stay gone. In remote mode the daemon
+    /// keeps its own history and the next refresh re-fetches all of it,
+    /// so the last visible line is remembered as a marker (see
+    /// `remote_logs_clear_marker`) for `refresh()` to drop.
+    pub fn clear_logs(&mut self) {
+        if let Some(buf) = &self.log_buffer {
+            buf.clear();
+        } else {
+            // Only move the marker when lines are actually visible:
+            // clearing an already-empty view must keep the previous
+            // marker, or the next refresh would resurrect the lines
+            // the first clear dropped.
+            if let Some(last) = self.remote_logs.last() {
+                self.remote_logs_clear_marker = Some(last.clone());
+            }
+            self.remote_logs.clear();
+        }
+    }
+
+    /// Drop lines up to and including the clear marker from a freshly
+    /// fetched remote log list. Log lines carry timestamps, so the
+    /// marker is unique in practice; the LAST occurrence is dropped
+    /// through, so a duplicate of the marker logged after the clear
+    /// is the only line this can over-drop. A missing marker means it
+    /// rotated out of the daemon's ring buffer, in which case
+    /// everything fetched is newer than the clear — keep it all.
+    pub(crate) fn drop_cleared_logs(&self, mut logs: Vec<String>) -> Vec<String> {
+        if let Some(marker) = &self.remote_logs_clear_marker
+            && let Some(pos) = logs.iter().rposition(|l| l == marker)
+        {
+            logs.drain(..=pos);
+        }
+        logs
     }
 
     /// Cycle the log level filter (`None` -> `ERROR` -> `WARN` -> `INFO` -> `DEBUG`).
@@ -753,12 +787,37 @@ impl TuiApp {
             cfg.validate()
                 .map_err(|e| format!("Validation failed for {}: {e}", field.key()))?;
         }
-        self.data_source.apply_config(&cfg).await?;
-        if field == ConfigField::AdminAuthToken
-            && let Some(tok) = &cfg.admin.auth_token
-            && !crate::config::is_redacted_secret_placeholder(tok)
-        {
-            self.data_source.set_remote_auth_token(Some(tok.clone()));
+        match field.scope() {
+            ConfigApplyScope::Live => {
+                // Apply the live change now — but only that change. The
+                // table may also hold staged `[RESTART]` edits (their
+                // values live in `cfg` too), and posting the whole
+                // snapshot would apply them early: remotely that also
+                // writes them to the daemon's file, so quitting with
+                // `q` would have "saved" a change the UI calls unsaved.
+                // Revert every restart-scoped field to the last saved
+                // baseline for the apply; the staged values stay visible
+                // in the table until `w`.
+                let mut to_apply = cfg.clone();
+                if let Some(base) = self
+                    .config_saved_baseline
+                    .clone()
+                    .or_else(|| self.config_startup_baseline.clone())
+                    .or_else(|| self.config_snapshot.clone())
+                {
+                    for f in ConfigField::ALL {
+                        if f.scope() == ConfigApplyScope::Restart {
+                            f.copy_value(&base, &mut to_apply);
+                        }
+                    }
+                }
+                self.data_source.apply_config(&to_apply).await?;
+            }
+            // `[RESTART]` edits are staged only: the daemon (and its
+            // file) keep the old value until `w` saves and applies the
+            // whole snapshot. Nothing here touches the daemon, so
+            // quitting with `q` genuinely discards them.
+            ConfigApplyScope::Restart => {}
         }
         let val = field.display_value(&cfg);
         self.sync_tui_settings(&cfg);
@@ -833,8 +892,16 @@ impl TuiApp {
         }
 
         let saved_to_disk = if let Some(path) = &self.config_path {
-            let serialized = toml::to_string_pretty(&cfg)
+            let fresh = toml::to_string_pretty(&cfg)
                 .map_err(|e| format!("Failed to serialize TOML: {e}"))?;
+            // Preserve the user's comments in the existing file where
+            // possible; fall back to the plain dump if the file cannot
+            // be merged safely.
+            let existing = tokio::fs::read_to_string(path).await.ok();
+            let serialized = existing
+                .as_deref()
+                .and_then(|text| crate::config::merge_config_preserving_comments(text, &fresh))
+                .unwrap_or(fresh);
             crate::core::write_config_atomically(path, &serialized)
                 .await
                 .map_err(|e| format!("Failed to write '{}': {e}", path.display()))?;
@@ -844,6 +911,17 @@ impl TuiApp {
         };
 
         self.data_source.apply_config(&cfg).await?;
+        // A rotated `admin.auth_token` is a `[RESTART]` edit, so it is
+        // only staged at commit time and the TUI must not start using it
+        // before this save applies it — the daemon doesn't know the new
+        // token yet. Switch the remote bearer here, once the save has
+        // landed, so the refresh right after a rotation stays
+        // authenticated.
+        if let Some(tok) = &cfg.admin.auth_token
+            && !crate::config::is_redacted_secret_placeholder(tok)
+        {
+            self.data_source.set_remote_auth_token(Some(tok.clone()));
+        }
         self.sync_tui_settings(&cfg);
         let reload_report = self.data_source.reload().await?;
 
@@ -1107,8 +1185,22 @@ impl TuiApp {
     }
 
     /// Fetch latest tunnel states (and active tab data + bandwidth samples) from data source.
+    /// Refresh tunnel list (and tab-specific data) from the data source.
+    /// A fetch failure is recorded in `data_source_error` and reported
+    /// as `Ok`: the monitor keeps retrying on its 500 ms tick and the
+    /// footer shows the error instead of an empty dashboard that looks
+    /// like a healthy daemon with no tunnels.
     pub async fn refresh(&mut self) -> Result<(), String> {
-        let list = self.data_source.fetch_tunnels().await?;
+        let list = match self.data_source.fetch_tunnels().await {
+            Ok(list) => {
+                self.data_source_error = None;
+                list
+            }
+            Err(e) => {
+                self.data_source_error = Some(e);
+                return Ok(());
+            }
+        };
         let total_rx: u64 = list
             .iter()
             .fold(0u64, |acc, t| acc.saturating_add(t.rx_bytes));
@@ -1146,7 +1238,7 @@ impl TuiApp {
             && self.log_buffer.is_none()
             && let Ok(logs) = self.data_source.fetch_logs().await
         {
-            self.remote_logs = logs;
+            self.remote_logs = self.drop_cleared_logs(logs);
         }
         if self.active_tab == TuiTab::Listeners
             && let Ok(listeners) = self.data_source.fetch_listeners().await

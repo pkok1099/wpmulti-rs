@@ -20,8 +20,13 @@ use crate::core::registry::TunnelRegistry;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthStatus {
-    /// Normal operating state. Tunnel participates in routing.
+    /// No successful handshake or probe has been observed yet (fresh or reset tunnel).
+    /// The tunnel still participates in routing (unproven, not broken), but it is
+    /// reported distinctly from proven-healthy tunnels so callers can tell the
+    /// difference between "works" and "never tried".
     #[default]
+    Unknown,
+    /// Normal operating state. Tunnel participates in routing.
     Healthy,
     /// Circuit breaker tripped after threshold consecutive failures. In cooldown.
     Unhealthy,
@@ -32,6 +37,7 @@ pub enum HealthStatus {
 impl std::fmt::Display for HealthStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Unknown => write!(f, "unknown"),
             Self::Healthy => write!(f, "healthy"),
             Self::Unhealthy => write!(f, "unhealthy"),
             Self::HalfOpen => write!(f, "half_open"),
@@ -64,11 +70,11 @@ impl Default for TunnelHealthTracker {
 }
 
 impl TunnelHealthTracker {
-    /// Construct a new tracker initialized to Healthy.
+    /// Construct a new tracker initialized to Unknown (never proven).
     pub const fn new() -> Self {
         Self {
             state: RwLock::new(HealthState {
-                status: HealthStatus::Healthy,
+                status: HealthStatus::Unknown,
                 cooldown_until: None,
                 trial_in_flight: false,
             }),
@@ -81,7 +87,7 @@ impl TunnelHealthTracker {
     pub fn can_route(&self) -> bool {
         let state = self.state.read();
         match state.status {
-            HealthStatus::Healthy => true,
+            HealthStatus::Unknown | HealthStatus::Healthy => true,
             HealthStatus::HalfOpen => !state.trial_in_flight,
             HealthStatus::Unhealthy => state
                 .cooldown_until
@@ -105,7 +111,7 @@ impl TunnelHealthTracker {
         {
             let state = self.state.read();
             match state.status {
-                HealthStatus::Healthy => return true,
+                HealthStatus::Unknown | HealthStatus::Healthy => return true,
                 HealthStatus::HalfOpen if state.trial_in_flight => return false,
                 HealthStatus::HalfOpen | HealthStatus::Unhealthy => {}
             }
@@ -113,7 +119,7 @@ impl TunnelHealthTracker {
 
         let mut state = self.state.write();
         match state.status {
-            HealthStatus::Healthy => true,
+            HealthStatus::Unknown | HealthStatus::Healthy => true,
             HealthStatus::HalfOpen => {
                 if state.trial_in_flight {
                     false
@@ -169,6 +175,19 @@ impl TunnelHealthTracker {
         state.trial_in_flight = false;
     }
 
+    /// Record an inconclusive attempt: the operation completed without
+    /// proving the tunnel works (or not). Binding a virtual UDP socket,
+    /// for example, only allocates a local port — no packet has crossed
+    /// the WireGuard handshake — so it must neither promote the tunnel
+    /// to Healthy nor reset its failure count. A HalfOpen trial slot is
+    /// released so a later trial can decide; anything else is untouched.
+    pub fn record_inconclusive(&self) {
+        let mut state = self.state.write();
+        if state.status == HealthStatus::HalfOpen {
+            state.trial_in_flight = false;
+        }
+    }
+
     /// Record a failed connection, handshake, or probe attempt.
     ///
     /// Increments consecutive failure count. If it meets or exceeds `threshold`,
@@ -183,7 +202,7 @@ impl TunnelHealthTracker {
         let mut state = self.state.write();
         let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
         match state.status {
-            HealthStatus::Healthy => {
+            HealthStatus::Unknown | HealthStatus::Healthy => {
                 if failures >= threshold {
                     state.cooldown_until = Some(Instant::now() + cooldown);
                     state.status = HealthStatus::Unhealthy;
@@ -229,12 +248,13 @@ impl TunnelHealthTracker {
         })
     }
 
-    /// Reset tracker back to initial Healthy state.
+    /// Reset the tracker to its initial state: Unknown with no failure history.
+    /// Forgets any proven-healthy past; the tunnel must succeed again to be Healthy.
     pub fn reset(&self) {
         let mut state = self.state.write();
         self.consecutive_failures.store(0, Ordering::Relaxed);
         state.cooldown_until = None;
-        state.status = HealthStatus::Healthy;
+        state.status = HealthStatus::Unknown;
         state.trial_in_flight = false;
     }
 }
@@ -535,14 +555,14 @@ mod tests {
     #[test]
     fn test_health_tracker_state_transitions() {
         let tracker = TunnelHealthTracker::new();
-        assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
+        assert_tracker_state(&tracker, HealthStatus::Unknown, 0, true);
         assert_eq!(tracker.cooldown_remaining_secs(), 0);
 
         let threshold = 3;
         let cooldown = Duration::from_millis(50);
 
         tracker.record_failure(threshold, cooldown);
-        assert_tracker_state(&tracker, HealthStatus::Healthy, 1, true);
+        assert_tracker_state(&tracker, HealthStatus::Unknown, 1, true);
 
         tracker.record_success();
         assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
@@ -583,6 +603,42 @@ mod tests {
     }
 
     #[test]
+    fn test_record_inconclusive_keeps_status_and_failures() {
+        let tracker = TunnelHealthTracker::new();
+        let threshold = 3;
+        let cooldown = Duration::from_millis(50);
+
+        // A fresh tunnel stays Unknown: an inconclusive attempt proves
+        // nothing, so it must not promote to Healthy.
+        tracker.record_inconclusive();
+        assert_tracker_state(&tracker, HealthStatus::Unknown, 0, true);
+
+        // Drive it to Unhealthy, then claim the HalfOpen trial slot.
+        tracker.record_failure(threshold, cooldown);
+        tracker.record_failure(threshold, cooldown);
+        tracker.record_failure(threshold, cooldown);
+        assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
+        assert_eq!(tracker.consecutive_failures(), 3);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(tracker.is_routable());
+        assert_eq!(tracker.current_status(), HealthStatus::HalfOpen);
+
+        // An inconclusive trial must not reset the failure count or
+        // promote the tunnel — but it releases the trial slot, so a
+        // later trial can still decide.
+        tracker.record_inconclusive();
+        assert_eq!(tracker.current_status(), HealthStatus::HalfOpen);
+        assert_eq!(tracker.consecutive_failures(), 3);
+        assert!(tracker.is_routable());
+        assert_eq!(tracker.current_status(), HealthStatus::HalfOpen);
+
+        // And a failed trial after that still returns to Unhealthy.
+        tracker.record_failure(threshold, cooldown);
+        assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
+        assert_eq!(tracker.consecutive_failures(), 4);
+    }
+
+    #[test]
     fn test_health_tracker_reset() {
         let tracker = TunnelHealthTracker::new();
         tracker.record_failure(1, Duration::from_secs(60));
@@ -590,9 +646,29 @@ mod tests {
         assert!(!tracker.is_routable());
 
         tracker.reset();
-        assert_eq!(tracker.current_status(), HealthStatus::Healthy);
+        assert_eq!(tracker.current_status(), HealthStatus::Unknown);
         assert!(tracker.is_routable());
         assert_eq!(tracker.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_health_tracker_unknown_until_first_success() {
+        let tracker = TunnelHealthTracker::new();
+
+        // A fresh tunnel is Unknown, not Healthy: never proven, but still routable.
+        assert_tracker_state(&tracker, HealthStatus::Unknown, 0, true);
+
+        // Failures below threshold keep it Unknown (still unproven, not broken).
+        tracker.record_failure(3, Duration::from_secs(30));
+        assert_tracker_state(&tracker, HealthStatus::Unknown, 1, true);
+
+        // Only a success promotes it to Healthy.
+        tracker.record_success();
+        assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
+
+        // And reset() forgets the proven past, returning to Unknown.
+        tracker.reset();
+        assert_tracker_state(&tracker, HealthStatus::Unknown, 0, true);
     }
 
     #[test]

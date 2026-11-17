@@ -1,9 +1,10 @@
 //! Command handlers for the `wpmulti` CLI.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -140,19 +141,38 @@ pub async fn graceful_shutdown(
     manager.lifecycle().close_all_tunnels().await;
 }
 
+/// Find a `wpmulti.toml` in `dir` for `run` when it was started without
+/// `-c` or `-d`. `run` without arguments used to ignore a `wpmulti.toml`
+/// sitting in the working directory and start with the compiled-in
+/// defaults instead (whose `config_dir` points at `/etc/wpmulti/conf.d`),
+/// so a user standing in a folder that already had a config got "No
+/// WireGuard tunnel configurations found" for a config that was right
+/// there.
+pub(crate) fn discover_local_config_in(dir: &Path) -> Option<PathBuf> {
+    let path = dir.join("wpmulti.toml");
+    path.exists().then_some(path)
+}
+
 /// Execute the `wpmulti run` command: starts multi-tunnel daemon and optional TUI.
 pub async fn cmd_run(
     config_path: Option<PathBuf>,
     dir_path: Option<PathBuf>,
     tui_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = if config_path.is_none() && dir_path.is_none() {
+        discover_local_config_in(Path::new("."))
+    } else {
+        config_path
+    };
     let saved_config_path = config_path.clone();
     let mut config = if let Some(path) = config_path {
         let content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
-        MainConfig::from_toml_str(&content)
-            .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?
+        let mut cfg = MainConfig::from_toml_str(&content)
+            .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?;
+        cfg.resolve_config_dir_against(&path);
+        cfg
     } else {
         MainConfig::default()
     };
@@ -167,6 +187,23 @@ pub async fn cmd_run(
     } else {
         Vec::new()
     };
+
+    if tunnels.is_empty() {
+        return Err(format!(
+            "No WireGuard tunnel configurations found in '{}' (directory missing or empty). Create .conf files there first, pass -d <dir> with your tunnel configs, or run from a directory containing wpmulti.toml (or pass -c <file>); refusing to start a daemon with 0 tunnels.",
+            config.global.config_dir.display()
+        )
+        .into());
+    }
+
+    // A config that names a tunnel ID no .conf file provides (a typo in
+    // `pool`, `disabled_tunnels`, `eager_tunnels`, or an override key)
+    // would otherwise start fine and only fail later as `no healthy
+    // tunnels available in pool` — refuse to start instead.
+    let known_ids: HashSet<String> = tunnels.iter().map(|t| t.id.clone()).collect();
+    config
+        .validate_tunnel_references(&known_ids)
+        .map_err(|e| format!("Invalid tunnel reference: {e}"))?;
 
     let total_tunnels = tunnels.len();
     let manager = Arc::new(
@@ -202,12 +239,6 @@ pub async fn cmd_run(
         "wpmulti daemon started successfully with {} tunnels",
         total_tunnels
     );
-    if total_tunnels == 0 {
-        tracing::warn!(
-            "No WireGuard tunnel configurations found in '{}'; daemon has 0 tunnels.",
-            config.global.config_dir.display()
-        );
-    }
     if saved_config_path.is_none() {
         tracing::info!(
             "Running without wpmulti.toml: dedicated per-tunnel ports active (pass -c wpmulti.toml for shared listeners & Admin API)."
@@ -330,8 +361,10 @@ pub fn cmd_validate(
     let mut config = if let Some(path) = config_path {
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
-        MainConfig::from_toml_str(&content)
-            .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?
+        let mut cfg = MainConfig::from_toml_str(&content)
+            .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?;
+        cfg.resolve_config_dir_against(&path);
+        cfg
     } else {
         MainConfig::default()
     };
@@ -348,6 +381,13 @@ pub fn cmd_validate(
         .into());
     }
     let tunnels = load_tunnel_configs_from_dir(&config.global.config_dir)?;
+
+    // Same check as `run`: a config referencing a tunnel ID that no
+    // loaded `.conf` provides is a typo until proven otherwise.
+    let known_ids: HashSet<String> = tunnels.iter().map(|t| t.id.clone()).collect();
+    config
+        .validate_tunnel_references(&known_ids)
+        .map_err(|e| format!("Invalid tunnel reference: {e}"))?;
 
     let count = tunnels.len();
     let mut out = std::io::stdout().lock();
@@ -396,6 +436,21 @@ pub async fn cmd_top(
     Ok(())
 }
 
+/// Human-readable error for a failed Admin API call: an HTTP status
+/// response is reported as what the API returned — the API was reached,
+/// the request itself failed (e.g. unknown tunnel name) — while
+/// transport errors keep their own wording, which already names the
+/// Admin API.
+pub(crate) fn admin_api_call_error(e: String) -> String {
+    if e.starts_with("HTTP ") {
+        format!("Admin API returned {e}")
+    } else if e.starts_with("Failed to connect") || e.starts_with("Timed out") {
+        e
+    } else {
+        format!("Failed to reach Admin API: {e}")
+    }
+}
+
 /// Enable or disable tunnels (`A`, `1`, `1-200`, `all`) via Admin API.
 pub async fn cmd_toggle_tunnels(
     target: String,
@@ -417,7 +472,7 @@ pub async fn cmd_toggle_tunnels(
         Some(&body),
     )
     .await
-    .map_err(|e| format!("Failed to reach Admin API: {e}"))?;
+    .map_err(admin_api_call_error)?;
     let val: serde_json::Value = serde_json::from_slice(&resp)?;
     let count = val
         .get("count")
@@ -675,6 +730,7 @@ pub async fn cmd_probe(
     } else {
         print_probe_table(&results);
     }
+    write_udp_blocked_hint(&mut std::io::stderr().lock(), &results);
 
     Ok(results)
 }
@@ -688,8 +744,32 @@ pub(crate) fn write_probe_json<W: Write>(
     Ok(())
 }
 
+/// Warn on stderr when a probe failure looks like UDP being blocked in this
+/// environment (sandbox/container without permission to send UDP). WireGuard
+/// handshakes need UDP, so such a failure says nothing about the tunnel
+/// configs themselves — without this hint the user cannot tell a broken
+/// setup apart from a blocked environment. Prints nothing otherwise, and
+/// never touches stdout, so `--json` output stays parseable.
+pub(crate) fn write_udp_blocked_hint<W: Write>(out: &mut W, results: &[ProbeResult]) {
+    let blocked = results.iter().any(|r| {
+        r.error.as_deref().is_some_and(|err| {
+            let lower = err.to_lowercase();
+            lower.contains("operation not permitted") || lower.contains("permission denied")
+        })
+    });
+    if blocked {
+        let _ = writeln!(
+            out,
+            "Hint: a tunnel failed with \"Operation not permitted\" — UDP appears to be blocked in this environment, and WireGuard handshakes need UDP. The tunnel configs themselves may be fine. Quick check: python3 -c \"import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b'x', ('8.8.8.8', 53))\""
+        );
+    }
+}
+
 fn print_probe_table(results: &[ProbeResult]) {
-    let mut out = std::io::stdout().lock();
+    print_probe_table_to(&mut std::io::stdout().lock(), results);
+}
+
+pub(crate) fn print_probe_table_to<W: Write>(out: &mut W, results: &[ProbeResult]) {
     let _ = writeln!(
         out,
         "┌──────────┬──────────────────────┬─────────────┬────────────────┬────────────────────────┬──────────────────────────────┐"
@@ -750,6 +830,15 @@ fn print_probe_table(results: &[ProbeResult]) {
         failed,
         results.len()
     );
+    if failed > 0 {
+        let _ = writeln!(out, "Failed probe errors (full text):");
+        for r in results.iter().filter(|r| !r.healthy) {
+            if let Some(err) = r.error.as_deref() {
+                let clean: String = err.chars().filter(|c| !c.is_control()).collect();
+                let _ = writeln!(out, "  {}: {}", r.id, clean);
+            }
+        }
+    }
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {

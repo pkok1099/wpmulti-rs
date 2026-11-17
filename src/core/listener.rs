@@ -58,6 +58,16 @@ impl Default for ListenerSupervisor {
     }
 }
 
+/// Settings shared by both dedicated-protocol start passes: the
+/// per-tunnel section plus the global-password fallback derived from the
+/// shared listeners (see `MainConfig::dedicated_fallback_password`).
+#[derive(Clone, Copy)]
+struct DedicatedStartup<'a> {
+    per_tunnel: &'a PerTunnelSettings,
+    fallback_password: Option<&'a str>,
+    bind_address: IpAddr,
+}
+
 impl ListenerSupervisor {
     /// Construct a new listener supervisor.
     pub fn new() -> Self {
@@ -90,6 +100,7 @@ impl ListenerSupervisor {
             let dedicated = self
                 .start_dedicated_listeners(
                     &config.per_tunnel,
+                    config.dedicated_fallback_password().as_deref(),
                     config.global.bind_address,
                     registry,
                     lifecycle,
@@ -193,7 +204,7 @@ impl ListenerSupervisor {
                 Ok(l) => return Ok(Some(l)),
                 Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
                     tracing::warn!(
-                        "Port {port} already in use for {proto_label} tunnel '{tunnel_id}', shifting to next free port"
+                        "Port {port} already in use while binding dedicated {proto_label} listener for tunnel '{tunnel_id}', shifting to next free port"
                     );
                 }
                 Err(e) => {
@@ -209,11 +220,43 @@ impl ListenerSupervisor {
         )))
     }
 
+    /// Derive the credential a dedicated listener must enforce for
+    /// `tunnel_id`: the tunnel's own override password when one exists,
+    /// else the single configured global password (fallback). Fails closed:
+    /// when a password is configured anywhere (a global fallback or any
+    /// override) but this tunnel has neither, the listener must not start
+    /// unauthenticated (audit run-1, high).
+    fn dedicated_auth_for_tunnel(
+        per_tunnel: &PerTunnelSettings,
+        fallback_password: Option<&str>,
+        tunnel_id: &str,
+    ) -> Result<Option<(String, String)>, CoreError> {
+        let auth = per_tunnel
+            .overrides
+            .get(tunnel_id)
+            .and_then(|o| o.password.as_ref())
+            .map(|p| (tunnel_id.to_string(), p.clone()))
+            .or_else(|| fallback_password.map(|p| (tunnel_id.to_string(), p.to_string())));
+        if auth.is_none() {
+            let any_password = fallback_password.is_some()
+                || per_tunnel
+                    .overrides
+                    .values()
+                    .any(|o| o.password.as_ref().is_some_and(|p| !p.is_empty()));
+            if any_password {
+                return Err(CoreError::ListenerError(format!(
+                    "dedicated listener for tunnel '{tunnel_id}' would accept unauthenticated clients while a proxy password is configured; set a per_tunnel.overrides.{tunnel_id}.password or disable dedicated listeners"
+                )));
+            }
+        }
+        Ok(auth)
+    }
+
     fn register_dedicated_listener(
         &self,
         (listener, actual_addr): (TcpListener, SocketAddr),
         entry: &Arc<crate::core::registry::TunnelEntry>,
-        per_tunnel: &PerTunnelSettings,
+        auth: Option<(String, String)>,
         listener_type: ListenerType,
         lifecycle: &Arc<LifecycleController>,
     ) -> ActiveListenerInfo {
@@ -224,12 +267,6 @@ impl ListenerSupervisor {
         if listener_type == ListenerType::Socks5 || entry.assigned_port.read().is_none() {
             entry.set_assigned_port(actual_addr.port());
         }
-
-        let auth = per_tunnel
-            .overrides
-            .get(&entry.id)
-            .and_then(|o| o.password.as_ref())
-            .map(|p| (entry.id.clone(), p.clone()));
 
         let router = Arc::new(DedicatedTunnelRouter::new(
             entry.id.clone(),
@@ -264,14 +301,13 @@ impl ListenerSupervisor {
     async fn start_dedicated_protocol_listeners(
         &self,
         entries: &[Arc<crate::core::registry::TunnelEntry>],
-        per_tunnel: &PerTunnelSettings,
-        bind_address: IpAddr,
+        startup: DedicatedStartup<'_>,
         listener_type: ListenerType,
         lifecycle: &Arc<LifecycleController>,
     ) -> Result<Vec<ActiveListenerInfo>, CoreError> {
         let base_port = match listener_type {
-            ListenerType::Socks5 => per_tunnel.base_socks5_port,
-            ListenerType::Http => per_tunnel.base_http_port,
+            ListenerType::Socks5 => startup.per_tunnel.base_socks5_port,
+            ListenerType::Http => startup.per_tunnel.base_http_port,
         };
         let Some(base_port) = base_port else {
             return Ok(Vec::new());
@@ -286,13 +322,15 @@ impl ListenerSupervisor {
             handles.iter().map(|h| h.info.address.port()).collect()
         };
         for e in entries {
-            if let Some(p) = per_tunnel
-                .overrides
-                .get(&e.id)
-                .and_then(|o| match listener_type {
-                    ListenerType::Socks5 => o.socks5_port,
-                    ListenerType::Http => o.http_port,
-                })
+            if let Some(p) =
+                startup
+                    .per_tunnel
+                    .overrides
+                    .get(&e.id)
+                    .and_then(|o| match listener_type {
+                        ListenerType::Socks5 => o.socks5_port,
+                        ListenerType::Http => o.http_port,
+                    })
             {
                 used_ports.insert(p);
             }
@@ -301,15 +339,30 @@ impl ListenerSupervisor {
 
         for entry in entries {
             let override_port =
-                per_tunnel
+                startup
+                    .per_tunnel
                     .overrides
                     .get(&entry.id)
                     .and_then(|o| match listener_type {
                         ListenerType::Socks5 => o.socks5_port,
                         ListenerType::Http => o.http_port,
                     });
+            // Derive (and enforce) the credential before binding: a tunnel
+            // with no credential must not get an unauthenticated dedicated
+            // listener while a password is configured anywhere.
+            let auth = match Self::dedicated_auth_for_tunnel(
+                startup.per_tunnel,
+                startup.fallback_password,
+                &entry.id,
+            ) {
+                Ok(auth) => auth,
+                Err(e) => {
+                    self.rollback_dedicated_batch(&started, entries);
+                    return Err(e);
+                }
+            };
             let listener = match Self::bind_dedicated_listener(
-                bind_address,
+                startup.bind_address,
                 proto_label,
                 &entry.id,
                 override_port,
@@ -339,7 +392,7 @@ impl ListenerSupervisor {
             let info = self.register_dedicated_listener(
                 (listener, actual_addr),
                 entry,
-                per_tunnel,
+                auth,
                 listener_type,
                 lifecycle,
             );
@@ -394,28 +447,22 @@ impl ListenerSupervisor {
     pub async fn start_dedicated_listeners(
         &self,
         per_tunnel: &PerTunnelSettings,
+        fallback_password: Option<&str>,
         bind_address: IpAddr,
         registry: &Arc<TunnelRegistry>,
         lifecycle: &Arc<LifecycleController>,
     ) -> Result<Vec<ActiveListenerInfo>, CoreError> {
         let entries = registry.all_entries();
+        let startup = DedicatedStartup {
+            per_tunnel,
+            fallback_password,
+            bind_address,
+        };
         let mut started = self
-            .start_dedicated_protocol_listeners(
-                &entries,
-                per_tunnel,
-                bind_address,
-                ListenerType::Socks5,
-                lifecycle,
-            )
+            .start_dedicated_protocol_listeners(&entries, startup, ListenerType::Socks5, lifecycle)
             .await?;
         let http_started = match self
-            .start_dedicated_protocol_listeners(
-                &entries,
-                per_tunnel,
-                bind_address,
-                ListenerType::Http,
-                lifecycle,
-            )
+            .start_dedicated_protocol_listeners(&entries, startup, ListenerType::Http, lifecycle)
             .await
         {
             Ok(h) => h,
@@ -626,6 +673,7 @@ impl ListenerSupervisor {
         &self,
         entry: &Arc<crate::core::registry::TunnelEntry>,
         per_tunnel: &PerTunnelSettings,
+        fallback_password: Option<&str>,
         bind_address: IpAddr,
         lifecycle: &Arc<LifecycleController>,
     ) -> Result<Vec<ActiveListenerInfo>, CoreError> {
@@ -636,9 +684,10 @@ impl ListenerSupervisor {
         };
 
         let ovr = per_tunnel.overrides.get(&entry.id);
-        let auth = ovr
-            .and_then(|o| o.password.as_ref())
-            .map(|p| (entry.id.clone(), p.clone()));
+        // Fail fast before binding anything: a tunnel with no credential
+        // must not get an unauthenticated dedicated listener while a
+        // password is configured anywhere (audit run-1, high).
+        let auth = Self::dedicated_auth_for_tunnel(per_tunnel, fallback_password, &entry.id)?;
 
         let specs = [
             (
@@ -821,12 +870,28 @@ async fn run_listener_loop(
                         let peer_ip = Some(peer_addr.ip());
                         client_tasks.spawn(async move {
                             let _permit = permit;
-                            match listener_type {
+                            let result = match listener_type {
                                 ListenerType::Socks5 => {
-                                    let _ = handle_socks5_with_addrs(stream, r, local_ip, peer_ip).await;
+                                    handle_socks5_with_addrs(stream, r, local_ip, peer_ip).await
                                 }
-                                ListenerType::Http => {
-                                    let _ = handle_http(stream, r).await;
+                                ListenerType::Http => handle_http(stream, r).await,
+                            };
+                            if let Err(e) = result {
+                                // A handshake timeout means the client
+                                // stalled mid-handshake and the server
+                                // closed the connection without a
+                                // reply — worth a warning so it is
+                                // diagnosable. Anything else (a client
+                                // disconnecting mid-request, a rejected
+                                // auth) is routine noise.
+                                if e.kind() == io::ErrorKind::TimedOut {
+                                    tracing::warn!(
+                                        "Proxy connection from {peer_addr} failed: {e}"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "Proxy connection from {peer_addr} ended: {e}"
+                                    );
                                 }
                             }
                         });
@@ -839,7 +904,7 @@ async fn run_listener_loop(
                             || e.kind() == io::ErrorKind::Interrupted;
 
                         if is_transient {
-                            tracing::warn!("Transient TCP accept error: {:?}; backing off", e);
+                            tracing::warn!("Transient TCP accept error: {}; backing off", e);
                             tokio::time::sleep(Duration::from_millis(50)).await;
                         } else {
                             tracing::debug!("TCP listener accept stopped: {:?}", e);

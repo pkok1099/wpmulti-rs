@@ -81,16 +81,16 @@ fn test_circuit_breaker_passive_lifecycle() {
     let threshold = 3;
     let cooldown = Duration::from_millis(50);
 
-    // Initial state: Healthy and routable
-    assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
+    // Initial state: Unknown (never proven) but routable
+    assert_tracker_state(&tracker, HealthStatus::Unknown, 0, true);
     assert_eq!(tracker.cooldown_remaining_secs(), 0);
 
-    // Failure 1 & 2: below threshold -> remains Healthy
+    // Failure 1 & 2: below threshold -> remains Unknown
     tracker.record_failure(threshold, cooldown);
-    assert_tracker_state(&tracker, HealthStatus::Healthy, 1, true);
+    assert_tracker_state(&tracker, HealthStatus::Unknown, 1, true);
 
     tracker.record_failure(threshold, cooldown);
-    assert_tracker_state(&tracker, HealthStatus::Healthy, 2, true);
+    assert_tracker_state(&tracker, HealthStatus::Unknown, 2, true);
 
     // Failure 3: reaches threshold -> trips to Unhealthy
     tracker.record_failure(threshold, cooldown);
@@ -494,7 +494,8 @@ async fn test_admin_api_health_visibility() {
 
     let val: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
     assert_eq!(val["total_tunnels"], 3);
-    assert_eq!(val["healthy_tunnels"], 2);
+    assert_eq!(val["healthy_tunnels"], 0);
+    assert_eq!(val["unknown_tunnels"], 2);
     assert_eq!(val["unhealthy_tunnels"], 1);
 
     // 2. Test GET /tunnels includes health fields in TunnelSummary
@@ -524,9 +525,10 @@ async fn test_admin_api_health_visibility() {
     assert_eq!(resp_metrics.status, 200);
     let metrics_text = String::from_utf8(resp_metrics.body).unwrap();
 
-    assert!(metrics_text.contains("wpmulti_tunnels_healthy 2"));
+    assert!(metrics_text.contains("wpmulti_tunnels_healthy 0"));
+    assert!(metrics_text.contains("wpmulti_tunnels_unknown 2"));
     assert!(metrics_text.contains("wpmulti_tunnels_unhealthy 1"));
-    assert!(metrics_text.contains("wpmulti_tunnel_health{tunnel_id=\"tun-ok-1\"} 1"));
+    assert!(metrics_text.contains("wpmulti_tunnel_health{tunnel_id=\"tun-ok-1\"} 0"));
     assert!(metrics_text.contains("wpmulti_tunnel_health{tunnel_id=\"tun-fail\"} 0"));
     assert!(metrics_text.contains("wpmulti_tunnel_consecutive_failures{tunnel_id=\"tun-fail\"}"));
     assert!(

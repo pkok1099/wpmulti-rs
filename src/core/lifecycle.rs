@@ -161,13 +161,23 @@ impl GuardedTunnelTarget {
             {
                 Ok(ips) => {
                     tunnel.stats.record_handshake(now_unix_secs());
-                    trial_resolved.store(true, Ordering::Relaxed);
+                    // Deliberately NOT marking the trial resolved here:
+                    // a successful DNS resolve proves nothing about the
+                    // tunnel carrying traffic yet. The verdict comes
+                    // from the TCP connect (or UDP bind) that follows;
+                    // marking it here would let a later aborted connect
+                    // leak the claimed `HalfOpen` trial slot forever.
                     Ok(ips)
                 }
                 Err(e) => {
                     trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
-                        h.record_failure(threshold, cooldown);
+                        let handshaked = tunnel.stats.last_handshake.load(Ordering::Relaxed) > 0;
+                        if is_destination_caused_error(e.kind(), handshaked) {
+                            h.record_inconclusive();
+                        } else {
+                            h.record_failure(threshold, cooldown);
+                        }
                     }
                     let err = if e.kind() == io::ErrorKind::TimedOut
                         && tunnel.stats.last_handshake.load(Ordering::Relaxed) == 0
@@ -191,6 +201,33 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Whether a failed attempt says nothing about the tunnel's health: the
+/// failure is attributable to the client-chosen destination, not to the
+/// WireGuard peer. Such attempts must not trip the circuit breaker
+/// (audit run-1, medium). A refused connection proves the tunnel carried
+/// the SYN and got an answer back; an unroutable address family or a
+/// nonexistent domain is a property of the request; a timeout against a
+/// peer that has handshaked before points at a blackholing destination,
+/// while a timeout against a peer that never handshaked points at the
+/// peer itself — so it stays a failure.
+pub(crate) const fn is_destination_caused_error(
+    kind: io::ErrorKind,
+    tunnel_handshaked: bool,
+) -> bool {
+    // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; the
+    // destination-caused ones are listed explicitly and all others stay
+    // tunnel-side failures.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match kind {
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::AddrNotAvailable
+        | io::ErrorKind::InvalidInput
+        | io::ErrorKind::NotFound => true,
+        io::ErrorKind::TimedOut => tunnel_handshaked,
+        _ => false,
+    }
 }
 
 impl ProxyTunnelTarget for GuardedTunnelTarget {
@@ -221,7 +258,12 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
                 Err(e) => {
                     trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
-                        h.record_failure(threshold, cooldown);
+                        let handshaked = tunnel.stats.last_handshake.load(Ordering::Relaxed) > 0;
+                        if is_destination_caused_error(e.kind(), handshaked) {
+                            h.record_inconclusive();
+                        } else {
+                            h.record_failure(threshold, cooldown);
+                        }
                     }
                     let err = if e.kind() == io::ErrorKind::TimedOut
                         && tunnel.stats.last_handshake.load(Ordering::Relaxed) == 0
@@ -254,7 +296,13 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
                 Ok(socket) => {
                     trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
-                        h.record_success();
+                        // Binding a virtual UDP socket only allocates
+                        // a local port in the netstack — no packet has
+                        // crossed the WireGuard handshake — so granting
+                        // a UDP relay proves nothing about the tunnel.
+                        // It must not promote the tunnel to Healthy or
+                        // reset its failure count.
+                        h.record_inconclusive();
                     }
                     let guarded: Box<dyn ProxyUdpSocket> = Box::new(GuardedUdpSocket {
                         inner: socket,
@@ -305,6 +353,23 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
 
     fn connect_timeout(&self) -> Duration {
         self.tunnel.netstack.connect_timeout()
+    }
+
+    fn note_attempt_aborted(&self) {
+        // Idempotent per target instance: the swap claims the verdict
+        // exactly once, so a budget abort after an inner per-candidate
+        // timeout cannot count the same attempt twice.
+        if self.trial_resolved.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(h) = &self.health {
+            // A budget-aborted attempt ended without a verdict about the
+            // tunnel — the destination may simply be slow — so it must not
+            // count as a failure (audit run-1, medium). Release the
+            // HalfOpen trial slot without touching status or failure
+            // count; the next request may trial the tunnel again.
+            h.record_inconclusive();
+        }
     }
 }
 
@@ -1070,7 +1135,12 @@ impl LifecycleController {
             .as_secs();
 
         for entry in entries {
-            if entry.lifecycle_mode == LifecycleMode::Eager {
+            let disable_pending = entry.is_disable_pending();
+            // Eager tunnels never idle-suspend — except when a disable is
+            // waiting for their live sessions to drain (audit run-1,
+            // medium): a disabled eager tunnel must be re-attempted once
+            // idle, or it stays Active forever.
+            if entry.lifecycle_mode == LifecycleMode::Eager && !disable_pending {
                 continue;
             }
 
@@ -1080,6 +1150,15 @@ impl LifecycleController {
 
             let active_conns = entry.stats.active_conns.load(Ordering::SeqCst);
             if active_conns == 0 {
+                if disable_pending {
+                    // A disabled tunnel with drained connections suspends
+                    // immediately, regardless of mode or idle timeout.
+                    let _ = self.suspend_tunnel(&entry.id).await;
+                    if *entry.state.read() != TunnelState::Active {
+                        entry.set_disable_pending(false);
+                    }
+                    continue;
+                }
                 let last_active = entry.stats.last_active_at.load(Ordering::Relaxed);
                 let idle_secs = if last_active > 0 {
                     now.saturating_sub(last_active)

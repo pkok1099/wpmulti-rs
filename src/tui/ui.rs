@@ -1,6 +1,6 @@
 //! Ratatui + Crossterm terminal UI renderer and interactive event loop for `wpmulti`.
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -280,6 +280,41 @@ fn draw_overview_sparklines(f: &mut Frame<'_>, app: &TuiApp, spark_col: Rect) {
     f.render_widget(tx_spark, tx_spark_area);
 }
 
+/// Longest common prefix of the given strings, compared char by char.
+pub(crate) fn common_prefix(strs: &[&str]) -> String {
+    let mut prefix: Vec<char> = strs.first().map_or(Vec::new(), |s| s.chars().collect());
+    for s in strs.iter().skip(1) {
+        let kept = prefix
+            .iter()
+            .zip(s.chars())
+            .take_while(|(a, b)| a == &b)
+            .count();
+        prefix.truncate(kept);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix.into_iter().collect()
+}
+
+/// Short label for a bar in the "Top 5 Tunnels" chart. Bars are 7
+/// cells wide, so a label longer than that is clipped by the chart —
+/// with a plain first-7-chars truncation, IDs sharing a prefix
+/// (`wgcf-001`, `wgcf-002`) rendered identically as `wgcf-00`. The
+/// shared prefix is stripped first; if that leaves fewer than 3
+/// chars, the last 3 chars of the full ID are shown instead, so the
+/// bars stay distinguishable.
+pub(crate) fn short_bar_label(id: &str, common: &str) -> String {
+    let stripped = id.strip_prefix(common).unwrap_or(id);
+    if stripped.chars().count() >= 3 {
+        stripped.chars().take(7).collect()
+    } else {
+        let chars: Vec<char> = id.chars().collect();
+        let skip = chars.len().saturating_sub(3);
+        chars.iter().skip(skip).collect()
+    }
+}
+
 fn draw_tunnels_overview(f: &mut Frame<'_>, app: &TuiApp, t_area: Rect) {
     let [spark_col, bar_col, gauge_col] = Layout::default()
         .direction(Direction::Horizontal)
@@ -293,13 +328,14 @@ fn draw_tunnels_overview(f: &mut Frame<'_>, app: &TuiApp, t_area: Rect) {
     draw_overview_sparklines(f, app, spark_col);
 
     let top = app.top_tunnels(5);
+    let ids: Vec<&str> = top.iter().map(|(id, _)| *id).collect();
+    let common = common_prefix(&ids);
     let bars: Vec<Bar<'_>> = top
         .iter()
         .map(|(id, total)| {
-            let short: String = id.chars().take(8).collect();
             Bar::default()
                 .value(*total)
-                .label(Line::from(short))
+                .label(Line::from(short_bar_label(id, &common)))
                 .text_value(format_bytes(*total))
                 .style(Style::default().fg(ACCENT_CYAN))
         })
@@ -385,6 +421,7 @@ fn build_tunnel_table_rows(
                 (format!("{:?}", t.state), state_style(t.state))
             };
             let health_str = match t.health {
+                HealthStatus::Unknown => "Unknown",
                 HealthStatus::Healthy => "Healthy",
                 HealthStatus::HalfOpen => "HalfOpen",
                 HealthStatus::Unhealthy => "Unhealthy",
@@ -613,10 +650,31 @@ fn draw_listeners_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     f.render_widget(table, area);
 }
 
+/// Show the tail of a Config edit buffer, so the cursor — always at the
+/// end, because editing is append-only (`Backspace` pops the last
+/// character) — stays visible. A long JSON used to be cut off at the
+/// right edge of the VALUE column with no way to see its end (`End` and
+/// the arrow keys do nothing while editing); now the head is replaced by
+/// "…" and the last characters plus the cursor are shown.
+pub(crate) fn visible_edit_tail(buf: &str, width: usize) -> String {
+    let chars: Vec<char> = buf.chars().collect();
+    if chars.len() < width {
+        return format!("{buf}_");
+    }
+    let shown = width.saturating_sub(2).max(1).min(chars.len());
+    let tail: String = chars
+        .get(chars.len() - shown..)
+        .unwrap_or(&[])
+        .iter()
+        .collect();
+    format!("…{tail}_")
+}
+
 fn build_config_table_row<'a>(
     app: &TuiApp,
     cfg: &crate::config::MainConfig,
     idx: usize,
+    value_width: usize,
 ) -> Row<'a> {
     let field = ConfigField::from_index(idx).unwrap_or(ConfigField::DisabledTunnels);
     let scope = field.scope();
@@ -647,7 +705,7 @@ fn build_config_table_row<'a>(
     let display_val = if idx == app.config_selected && app.config_editing.is_some() {
         app.config_editing
             .as_ref()
-            .map_or(val, |edit_buf| format!("{edit_buf}_"))
+            .map_or(val, |edit_buf| visible_edit_tail(edit_buf, value_width))
     } else if is_modified {
         format!("{val} *")
     } else {
@@ -712,7 +770,12 @@ fn draw_config_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
 
     let rows: Vec<Row<'_>> = (start..total)
         .take(visible)
-        .map(|idx| build_config_table_row(app, cfg, idx))
+        .map(|idx| {
+            // SCOPE(10) + SETTING(28) + ACTION(14) + borders and cell
+            // spacing: the VALUE column gets the rest of the width.
+            let value_width = (area.width as usize).saturating_sub(57).max(18);
+            build_config_table_row(app, cfg, idx, value_width)
+        })
         .collect();
 
     let path_label = app.config_path.as_ref().map_or_else(
@@ -748,7 +811,13 @@ fn draw_config_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         rows,
         [
             Constraint::Length(10),
-            Constraint::Min(28),
+            // Length, not Min: with Min the solver grew SETTING past
+            // 28 and starved VALUE, so at 110 cols the
+            // `shared_listener` summary was clipped right after
+            // `anon` even though the `value_width` math above assumes
+            // SETTING is exactly 28. The longest setting key is 27
+            // chars (`per_tunnel.base_socks5_port`), so 28 fits.
+            Constraint::Length(28),
             Constraint::Min(18),
             Constraint::Length(14),
         ],
@@ -825,7 +894,14 @@ fn draw_probe_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
 fn draw_footer(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     let help = match app.active_tab {
         TuiTab::Tunnels => {
-            "1-5/Tab:Tabs  j/k:Nav  /:Search  s:Sort  a:Activate  d:Suspend  x:Toggle  X:Batch  r:Reload  q:Quit"
+            // When a search filter is active, say on-screen how to clear
+            // it — before this, the only clue was "Tunnel 1 of 1" in the
+            // table title and `Esc` silently did nothing.
+            if app.search_query.is_empty() {
+                "1-5/Tab:Tabs  j/k:Nav  /:Search  s:Sort  a:Activate  d:Suspend  x:Toggle  X:Batch  r:Reload  q:Quit"
+            } else {
+                "1-5/Tab:Tabs  j/k:Nav  /:Search  Esc:Clear filter  s:Sort  a:Activate  d:Suspend  x:Toggle  X:Batch  r:Reload  q:Quit"
+            }
         }
         TuiTab::Logs => "1-5/Tab:Tabs  j/k:Scroll  f:Filter Level  c:Clear  q:Quit",
         TuiTab::Listeners => "1-5/Tab:Tabs  j/k:Scroll  q:Quit",
@@ -843,6 +919,22 @@ fn draw_footer(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         lines.push(Line::from(Span::styled(
             format!("Search: {}_", app.search_query),
             Style::default().fg(Color::Yellow),
+        )));
+    } else if app.config_editing.is_some() {
+        // While a Config value is being edited every typed character,
+        // including `q`, goes into the editor; say so before the user
+        // discovers it by losing a quit keystroke.
+        lines.push(Line::from(Span::styled(
+            "Editing value: Enter confirms, Esc cancels",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if let Some(err) = &app.data_source_error {
+        // A dead data source must not look like an empty daemon. This
+        // outranks the transient status message (it is persistent until
+        // a fetch succeeds) but not an interactive prompt above.
+        lines.push(Line::from(Span::styled(
+            format!("⚠ {}", sanitize_terminal_text(err)),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     } else if let Some((msg, at)) = &app.status_message
         && at.elapsed() < Duration::from_secs(8)
@@ -876,6 +968,7 @@ fn state_style(state: TunnelState) -> Style {
 
 fn health_style(health: HealthStatus) -> Style {
     match health {
+        HealthStatus::Unknown => Style::default().fg(Color::Gray),
         HealthStatus::Healthy => Style::default().fg(Color::Green),
         HealthStatus::HalfOpen => Style::default().fg(Color::Yellow),
         HealthStatus::Unhealthy => Style::default().fg(Color::Red),
@@ -953,6 +1046,11 @@ async fn process_terminal_event(app: &mut TuiApp, ev: Event) {
 
 /// Run the interactive terminal TUI loop using `ratatui` + `crossterm`.
 pub async fn run_terminal_tui(mut app: TuiApp, refresh_rate_ms: u64) -> io::Result<()> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(io::Error::other(
+            "TUI requires an interactive terminal (TTY). Run this command in a terminal, or use `wpmulti status` / the Admin API to inspect the daemon instead.",
+        ));
+    }
     install_terminal_panic_hook();
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -1165,7 +1263,24 @@ async fn handle_tunnels_tab_key(app: &mut TuiApp, key: TuiKey) {
         TuiKey::PageDown => app.page_down(10),
         TuiKey::Home => app.scroll_to_top(),
         TuiKey::End => app.scroll_to_bottom(),
-        TuiKey::Char('/') => app.is_searching = true,
+        // A fresh search starts from an empty query: the previous query
+        // is NOT carried over, so `/` + `Enter` with nothing typed clears
+        // the filter instead of silently keeping the old one.
+        TuiKey::Char('/') => {
+            app.search_query.clear();
+            app.apply_filter_and_sort();
+            app.is_searching = true;
+        }
+        // `Esc` with no prompt open clears an active search filter. Before
+        // this, `Esc` did nothing once a filter was applied, and the only
+        // way out was re-opening `/` and backspacing the old query — which
+        // no docs or on-screen hint ever said.
+        TuiKey::Esc => {
+            if !app.search_query.is_empty() {
+                app.search_query.clear();
+                app.apply_filter_and_sort();
+            }
+        }
         TuiKey::Char('s') => app.cycle_sort(),
         TuiKey::Char('a') => {
             if let Err(e) = app.activate_selected().await {
@@ -1195,8 +1310,7 @@ async fn handle_tunnels_tab_key(app: &mut TuiApp, key: TuiKey) {
         | TuiKey::Right
         | TuiKey::Enter
         | TuiKey::Backspace
-        | TuiKey::Tab
-        | TuiKey::Esc => {}
+        | TuiKey::Tab => {}
     }
 }
 
@@ -1208,11 +1322,7 @@ fn handle_logs_tab_key(app: &mut TuiApp, key: TuiKey) {
         }
         TuiKey::Char('f') => app.cycle_log_filter(),
         TuiKey::Char('c') => {
-            if let Some(buf) = &app.log_buffer {
-                buf.clear();
-            } else {
-                app.remote_logs.clear();
-            }
+            app.clear_logs();
             app.log_scroll = 0;
             app.set_status("Logs cleared");
         }
@@ -1315,7 +1425,7 @@ async fn handle_probe_tab_key(app: &mut TuiApp, key: TuiKey) {
     }
 }
 
-async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
+pub(crate) async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
     if handle_prompt_key(app, key).await {
         return;
     }

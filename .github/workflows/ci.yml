@@ -22,13 +22,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
-          components: clippy, rustfmt
+          components: clippy, rustfmt, llvm-tools
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: "ci-linux"
           cache-on-failure: true
           cache-all-crates: true
+
+      - uses: taiki-e/install-action@e800962fea8b802cd1bd32c4e6f08fbda4bb0048 # nextest
+        with:
+          tool: nextest
+
+      - uses: taiki-e/install-action@c2e5d2ce8920c881761c4cabb41434daa1f95687 # cargo-llvm-cov
+        with:
+          tool: cargo-llvm-cov
 
       - name: Format check
         run: cargo fmt --check
@@ -37,4 +45,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked --all-targets
+        run: cargo nextest run --locked --lib --bins --tests --no-fail-fast
+
+      - name: Coverage
+        run: cargo llvm-cov nextest --locked --lib --bins --tests --no-fail-fast --summary-only

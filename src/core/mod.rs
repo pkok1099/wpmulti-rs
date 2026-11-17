@@ -14,7 +14,7 @@ pub mod tests;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,16 @@ pub struct ReloadReport {
     pub updated: usize,
     /// Total count of tunnels active in the registry following reload.
     pub total: usize,
+}
+
+/// Outcome of a handshake probe of one tunnel (see
+/// [`TunnelManager::probe_tunnel`]). `rtt_ms` is set only when the
+/// handshake completes; `message` always explains the outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelProbeOutcome {
+    pub ok: bool,
+    pub rtt_ms: Option<u64>,
+    pub message: String,
 }
 
 /// Central multi-tunnel coordinator managing lifecycle, routing, and listeners.
@@ -263,6 +273,19 @@ impl TunnelManager {
 
     /// Enable or disable one or more tunnels (`A`, `1`, `1-200`, `all`) in runtime and persist
     /// `disabled_tunnels` to `wpmulti.toml` if a config path is configured.
+    /// Suspend a newly disabled tunnel, marking it disable-pending when
+    /// live sessions keep it Active so the idle checker can suspend it
+    /// once drained (audit run-1, medium). A suspend that actually
+    /// happens clears any pending flag.
+    async fn suspend_disabled_tunnel(&self, entry: &Arc<TunnelEntry>) {
+        if let Err(e) = self.lifecycle.suspend_tunnel(&entry.id).await {
+            tracing::warn!("Failed to suspend disabled tunnel '{}': {}", entry.id, e);
+        }
+        let still_busy = *entry.state.read() == TunnelState::Active
+            && entry.stats.active_conns.load(Ordering::SeqCst) > 0;
+        entry.set_disable_pending(still_busy);
+    }
+
     pub async fn set_tunnels_disabled(
         &self,
         spec: &str,
@@ -273,13 +296,14 @@ impl TunnelManager {
             if let Some(entry) = self.registry.get(id) {
                 entry.set_disabled(disabled);
                 if disabled {
-                    if let Err(e) = self.lifecycle.suspend_tunnel(id).await {
-                        tracing::warn!("Failed to suspend disabled tunnel '{}': {}", id, e);
+                    self.suspend_disabled_tunnel(&entry).await;
+                } else {
+                    entry.set_disable_pending(false);
+                    if entry.lifecycle_mode == LifecycleMode::Eager
+                        && let Err(e) = self.lifecycle.activate_tunnel(id).await
+                    {
+                        tracing::warn!("Failed to activate re-enabled tunnel '{}': {}", id, e);
                     }
-                } else if entry.lifecycle_mode == LifecycleMode::Eager
-                    && let Err(e) = self.lifecycle.activate_tunnel(id).await
-                {
-                    tracing::warn!("Failed to activate re-enabled tunnel '{}': {}", id, e);
                 }
             }
         }
@@ -303,14 +327,22 @@ impl TunnelManager {
         if let Some(path) = maybe_path {
             let _write_guard = self.config_write_lock.lock().await;
             let latest_snapshot = self.config.read().clone();
-            if let Ok(toml_str) = toml::to_string_pretty(&latest_snapshot)
-                && let Err(e) = write_config_atomically(&path, &toml_str).await
-            {
-                tracing::warn!(
-                    "Failed to persist disabled_tunnels to '{}': {}",
-                    path.display(),
-                    e
-                );
+            if let Ok(fresh) = toml::to_string_pretty(&latest_snapshot) {
+                // Preserve the user's comments in the existing file
+                // where possible; fall back to the plain dump if the
+                // file cannot be merged safely.
+                let existing = tokio::fs::read_to_string(&path).await.ok();
+                let serialized = existing
+                    .as_deref()
+                    .and_then(|text| crate::config::merge_config_preserving_comments(text, &fresh))
+                    .unwrap_or(fresh);
+                if let Err(e) = write_config_atomically(&path, &serialized).await {
+                    tracing::warn!(
+                        "Failed to persist disabled_tunnels to '{}': {}",
+                        path.display(),
+                        e
+                    );
+                }
             }
         }
         let _ = cfg_snapshot;
@@ -348,6 +380,9 @@ impl TunnelManager {
         for entry in self.registry.all_entries() {
             let disabled = new_cfg.disabled_tunnels.iter().any(|d| d == &entry.id);
             entry.set_disabled(disabled);
+            if !disabled {
+                entry.set_disable_pending(false);
+            }
             let maybe_active = entry.active.read().clone();
             if let Some(active) = maybe_active {
                 active.netstack.set_prefer_ipv6(prefer_ipv6);
@@ -371,6 +406,15 @@ impl TunnelManager {
     /// Validate and apply updated runtime settings asynchronously, suspending newly disabled
     /// tunnels and re-activating newly re-enabled eager tunnels.
     pub async fn apply_runtime_config(&self, new_cfg: MainConfig) -> Result<(), CoreError> {
+        // Reject configs that reference tunnel IDs the registry never
+        // loaded (a typo in `pool`, `disabled_tunnels`, `eager_tunnels`,
+        // or an override key) before anything is applied or saved. This
+        // is the runtime counterpart of the CLI `validate`/`run` check;
+        // both `POST /config` and the in-process TUI save path flow
+        // through here.
+        let known_ids: std::collections::HashSet<String> =
+            self.registry.all_ids().into_iter().collect();
+        new_cfg.validate_tunnel_references(&known_ids)?;
         let prev_disabled: Vec<(String, bool)> = self
             .registry
             .all_entries()
@@ -385,9 +429,7 @@ impl TunnelManager {
             };
             let is_disabled = entry.is_disabled();
             if is_disabled && *entry.state.read() == TunnelState::Active {
-                if let Err(e) = self.lifecycle.suspend_tunnel(&id).await {
-                    tracing::warn!("Failed to suspend newly disabled tunnel '{}': {}", id, e);
-                }
+                self.suspend_disabled_tunnel(&entry).await;
             } else if was_disabled
                 && !is_disabled
                 && entry.lifecycle_mode == LifecycleMode::Eager
@@ -407,11 +449,25 @@ impl TunnelManager {
         new_cfg: MainConfig,
     ) -> Result<(), CoreError> {
         new_cfg.validate()?;
+        // Check references BEFORE writing the file: `apply_runtime_config`
+        // below checks again, but by then the bad config would already be
+        // persisted to disk.
+        let known_ids: std::collections::HashSet<String> =
+            self.registry.all_ids().into_iter().collect();
+        new_cfg.validate_tunnel_references(&known_ids)?;
         let maybe_path = self.config_path.read().clone();
         if let Some(path) = maybe_path {
             let _write_guard = self.config_write_lock.lock().await;
-            let serialized = toml::to_string_pretty(&new_cfg)
+            let fresh = toml::to_string_pretty(&new_cfg)
                 .map_err(|e| CoreError::Other(format!("Failed to serialize TOML: {e}")))?;
+            // Preserve the user's comments in the existing file where
+            // possible; fall back to the plain dump if the file cannot
+            // be merged safely.
+            let existing = tokio::fs::read_to_string(&path).await.ok();
+            let serialized = existing
+                .as_deref()
+                .and_then(|text| crate::config::merge_config_preserving_comments(text, &fresh))
+                .unwrap_or(fresh);
             write_config_atomically(&path, &serialized)
                 .await
                 .map_err(|e| {
@@ -539,6 +595,56 @@ impl TunnelManager {
         self.lifecycle.activate_tunnel(id).await
     }
 
+    /// Probe one tunnel: activate it, then force a WireGuard handshake
+    /// with its first peer and report whether it completes within the
+    /// configured probe timeout. Activation alone proves nothing about
+    /// the tunnel, so the outcome is the handshake result, never the
+    /// activation result. The Admin API exposes this so `wpmulti top`
+    /// can probe a remote daemon honestly instead of reporting
+    /// activation as a probe result.
+    pub async fn probe_tunnel(&self, id: &str) -> TunnelProbeOutcome {
+        let start = Instant::now();
+        let active = match self.activate_tunnel(id).await {
+            Ok(active) => active,
+            Err(e) => {
+                return TunnelProbeOutcome {
+                    ok: false,
+                    rtt_ms: None,
+                    message: e.to_string(),
+                };
+            }
+        };
+        let probe_timeout = self.config_snapshot().health_check.probe_timeout;
+        let Some(pubkey) = self
+            .registry()
+            .get(id)
+            .and_then(|entry| entry.config.read().peers.first().map(|p| p.public_key))
+        else {
+            return TunnelProbeOutcome {
+                ok: false,
+                rtt_ms: None,
+                message: "No peer public key configured".to_string(),
+            };
+        };
+        match tokio::time::timeout(probe_timeout, active.device.force_handshake(&pubkey)).await {
+            Ok(Ok(())) => TunnelProbeOutcome {
+                ok: true,
+                rtt_ms: Some(start.elapsed().as_millis() as u64),
+                message: "Handshake OK".to_string(),
+            },
+            Ok(Err(e)) => TunnelProbeOutcome {
+                ok: false,
+                rtt_ms: None,
+                message: e.to_string(),
+            },
+            Err(_) => TunnelProbeOutcome {
+                ok: false,
+                rtt_ms: None,
+                message: "Handshake timed out".to_string(),
+            },
+        }
+    }
+
     /// Manually suspend a tunnel by its ID.
     pub async fn suspend_tunnel(&self, id: &str) -> Result<(), CoreError> {
         self.lifecycle.suspend_tunnel(id).await
@@ -613,6 +719,7 @@ impl TunnelManager {
                         .start_dedicated_for_tunnel(
                             &entry,
                             &cfg_snapshot.per_tunnel,
+                            cfg_snapshot.dedicated_fallback_password().as_deref(),
                             cfg_snapshot.global.bind_address,
                             &self.lifecycle,
                         )

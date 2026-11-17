@@ -9,7 +9,9 @@ use crate::config::{
 };
 use crate::core::{HealthStatus, TunnelManager, TunnelState, TunnelSummary};
 use crate::tui::app::{TuiApp, TuiDataSource};
-use crate::tui::ui::{format_bytes, render_dashboard};
+use crate::tui::ui::{
+    common_prefix, format_bytes, render_dashboard, short_bar_label, visible_edit_tail,
+};
 
 fn make_test_tunnel_config(id: &str, endpoint: &str) -> TunnelConfig {
     TunnelConfig {
@@ -54,6 +56,7 @@ fn make_dummy_summary(
         consecutive_failures: 0,
         cooldown_remaining_secs: 0,
         disabled: false,
+        disable_pending: false,
     }
 }
 
@@ -107,6 +110,41 @@ fn test_tui_app_initial_state_and_navigation() {
     assert_eq!(app.selected_index, 0);
 }
 
+#[tokio::test]
+async fn test_tui_refresh_records_unreachable_admin_api_error() {
+    // `top` against a dead Admin API used to show an empty dashboard
+    // with no error at all. A failed fetch must now be recorded so the
+    // footer can show it, and the app must stay alive and keep
+    // retrying instead of failing the refresh.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let source = TuiDataSource::Remote {
+        admin_url: format!("http://127.0.0.1:{dead_port}"),
+        auth_token: None,
+    };
+    let mut app = TuiApp::new(source, TuiSortField::Id);
+
+    let result = app.refresh().await;
+    assert!(
+        result.is_ok(),
+        "refresh must not fail on a dead API: {result:?}"
+    );
+    let err = app
+        .data_source_error
+        .as_deref()
+        .expect("a fetch failure must be recorded");
+    assert!(
+        err.contains("Failed to connect to Admin API"),
+        "expected a connection error, got: {err}"
+    );
+    assert!(
+        err.contains(&dead_port.to_string()),
+        "error must name the unreachable address, got: {err}"
+    );
+    assert!(app.tunnels.is_empty());
+}
+
 #[test]
 fn test_tui_search_filtering() {
     let dummy_source = TuiDataSource::Remote {
@@ -140,6 +178,116 @@ fn test_tui_search_filtering() {
     app.search_query.clear();
     app.apply_filter_and_sort();
     assert_eq!(app.filtered_indices.len(), 3);
+}
+
+#[tokio::test]
+async fn test_tui_search_filter_can_be_cleared() {
+    use crate::tui::ui::{TuiKey, handle_tui_key};
+
+    let dummy_source = TuiDataSource::Remote {
+        admin_url: "http://127.0.0.1:9090".to_string(),
+        auth_token: None,
+    };
+    let mut app = TuiApp::new(dummy_source, TuiSortField::Id);
+    let list = vec![
+        make_dummy_summary("wgcf-001", TunnelState::Dormant, 0, 0, 0),
+        make_dummy_summary("wgcf-002", TunnelState::Active, 0, 0, 0),
+    ];
+    app.set_tunnels(list);
+    assert_eq!(app.filtered_indices.len(), 2);
+
+    // `/` + "002" + Enter filters to one tunnel.
+    handle_tui_key(&mut app, TuiKey::Char('/')).await;
+    assert!(app.is_searching);
+    for c in "002".chars() {
+        handle_tui_key(&mut app, TuiKey::Char(c)).await;
+    }
+    handle_tui_key(&mut app, TuiKey::Enter).await;
+    assert!(!app.is_searching);
+    assert_eq!(app.filtered_indices.len(), 1);
+    assert_eq!(app.tunnels[app.filtered_indices[0]].id, "wgcf-002");
+    // The footer says how to clear the filter while one is active.
+    assert!(render_dashboard(&mut app, 110, 24).contains("Esc:Clear filter"));
+
+    // `Esc` with no prompt open clears the active filter.
+    handle_tui_key(&mut app, TuiKey::Esc).await;
+    assert!(app.search_query.is_empty());
+    assert_eq!(app.filtered_indices.len(), 2);
+    assert!(!render_dashboard(&mut app, 110, 24).contains("Esc:Clear filter"));
+
+    // Opening `/` starts a fresh search: the old query is not carried
+    // over, so `/` + `Enter` with nothing typed clears the filter too.
+    handle_tui_key(&mut app, TuiKey::Char('/')).await;
+    assert!(app.is_searching);
+    assert!(app.search_query.is_empty());
+    for c in "001".chars() {
+        handle_tui_key(&mut app, TuiKey::Char(c)).await;
+    }
+    handle_tui_key(&mut app, TuiKey::Enter).await;
+    assert_eq!(app.filtered_indices.len(), 1);
+    handle_tui_key(&mut app, TuiKey::Char('/')).await;
+    assert!(app.search_query.is_empty());
+    assert_eq!(app.filtered_indices.len(), 2);
+    handle_tui_key(&mut app, TuiKey::Enter).await;
+    assert!(!app.is_searching);
+    assert_eq!(app.filtered_indices.len(), 2);
+}
+
+#[tokio::test]
+async fn test_tui_remote_logs_clear_sticks_across_refresh() {
+    // In remote `top` mode, `c` used to clear only the local copy: the
+    // next 500 ms refresh re-fetched the daemon's full history and the
+    // same lines came straight back. The clear must remember the last
+    // visible line as a marker and drop everything up to it on the
+    // next fetch, so cleared lines stay gone and only lines logged
+    // after the clear reappear.
+    use crate::tui::TuiTab;
+    use crate::tui::ui::{TuiKey, handle_tui_key};
+
+    let dummy_source = TuiDataSource::Remote {
+        admin_url: "http://127.0.0.1:9090".to_string(),
+        auth_token: None,
+    };
+    let mut app = TuiApp::new(dummy_source, TuiSortField::Id);
+    app.set_tab(TuiTab::Logs);
+    app.remote_logs = vec![
+        "2026-11-17T04:34:59Z INFO first".to_string(),
+        "2026-11-17T04:35:00Z INFO second".to_string(),
+        "2026-11-17T04:35:01Z INFO third".to_string(),
+    ];
+
+    handle_tui_key(&mut app, TuiKey::Char('c')).await;
+    assert!(app.remote_logs.is_empty());
+    assert_eq!(
+        app.remote_logs_clear_marker.as_deref(),
+        Some("2026-11-17T04:35:01Z INFO third")
+    );
+
+    // A refresh fetching the same history plus one new line drops
+    // everything up to the marker and keeps only the new line.
+    let fetched = vec![
+        "2026-11-17T04:34:59Z INFO first".to_string(),
+        "2026-11-17T04:35:00Z INFO second".to_string(),
+        "2026-11-17T04:35:01Z INFO third".to_string(),
+        "2026-11-17T04:35:02Z INFO fourth".to_string(),
+    ];
+    assert_eq!(
+        app.drop_cleared_logs(fetched),
+        vec!["2026-11-17T04:35:02Z INFO fourth".to_string()]
+    );
+
+    // A fetch where the marker rotated out of the daemon's ring buffer
+    // keeps everything: it is all newer than the clear.
+    let rotated = vec!["2026-11-17T04:35:03Z INFO fifth".to_string()];
+    assert_eq!(app.drop_cleared_logs(rotated.clone()), rotated);
+
+    // Clearing an already-empty view keeps the previous marker: wiping
+    // it would let the next refresh resurrect the dropped lines.
+    handle_tui_key(&mut app, TuiKey::Char('c')).await;
+    assert_eq!(
+        app.remote_logs_clear_marker.as_deref(),
+        Some("2026-11-17T04:35:01Z INFO third")
+    );
 }
 
 #[test]
@@ -194,6 +342,26 @@ fn test_tui_render_dashboard_ansi() {
     assert!(output.contains("wgcf-001"));
     assert!(output.contains("wgcf-002"));
     assert!(output.contains("Conns: 3"));
+}
+
+#[test]
+fn test_tui_render_dashboard_shows_unknown_health() {
+    let dummy_source = TuiDataSource::Remote {
+        admin_url: "http://127.0.0.1:9090".to_string(),
+        auth_token: None,
+    };
+    let mut app = TuiApp::new(dummy_source, TuiSortField::Id);
+
+    let mut summary = make_dummy_summary("wgcf-new", TunnelState::Dormant, 0, 0, 0);
+    summary.health = HealthStatus::Unknown;
+    app.set_tunnels(vec![summary]);
+
+    let output = render_dashboard(&mut app, 100, 30);
+    assert!(output.contains("Unknown"), "dashboard was:\n{output}");
+    assert!(
+        !output.contains("Healthy"),
+        "unproven tunnel shown as Healthy:\n{output}"
+    );
 }
 
 #[tokio::test]
@@ -404,8 +572,6 @@ fn collect_main_config_json_keys() -> Vec<String> {
             for sub_key in sub.keys() {
                 keys.push(format!("{top_key}.{sub_key}"));
             }
-        } else if top_key == "shared_listener" {
-            keys.push("shared_listeners".to_string());
         } else {
             keys.push(top_key.clone());
         }
@@ -738,7 +904,7 @@ async fn test_tui_config_live_hot_reload_and_restart_warning_e2e() {
     assert_live_runtime_propagation(&mgr, &active, &app);
 
     let target = router
-        .select_tunnel(&TunnelSelector::ById("t-live".to_string()))
+        .select_tunnel(&TunnelSelector::ById("t-live".to_string()), None)
         .await
         .expect("select target");
     let v6_err = target
@@ -758,6 +924,182 @@ async fn test_tui_config_live_hot_reload_and_restart_warning_e2e() {
     assert!(warn_banner.contains("WARNING") && warn_banner.contains("[RESTART]"));
     assert!(warn_banner.contains("global.log_level"));
     assert!(render_dashboard(&mut app, 110, 30).contains("restart pending"));
+
+    let _ = mgr.stop().await;
+}
+
+#[test]
+fn test_config_edit_tail_keeps_cursor_visible() {
+    // While editing, the buffer is append-only and the cursor sits at
+    // its end — but the VALUE cell used to show the head of a long value
+    // and clip the tail, so the end of a listener JSON (where
+    // `allow_anonymous` and `pool` live) could never be seen. The tail
+    // window keeps the cursor visible instead.
+    assert_eq!(visible_edit_tail("abc", 10), "abc_");
+    assert_eq!(visible_edit_tail("abc", 4), "abc_");
+    assert_eq!(visible_edit_tail("", 10), "_");
+    assert_eq!(visible_edit_tail("0123456789ABCDEF", 10), "…89ABCDEF_");
+    assert_eq!(
+        visible_edit_tail(
+            r#"[{"name":"shared-socks","type":"socks5","bind":"127.0.0.1:1080","auth_mode":"per_tunnel","default_strategy":"round-robin","allow_anonymous":true,"pool":"all"}]"#,
+            53
+        ),
+        "…\"round-robin\",\"allow_anonymous\":true,\"pool\":\"all\"}]_"
+    );
+}
+
+#[test]
+fn test_shared_listeners_row_shows_anon_auth_and_strategy() {
+    // The Config tab row for `shared_listeners` used to show only names
+    // and ports ("2 listener(s): shared-socks(127.0.0.1:1080), ..."),
+    // so a user could not see whether a listener allows anonymous
+    // requests or which pool strategy it uses without opening the JSON
+    // editor. The row must show both at a glance.
+    use crate::config::{
+        AuthMode, ListenerType, PoolStrategy, SharedListenerSettings, TunnelPoolSelection,
+    };
+    use crate::tui::ConfigField;
+
+    let cfg = MainConfig {
+        shared_listeners: vec![
+            SharedListenerSettings {
+                name: "shared-socks".to_string(),
+                listener_type: ListenerType::Socks5,
+                bind: "127.0.0.1:1080".parse().unwrap(),
+                auth_mode: AuthMode::None,
+                global_password: None,
+                default_strategy: PoolStrategy::RoundRobin,
+                allow_anonymous: true,
+                pool: TunnelPoolSelection::All,
+                ip_mode: None,
+            },
+            SharedListenerSettings {
+                name: "shared-http".to_string(),
+                listener_type: ListenerType::Http,
+                bind: "127.0.0.1:8080".parse().unwrap(),
+                auth_mode: AuthMode::Global,
+                global_password: Some("secret".to_string()),
+                default_strategy: PoolStrategy::LeastConn,
+                allow_anonymous: false,
+                pool: TunnelPoolSelection::All,
+                ip_mode: None,
+            },
+        ],
+        ..Default::default()
+    };
+    let shown = ConfigField::SharedListeners.display_value(&cfg);
+    assert_eq!(
+        shown,
+        "2 listener(s): shared-socks socks5 anon round-robin 127.0.0.1:1080, \
+         shared-http http auth least-conn 127.0.0.1:8080"
+    );
+    assert_eq!(
+        ConfigField::SharedListeners.display_value(&MainConfig::default()),
+        "0 listener(s)"
+    );
+}
+
+#[test]
+fn test_top_tunnels_bar_labels_stay_distinguishable() {
+    // Bars are 7 cells wide, so a label longer than that is clipped by
+    // the chart. A plain first-7-chars truncation rendered `wgcf-001`
+    // and `wgcf-002` identically as `wgcf-00`, so the two bars could
+    // not be told apart. Stripping the shared prefix first keeps the
+    // distinguishing tail visible.
+    assert_eq!(common_prefix(&["wgcf-001", "wgcf-002"]), "wgcf-00");
+    assert_eq!(common_prefix(&["alpha", "beta"]), "");
+    assert_eq!(common_prefix(&["only"]), "only");
+    assert_eq!(common_prefix(&[]), "");
+    assert_eq!(short_bar_label("wgcf-001", "wgcf-00"), "001");
+    assert_eq!(short_bar_label("wgcf-002", "wgcf-00"), "002");
+    assert_eq!(short_bar_label("wgcf-001", "wgcf-001"), "001");
+    assert_eq!(short_bar_label("alpha-long-name", ""), "alpha-l");
+    assert_eq!(short_bar_label("ab", ""), "ab");
+}
+
+#[tokio::test]
+async fn test_tui_restart_edit_stays_staged_until_save() {
+    // A `[RESTART]` edit used to be applied to the daemon (and, remotely,
+    // written to its file) the moment Enter was pressed — so quitting
+    // with `q` "saved" a change the UI itself called unsaved. A staged
+    // restart change must touch nothing until `w`, and a later `[LIVE]`
+    // apply must not drag the staged value along with it.
+    use crate::config::{LogLevel, MainConfig, load_tunnel_configs_from_dir};
+    use crate::tui::{ConfigField, TuiTab};
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let conf_dir = temp.path().join("conf.d");
+    std::fs::create_dir_all(&conf_dir).expect("mkdir conf.d");
+    write_test_wg_conf(&conf_dir, "t-stage", "172.16.0.2/32", "127.0.0.1:51820");
+    let tunnels = load_tunnel_configs_from_dir(&conf_dir).expect("load conf dir");
+    let toml_path = temp.path().join("wpmulti.toml");
+
+    let mut cfg = MainConfig::default();
+    cfg.global.config_dir = conf_dir;
+    std::fs::write(&toml_path, toml::to_string_pretty(&cfg).expect("toml"))
+        .expect("write initial toml");
+
+    let mgr = Arc::new(TunnelManager::new(cfg.clone(), tunnels).expect("mgr"));
+    mgr.set_config_path(toml_path.clone());
+
+    let mut app = TuiApp::new(TuiDataSource::InProcess(Arc::clone(&mgr)), TuiSortField::Id)
+        .with_config_path(toml_path.clone());
+    app.set_tab(TuiTab::Config);
+
+    // Stage a [RESTART] change (info -> warn) without saving.
+    select_config_field(&mut app, ConfigField::GlobalLogLevel);
+    app.activate_config_row().await.expect("cycle log_level");
+    assert_eq!(
+        app.config_snapshot.as_ref().unwrap().global.log_level,
+        LogLevel::Warn
+    );
+    assert_eq!(mgr.config_snapshot().global.log_level, LogLevel::Info);
+    assert_eq!(
+        MainConfig::from_file(&toml_path)
+            .expect("toml")
+            .global
+            .log_level,
+        LogLevel::Info,
+        "staged restart change leaked onto disk"
+    );
+
+    // Apply a [LIVE] change: it lands immediately, but the staged
+    // restart value must not leak through with it.
+    select_config_field(&mut app, ConfigField::GlobalDnsFallback);
+    app.config_editing = Some("9.9.9.9:53".to_string());
+    app.commit_config_edit().await.expect("commit dns_fallback");
+    assert_eq!(
+        mgr.config_snapshot().global.dns_fallback.to_string(),
+        "9.9.9.9:53"
+    );
+    assert_eq!(
+        mgr.config_snapshot().global.log_level,
+        LogLevel::Info,
+        "live apply dragged the staged restart value along"
+    );
+
+    // `w` applies and persists everything, staged restart included.
+    let report = app
+        .save_config_and_reload_with_report()
+        .await
+        .expect("save and reload");
+    assert!(report.restart_pending.contains(&"global.log_level"));
+    assert_eq!(mgr.config_snapshot().global.log_level, LogLevel::Warn);
+    assert_eq!(
+        MainConfig::from_file(&toml_path)
+            .expect("toml")
+            .global
+            .log_level,
+        LogLevel::Warn
+    );
+    assert_eq!(
+        MainConfig::from_file(&toml_path)
+            .expect("toml")
+            .global
+            .dns_fallback
+            .to_string(),
+        "9.9.9.9:53"
+    );
 
     let _ = mgr.stop().await;
 }

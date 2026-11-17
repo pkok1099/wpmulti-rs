@@ -6,6 +6,7 @@
 #[cfg(test)]
 mod tests;
 pub mod toml_config;
+pub mod toml_preserve;
 pub mod wg_conf;
 
 pub use toml_config::{
@@ -14,6 +15,7 @@ pub use toml_config::{
     MainConfig, PerTunnelSettings, PoolStrategy, SharedListenerSettings, TuiSettings, TuiSortField,
     TunnelPoolSelection, TunnelPortOverride, is_redacted_secret_placeholder, parse_duration_str,
 };
+pub use toml_preserve::merge_config_preserving_comments;
 pub use wg_conf::{
     WgConfError, WgConfig, WgInterfaceConfig, WgPeerConfig, parse_wg_conf, parse_wg_conf_file,
     strip_comment,
@@ -132,49 +134,69 @@ pub fn load_tunnel_configs_from_dir<P: AsRef<Path>>(
     // Sort paths alphabetically to ensure deterministic ordering
     entries.sort();
 
+    // Every broken file is reported, not just the first one: a user with
+    // several bad `.conf` files should fix them all in one pass instead of
+    // re-running `validate` after each single fix. Per-file failures are
+    // collected and returned together; only files that parse cleanly are
+    // loaded (a failed file never reserves its tunnel id).
     let mut seen_ids: HashMap<String, PathBuf> = HashMap::new();
     let mut configs = Vec::with_capacity(entries.len());
+    let mut failures: Vec<String> = Vec::new();
 
     for path in entries {
-        let id = path
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .ok_or_else(|| {
-                ConfigError::InvalidTunnelId(format!(
-                    "Path '{}' has no valid filename stem",
-                    path.display()
-                ))
-            })?
-            .to_string();
-        validate_tunnel_id(&id)?;
-
+        let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+            failures.push(format!(
+                "Path '{}' has no valid filename stem",
+                path.display()
+            ));
+            continue;
+        };
+        let id = stem.to_string();
+        if let Err(e) = validate_tunnel_id(&id) {
+            failures.push(e.to_string());
+            continue;
+        }
         if let Some(first_path) = seen_ids.get(&id) {
-            return Err(ConfigError::DuplicateTunnelId {
-                id,
-                file1: first_path.clone(),
-                file2: path,
-            });
+            failures.push(
+                ConfigError::DuplicateTunnelId {
+                    id,
+                    file1: first_path.clone(),
+                    file2: path,
+                }
+                .to_string(),
+            );
+            continue;
         }
-        seen_ids.insert(id.clone(), path.clone());
 
-        let meta = std::fs::symlink_metadata(&path)?;
-        if meta.len() > MAX_WG_CONF_BYTES {
-            return Err(ConfigError::WgConf(format!(
-                "File '{}' exceeds maximum size of {} bytes",
-                path.display(),
-                MAX_WG_CONF_BYTES
-            )));
+        let loaded = (|| -> Result<(WgInterfaceConfig, Vec<WgPeerConfig>), ConfigError> {
+            let meta = std::fs::symlink_metadata(&path)?;
+            if meta.len() > MAX_WG_CONF_BYTES {
+                return Err(ConfigError::WgConf(format!(
+                    "File '{}' exceeds maximum size of {} bytes",
+                    path.display(),
+                    MAX_WG_CONF_BYTES
+                )));
+            }
+            let content = std::fs::read_to_string(&path)?;
+            parse_wg_conf(&content)
+                .map_err(|e| ConfigError::WgConf(format!("Failed parsing {}: {e}", path.display())))
+        })();
+        match loaded {
+            Ok((interface, peers)) => {
+                seen_ids.insert(id.clone(), path.clone());
+                configs.push(TunnelConfig {
+                    id,
+                    interface,
+                    peers,
+                });
+            }
+            Err(e) => failures.push(e.to_string()),
         }
-        let content = std::fs::read_to_string(&path)?;
-        let (interface, peers) = parse_wg_conf(&content)
-            .map_err(|e| ConfigError::WgConf(format!("Failed parsing {}: {e}", path.display())))?;
-
-        configs.push(TunnelConfig {
-            id,
-            interface,
-            peers,
-        });
     }
 
-    Ok(configs)
+    if failures.is_empty() {
+        Ok(configs)
+    } else {
+        Err(ConfigError::MultipleTunnelErrors(failures.join("\n")))
+    }
 }

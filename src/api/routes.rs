@@ -296,9 +296,14 @@ fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> Http
         .iter()
         .filter(|s| s.state == TunnelState::Dormant)
         .count();
+    let disabled_tunnels = stats.iter().filter(|s| s.disabled).count();
     let healthy_tunnels = stats
         .iter()
         .filter(|s| s.health == crate::core::HealthStatus::Healthy)
+        .count();
+    let unknown_tunnels = stats
+        .iter()
+        .filter(|s| s.health == crate::core::HealthStatus::Unknown)
         .count();
     let unhealthy_tunnels = stats
         .iter()
@@ -322,7 +327,9 @@ fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> Http
         "active_tunnels": active_tunnels,
         "suspended_tunnels": suspended_tunnels,
         "dormant_tunnels": dormant_tunnels,
+        "disabled_tunnels": disabled_tunnels,
         "healthy_tunnels": healthy_tunnels,
+        "unknown_tunnels": unknown_tunnels,
         "half_open_tunnels": half_open_tunnels,
         "unhealthy_tunnels": unhealthy_tunnels,
         "total_connections": total_connections,
@@ -337,6 +344,19 @@ fn handle_list_tunnels_request(req: &HttpRequest, manager: &Arc<TunnelManager>) 
     let params = parse_query_params(req.query.as_deref());
     let query_filter = params.get("q").map(|s| s.to_lowercase());
     let state_filter = params.get("state").map(|s| s.to_lowercase());
+    // A filter value that matches no state used to answer `[]` with HTTP
+    // 200, so a typo (or a copy of the capitalised `"Active"` from the
+    // JSON) looked like "no tunnels in that state". Reject it loudly.
+    if let Some(st) = &state_filter
+        && !matches!(
+            st.as_str(),
+            "dormant" | "activating" | "active" | "suspended"
+        )
+    {
+        return HttpResponse::bad_request(&format!(
+            "Invalid state filter '{st}': expected one of dormant, activating, active, suspended"
+        ));
+    }
     let mut tunnels = manager.get_tunnel_stats();
 
     if let Some(q) = query_filter {
@@ -422,24 +442,54 @@ async fn handle_tunnel_subroute(
                 "Activation error",
                 manager,
             ),
-            ("POST", "suspend" | "deactivate") => tunnel_action_response(
-                manager.suspend_tunnel(id).await,
-                id,
-                "suspended",
-                "Suspend error",
-                manager,
-            ),
+            ("POST", "probe") => {
+                if manager.registry().get(id).is_none() {
+                    HttpResponse::not_found(&format!("Tunnel '{id}' not found"))
+                } else {
+                    // A probe reports the handshake outcome, never the
+                    // activation outcome: `ok` is false when the
+                    // handshake fails or times out, even though the
+                    // tunnel activated fine.
+                    let outcome = manager.probe_tunnel(id).await;
+                    HttpResponse::ok_json(&json!({
+                        "id": id,
+                        "ok": outcome.ok,
+                        "rtt_ms": outcome.rtt_ms,
+                        "message": outcome.message,
+                    }))
+                }
+            }
+            ("POST", "suspend" | "deactivate") => {
+                let res = manager.suspend_tunnel(id).await;
+                // A suspend that changes nothing must not claim
+                // "suspended": a dormant tunnel stays dormant, and a
+                // busy active tunnel stays active. Report the
+                // resulting state instead.
+                let label = match manager.registry().get(id).map(|e| e.summary().state) {
+                    Some(TunnelState::Suspended) | None => "suspended".to_string(),
+                    Some(TunnelState::Dormant) => "already dormant".to_string(),
+                    Some(TunnelState::Activating) => "already activating".to_string(),
+                    Some(TunnelState::Active) => "already active".to_string(),
+                };
+                tunnel_action_response(res, id, &label, "Suspend error", manager)
+            }
             ("POST", "disable") => {
                 if manager.registry().get(id).is_none() {
                     HttpResponse::not_found(&format!("Tunnel '{id}' not found"))
                 } else {
-                    tunnel_action_response(
-                        manager.set_tunnels_disabled(id, true).await,
-                        id,
-                        "disabled",
-                        "Disable error",
-                        manager,
-                    )
+                    let res = manager.set_tunnels_disabled(id, true).await;
+                    // A disable that leaves live sessions running must not
+                    // claim plain "disabled": the tunnel stays Active
+                    // until drained. Report the pending state instead
+                    // (the tunnel summary also carries disable_pending).
+                    let label = match manager.registry().get(id) {
+                        Some(e) if e.is_disable_pending() => format!(
+                            "disabled (pending: {} active connection(s) still running; will suspend when drained)",
+                            e.summary().active_conns
+                        ),
+                        _ => "disabled".to_string(),
+                    };
+                    tunnel_action_response(res, id, &label, "Disable error", manager)
                 }
             }
             ("POST", "enable") => {
@@ -537,7 +587,7 @@ pub async fn handle_admin_request(
                 "reloaded": report.total
             })),
             Err(e) => {
-                tracing::error!("Admin API /reload failed: {:?}", e);
+                tracing::error!("Admin API /reload failed: {}", e);
                 let msg = if e.to_string().contains("does not exist") {
                     "Reload failed: config directory does not exist"
                 } else {
@@ -567,20 +617,99 @@ pub async fn handle_admin_request(
 }
 
 async fn handle_post_config(body: &[u8], manager: &Arc<TunnelManager>) -> HttpResponse {
-    let mut new_cfg = match serde_json::from_slice::<crate::config::MainConfig>(body) {
+    // `POST /config` is a *partial* update: only the fields present in the
+    // body change. A body used to be deserialized straight into `MainConfig`,
+    // so every omitted section silently fell back to its serde default —
+    // a one-setting change wiped `shared_listeners` and disabled the Admin
+    // API while answering `{"status":"updated"}`. Deep-merge the incoming
+    // JSON object over the running config instead; arrays (e.g.
+    // `shared_listeners`) still replace wholesale when present.
+    let incoming = match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::bad_request(&format!("Invalid JSON config: {e}")),
+    };
+    let Some(patch) = incoming.as_object() else {
+        return HttpResponse::bad_request("Invalid JSON config: expected a JSON object");
+    };
+    let existing = manager.config_snapshot();
+    let mut merged = match serde_json::to_value(&existing) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Admin API POST /config failed to serialize current config: {e}");
+            return HttpResponse::internal_error("Failed to save configuration");
+        }
+    };
+    // The `shared_listeners` field serializes under its TOML name
+    // `shared_listener` (singular) and accepts `shared_listeners` only
+    // as a serde alias. The merge below is keyed on the serialized
+    // names, so a patch using the alias would leave both keys in the
+    // merged object and serde would reject it as a duplicate field.
+    // Normalize the alias to the canonical key first.
+    let mut patch = patch.clone();
+    if let Some(listeners) = patch.remove("shared_listeners") {
+        if patch.contains_key("shared_listener") {
+            return HttpResponse::bad_request(
+                "Invalid JSON config: use only one of `shared_listener` or `shared_listeners`",
+            );
+        }
+        patch.insert("shared_listener".to_string(), listeners);
+    }
+    merge_config_json(&mut merged, &patch);
+    let mut new_cfg = match serde_json::from_value::<crate::config::MainConfig>(merged) {
         Ok(cfg) => cfg,
         Err(e) => return HttpResponse::bad_request(&format!("Invalid JSON config: {e}")),
     };
-    preserve_config_secrets(&mut new_cfg, &manager.config_snapshot());
+    // `config_dir` is deliberately not preserved from remote updates:
+    // letting the Admin API redirect the directory the daemon loads
+    // .conf files from would let a remote caller point it at
+    // attacker-controlled configs. Reject the change loudly instead
+    // of silently discarding it while answering "updated".
+    if new_cfg.global.config_dir != existing.global.config_dir {
+        return HttpResponse::bad_request(
+            "config_dir cannot be changed through the Admin API: edit wpmulti.toml directly and restart the daemon",
+        );
+    }
+    preserve_config_secrets(&mut new_cfg, &existing);
     if let Err(e) = new_cfg.validate() {
         return HttpResponse::bad_request(&format!("Invalid config: {e}"));
     }
+    // Tell the caller which of the settings it just changed only take
+    // effect after a daemon restart, instead of letting `"updated"`
+    // imply everything is live now. Live vs Restart follows the same
+    // scope table the TUI Config tab shows (`[LIVE]` / `[RESTART]`).
+    let restart_pending =
+        crate::tui::config_editor::diff_config_scopes(&existing, &new_cfg).restart_changed;
     match manager.save_and_apply_runtime_config(new_cfg).await {
-        Ok(()) => HttpResponse::ok_json(&json!({ "status": "updated" })),
+        Ok(()) => HttpResponse::ok_json(&json!({
+            "status": "updated",
+            "restart_pending": restart_pending,
+        })),
         Err(CoreError::Config(e)) => HttpResponse::bad_request(&format!("Invalid config: {e}")),
         Err(e) => {
-            tracing::error!("Admin API POST /config failed: {:?}", e);
+            tracing::error!("Admin API POST /config failed: {}", e);
             HttpResponse::internal_error("Failed to save configuration")
+        }
+    }
+}
+
+/// Recursively merge `patch` into `base`: object keys merge key-by-key,
+/// anything else (arrays, scalars, `null`) replaces the base value.
+/// `patch` is borrowed so the caller keeps the parsed body.
+fn merge_config_json(
+    base: &mut serde_json::Value,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(base_obj) = base.as_object_mut() else {
+        return;
+    };
+    for (key, value) in patch {
+        match (base_obj.get_mut(key), value) {
+            (Some(existing), serde_json::Value::Object(patch_obj)) if existing.is_object() => {
+                merge_config_json(existing, patch_obj);
+            }
+            _ => {
+                base_obj.insert(key.clone(), value.clone());
+            }
         }
     }
 }

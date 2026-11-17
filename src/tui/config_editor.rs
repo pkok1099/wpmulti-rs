@@ -139,7 +139,10 @@ impl ConfigField {
             Self::PerTunnelBaseSocks5Port => "per_tunnel.base_socks5_port",
             Self::PerTunnelBaseHttpPort => "per_tunnel.base_http_port",
             Self::PerTunnelOverrides => "per_tunnel.overrides",
-            Self::SharedListeners => "shared_listeners",
+            // The serialized (TOML / `GET /config`) name is the singular
+            // `shared_listener`; the key must match it so a name read from
+            // `restart_pending` can be found in the `GET /config` JSON.
+            Self::SharedListeners => "shared_listener",
             Self::AdminEnabled => "admin.enabled",
             Self::AdminBind => "admin.bind",
             Self::AdminAuthToken => "admin.auth_token",
@@ -243,6 +246,65 @@ impl ConfigField {
                 a.health_check.probe_timeout != b.health_check.probe_timeout
             }
             Self::DisabledTunnels => a.disabled_tunnels != b.disabled_tunnels,
+        }
+    }
+
+    /// Copy this field's value from `from` into `to`.
+    ///
+    /// Used when a `[LIVE]` edit is applied while `[RESTART]` edits are
+    /// still staged: the applied snapshot takes the staged field's new
+    /// value for the live field but keeps every restart-scoped field at
+    /// the saved baseline, so staging a restart change can never leak
+    /// into the daemon (or onto disk) through a later live apply.
+    pub fn copy_value(self, from: &MainConfig, to: &mut MainConfig) {
+        match self {
+            Self::GlobalConfigDir => to.global.config_dir.clone_from(&from.global.config_dir),
+            Self::GlobalBindAddress => to.global.bind_address = from.global.bind_address,
+            Self::GlobalLogLevel => to.global.log_level = from.global.log_level,
+            Self::GlobalDnsFallback => to.global.dns_fallback.clone_from(&from.global.dns_fallback),
+            Self::GlobalDnsStrategy => to.global.dns_strategy = from.global.dns_strategy,
+            Self::GlobalDnsPreference => to.global.dns_preference = from.global.dns_preference,
+            Self::GlobalIpMode => to.global.ip_mode = from.global.ip_mode,
+            Self::GlobalMaxActiveTunnels => {
+                to.global.max_active_tunnels = from.global.max_active_tunnels;
+            }
+            Self::LifecycleMode => to.lifecycle.mode = from.lifecycle.mode,
+            Self::LifecycleIdleTimeout => to.lifecycle.idle_timeout = from.lifecycle.idle_timeout,
+            Self::LifecycleHandshakeTimeout => {
+                to.lifecycle.handshake_timeout = from.lifecycle.handshake_timeout;
+            }
+            Self::LifecycleEagerTunnels => {
+                to.lifecycle
+                    .eager_tunnels
+                    .clone_from(&from.lifecycle.eager_tunnels);
+            }
+            Self::PerTunnelEnabled => to.per_tunnel.enabled = from.per_tunnel.enabled,
+            Self::PerTunnelBaseSocks5Port => {
+                to.per_tunnel.base_socks5_port = from.per_tunnel.base_socks5_port;
+            }
+            Self::PerTunnelBaseHttpPort => {
+                to.per_tunnel.base_http_port = from.per_tunnel.base_http_port;
+            }
+            Self::PerTunnelOverrides => {
+                to.per_tunnel
+                    .overrides
+                    .clone_from(&from.per_tunnel.overrides);
+            }
+            Self::SharedListeners => to.shared_listeners.clone_from(&from.shared_listeners),
+            Self::AdminEnabled => to.admin.enabled = from.admin.enabled,
+            Self::AdminBind => to.admin.bind = from.admin.bind,
+            Self::AdminAuthToken => to.admin.auth_token.clone_from(&from.admin.auth_token),
+            Self::TuiRefreshRateMs => to.tui.refresh_rate_ms = from.tui.refresh_rate_ms,
+            Self::TuiDefaultSort => to.tui.default_sort = from.tui.default_sort,
+            Self::HealthCheckThreshold => to.health_check.threshold = from.health_check.threshold,
+            Self::HealthCheckCooldown => to.health_check.cooldown = from.health_check.cooldown,
+            Self::HealthCheckProbeInterval => {
+                to.health_check.probe_interval = from.health_check.probe_interval;
+            }
+            Self::HealthCheckProbeTimeout => {
+                to.health_check.probe_timeout = from.health_check.probe_timeout;
+            }
+            Self::DisabledTunnels => to.disabled_tunnels.clone_from(&from.disabled_tunnels),
         }
     }
 
@@ -661,10 +723,34 @@ fn format_listeners_summary(listeners: &[SharedListenerSettings]) -> String {
     if listeners.is_empty() {
         return "0 listener(s)".to_string();
     }
+    // Show the settings a user actually needs to see at a glance —
+    // whether anonymous requests are allowed and which pool strategy
+    // the listener uses — instead of only names and ports. The
+    // informative tokens come BEFORE the bind address on purpose: the
+    // VALUE column clips the tail in narrow terminals, so `anon`/`auth`
+    // and the strategy must survive the cut. The full per-listener JSON
+    // (passwords redacted) is available by pressing Enter on this row.
     let preview: Vec<String> = listeners
         .iter()
         .take(2)
-        .map(|l| format!("{}({})", l.name, l.bind))
+        .map(|l| {
+            format!(
+                "{} {} {} {} {}",
+                l.name,
+                match l.listener_type {
+                    crate::config::ListenerType::Socks5 => "socks5",
+                    crate::config::ListenerType::Http => "http",
+                },
+                if l.allow_anonymous { "anon" } else { "auth" },
+                match l.default_strategy {
+                    crate::config::PoolStrategy::RoundRobin => "round-robin",
+                    crate::config::PoolStrategy::Random => "random",
+                    crate::config::PoolStrategy::LeastConn => "least-conn",
+                    crate::config::PoolStrategy::Fallback => "fallback",
+                },
+                l.bind,
+            )
+        })
         .collect();
     let suffix = if listeners.len() > 2 { ", ..." } else { "" };
     format!(

@@ -35,6 +35,12 @@ pub enum ConfigError {
     #[error("Directory not found: {0}")]
     DirectoryNotFound(PathBuf),
 
+    /// Several `.conf` files failed to parse at once; the message lists
+    /// every failure so `wpmulti validate` can report them all in one run
+    /// instead of stopping at the first broken file.
+    #[error("Multiple tunnel configuration errors:\n{0}")]
+    MultipleTunnelErrors(String),
+
     #[error("Configuration validation error: {0}")]
     Validation(String),
 }
@@ -348,6 +354,7 @@ impl Serialize for TunnelPoolSelection {
 
 /// Global settings section `[global]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlobalSettings {
     #[serde(default = "default_config_dir")]
     pub config_dir: PathBuf,
@@ -407,6 +414,7 @@ impl Default for GlobalSettings {
 
 /// Lifecycle section `[lifecycle]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LifecycleSettings {
     #[serde(default)]
     pub mode: LifecycleMode,
@@ -442,6 +450,7 @@ impl Default for LifecycleSettings {
 
 /// Explicit port and credential overrides for specific tunnel IDs.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelPortOverride {
     #[serde(default)]
     pub socks5_port: Option<u16>,
@@ -465,6 +474,7 @@ impl std::fmt::Debug for TunnelPortOverride {
 
 /// Per-tunnel dedicated port configuration `[per_tunnel]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerTunnelSettings {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -508,6 +518,7 @@ impl Default for PerTunnelSettings {
 
 /// Shared listener section `[[shared_listener]]`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SharedListenerSettings {
     pub name: String,
 
@@ -560,6 +571,7 @@ const fn default_false() -> bool {
 
 /// Admin HTTP REST API section `[admin]`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminSettings {
     #[serde(default = "default_false")]
     pub enabled: bool,
@@ -600,6 +612,7 @@ impl Default for AdminSettings {
 
 /// TUI Monitor dashboard section `[tui]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TuiSettings {
     #[serde(default = "default_refresh_rate_ms")]
     pub refresh_rate_ms: u64,
@@ -623,6 +636,7 @@ impl Default for TuiSettings {
 
 /// Health check configuration `[health_check]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthCheckSettings {
     #[serde(default = "default_failure_threshold")]
     pub threshold: usize,
@@ -666,6 +680,7 @@ impl Default for HealthCheckSettings {
 
 /// Main application configuration structure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MainConfig {
     #[serde(default)]
     pub global: GlobalSettings,
@@ -703,8 +718,39 @@ impl MainConfig {
 
     /// Load and validate configuration from a file path.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path)?;
-        Self::from_toml_str(&content)
+        let content = std::fs::read_to_string(path.as_ref())?;
+        let mut config = Self::from_toml_str(&content)?;
+        config.resolve_config_dir_against(path.as_ref());
+        Ok(config)
+    }
+
+    /// Resolve a relative `config_dir` against the directory containing
+    /// the TOML file it was loaded from. Without this, `validate -c
+    /// /abs/dir/wpmulti.toml` run from another directory failed with
+    /// "Tunnel directory './confs' does not exist", because `./confs`
+    /// was resolved against the current working directory instead of the
+    /// TOML file. Absolute `config_dir` values are left alone, as is a
+    /// path with no parent (a bare filename in the current directory).
+    /// Note `Path::parent` of a bare filename is `Some("")`, not
+    /// `None`, so the empty-parent check is what actually keeps
+    /// `./confs` verbatim when the TOML lives in the working
+    /// directory — without it, a save rewrote `./confs` to `confs`
+    /// even though the user never touched the value.
+    /// Call this before applying an explicit `-d` override, so the
+    /// override (the user's own path, resolved against the working
+    /// directory as usual) still wins.
+    pub fn resolve_config_dir_against(&mut self, toml_path: &Path) {
+        if self.global.config_dir.is_relative()
+            && let Some(parent) = toml_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let stripped = self
+                .global
+                .config_dir
+                .strip_prefix(".")
+                .unwrap_or(&self.global.config_dir);
+            self.global.config_dir = parent.join(stripped);
+        }
     }
 
     fn validate_shared_listeners(&self) -> Result<(), ConfigError> {
@@ -777,6 +823,24 @@ impl MainConfig {
 
     /// Validate the auth settings of one shared listener.
     fn validate_listener_auth(&self, listener: &SharedListenerSettings) -> Result<(), ConfigError> {
+        // Finding (audit run-1, low): a password configured on a listener
+        // whose auth_mode is 'none' is silently ignored — AuthChecker never
+        // consults it — so the combination must fail at load instead of
+        // reaching runtime as a fail-open. (Per-tunnel override passwords
+        // are intentionally not checked here: they belong to the config as
+        // a whole and stay meaningful while any other listener uses
+        // PerTunnel mode.)
+        if listener.auth_mode == AuthMode::None
+            && listener
+                .global_password
+                .as_ref()
+                .is_some_and(|p| !p.is_empty())
+        {
+            return Err(ConfigError::Validation(format!(
+                "shared_listener '{}' configures global_password but auth_mode is 'none'; passwords are ignored in this mode — set auth_mode to 'global' or 'per_tunnel'",
+                listener.name
+            )));
+        }
         if listener.auth_mode == AuthMode::Global {
             match &listener.global_password {
                 Some(pwd) if !pwd.is_empty() => {}
@@ -821,6 +885,56 @@ impl MainConfig {
                 "shared_listener '{}' specifies auth_mode = 'per_tunnel' but neither global_password nor any per_tunnel.overrides.<id>.password is configured",
                 listener.name
             )));
+        }
+        Ok(())
+    }
+
+    /// Distinct non-empty `global_password` values configured on shared
+    /// listeners whose auth_mode actually enforces them (Global or
+    /// PerTunnel). Listeners in None mode are skipped: their password is
+    /// ignored (see `validate_listener_auth`), so it must not become the
+    /// fallback for dedicated ports either.
+    fn enforced_global_passwords(&self) -> HashSet<&str> {
+        self.shared_listeners
+            .iter()
+            .filter(|l| l.auth_mode != AuthMode::None)
+            .filter_map(|l| l.global_password.as_deref())
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
+    /// The single global password dedicated per-tunnel listeners fall back
+    /// to when a tunnel has no own override password. Returns `Some` only
+    /// when exactly one distinct password is enforced across the shared
+    /// listeners; `None` when none is configured — or when several
+    /// distinct ones are, in which case [`Self::validate_dedicated_auth`]
+    /// rejects the config because a dedicated listener cannot choose
+    /// between them.
+    pub fn dedicated_fallback_password(&self) -> Option<String> {
+        let distinct = self.enforced_global_passwords();
+        if distinct.len() == 1 {
+            distinct.iter().next().map(|p| (*p).to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Reject configs where dedicated listeners cannot pick a single
+    /// fallback password: several shared listeners enforce distinct
+    /// global passwords. (Audit run-1, high: dedicated ports must never
+    /// silently fall back to "no password" while one is configured.)
+    /// Only enforced while dedicated listeners are enabled: with them
+    /// disabled no dedicated listener ever consults the fallback, so
+    /// distinct per-listener passwords are a legitimate config then.
+    fn validate_dedicated_auth(&self) -> Result<(), ConfigError> {
+        if !self.per_tunnel.enabled {
+            return Ok(());
+        }
+        if self.enforced_global_passwords().len() > 1 {
+            return Err(ConfigError::Validation(
+                "shared listeners enforce distinct global_password values; dedicated per-tunnel listeners cannot choose one — set the same global_password on all shared listeners, set a per_tunnel.overrides.<id>.password for each tunnel, or disable dedicated listeners"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -1007,6 +1121,7 @@ impl MainConfig {
 
         self.validate_shared_listeners()?;
         self.validate_per_tunnel()?;
+        self.validate_dedicated_auth()?;
         self.validate_port_conflicts()?;
 
         if self.tui.refresh_rate_ms < 50 {
@@ -1036,6 +1151,51 @@ impl MainConfig {
         }
 
         Ok(())
+    }
+
+    /// Check every tunnel ID the config *references by value* against the
+    /// IDs actually loaded from the `.conf` directory. A typo such as
+    /// `pool = ["wgcf-010"]` otherwise passes `validate` silently and only
+    /// surfaces at runtime as `no healthy tunnels available in pool` — a
+    /// symptom whose documented remedies point the wrong way. Callers
+    /// that have the loaded IDs (CLI `validate`/`run`, the runtime
+    /// config-apply path) must call this after `validate()`; `validate()`
+    /// itself cannot, because it never sees the `.conf` files. Every
+    /// unknown reference is reported in one error, like the multi-file
+    /// `.conf` loader does for broken files.
+    pub fn validate_tunnel_references(
+        &self,
+        known_ids: &HashSet<String>,
+    ) -> Result<(), ConfigError> {
+        let mut problems: Vec<String> = Vec::new();
+        let mut check = |id: &str, location: &str| {
+            if !known_ids.contains(id) {
+                problems.push(format!(
+                    "unknown tunnel id '{id}' referenced by {location} (no .conf file with that id was loaded)"
+                ));
+            }
+        };
+        for id in &self.disabled_tunnels {
+            check(id, "disabled_tunnels");
+        }
+        for id in &self.lifecycle.eager_tunnels {
+            check(id, "lifecycle.eager_tunnels");
+        }
+        for id in self.per_tunnel.overrides.keys() {
+            check(id, &format!("per_tunnel.overrides.{id}"));
+        }
+        for listener in &self.shared_listeners {
+            if let TunnelPoolSelection::Selected(ids) = &listener.pool {
+                for id in ids {
+                    check(id, &format!("shared_listener '{}' pool", listener.name));
+                }
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigError::Validation(problems.join("; ")))
+        }
     }
 }
 

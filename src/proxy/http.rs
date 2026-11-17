@@ -326,7 +326,7 @@ where
 
     // 3. Dispatch based on HTTP method and URI form
     if method.eq_ignore_ascii_case("CONNECT") {
-        handle_http_connect(stream, router, &selector, &uri, leftover).await
+        handle_http_connect(stream, router, &selector, &uri, leftover, cred_refs).await
     } else if uri
         .get(..7)
         .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
@@ -337,7 +337,7 @@ where
             version,
             headers,
         };
-        handle_http_forward(stream, router, &selector, req, leftover).await
+        handle_http_forward(stream, router, &selector, req, leftover, cred_refs).await
     } else if uri
         .get(..8)
         .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
@@ -376,6 +376,7 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
     selector: &TunnelSelector,
     authority: &str,
     leftover: Vec<u8>,
+    credentials: Option<(&str, &str)>,
 ) -> io::Result<()> {
     let Some((host, port)) = parse_authority(authority) else {
         send_response(
@@ -392,7 +393,8 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     let mut tunnel_stream =
-        resolve_and_connect_http_target(&mut stream, &router, selector, &host, port).await?;
+        resolve_and_connect_http_target(&mut stream, &router, selector, &host, port, credentials)
+            .await?;
 
     // Respond 200 Connection Established
     stream
@@ -751,6 +753,7 @@ async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
     selector: &TunnelSelector,
     host: &str,
     port: u16,
+    credentials: Option<(&str, &str)>,
 ) -> io::Result<DynStream> {
     let literal_ip = validate_target_host_before_routing(stream, host).await?;
     let target = literal_ip.map_or_else(
@@ -758,11 +761,26 @@ async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
         |ip| TargetAddr::Ip(SocketAddr::new(ip, port)),
     );
 
-    match connect_via_router(router, selector, &target).await {
+    match connect_via_router(router, selector, &target, credentials).await {
         Ok(s) => Ok(s),
         Err(RouterConnectError::SelectTunnel(e)) => {
-            let msg = format!("Bad Gateway: {e}\n");
-            send_response(stream, "502 Bad Gateway", "text/plain", msg.as_bytes()).await?;
+            // Log exactly like the SOCKS5 path: docs §4 promises this
+            // line for the pool-empty case, and without it an HTTP user
+            // has no daemon-side trace of why the request got a 503.
+            tracing::warn!("Failed to select tunnel for {:?}: {}", selector, e);
+            // A bad tunnel name (`NotFound`) is 404; a valid selector
+            // whose pool is empty right now (`NotConnected` — no healthy
+            // tunnel to attempt) is 503, so a client can tell "you
+            // mistyped the name" apart from "all tunnels are down". A
+            // dead tunnel stays 502 below. The body still carries the
+            // exact error.
+            let (status, prefix) = if e.kind() == io::ErrorKind::NotConnected {
+                ("503 Service Unavailable", "No Healthy Tunnel")
+            } else {
+                ("404 Not Found", "Tunnel Not Found")
+            };
+            let msg = format!("{prefix}: {e}\n");
+            send_response(stream, status, "text/plain", msg.as_bytes()).await?;
             Err(e)
         }
         Err(RouterConnectError::ForbiddenDestination(e)) => {
@@ -833,6 +851,7 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
     selector: &TunnelSelector,
     req: ForwardRequest,
     leftover: Vec<u8>,
+    credentials: Option<(&str, &str)>,
 ) -> io::Result<()> {
     let (host, port, path) = match parse_forward_uri(&req.uri) {
         Ok(parsed) => parsed,
@@ -863,7 +882,8 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     let mut tunnel_stream =
-        resolve_and_connect_http_target(&mut stream, &router, selector, &host, port).await?;
+        resolve_and_connect_http_target(&mut stream, &router, selector, &host, port, credentials)
+            .await?;
 
     let content_length = req
         .headers

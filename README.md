@@ -28,7 +28,19 @@ High-concurrency multi-tunnel WireGuard SOCKS5 & HTTP proxy daemon in Rust, buil
 
 ## Quick Start
 
-### 1. Build
+### 1. Get the binary
+
+Download a prebuilt binary from [GitHub Releases](https://github.com/pkok1099/wpmulti-rs/releases) — pick the tarball for your platform (`linux-amd64`, `linux-arm64`, `linux-x86`, or `termux-arm64`), or a `.deb` package for Debian/Ubuntu and Termux:
+
+```bash
+# Prebuilt binary (example: Linux amd64, v0.2.9 — use the latest release)
+curl -LO https://github.com/pkok1099/wpmulti-rs/releases/download/v0.2.9/wpmulti-v0.2.9-linux-amd64.tar.gz
+tar -xzf wpmulti-v0.2.9-linux-amd64.tar.gz
+./wpmulti-v0.2.9-linux-amd64/wpmulti --help
+```
+
+Or build from source:
+
 ```bash
 cargo build --release -p wpmulti
 # Binary: ./target/release/wpmulti
@@ -39,10 +51,16 @@ cargo build --release -p wpmulti
 # Validate all WireGuard configs
 wpmulti validate -d ./confs
 
-# Start daemon + interactive TUI
+# Start the daemon (foreground; Ctrl-C to stop)
+wpmulti run -d ./confs
+```
+Add `--tui` for the interactive monitor — it needs a real terminal, so it
+fails in scripts, CI, or any non-terminal session:
+
+```bash
 wpmulti run -d ./confs --tui
 ```
-By default (without a `wpmulti.toml`), `wpmulti` binds per-tunnel ports starting at **SOCKS5 `10000`** and **HTTP `20000`** in `lazy` mode.
+By default (without a `wpmulti.toml`), `wpmulti` binds per-tunnel ports starting at **SOCKS5 `10000`** and **HTTP `20000`** in `lazy` mode. If a port in that range is already in use (for example by another running daemon), the daemon shifts that tunnel to the next free port and logs a warning with the actual port — the startup line lists the ports it really bound, so check it instead of assuming `10000`/`20000`. A tunnel whose port is set explicitly under `[per_tunnel.overrides]` gets no listener at all when that port is busy (same warning, no shift).
 
 ### 3. Run with `wpmulti.toml`
 ```bash
@@ -71,7 +89,7 @@ curl -x http://auto@127.0.0.1:8080 https://ifconfig.co
 
 | Command | Description |
 | :--- | :--- |
-| `wpmulti run [-c FILE] [-d DIR] [--tui]` | Start the daemon (`-d` alone starts dedicated ports only; `-c wpmulti.toml` enables shared ports & Admin API). |
+| `wpmulti run [-c FILE] [-d DIR] [--tui]` | Start the daemon (`-d` alone starts dedicated ports only; `-c wpmulti.toml` enables shared ports & Admin API; with neither flag, a `wpmulti.toml` in the current directory is used if one exists). |
 | `wpmulti validate [-c FILE] [-d DIR]` | Validate `wpmulti.toml` and all `.conf` files without binding ports. |
 | `wpmulti probe [-c WG_CONF \| -d DIR] [--json]` | Actively probe WireGuard tunnel handshake, RTT, and exit IP. |
 | `wpmulti disable <TARGET>` / `enable <TARGET>` | Disable or re-enable tunnels by ID, 1-based index/range (`1`, `1-200`), comma list, or `all` via Admin API. |

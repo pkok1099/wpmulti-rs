@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -88,10 +89,47 @@ async fn test_status_endpoint() {
     assert_eq!(json_val["total_tunnels"], 3);
     assert_eq!(json_val["active_tunnels"], 0);
     assert_eq!(json_val["dormant_tunnels"], 3);
-    assert_eq!(json_val["healthy_tunnels"], 3);
+    assert_eq!(json_val["disabled_tunnels"], 0);
+    assert_eq!(json_val["healthy_tunnels"], 0);
+    assert_eq!(json_val["unknown_tunnels"], 3);
     assert_eq!(json_val["unhealthy_tunnels"], 0);
     assert_eq!(json_val["total_connections"], 0);
     assert!(json_val["listeners"].is_array());
+}
+
+#[tokio::test]
+async fn test_status_endpoint_counts_disabled_tunnels() {
+    // A dormant tunnel that is disabled stays "Dormant" in the state
+    // counts, so the summary needs its own disabled count — otherwise
+    // `disable` looks like it had no effect on `wpmulti status`.
+    let manager = create_test_manager();
+    manager
+        .set_tunnels_disabled("wgcf-001", true)
+        .await
+        .expect("disable succeeds");
+    let req = HttpRequest {
+        method: "GET".to_string(),
+        path: "/status".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+
+    let resp = handle_admin_request(&req, &manager, None, 10).await;
+    assert_eq!(resp.status, 200);
+
+    let json_val: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(json_val["total_tunnels"], 3);
+    assert_eq!(json_val["dormant_tunnels"], 3);
+    assert_eq!(json_val["disabled_tunnels"], 1);
+
+    manager
+        .set_tunnels_disabled("wgcf-001", false)
+        .await
+        .expect("enable succeeds");
+    let resp = handle_admin_request(&req, &manager, None, 10).await;
+    let json_val: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(json_val["disabled_tunnels"], 0);
 }
 
 #[tokio::test]
@@ -165,6 +203,38 @@ async fn test_list_tunnels_state_filter() {
     let resp_active = handle_admin_request(&req_active, &manager, None, 10).await;
     let json_active: serde_json::Value = serde_json::from_slice(&resp_active.body).unwrap();
     assert_eq!(json_active.as_array().unwrap().len(), 0);
+
+    // Matching is case-insensitive: the JSON spells the state "Dormant"
+    // (capitalised), so a user copying that value must get the same
+    // result as the lowercase spelling in the docs.
+    let req_capital = HttpRequest {
+        method: "GET".to_string(),
+        path: "/tunnels".to_string(),
+        query: Some("state=Dormant".to_string()),
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let resp_capital = handle_admin_request(&req_capital, &manager, None, 10).await;
+    assert_eq!(resp_capital.status, 200);
+    let json_capital: serde_json::Value = serde_json::from_slice(&resp_capital.body).unwrap();
+    assert_eq!(json_capital.as_array().unwrap().len(), 3);
+
+    // A value that matches no state is rejected loudly instead of
+    // silently answering an empty list.
+    let req_bogus = HttpRequest {
+        method: "GET".to_string(),
+        path: "/tunnels".to_string(),
+        query: Some("state=bogus".to_string()),
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let resp_bogus = handle_admin_request(&req_bogus, &manager, None, 10).await;
+    assert_eq!(resp_bogus.status, 400);
+    let body_bogus = String::from_utf8_lossy(&resp_bogus.body);
+    assert!(
+        body_bogus.contains("bogus") && body_bogus.contains("dormant"),
+        "expected the 400 to name the bad value and the valid ones, got: {body_bogus}"
+    );
 }
 
 #[tokio::test]
@@ -243,6 +313,89 @@ async fn test_activate_and_suspend_endpoints() {
 }
 
 #[tokio::test]
+async fn test_probe_endpoint_reports_handshake_outcome_and_404_for_unknown() {
+    // The test tunnels point at TEST-NET endpoints no handshake can
+    // ever complete against, so the probe must report the handshake
+    // failure — never a success from merely activating the tunnel.
+    // A short probe timeout bounds the wait on machines where UDP
+    // works and the handshake would otherwise hang until timeout.
+    let mut config = MainConfig::default();
+    config.per_tunnel.enabled = false;
+    config.health_check.probe_timeout = Duration::from_secs(1);
+    let tunnels = vec![
+        make_test_tunnel_config("wgcf-001", "198.51.100.1:51820"),
+        make_test_tunnel_config("wgcf-002", "198.51.100.2:51820"),
+    ];
+    let manager = Arc::new(TunnelManager::new(config, tunnels).expect("manager created"));
+
+    let req = HttpRequest {
+        method: "POST".to_string(),
+        path: "/tunnels/wgcf-001/probe".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let resp = handle_admin_request(&req, &manager, None, 10).await;
+    assert_eq!(resp.status, 200);
+    let val: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(val["id"], "wgcf-001");
+    assert_eq!(val["ok"], false);
+    assert!(val["rtt_ms"].is_null());
+    assert!(!val["message"].as_str().unwrap_or_default().is_empty());
+
+    let req_unknown = HttpRequest {
+        method: "POST".to_string(),
+        path: "/tunnels/wgcf-999/probe".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let resp_unknown = handle_admin_request(&req_unknown, &manager, None, 10).await;
+    assert_eq!(resp_unknown.status, 404);
+}
+
+#[tokio::test]
+async fn test_suspend_dormant_tunnel_reports_already_dormant() {
+    // Suspending a tunnel that was never activated changes nothing, so
+    // the response must say so instead of claiming "suspended".
+    let manager = create_test_manager();
+    let req = HttpRequest {
+        method: "POST".to_string(),
+        path: "/tunnels/wgcf-001/suspend".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+
+    let resp = handle_admin_request(&req, &manager, None, 10).await;
+    assert_eq!(resp.status, 200);
+    let val: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(val["status"], "already dormant");
+    assert_eq!(val["tunnel"]["state"], "Dormant");
+
+    // Suspending an active tunnel still reports "suspended", and
+    // suspending it again keeps "suspended" — the resulting state
+    // really is Suspended in both cases.
+    let req_act = HttpRequest {
+        method: "POST".to_string(),
+        path: "/tunnels/wgcf-001/activate".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let resp_act = handle_admin_request(&req_act, &manager, None, 10).await;
+    assert_eq!(resp_act.status, 200);
+    let resp = handle_admin_request(&req, &manager, None, 10).await;
+    let val: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(val["status"], "suspended");
+    assert_eq!(val["tunnel"]["state"], "Suspended");
+    let resp = handle_admin_request(&req, &manager, None, 10).await;
+    let val: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(val["status"], "suspended");
+    assert_eq!(val["tunnel"]["state"], "Suspended");
+}
+
+#[tokio::test]
 async fn test_reload_endpoint() {
     let manager = create_test_manager();
     let req = HttpRequest {
@@ -281,13 +434,14 @@ async fn test_metrics_prometheus_exposition() {
 
     let body_str = String::from_utf8(resp.body).unwrap();
     assert!(body_str.contains("wpmulti_tunnels_total 3"));
-    assert!(body_str.contains("wpmulti_tunnels_healthy 3"));
+    assert!(body_str.contains("wpmulti_tunnels_healthy 0"));
+    assert!(body_str.contains("wpmulti_tunnels_unknown 3"));
     assert!(body_str.contains("wpmulti_tunnels_unhealthy 0"));
     assert!(body_str.contains("wpmulti_connections_active_total 1"));
     assert!(body_str.contains("wpmulti_tunnel_rx_bytes{tunnel_id=\"wgcf-001\"} 1048576"));
     assert!(body_str.contains("wpmulti_tunnel_tx_bytes{tunnel_id=\"wgcf-001\"} 524288"));
     assert!(body_str.contains("wpmulti_tunnel_active_conns{tunnel_id=\"wgcf-001\"} 1"));
-    assert!(body_str.contains("wpmulti_tunnel_health{tunnel_id=\"wgcf-001\"} 1"));
+    assert!(body_str.contains("wpmulti_tunnel_health{tunnel_id=\"wgcf-001\"} 0"));
     assert!(body_str.contains("wpmulti_tunnel_consecutive_failures{tunnel_id=\"wgcf-001\"} 0"));
 }
 
@@ -562,6 +716,258 @@ async fn test_config_endpoint_redacts_and_preserves_secrets_and_auth_rejects_emp
 }
 
 #[tokio::test]
+async fn test_post_config_rejects_config_dir_change() {
+    // A remote config update that changes config_dir used to be
+    // silently discarded while the API answered {"status":"updated"}.
+    // The change must now be rejected loudly; an unchanged config_dir
+    // still posts fine.
+    let manager = create_test_manager();
+
+    let get_req = HttpRequest {
+        method: "GET".to_string(),
+        path: "/config".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let resp_get = handle_admin_request(&get_req, &manager, None, 10).await;
+    assert_eq!(resp_get.status, 200);
+    let mut cfg: MainConfig = serde_json::from_slice(&resp_get.body).unwrap();
+    let original_dir = cfg.global.config_dir.clone();
+
+    cfg.global.config_dir = std::path::PathBuf::from("./confs9");
+    let changed_req = HttpRequest {
+        method: "POST".to_string(),
+        path: "/config".to_string(),
+        query: None,
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: serde_json::to_vec(&cfg).unwrap(),
+    };
+    let resp_changed = handle_admin_request(&changed_req, &manager, None, 10).await;
+    assert_eq!(resp_changed.status, 400);
+    let val: serde_json::Value = serde_json::from_slice(&resp_changed.body).unwrap();
+    assert!(
+        val["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("config_dir"),
+        "expected a config_dir error, got: {val}"
+    );
+    assert_eq!(manager.config_snapshot().global.config_dir, original_dir);
+
+    cfg.global.config_dir = original_dir;
+    let unchanged_req = HttpRequest {
+        method: "POST".to_string(),
+        path: "/config".to_string(),
+        query: None,
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: serde_json::to_vec(&cfg).unwrap(),
+    };
+    let resp_unchanged = handle_admin_request(&unchanged_req, &manager, None, 10).await;
+    assert_eq!(resp_unchanged.status, 200);
+}
+
+fn post_config_request(body: Vec<u8>) -> HttpRequest {
+    HttpRequest {
+        method: "POST".to_string(),
+        path: "/config".to_string(),
+        query: None,
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body,
+    }
+}
+
+fn create_test_manager_with_listeners() -> Arc<TunnelManager> {
+    use crate::config::{
+        AuthMode, ListenerType, PoolStrategy, SharedListenerSettings, TunnelPoolSelection,
+    };
+
+    let mut config = MainConfig::default();
+    config.per_tunnel.enabled = false;
+    config.admin.enabled = true;
+    config.shared_listeners = vec![
+        SharedListenerSettings {
+            name: "shared-socks".to_string(),
+            listener_type: ListenerType::Socks5,
+            bind: "127.0.0.1:1080".parse().unwrap(),
+            auth_mode: AuthMode::None,
+            global_password: None,
+            default_strategy: PoolStrategy::RoundRobin,
+            allow_anonymous: true,
+            pool: TunnelPoolSelection::All,
+            ip_mode: None,
+        },
+        SharedListenerSettings {
+            name: "shared-http".to_string(),
+            listener_type: ListenerType::Http,
+            bind: "127.0.0.1:8080".parse().unwrap(),
+            auth_mode: AuthMode::None,
+            global_password: None,
+            default_strategy: PoolStrategy::RoundRobin,
+            allow_anonymous: true,
+            pool: TunnelPoolSelection::All,
+            ip_mode: None,
+        },
+    ];
+    let tunnels = vec![make_test_tunnel_config("wgcf-001", "198.51.100.1:51820")];
+    Arc::new(TunnelManager::new(config, tunnels).expect("manager created"))
+}
+
+#[tokio::test]
+async fn test_post_config_partial_body_keeps_omitted_sections() {
+    // A partial body used to be deserialized straight into MainConfig, so
+    // every omitted section silently fell back to its serde default: one
+    // `{"global":{"log_level":"debug"}}` wiped `shared_listeners` and
+    // disabled the Admin API while answering `{"status":"updated"}`.
+    // Partial bodies must now merge over the running config.
+    use crate::config::LogLevel;
+
+    let manager = create_test_manager_with_listeners();
+
+    let resp = handle_admin_request(
+        &post_config_request(br#"{"global":{"log_level":"debug"}}"#.to_vec()),
+        &manager,
+        None,
+        10,
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let val: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(val["status"], "updated");
+    // `log_level` is a [RESTART] setting: the response must say so instead
+    // of implying everything is live now.
+    let pending = val["restart_pending"].as_array().expect("restart_pending");
+    assert!(
+        pending.iter().any(|v| v == "global.log_level"),
+        "expected global.log_level in restart_pending, got: {val}"
+    );
+
+    let snap = manager.config_snapshot();
+    assert_eq!(snap.global.log_level, LogLevel::Debug);
+    assert_eq!(
+        snap.shared_listeners.len(),
+        2,
+        "partial POST wiped listeners"
+    );
+    assert!(snap.admin.enabled, "partial POST disabled the Admin API");
+
+    // A partial body that changes only a [LIVE] setting reports nothing pending.
+    let resp_live = handle_admin_request(
+        &post_config_request(br#"{"health_check":{"threshold":9}}"#.to_vec()),
+        &manager,
+        None,
+        10,
+    )
+    .await;
+    assert_eq!(resp_live.status, 200);
+    let val_live: serde_json::Value = serde_json::from_slice(&resp_live.body).unwrap();
+    assert_eq!(val_live["restart_pending"].as_array().unwrap().len(), 0);
+    let snap_live = manager.config_snapshot();
+    assert_eq!(snap_live.health_check.threshold, 9);
+    assert_eq!(snap_live.shared_listeners.len(), 2);
+    assert_eq!(snap_live.global.log_level, LogLevel::Debug);
+}
+
+#[tokio::test]
+async fn test_post_config_listener_array_replaces_and_alias_works() {
+    let manager = create_test_manager_with_listeners();
+
+    // An array that IS present replaces wholesale (documented): posting a
+    // single listener leaves exactly that one. The field serializes
+    // under its TOML name `shared_listener` (singular).
+    let resp_arr = handle_admin_request(
+        &post_config_request(
+            br#"{"shared_listener":[{"name":"only","type":"socks5","bind":"127.0.0.1:1080","auth_mode":"none","default_strategy":"round-robin","allow_anonymous":true,"pool":"all"}]}"#
+                .to_vec(),
+        ),
+        &manager,
+        None,
+        10,
+    )
+    .await;
+    assert_eq!(resp_arr.status, 200);
+    assert_eq!(manager.config_snapshot().shared_listeners.len(), 1);
+    // `restart_pending` must name the field the way `GET /config`
+    // serializes it (`shared_listener`, singular) — a client looking the
+    // key up in the GET response must find it.
+    let val_arr: serde_json::Value = serde_json::from_slice(&resp_arr.body).unwrap();
+    let pending_arr = val_arr["restart_pending"]
+        .as_array()
+        .expect("restart_pending");
+    assert!(
+        pending_arr.iter().any(|v| v == "shared_listener"),
+        "expected shared_listener in restart_pending, got: {val_arr}"
+    );
+
+    // The plural spelling is a serde alias and must keep working after
+    // the merge: it may not collide with the serialized singular key.
+    let resp_alias = handle_admin_request(
+        &post_config_request(
+            br#"{"shared_listeners":[{"name":"a","type":"socks5","bind":"127.0.0.1:1080","auth_mode":"none","default_strategy":"round-robin","allow_anonymous":true,"pool":"all"},{"name":"b","type":"http","bind":"127.0.0.1:8080","auth_mode":"none","default_strategy":"round-robin","allow_anonymous":true,"pool":"all"}]}"#
+                .to_vec(),
+        ),
+        &manager,
+        None,
+        10,
+    )
+    .await;
+    assert_eq!(resp_alias.status, 200);
+    assert_eq!(manager.config_snapshot().shared_listeners.len(), 2);
+
+    // A non-object body is rejected loudly, not merged into nonsense.
+    let resp_bad = handle_admin_request(
+        &post_config_request(br#"[1, 2, 3]"#.to_vec()),
+        &manager,
+        None,
+        10,
+    )
+    .await;
+    assert_eq!(resp_bad.status, 400);
+}
+
+#[tokio::test]
+async fn test_post_config_rejects_unknown_tunnel_id() {
+    // The test manager loads exactly one tunnel, wgcf-001. A listener
+    // pool (or disabled list) naming any other id is a typo: reject it
+    // with 400 instead of storing the ghost id and failing later as
+    // `no healthy tunnels available in pool`.
+    let manager = create_test_manager_with_listeners();
+
+    let resp = handle_admin_request(
+        &post_config_request(
+            br#"{"shared_listener":[{"name":"only","type":"socks5","bind":"127.0.0.1:1080","auth_mode":"none","default_strategy":"round-robin","allow_anonymous":true,"pool":["wgcf-999"]}]}"#.to_vec(),
+        ),
+        &manager,
+        None,
+        10,
+    )
+    .await;
+    assert_eq!(resp.status, 400);
+    let body = String::from_utf8_lossy(&resp.body);
+    assert!(body.contains("wgcf-999"), "got: {body}");
+    // The stored config is untouched: still 2 listeners, no ghost id.
+    assert_eq!(manager.config_snapshot().shared_listeners.len(), 2);
+    assert!(
+        manager.config_snapshot().disabled_tunnels.is_empty(),
+        "ghost id must not be persisted"
+    );
+
+    // The same field with a real id is accepted.
+    let resp_ok = handle_admin_request(
+        &post_config_request(br#"{"disabled_tunnels":["wgcf-001"]}"#.to_vec()),
+        &manager,
+        None,
+        10,
+    )
+    .await;
+    assert_eq!(resp_ok.status, 200);
+    assert_eq!(
+        manager.config_snapshot().disabled_tunnels,
+        vec!["wgcf-001".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn test_admin_rejects_dns_rebinding_host_and_non_json_post() {
     let manager = create_test_manager();
 
@@ -796,7 +1202,16 @@ async fn test_post_config_preserves_placeholder_secrets_reorders_and_persists_to
     let cfg = build_secret_test_config(temp.path());
     std::fs::write(&toml_path, toml::to_string_pretty(&cfg).expect("toml")).expect("write");
 
-    let manager = Arc::new(TunnelManager::new(cfg, Vec::new()).expect("mgr"));
+    let manager = Arc::new(
+        TunnelManager::new(
+            cfg,
+            vec![
+                make_test_tunnel_config("wg-1", "198.51.100.1:51820"),
+                make_test_tunnel_config("wg-2", "198.51.100.2:51820"),
+            ],
+        )
+        .expect("mgr"),
+    );
     manager.set_config_path(toml_path.clone());
     let server = AdminServer::new(
         "127.0.0.1:0".parse().expect("addr"),
@@ -909,7 +1324,19 @@ async fn test_post_config_validates_post_merge_and_rotates_new_secrets() {
     // Explicitly sending new secrets updates both runtime and disk .toml
     let cfg = build_secret_test_config(temp.path());
     std::fs::write(&toml_path, toml::to_string_pretty(&cfg).expect("toml")).expect("write");
-    let manager = Arc::new(TunnelManager::new(cfg, Vec::new()).expect("mgr"));
+    // The fixture config has per-tunnel overrides for wg-1/wg-2, so the
+    // manager must actually load those tunnels: the reference check
+    // rejects configs naming IDs no loaded .conf provides.
+    let manager = Arc::new(
+        TunnelManager::new(
+            cfg,
+            vec![
+                make_test_tunnel_config("wg-1", "198.51.100.1:51820"),
+                make_test_tunnel_config("wg-2", "198.51.100.2:51820"),
+            ],
+        )
+        .expect("mgr"),
+    );
     manager.set_config_path(toml_path.clone());
     let server = AdminServer::new(
         "127.0.0.1:0".parse().expect("addr"),

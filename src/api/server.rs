@@ -114,7 +114,7 @@ impl AdminServer {
                                     || e.kind() == std::io::ErrorKind::Interrupted;
 
                                 if is_transient {
-                                    tracing::warn!("Transient Admin HTTP accept error: {:?}; backing off", e);
+                                    tracing::warn!("Transient Admin HTTP accept error: {}; backing off", e);
                                     tokio::time::sleep(Duration::from_millis(50)).await;
                                 } else {
                                     tracing::debug!("Admin HTTP accept error: {:?}", e);

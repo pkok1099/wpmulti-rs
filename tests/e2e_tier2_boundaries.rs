@@ -879,7 +879,7 @@ async fn test_f10_bnd_shared_port_non_existent_tunnel_id() {
     );
 
     let res = router
-        .select_tunnel(&TunnelSelector::ById("non_existent".to_string()))
+        .select_tunnel(&TunnelSelector::ById("non_existent".to_string()), None)
         .await;
     assert!(res.is_err());
 }
@@ -969,7 +969,7 @@ async fn test_f10_bnd_shared_port_pool_isolation_rejected() {
     router.set_allowed_tunnels(Some(vec!["pool_a_tun".to_string()]));
 
     let res = router
-        .select_tunnel(&TunnelSelector::ById("pool_b_tun".to_string()))
+        .select_tunnel(&TunnelSelector::ById("pool_b_tun".to_string()), None)
         .await;
     assert!(res.is_err());
 }
@@ -1247,6 +1247,7 @@ fn test_f13_bnd_tui_search_query_no_matches() {
         consecutive_failures: 0,
         cooldown_remaining_secs: 0,
         disabled: false,
+        disable_pending: false,
     }];
     app.set_tunnels(list);
 
@@ -1279,6 +1280,7 @@ fn test_f13_bnd_tui_scroll_past_bounds() {
         consecutive_failures: 0,
         cooldown_remaining_secs: 0,
         disabled: false,
+        disable_pending: false,
     }];
     app.set_tunnels(list);
 

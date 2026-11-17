@@ -107,7 +107,7 @@ pub enum Commands {
         #[clap(short, long)]
         dir: Option<PathBuf>,
 
-        /// Output results as JSON (exits 0 with JSON array; table mode exits 1 if all probes fail)
+        /// Output results as JSON (exits 1 if all probes fail, like table mode; stdout stays a pure JSON array)
         #[clap(long)]
         json: bool,
 
@@ -224,7 +224,9 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             timeout,
         } => {
             let results = cmd_probe(config, dir, json, timeout).await?;
-            if !json && !results.is_empty() && results.iter().all(|r| !r.healthy) {
+            // Same rule for table and JSON output: scripts must not read a
+            // successful exit code from `--json` when every tunnel failed.
+            if !results.is_empty() && results.iter().all(|r| !r.healthy) {
                 return Err("All probed tunnels failed".into());
             }
             Ok(())

@@ -279,7 +279,7 @@ async fn read_rfc1929_credentials<S: AsyncRead + AsyncWrite + Unpin>(
 async fn negotiate_socks5_auth<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     router: &Arc<dyn TunnelRouter>,
-) -> io::Result<TunnelSelector> {
+) -> io::Result<(TunnelSelector, Option<(String, String)>)> {
     let mut header = [0u8; 2];
     stream.read_exact(&mut header).await?;
     if header[0] != SOCKS5_VERSION {
@@ -319,12 +319,15 @@ async fn negotiate_socks5_auth<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     if chosen_method != METHOD_USER_PASS {
-        return router.authenticate(None).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("anonymous access not permitted: {e:?}"),
-            )
-        });
+        return router
+            .authenticate(None)
+            .map(|sel| (sel, None))
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("anonymous access not permitted: {e}"),
+                )
+            });
     }
 
     let (username, password) = read_rfc1929_credentials(stream).await?;
@@ -333,7 +336,10 @@ async fn negotiate_socks5_auth<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(sel) => {
             stream.write_all(&[RFC1929_VERSION, 0x00]).await?;
             stream.flush().await?;
-            Ok(sel)
+            // The credentials travel with the selector: the router
+            // verifies them again against the tunnel the selector
+            // finally resolves to (see `TunnelRouter::select_tunnel`).
+            Ok((sel, Some((username, password))))
         }
         Err(err) => {
             tracing::debug!("SOCKS5 RFC 1929 authentication rejected: {:?}", err);
@@ -431,12 +437,15 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let handshake_timeout = std::time::Duration::from_secs(30);
-    let selector = tokio::time::timeout(
+    let (selector, credentials) = tokio::time::timeout(
         handshake_timeout,
         negotiate_socks5_auth(&mut stream, &router),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 auth timed out"))??;
+    let cred_refs = credentials
+        .as_ref()
+        .map(|(user, pass)| (user.as_str(), pass.as_str()));
     let (cmd, target) = tokio::time::timeout(handshake_timeout, read_socks5_command(&mut stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 command timed out"))??;
@@ -455,7 +464,7 @@ where
                     "CONNECT target port cannot be 0",
                 ));
             }
-            handle_connect(stream, router, &selector, target).await
+            handle_connect(stream, router, &selector, target, cred_refs).await
         }
         CMD_UDP_ASSOCIATE => {
             let initial_client = match target {
@@ -464,7 +473,18 @@ where
                 }
                 TargetAddr::Ip(_) | TargetAddr::Domain(_, _) => None,
             };
-            handle_udp_associate(stream, router, &selector, local_ip, peer_ip, initial_client).await
+            handle_udp_associate(
+                stream,
+                router,
+                UdpAssociateRequest {
+                    selector: &selector,
+                    local_ip,
+                    peer_ip,
+                    initial_client,
+                    credentials: cred_refs,
+                },
+            )
+            .await
         }
         other => {
             let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
@@ -477,12 +497,28 @@ where
     }
 }
 
+/// Reply code for a tunnel-selection failure: a bad name (`NotFound`) is
+/// a general failure, while an empty pool (`NotConnected` — the selector
+/// is valid but no tunnel is healthy right now) is network unreachable,
+/// so a client can tell "you mistyped the name" apart from "all tunnels
+/// are down". A tunnel that exists but cannot connect reports host
+/// unreachable instead (see `handle_connect` below).
+fn select_failure_rep(e: &io::Error) -> u8 {
+    // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; map all others to general failure.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match e.kind() {
+        io::ErrorKind::NotConnected => REP_NETWORK_UNREACHABLE,
+        _ => REP_GENERAL_FAILURE,
+    }
+}
+
 /// Executes SOCKS5 `CMD_CONNECT` TCP stream tunneling.
 async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     router: Arc<dyn TunnelRouter>,
     selector: &TunnelSelector,
     target: TargetAddr,
+    credentials: Option<(&str, &str)>,
 ) -> io::Result<()> {
     let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
 
@@ -496,34 +532,45 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         ));
     }
 
-    let mut tunnel_stream: DynStream = match connect_via_router(&router, selector, &target).await {
-        Ok(s) => s,
-        Err(RouterConnectError::SelectTunnel(e)) => {
-            tracing::warn!("Failed to select tunnel for {:?}: {:?}", selector, e);
-            let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
-            return Err(e);
-        }
-        Err(RouterConnectError::ForbiddenDestination(e)) => {
-            let _ = send_socks5_reply(&mut stream, REP_CONN_NOT_ALLOWED, dummy_addr).await;
-            return Err(e);
-        }
-        Err(RouterConnectError::DnsResolution(e)) => {
-            let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
-            return Err(e);
-        }
-        Err(RouterConnectError::TcpConnect(e)) => {
-            // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; map all others to general failure.
-            #[allow(clippy::wildcard_enum_match_arm)]
-            let rep = match e.kind() {
-                io::ErrorKind::ConnectionRefused => REP_CONN_REFUSED,
-                io::ErrorKind::TimedOut => REP_TTL_EXPIRED,
-                io::ErrorKind::AddrNotAvailable => REP_HOST_UNREACHABLE,
-                _ => REP_GENERAL_FAILURE,
-            };
-            let _ = send_socks5_reply(&mut stream, rep, dummy_addr).await;
-            return Err(e);
-        }
-    };
+    let mut tunnel_stream: DynStream =
+        match connect_via_router(&router, selector, &target, credentials).await {
+            Ok(s) => s,
+            Err(RouterConnectError::SelectTunnel(e)) => {
+                tracing::warn!("Failed to select tunnel for {:?}: {}", selector, e);
+                // A tunnel that cannot even be selected is a server-side
+                // failure: a bad name reports general failure, an empty pool
+                // reports network unreachable (see `select_failure_rep`).
+                let _ = send_socks5_reply(&mut stream, select_failure_rep(&e), dummy_addr).await;
+                return Err(e);
+            }
+            Err(RouterConnectError::ForbiddenDestination(e)) => {
+                let _ = send_socks5_reply(&mut stream, REP_CONN_NOT_ALLOWED, dummy_addr).await;
+                return Err(e);
+            }
+            Err(RouterConnectError::DnsResolution(e)) => {
+                let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
+                return Err(e);
+            }
+            Err(RouterConnectError::TcpConnect(e)) => {
+                // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; map all others to general failure.
+                #[allow(clippy::wildcard_enum_match_arm)]
+                let rep = match e.kind() {
+                    io::ErrorKind::ConnectionRefused => REP_CONN_REFUSED,
+                    // A timeout while connecting through a tunnel means the
+                    // peer never completed its WireGuard handshake, i.e. the
+                    // host is unreachable — not that a packet's TTL expired.
+                    // TTL expiry never applies to this userspace stack, and
+                    // reporting 0x04 here keeps the reply code stable for
+                    // the same failure (DNS failure already reports 0x04).
+                    io::ErrorKind::TimedOut | io::ErrorKind::AddrNotAvailable => {
+                        REP_HOST_UNREACHABLE
+                    }
+                    _ => REP_GENERAL_FAILURE,
+                };
+                let _ = send_socks5_reply(&mut stream, rep, dummy_addr).await;
+                return Err(e);
+            }
+        };
 
     // Send SOCKS5 success reply
     send_socks5_reply(&mut stream, REP_SUCCESS, dummy_addr).await?;
@@ -534,29 +581,39 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// What a `CMD_UDP_ASSOCIATE` request carries from the SOCKS5 handshake
+/// into the relay session: the resolved selector, the control socket's
+/// addresses, and the credentials presented at auth time (verified again
+/// against the tunnel the selector resolves to).
+struct UdpAssociateRequest<'a> {
+    selector: &'a TunnelSelector,
+    local_ip: Option<IpAddr>,
+    peer_ip: Option<IpAddr>,
+    initial_client: Option<SocketAddr>,
+    credentials: Option<(&'a str, &'a str)>,
+}
+
 /// Executes SOCKS5 `CMD_UDP_ASSOCIATE` UDP relay session.
 async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     router: Arc<dyn TunnelRouter>,
-    selector: &TunnelSelector,
-    local_ip: Option<IpAddr>,
-    peer_ip: Option<IpAddr>,
-    initial_client: Option<SocketAddr>,
+    req: UdpAssociateRequest<'_>,
 ) -> io::Result<()> {
     let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
 
     // Resolve tunnel
-    let target_tunnel = match router.select_tunnel(selector).await {
+    let target_tunnel = match router.select_tunnel(req.selector, req.credentials).await {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!("Failed to select tunnel for {:?}: {:?}", selector, e);
-            let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
+            tracing::warn!("Failed to select tunnel for {:?}: {}", req.selector, e);
+            // Same split as CONNECT above (see `select_failure_rep`).
+            let _ = send_socks5_reply(&mut stream, select_failure_rep(&e), dummy_addr).await;
             return Err(e);
         }
     };
 
     // Bind local Tokio UDP relay socket on the control socket's local IP (fallback to loopback)
-    let bind_ip = match local_ip {
+    let bind_ip = match req.local_ip {
         Some(ip) if !ip.is_unspecified() => ip,
         _ => IpAddr::V4(Ipv4Addr::LOCALHOST),
     };
@@ -565,7 +622,7 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(
-                "Failed to bind Tokio UDP relay socket on {}: {:?}",
+                "Failed to bind Tokio UDP relay socket on {}: {}",
                 bind_addr,
                 e
             );
@@ -587,7 +644,7 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     let virtual_udp = match target_tunnel.udp_bind(0).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("Failed to bind virtual UDP socket in tunnel: {:?}", e);
+            tracing::error!("Failed to bind virtual UDP socket in tunnel: {}", e);
             let _ = send_socks5_reply(&mut stream, REP_GENERAL_FAILURE, dummy_addr).await;
             return Err(e);
         }
@@ -602,8 +659,8 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
         relay_socket,
         virtual_udp,
         target_tunnel,
-        peer_ip,
-        initial_client,
+        req.peer_ip,
+        req.initial_client,
     )
     .await
 }
@@ -690,7 +747,7 @@ async fn forward_client_udp_datagram(
                         let _ = tx.send((addrs, payload_owned)).await;
                     }
                     Ok(Err(e)) => {
-                        tracing::warn!("Failed to resolve UDP target domain '{}': {:?}", dom, e);
+                        tracing::warn!("Failed to resolve UDP target domain '{}': {}", dom, e);
                     }
                     Err(_) => {
                         tracing::warn!("Timed out resolving UDP target domain '{}'", dom);

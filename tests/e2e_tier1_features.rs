@@ -1070,7 +1070,7 @@ async fn test_f9_dedicated_router_targets_assigned_tunnel() {
     let router = DedicatedTunnelRouter::new("fixed_tun".to_string(), lifecycle, None);
 
     let _selected = router
-        .select_tunnel(&TunnelSelector::DefaultPool)
+        .select_tunnel(&TunnelSelector::DefaultPool, None)
         .await
         .expect("Dedicated router should select fixed tunnel");
     assert!(registry.get("fixed_tun").unwrap().is_active());
@@ -1103,7 +1103,7 @@ async fn test_f10_shared_port_route_by_tunnel_id() {
     );
 
     let _sel = router
-        .select_tunnel(&TunnelSelector::ById("wgcf-002".to_string()))
+        .select_tunnel(&TunnelSelector::ById("wgcf-002".to_string()), None)
         .await
         .unwrap();
     assert!(registry.get("wgcf-002").unwrap().is_active());
@@ -1132,11 +1132,11 @@ async fn test_f10_shared_port_route_by_round_robin_keyword() {
     );
 
     let _sel1 = router
-        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::RoundRobin))
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::RoundRobin), None)
         .await
         .unwrap();
     let _sel2 = router
-        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::RoundRobin))
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::RoundRobin), None)
         .await
         .unwrap();
     assert_eq!(registry.active_count(), 2);
@@ -1161,7 +1161,7 @@ async fn test_f10_shared_port_route_by_random_keyword() {
         MultiTenantRouter::new(lifecycle, Arc::clone(&registry), PoolStrategy::Random, true);
 
     let _sel = router
-        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::Random))
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::Random), None)
         .await
         .unwrap();
     assert!(registry.active_count() >= 1);
@@ -1188,7 +1188,7 @@ async fn test_f10_shared_port_anonymous_default_pool() {
     );
 
     let _sel = router
-        .select_tunnel(&TunnelSelector::DefaultPool)
+        .select_tunnel(&TunnelSelector::DefaultPool, None)
         .await
         .unwrap();
     assert!(registry.get("anon-tun").unwrap().is_active());
@@ -1511,6 +1511,7 @@ fn test_f13_tui_app_navigation_key_events() {
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
             disabled: false,
+            disable_pending: false,
         },
         wpmulti::core::TunnelSummary {
             id: "wgcf-002".to_string(),
@@ -1528,6 +1529,7 @@ fn test_f13_tui_app_navigation_key_events() {
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
             disabled: false,
+            disable_pending: false,
         },
     ];
     app.set_tunnels(list);
@@ -1564,6 +1566,7 @@ fn test_f13_tui_app_search_filtering() {
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
             disabled: false,
+            disable_pending: false,
         },
         wpmulti::core::TunnelSummary {
             id: "staging-eu-west".to_string(),
@@ -1581,6 +1584,7 @@ fn test_f13_tui_app_search_filtering() {
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
             disabled: false,
+            disable_pending: false,
         },
     ];
     app.set_tunnels(list);
@@ -1617,6 +1621,7 @@ fn test_f13_tui_app_column_sorting() {
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
             disabled: false,
+            disable_pending: false,
         },
         wpmulti::core::TunnelSummary {
             id: "tun-a".to_string(),
@@ -1634,6 +1639,7 @@ fn test_f13_tui_app_column_sorting() {
             consecutive_failures: 0,
             cooldown_remaining_secs: 0,
             disabled: false,
+            disable_pending: false,
         },
     ];
     app.set_tunnels(list);
@@ -1673,6 +1679,7 @@ fn test_f13_tui_render_dashboard_output() {
         consecutive_failures: 0,
         cooldown_remaining_secs: 0,
         disabled: false,
+        disable_pending: false,
     }];
     app.set_tunnels(list);
 

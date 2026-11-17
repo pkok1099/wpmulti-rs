@@ -373,6 +373,11 @@ pub struct TunnelEntry {
     pub activation_lock: Arc<tokio::sync::Mutex<()>>,
     /// Whether this tunnel is administratively disabled (`true` = off).
     pub disabled: std::sync::atomic::AtomicBool,
+    /// Whether a disable is waiting for live sessions to drain: the
+    /// tunnel is disabled but still Active because connections are
+    /// running; the idle checker suspends it once they drop to zero
+    /// (audit run-1, medium).
+    pub disable_pending: std::sync::atomic::AtomicBool,
 }
 
 impl TunnelEntry {
@@ -390,6 +395,7 @@ impl TunnelEntry {
             assigned_port: RwLock::new(None),
             activation_lock: Arc::new(tokio::sync::Mutex::new(())),
             disabled: std::sync::atomic::AtomicBool::new(false),
+            disable_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -417,6 +423,16 @@ impl TunnelEntry {
     /// Set whether the tunnel is administratively disabled.
     pub fn set_disabled(&self, disabled: bool) {
         self.disabled.store(disabled, Ordering::Relaxed);
+    }
+
+    /// Check whether a disable is waiting for live sessions to drain.
+    pub fn is_disable_pending(&self) -> bool {
+        self.disable_pending.load(Ordering::Relaxed)
+    }
+
+    /// Set whether a disable is waiting for live sessions to drain.
+    pub fn set_disable_pending(&self, pending: bool) {
+        self.disable_pending.store(pending, Ordering::Relaxed);
     }
 
     /// Generate a summary snapshot for status APIs and TUI dashboards.
@@ -450,6 +466,7 @@ impl TunnelEntry {
             consecutive_failures: self.health.consecutive_failures(),
             cooldown_remaining_secs: self.health.cooldown_remaining_secs(),
             disabled: self.is_disabled(),
+            disable_pending: self.is_disable_pending(),
         }
     }
 }
@@ -491,6 +508,10 @@ pub struct TunnelSummary {
     /// Whether the tunnel is administratively disabled.
     #[serde(default)]
     pub disabled: bool,
+    /// Whether a disable is waiting for live sessions to drain (the
+    /// tunnel is disabled but still Active with running connections).
+    #[serde(default)]
+    pub disable_pending: bool,
 }
 
 #[derive(Debug)]

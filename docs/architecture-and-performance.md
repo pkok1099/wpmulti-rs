@@ -85,6 +85,12 @@ gotatun::Device (WireGuard UDP encryption & transport)
 
 ## 4. Verification & Benchmarks
 
+> This section is for developers working from the repository — it runs
+> `cargo` commands against the source tree. If you installed wpmulti as
+> a prebuilt binary, there is no source tree to check; skip this section
+> (the rest of this document still describes how the binary you run
+> works).
+
 Run the full verification and benchmark suite from the repository root:
 
 ```bash

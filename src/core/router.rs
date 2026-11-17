@@ -18,7 +18,7 @@ use parking_lot::RwLock;
 use crate::config::{AuthMode, IpMode, PoolStrategy, SharedListenerSettings, TunnelPoolSelection};
 use crate::core::lifecycle::{GuardedTunnelTarget, LifecycleController};
 use crate::core::registry::{TunnelEntry, TunnelRegistry};
-use crate::proxy::router::AuthChecker;
+use crate::proxy::router::{AuthChecker, constant_time_eq_str};
 use crate::proxy::{
     DynStream, PoolKeyword, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket, TunnelRouter,
     TunnelSelector,
@@ -144,6 +144,51 @@ impl MultiTenantRouter {
     pub fn set_allowed_tunnels(&self, list: Option<Vec<String>>) {
         let mut allowed = self.allowed_tunnels.write();
         *allowed = list.map(|l| l.into_boxed_slice().into());
+    }
+
+    /// Verify `credentials` against the password of the tunnel the
+    /// selector resolved to. Only enforced in [`AuthMode::PerTunnel`]:
+    /// the tunnel's own override password when one is set, else the
+    /// global password when one is set, else the anonymous rule — the
+    /// same rule `AuthChecker::authenticate` applies to a `ById`
+    /// selector, so a tag/keyword/default-pool selector cannot smuggle
+    /// the global password into a password-protected tunnel (audit
+    /// run-1, `proxy.auth.per-tunnel-password-bypass-via-tag-selector`).
+    fn verify_chosen_tunnel_password(
+        &self,
+        tunnel_id: &str,
+        credentials: Option<(&str, &str)>,
+    ) -> Result<(), ProxyAuthError> {
+        if self.auth_mode != AuthMode::PerTunnel {
+            return Ok(());
+        }
+        let expected = self
+            .per_tunnel_passwords
+            .read()
+            .get(tunnel_id)
+            .cloned()
+            .or_else(|| self.global_password.clone());
+        match (expected, credentials) {
+            (Some(expected), Some((_, pass))) if constant_time_eq_str(pass, &expected) => Ok(()),
+            (Some(_), Some(_)) => Err(ProxyAuthError::InvalidCredentials),
+            (None, Some(_)) => {
+                if self.allow_anonymous {
+                    Ok(())
+                } else {
+                    // A password was presented but none is configured
+                    // for this tunnel and anonymous access is off, so
+                    // there is nothing it could have matched.
+                    Err(ProxyAuthError::InvalidCredentials)
+                }
+            }
+            (_, None) => {
+                if self.allow_anonymous {
+                    Ok(())
+                } else {
+                    Err(ProxyAuthError::AuthRequired)
+                }
+            }
+        }
     }
 
     fn effective_ip_mode(&self) -> io::Result<IpMode> {
@@ -476,6 +521,7 @@ impl TunnelRouter for MultiTenantRouter {
     fn select_tunnel<'a>(
         &'a self,
         selector: &'a TunnelSelector,
+        credentials: Option<(&'a str, &'a str)>,
     ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>> {
         Box::pin(async move {
             let allowed_guard = self.allowed_tunnels.read().clone();
@@ -507,6 +553,25 @@ impl TunnelRouter for MultiTenantRouter {
                 };
                 let effective_allowed = candidate_override.as_deref().or(allowed_guard.as_deref());
                 let target_id = resolve_selector(self, selector, effective_allowed)?;
+
+                // Enforce the resolved tunnel's password before activating
+                // it: in PerTunnel mode a tag/keyword/default-pool selector
+                // must not open a password-protected tunnel with the global
+                // password (audit run-1,
+                // `proxy.auth.per-tunnel-password-bypass-via-tag-selector`).
+                // `authenticate` accepted the credentials only
+                // provisionally; this is the authoritative check, and a
+                // failure here is terminal — failing over to another tunnel
+                // with the same credentials would route the client to a
+                // tunnel it did not select. The error names no tunnel id,
+                // so a keyword selector cannot leak which tunnel was picked.
+                self.verify_chosen_tunnel_password(&target_id, credentials)
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "invalid proxy credentials for the selected tunnel",
+                        )
+                    })?;
 
                 match self.lifecycle.get_or_activate(&target_id).await {
                     Ok((active_tunnel, guard)) => {
@@ -595,8 +660,8 @@ impl TunnelRouter for DedicatedTunnelRouter {
         if let Some((expected_user, expected_pass)) = &self.auth {
             match credentials {
                 Some((u, p))
-                    if crate::proxy::router::constant_time_eq_str(u, expected_user)
-                        && crate::proxy::router::constant_time_eq_str(p, expected_pass) =>
+                    if constant_time_eq_str(u, expected_user)
+                        && constant_time_eq_str(p, expected_pass) =>
                 {
                     Ok(TunnelSelector::ById(self.tunnel_id.clone()))
                 }
@@ -611,7 +676,11 @@ impl TunnelRouter for DedicatedTunnelRouter {
     fn select_tunnel<'a>(
         &'a self,
         _selector: &'a TunnelSelector,
+        _credentials: Option<(&'a str, &'a str)>,
     ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>> {
+        // A dedicated router serves one tunnel whose credentials were
+        // already verified by `authenticate`; there is nothing further
+        // to check at selection time.
         Box::pin(async move {
             let (active, guard) = self
                 .lifecycle
@@ -702,6 +771,10 @@ impl ProxyTunnelTarget for IpFilteredTunnelTarget {
 
     fn tunnel_id(&self) -> Option<&str> {
         self.inner.tunnel_id()
+    }
+
+    fn note_attempt_aborted(&self) {
+        self.inner.note_attempt_aborted();
     }
 }
 
