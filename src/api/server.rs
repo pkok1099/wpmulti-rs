@@ -81,7 +81,9 @@ impl AdminServer {
 
             loop {
                 while let Some(res) = client_tasks.try_join_next() {
-                    let _ = res;
+                    if let Err(e) = res {
+                        tracing::warn!("Admin client task failed: {e}");
+                    }
                 }
 
                 tokio::select! {

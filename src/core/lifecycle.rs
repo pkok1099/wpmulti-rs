@@ -1156,7 +1156,9 @@ impl LifecycleController {
                 if disable_pending {
                     // A disabled tunnel with drained connections suspends
                     // immediately, regardless of mode or idle timeout.
-                    let _ = self.suspend_tunnel(&entry.id).await;
+                    if let Err(e) = self.suspend_tunnel(&entry.id).await {
+                        tracing::warn!("Failed to suspend tunnel '{}': {e}", entry.id);
+                    }
                     if *entry.state.read() != TunnelState::Active {
                         entry.set_disable_pending(false);
                     }
@@ -1178,7 +1180,9 @@ impl LifecycleController {
                         idle_secs,
                         idle_timeout_secs
                     );
-                    let _ = self.suspend_tunnel(&entry.id).await;
+                    if let Err(e) = self.suspend_tunnel(&entry.id).await {
+                        tracing::warn!("Failed to suspend tunnel '{}': {e}", entry.id);
+                    }
                 }
             }
         }
