@@ -10,7 +10,8 @@ use crate::config::{
 use crate::core::{HealthStatus, TunnelManager, TunnelState, TunnelSummary};
 use crate::tui::app::{TuiApp, TuiDataSource};
 use crate::tui::ui::{
-    common_prefix, format_bytes, render_dashboard, short_bar_label, visible_edit_tail,
+    common_prefix, format_bytes, format_bytes_compact, render_dashboard, short_bar_label,
+    visible_edit_tail,
 };
 
 fn make_test_tunnel_config(id: &str, endpoint: &str) -> TunnelConfig {
@@ -91,6 +92,35 @@ fn test_tui_format_bytes() {
     assert_eq!(format_bytes(2048), "2.00 KB");
     assert_eq!(format_bytes(5 * 1024 * 1024), "5.00 MB");
     assert_eq!(format_bytes(10 * 1024 * 1024 * 1024), "10.00 GB");
+}
+
+/// The bar chart only draws a value that fits its 7-cell bar width, so
+/// the compact formatter must never exceed 7 chars — including the
+/// rounding edges where 9.99 becomes "10.00" and 99.95 becomes "100.0".
+#[test]
+fn test_tui_format_bytes_compact_fits_bar_width() {
+    let cases: &[(u64, &str)] = &[
+        (0, "0 B"),
+        (500, "500 B"),
+        (2048, "2.00 KB"),
+        (5 * 1024 * 1024, "5.00 MB"),
+        (2_306_867, "2.20 MB"),
+        (12 * 1024 * 1024 + 512 * 1024, "12.5 MB"),
+        (123 * 1024 * 1024, "123 MB"),
+        (10 * 1024 * 1024 * 1024, "10.0 GB"),
+        (1023 * 1024 * 1024, "1023 MB"),
+        (5 * 1024 * 1024 * 1024 * 1024, "5.00 TB"),
+    ];
+    for (bytes, expected) in cases {
+        let got = format_bytes_compact(*bytes);
+        assert_eq!(got, *expected, "for {bytes} bytes");
+        assert!(got.len() <= 7, "compact value '{got}' exceeds 7 chars");
+    }
+    // Rounding edges: 9.99 KB must not become "10.00 KB" (8 chars).
+    for bytes in [10_229, 10_235, 102_349, 102_399, 1_047_500, 1_048_000] {
+        let got = format_bytes_compact(bytes);
+        assert!(got.len() <= 7, "compact value '{got}' exceeds 7 chars");
+    }
 }
 
 #[test]
@@ -378,11 +408,11 @@ fn test_tui_render_dashboard_shows_unknown_health() {
     let mut app = TuiApp::new(dummy_source, TuiSortField::Id);
 
     let mut summary = make_dummy_summary("wgcf-new", TunnelState::Dormant, 0, 0, 0);
-    summary.health = HealthStatus::Unknown;
+    summary.health = HealthStatus::Untested;
     app.set_tunnels(vec![summary]);
 
     let output = render_dashboard(&mut app, 100, 30);
-    assert!(output.contains("Unknown"), "dashboard was:\n{output}");
+    assert!(output.contains("Untested"), "dashboard was:\n{output}");
     assert!(
         !output.contains("Healthy"),
         "unproven tunnel shown as Healthy:\n{output}"
@@ -1350,4 +1380,155 @@ async fn test_tui_remote_http_config_preserves_redacted_secrets_and_auth() {
     );
 
     server.stop().await;
+}
+
+#[test]
+fn test_tui_format_ago() {
+    use crate::tui::ui::format_ago;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    assert_eq!(format_ago(None), "never");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    // Values sit well inside their bucket so a one-second skew between
+    // the `now` read here and the one inside `format_ago` cannot flip
+    // the unit.
+    assert_eq!(format_ago(Some(now - 45)), "45s ago");
+    assert_eq!(format_ago(Some(now - 150)), "2m ago");
+    assert_eq!(format_ago(Some(now - 7_500)), "2h ago");
+    assert_eq!(format_ago(Some(now - 300_000)), "3d ago");
+}
+
+/// The bandwidth chart must draw a real Y axis: with a 1 KB/s peak the
+/// top tick reads "1.00 KB", so a spike's size is readable at a glance
+/// instead of only the current rate in the title.
+#[test]
+fn test_tui_chart_shows_axis_scale() {
+    let dummy_source = TuiDataSource {
+        admin_url: "http://127.0.0.1:9090".to_string(),
+        auth_token: None,
+    };
+    let mut app = TuiApp::new(dummy_source, TuiSortField::Id);
+    app.set_tunnels(vec![make_dummy_summary(
+        "wgcf-001",
+        TunnelState::Active,
+        0,
+        0,
+        0,
+    )]);
+    for _ in 0..5 {
+        app.rx_rates.push_back(1024);
+        app.tx_rates.push_back(512);
+    }
+    app.current_rx_bps = 1024;
+    app.current_tx_bps = 512;
+
+    let output = render_dashboard(&mut app, 110, 24);
+    assert!(
+        output.contains("1.00 KB"),
+        "chart Y axis top tick missing:\n{output}"
+    );
+    assert!(output.contains("RX"), "chart title missing RX:\n{output}");
+    assert!(output.contains("TX"), "chart title missing TX:\n{output}");
+}
+
+#[tokio::test]
+async fn test_tui_help_overlay() {
+    use crate::tui::app::TuiOverlay;
+    use crate::tui::ui::{TuiKey, handle_tui_key};
+
+    let dummy_source = TuiDataSource {
+        admin_url: "http://127.0.0.1:9090".to_string(),
+        auth_token: None,
+    };
+    let mut app = TuiApp::new(dummy_source, TuiSortField::Id);
+    app.set_tunnels(vec![make_dummy_summary(
+        "wgcf-001",
+        TunnelState::Active,
+        0,
+        0,
+        0,
+    )]);
+
+    // `?` opens the help overlay and it renders its keybindings.
+    handle_tui_key(&mut app, TuiKey::Char('?')).await;
+    assert_eq!(app.overlay, TuiOverlay::Help);
+    let output = render_dashboard(&mut app, 110, 24);
+    assert!(output.contains("Help"), "help popup missing:\n{output}");
+    assert!(
+        output.contains("switch tabs"),
+        "help content missing:\n{output}"
+    );
+
+    // While the overlay is open it owns the keyboard: `j` must not
+    // move the selection underneath it.
+    handle_tui_key(&mut app, TuiKey::Char('j')).await;
+    assert_eq!(app.selected_index, 0);
+
+    // `q` closes the overlay instead of quitting the TUI.
+    handle_tui_key(&mut app, TuiKey::Char('q')).await;
+    assert_eq!(app.overlay, TuiOverlay::None);
+    assert!(app.running);
+
+    // `Esc` also closes it.
+    handle_tui_key(&mut app, TuiKey::Char('?')).await;
+    assert_eq!(app.overlay, TuiOverlay::Help);
+    handle_tui_key(&mut app, TuiKey::Esc).await;
+    assert_eq!(app.overlay, TuiOverlay::None);
+}
+
+#[tokio::test]
+async fn test_tui_tunnel_detail_overlay() {
+    use crate::tui::app::TuiOverlay;
+    use crate::tui::ui::{TuiKey, handle_tui_key};
+
+    let dummy_source = TuiDataSource {
+        admin_url: "http://127.0.0.1:9090".to_string(),
+        auth_token: None,
+    };
+
+    // `Enter` with no tunnels is a no-op, not a popup over nothing.
+    let mut empty = TuiApp::new(dummy_source.clone(), TuiSortField::Id);
+    handle_tui_key(&mut empty, TuiKey::Enter).await;
+    assert_eq!(empty.overlay, TuiOverlay::None);
+
+    let mut app = TuiApp::new(dummy_source, TuiSortField::Id);
+    app.set_tunnels(vec![
+        make_dummy_summary("wgcf-001", TunnelState::Active, 3, 1_048_576, 524_288),
+        make_dummy_summary("wgcf-002", TunnelState::Dormant, 0, 0, 0),
+    ]);
+
+    // `Enter` opens the detail overlay for the selected tunnel.
+    handle_tui_key(&mut app, TuiKey::Enter).await;
+    assert_eq!(app.overlay, TuiOverlay::TunnelDetail);
+    let output = render_dashboard(&mut app, 110, 24);
+    assert!(
+        output.contains("Tunnel Detail"),
+        "detail popup missing:\n{output}"
+    );
+    assert!(
+        output.contains("wgcf-001"),
+        "detail popup missing tunnel id:\n{output}"
+    );
+    assert!(
+        output.contains("Health"),
+        "detail popup missing health:\n{output}"
+    );
+    assert!(
+        output.contains("1.00 MB"),
+        "detail popup missing RX total:\n{output}"
+    );
+
+    // `q` closes the overlay instead of quitting the TUI.
+    handle_tui_key(&mut app, TuiKey::Char('q')).await;
+    assert_eq!(app.overlay, TuiOverlay::None);
+    assert!(app.running);
+
+    // `Enter` reopens it; `Esc` closes it.
+    handle_tui_key(&mut app, TuiKey::Enter).await;
+    assert_eq!(app.overlay, TuiOverlay::TunnelDetail);
+    handle_tui_key(&mut app, TuiKey::Esc).await;
+    assert_eq!(app.overlay, TuiOverlay::None);
 }

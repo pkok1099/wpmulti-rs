@@ -837,7 +837,7 @@ async fn test_udp_bind_does_not_mark_tunnel_healthy() {
     // tunnel to Healthy: no packet has crossed the handshake.
     let socket = guarded_target.udp_bind(0).await.unwrap();
     drop(socket);
-    assert_eq!(tracker.current_status(), HealthStatus::Unknown);
+    assert_eq!(tracker.current_status(), HealthStatus::Untested);
     assert_eq!(tracker.consecutive_failures(), 0);
 
     // Nor must it rescue an Unhealthy tunnel or reset its failures.
@@ -1265,7 +1265,7 @@ fn test_health_tracker_half_open_single_trial_and_failure_rearms_cooldown() {
     use crate::core::health::{HealthStatus, TunnelHealthTracker};
     let tracker = TunnelHealthTracker::new();
     tracker.record_failure(2, Duration::from_millis(20));
-    assert_eq!(tracker.current_status(), HealthStatus::Unknown);
+    assert_eq!(tracker.current_status(), HealthStatus::Untested);
     assert!(tracker.is_routable());
 
     tracker.record_failure(2, Duration::from_millis(20));
@@ -1607,7 +1607,7 @@ async fn test_destination_caused_tcp_errors_do_not_trip_breaker() {
         };
         assert_eq!(err.kind(), std::io::ErrorKind::AddrNotAvailable);
     }
-    assert_eq!(tracker.current_status(), HealthStatus::Unknown);
+    assert_eq!(tracker.current_status(), HealthStatus::Untested);
     assert_eq!(tracker.consecutive_failures(), 0);
 
     // Nor must they drag down a healthy tunnel.
@@ -1663,7 +1663,7 @@ async fn test_dns_timeout_without_handshake_still_counts_as_failure() {
         .expect_err("in-tunnel DNS must time out without a peer");
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     assert_eq!(tracker.consecutive_failures(), 1);
-    assert_eq!(tracker.current_status(), HealthStatus::Unknown);
+    assert_eq!(tracker.current_status(), HealthStatus::Untested);
 
     drop(guarded);
     lifecycle.stop().await;
@@ -1889,7 +1889,7 @@ async fn test_shared_listener_health_override_and_dynamic_lifecycle_tracking() {
         .unwrap();
 
     send_socks5_unresolvable_domain_connect(info2.address).await;
-    assert_eq!(entry.health.current_status(), HealthStatus::Unknown);
+    assert_eq!(entry.health.current_status(), HealthStatus::Untested);
     send_socks5_unresolvable_domain_connect(info2.address).await;
     assert_eq!(entry.health.current_status(), HealthStatus::Unhealthy);
 

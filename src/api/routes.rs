@@ -301,9 +301,9 @@ fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> Http
         .iter()
         .filter(|s| s.health == crate::core::HealthStatus::Healthy)
         .count();
-    let unknown_tunnels = stats
+    let untested_tunnels = stats
         .iter()
-        .filter(|s| s.health == crate::core::HealthStatus::Unknown)
+        .filter(|s| s.health == crate::core::HealthStatus::Untested)
         .count();
     let unhealthy_tunnels = stats
         .iter()
@@ -312,6 +312,10 @@ fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> Http
     let half_open_tunnels = stats
         .iter()
         .filter(|s| s.health == crate::core::HealthStatus::HalfOpen)
+        .count();
+    let dead_tunnels = stats
+        .iter()
+        .filter(|s| s.health == crate::core::HealthStatus::Dead)
         .count();
     let total_connections: u64 = stats.iter().map(|s| s.total_conns).sum();
     let active_connections: usize = stats.iter().map(|s| s.active_conns).sum();
@@ -329,9 +333,10 @@ fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> Http
         "dormant_tunnels": dormant_tunnels,
         "disabled_tunnels": disabled_tunnels,
         "healthy_tunnels": healthy_tunnels,
-        "unknown_tunnels": unknown_tunnels,
+        "untested_tunnels": untested_tunnels,
         "half_open_tunnels": half_open_tunnels,
         "unhealthy_tunnels": unhealthy_tunnels,
+        "dead_tunnels": dead_tunnels,
         "total_connections": total_connections,
         "active_connections": active_connections,
         "rx_bytes": rx_bytes,

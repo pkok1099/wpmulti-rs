@@ -25,22 +25,30 @@ pub enum HealthStatus {
     /// reported distinctly from proven-healthy tunnels so callers can tell the
     /// difference between "works" and "never tried".
     #[default]
-    Unknown,
+    Untested,
     /// Normal operating state. Tunnel participates in routing.
     Healthy,
     /// Circuit breaker tripped after threshold consecutive failures. In cooldown.
     Unhealthy,
     /// Cooldown timer has elapsed; single trial connection or probe permitted.
     HalfOpen,
+    /// Terminal state: the circuit breaker tripped [`MAX_BREAKER_TRIPS`]
+    /// times without a single success, so the tunnel is declared dead.
+    /// A dead tunnel is never routed to and never probed again, so a
+    /// permanently broken tunnel stops burning CPU on retries. It is
+    /// revived only by a successful manual probe, `record_success`, a
+    /// tracker reset, or a config reload/restart.
+    Dead,
 }
 
 impl std::fmt::Display for HealthStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unknown => write!(f, "unknown"),
+            Self::Untested => write!(f, "untested"),
             Self::Healthy => write!(f, "healthy"),
             Self::Unhealthy => write!(f, "unhealthy"),
             Self::HalfOpen => write!(f, "half_open"),
+            Self::Dead => write!(f, "dead"),
         }
     }
 }
@@ -52,6 +60,16 @@ struct HealthState {
     trial_in_flight: bool,
 }
 
+/// Maximum circuit-breaker trips before a tunnel is declared dead.
+///
+/// A trip is one full failure cycle: `threshold` consecutive failures
+/// (or one failed HalfOpen trial) that lands the tunnel in Unhealthy.
+/// After this many trips the tunnel is marked Dead and is no longer
+/// probed or routed to, so a permanently broken tunnel stops burning
+/// CPU on retries. A manual probe success, `record_success`, a tracker
+/// reset, or a config reload revives it.
+const MAX_BREAKER_TRIPS: usize = 3;
+
 /// Thread-safe tracker maintaining circuit breaker health status and failure counts.
 ///
 /// Designed to guarantee 0% idle CPU and 0 socket allocations for dormant lazy tunnels
@@ -60,6 +78,7 @@ struct HealthState {
 pub struct TunnelHealthTracker {
     state: RwLock<HealthState>,
     consecutive_failures: AtomicUsize,
+    breaker_trips: AtomicUsize,
     last_failure_at: AtomicU64,
 }
 
@@ -70,15 +89,16 @@ impl Default for TunnelHealthTracker {
 }
 
 impl TunnelHealthTracker {
-    /// Construct a new tracker initialized to Unknown (never proven).
+    /// Construct a new tracker initialized to Untested (never proven).
     pub const fn new() -> Self {
         Self {
             state: RwLock::new(HealthState {
-                status: HealthStatus::Unknown,
+                status: HealthStatus::Untested,
                 cooldown_until: None,
                 trial_in_flight: false,
             }),
             consecutive_failures: AtomicUsize::new(0),
+            breaker_trips: AtomicUsize::new(0),
             last_failure_at: AtomicU64::new(0),
         }
     }
@@ -87,8 +107,9 @@ impl TunnelHealthTracker {
     pub fn can_route(&self) -> bool {
         let state = self.state.read();
         match state.status {
-            HealthStatus::Unknown | HealthStatus::Healthy => true,
+            HealthStatus::Untested | HealthStatus::Healthy => true,
             HealthStatus::HalfOpen => !state.trial_in_flight,
+            HealthStatus::Dead => false,
             HealthStatus::Unhealthy => state
                 .cooldown_until
                 .is_none_or(|until| Instant::now() >= until),
@@ -111,7 +132,8 @@ impl TunnelHealthTracker {
         {
             let state = self.state.read();
             match state.status {
-                HealthStatus::Unknown | HealthStatus::Healthy => return true,
+                HealthStatus::Untested | HealthStatus::Healthy => return true,
+                HealthStatus::Dead => return false,
                 HealthStatus::HalfOpen if state.trial_in_flight => return false,
                 HealthStatus::HalfOpen | HealthStatus::Unhealthy => {}
             }
@@ -119,7 +141,8 @@ impl TunnelHealthTracker {
 
         let mut state = self.state.write();
         match state.status {
-            HealthStatus::Unknown | HealthStatus::Healthy => true,
+            HealthStatus::Untested | HealthStatus::Healthy => true,
+            HealthStatus::Dead => false,
             HealthStatus::HalfOpen => {
                 if state.trial_in_flight {
                     false
@@ -166,10 +189,12 @@ impl TunnelHealthTracker {
     }
 
     /// Record a successful connection, handshake, or probe attempt.
-    /// Resets consecutive failures to 0 and restores Healthy status.
+    /// Resets consecutive failures and breaker trips to 0 and restores Healthy status.
+    /// This is also how a Dead tunnel is revived (e.g. a manual probe that succeeds).
     pub fn record_success(&self) {
         let mut state = self.state.write();
         self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.breaker_trips.store(0, Ordering::Relaxed);
         state.cooldown_until = None;
         state.status = HealthStatus::Healthy;
         state.trial_in_flight = false;
@@ -188,10 +213,27 @@ impl TunnelHealthTracker {
         }
     }
 
+    /// Record one circuit-breaker trip: the tunnel failed hard enough to
+    /// land in Unhealthy. After [`MAX_BREAKER_TRIPS`] trips the tunnel is
+    /// declared Dead instead of cooling down again, so it stops being
+    /// probed and routed to. Caller must hold the state write lock.
+    fn trip_breaker(&self, state: &mut HealthState, cooldown: Duration) {
+        let trips = self.breaker_trips.fetch_add(1, Ordering::SeqCst) + 1;
+        if trips >= MAX_BREAKER_TRIPS {
+            state.cooldown_until = None;
+            state.status = HealthStatus::Dead;
+        } else {
+            state.cooldown_until = Some(Instant::now() + cooldown);
+            state.status = HealthStatus::Unhealthy;
+        }
+        state.trial_in_flight = false;
+    }
+
     /// Record a failed connection, handshake, or probe attempt.
     ///
     /// Increments consecutive failure count. If it meets or exceeds `threshold`,
-    /// transitions status to `Unhealthy` and arms cooldown timer.
+    /// transitions status to `Unhealthy` and arms cooldown timer. After
+    /// [`MAX_BREAKER_TRIPS`] such trips the tunnel is declared Dead instead.
     pub fn record_failure(&self, threshold: usize, cooldown: Duration) {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -202,22 +244,22 @@ impl TunnelHealthTracker {
         let mut state = self.state.write();
         let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
         match state.status {
-            HealthStatus::Unknown | HealthStatus::Healthy => {
+            HealthStatus::Untested | HealthStatus::Healthy => {
                 if failures >= threshold {
-                    state.cooldown_until = Some(Instant::now() + cooldown);
-                    state.status = HealthStatus::Unhealthy;
-                    state.trial_in_flight = false;
+                    self.trip_breaker(&mut state, cooldown);
                 }
             }
             HealthStatus::HalfOpen => {
-                state.cooldown_until = Some(Instant::now() + cooldown);
-                state.status = HealthStatus::Unhealthy;
-                state.trial_in_flight = false;
+                self.trip_breaker(&mut state, cooldown);
             }
             HealthStatus::Unhealthy => {
                 // Keep existing cooldown_until so repeated probe/request failures
                 // cannot permanently trap the tunnel in Unhealthy.
                 state.trial_in_flight = false;
+            }
+            HealthStatus::Dead => {
+                // Terminal: a dead tunnel stays dead until a manual probe
+                // succeeds, `record_success`, or a reset/reload revives it.
             }
         }
     }
@@ -235,6 +277,11 @@ impl TunnelHealthTracker {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
 
+    /// Return the count of circuit-breaker trips since the last success or reset.
+    pub fn breaker_trips(&self) -> usize {
+        self.breaker_trips.load(Ordering::Relaxed)
+    }
+
     /// Return the remaining cooldown in seconds, or 0 if not currently cooling down.
     pub fn cooldown_remaining_secs(&self) -> u64 {
         let until = self.state.read().cooldown_until;
@@ -248,13 +295,15 @@ impl TunnelHealthTracker {
         })
     }
 
-    /// Reset the tracker to its initial state: Unknown with no failure history.
+    /// Reset the tracker to its initial state: Untested with no failure history.
     /// Forgets any proven-healthy past; the tunnel must succeed again to be Healthy.
+    /// This also revives a Dead tunnel back to Untested.
     pub fn reset(&self) {
         let mut state = self.state.write();
         self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.breaker_trips.store(0, Ordering::Relaxed);
         state.cooldown_until = None;
-        state.status = HealthStatus::Unknown;
+        state.status = HealthStatus::Untested;
         state.trial_in_flight = false;
     }
 }
@@ -393,9 +442,12 @@ impl ActiveProber {
         let mut set = tokio::task::JoinSet::new();
 
         for entry in registry.all_entries() {
-            // STRICTLY SKIP LAZY, DISABLED, OR NON-ACTIVE TUNNELS
+            // STRICTLY SKIP LAZY, DISABLED, DEAD, OR NON-ACTIVE TUNNELS.
+            // Dead tunnels are never probed again: re-probing a tunnel
+            // that already failed 3 breaker trips only burns CPU.
             if entry.lifecycle_mode != LifecycleMode::Eager
                 || entry.is_disabled()
+                || entry.health.current_status() == HealthStatus::Dead
                 || *entry.state.read() != crate::core::registry::TunnelState::Active
                 || (entry.health.current_status() == HealthStatus::HalfOpen
                     && !entry.health.can_route())
@@ -466,6 +518,7 @@ impl ActiveProber {
     ) {
         const MAX_PROBE_ATTEMPTS: usize = 3;
         if entry_ref.is_disabled()
+            || entry_ref.health.current_status() == HealthStatus::Dead
             || *entry_ref.state.read() != crate::core::registry::TunnelState::Active
         {
             return;
@@ -555,14 +608,14 @@ mod tests {
     #[test]
     fn test_health_tracker_state_transitions() {
         let tracker = TunnelHealthTracker::new();
-        assert_tracker_state(&tracker, HealthStatus::Unknown, 0, true);
+        assert_tracker_state(&tracker, HealthStatus::Untested, 0, true);
         assert_eq!(tracker.cooldown_remaining_secs(), 0);
 
         let threshold = 3;
         let cooldown = Duration::from_millis(50);
 
         tracker.record_failure(threshold, cooldown);
-        assert_tracker_state(&tracker, HealthStatus::Unknown, 1, true);
+        assert_tracker_state(&tracker, HealthStatus::Untested, 1, true);
 
         tracker.record_success();
         assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
@@ -608,10 +661,10 @@ mod tests {
         let threshold = 3;
         let cooldown = Duration::from_millis(50);
 
-        // A fresh tunnel stays Unknown: an inconclusive attempt proves
+        // A fresh tunnel stays Untested: an inconclusive attempt proves
         // nothing, so it must not promote to Healthy.
         tracker.record_inconclusive();
-        assert_tracker_state(&tracker, HealthStatus::Unknown, 0, true);
+        assert_tracker_state(&tracker, HealthStatus::Untested, 0, true);
 
         // Drive it to Unhealthy, then claim the HalfOpen trial slot.
         tracker.record_failure(threshold, cooldown);
@@ -646,29 +699,107 @@ mod tests {
         assert!(!tracker.is_routable());
 
         tracker.reset();
-        assert_eq!(tracker.current_status(), HealthStatus::Unknown);
+        assert_eq!(tracker.current_status(), HealthStatus::Untested);
         assert!(tracker.is_routable());
         assert_eq!(tracker.consecutive_failures(), 0);
     }
 
     #[test]
-    fn test_health_tracker_unknown_until_first_success() {
+    fn test_health_tracker_untested_until_first_success() {
         let tracker = TunnelHealthTracker::new();
 
-        // A fresh tunnel is Unknown, not Healthy: never proven, but still routable.
-        assert_tracker_state(&tracker, HealthStatus::Unknown, 0, true);
+        // A fresh tunnel is Untested, not Healthy: never proven, but still routable.
+        assert_tracker_state(&tracker, HealthStatus::Untested, 0, true);
 
-        // Failures below threshold keep it Unknown (still unproven, not broken).
+        // Failures below threshold keep it Untested (still unproven, not broken).
         tracker.record_failure(3, Duration::from_secs(30));
-        assert_tracker_state(&tracker, HealthStatus::Unknown, 1, true);
+        assert_tracker_state(&tracker, HealthStatus::Untested, 1, true);
 
         // Only a success promotes it to Healthy.
         tracker.record_success();
         assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
 
-        // And reset() forgets the proven past, returning to Unknown.
+        // And reset() forgets the proven past, returning to Untested.
         tracker.reset();
-        assert_tracker_state(&tracker, HealthStatus::Unknown, 0, true);
+        assert_tracker_state(&tracker, HealthStatus::Untested, 0, true);
+    }
+
+    /// Drive a tracker to Dead: 3 breaker trips (threshold failures, then
+    /// a failed HalfOpen trial, twice more). A dead tunnel is terminal:
+    /// not routable, never probed again, and further failures keep it Dead.
+    /// A success revives it to Healthy; a reset revives it to Untested.
+    #[test]
+    fn test_health_tracker_dead_after_three_breaker_trips() {
+        let tracker = TunnelHealthTracker::new();
+        let threshold = 3;
+        let cooldown = Duration::from_millis(50);
+
+        // Trip 1: 3 consecutive failures land it in Unhealthy.
+        tracker.record_failure(threshold, cooldown);
+        tracker.record_failure(threshold, cooldown);
+        tracker.record_failure(threshold, cooldown);
+        assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
+        assert_eq!(tracker.breaker_trips(), 1);
+
+        // Trip 2: cooldown expires, HalfOpen trial fails.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(tracker.is_routable());
+        assert_eq!(tracker.current_status(), HealthStatus::HalfOpen);
+        tracker.record_failure(threshold, cooldown);
+        assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
+        assert_eq!(tracker.breaker_trips(), 2);
+
+        // Trip 3: another failed trial declares it Dead.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(tracker.is_routable());
+        assert_eq!(tracker.current_status(), HealthStatus::HalfOpen);
+        tracker.record_failure(threshold, cooldown);
+        assert_eq!(tracker.current_status(), HealthStatus::Dead);
+        assert_eq!(tracker.breaker_trips(), 3);
+
+        // Dead is terminal and not routable, even after the cooldown
+        // would have expired, and further failures keep it Dead.
+        assert!(!tracker.is_routable());
+        assert!(!tracker.can_route());
+        assert_eq!(tracker.current_status(), HealthStatus::Dead);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(tracker.current_status(), HealthStatus::Dead);
+        assert!(!tracker.is_routable());
+        tracker.record_failure(threshold, cooldown);
+        assert_eq!(tracker.current_status(), HealthStatus::Dead);
+        assert_eq!(tracker.breaker_trips(), 3);
+
+        // A success revives it to Healthy and resets the trip count.
+        tracker.record_success();
+        assert_tracker_state(&tracker, HealthStatus::Healthy, 0, true);
+        assert_eq!(tracker.breaker_trips(), 0);
+    }
+
+    #[test]
+    fn test_health_tracker_dead_revived_by_reset() {
+        let tracker = TunnelHealthTracker::new();
+        let threshold = 1;
+        let cooldown = Duration::from_millis(50);
+
+        // Trip 1: 1 failure (threshold 1) lands it in Unhealthy.
+        tracker.record_failure(threshold, cooldown);
+        assert_eq!(tracker.current_status(), HealthStatus::Unhealthy);
+        assert_eq!(tracker.breaker_trips(), 1);
+
+        // Trip 2 and 3: two failed HalfOpen trials.
+        for _ in 0..2 {
+            std::thread::sleep(Duration::from_millis(60));
+            assert!(tracker.is_routable());
+            tracker.record_failure(threshold, cooldown);
+        }
+        assert_eq!(tracker.current_status(), HealthStatus::Dead);
+        assert_eq!(tracker.breaker_trips(), 3);
+        assert!(!tracker.is_routable());
+
+        // A reset revives it to Untested with no failure history.
+        tracker.reset();
+        assert_tracker_state(&tracker, HealthStatus::Untested, 0, true);
+        assert_eq!(tracker.breaker_trips(), 0);
     }
 
     #[test]

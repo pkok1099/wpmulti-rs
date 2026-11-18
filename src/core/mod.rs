@@ -629,11 +629,21 @@ impl TunnelManager {
             };
         };
         match tokio::time::timeout(probe_timeout, active.device.force_handshake(&pubkey)).await {
-            Ok(Ok(())) => TunnelProbeOutcome {
-                ok: true,
-                rtt_ms: Some(start.elapsed().as_millis() as u64),
-                message: "Handshake OK".to_string(),
-            },
+            Ok(Ok(())) => {
+                // A successful handshake proves the tunnel works: record
+                // it, so a Dead tunnel is revived to Healthy and failure
+                // counts reset. A failed probe records nothing — a probe
+                // is diagnostic, and a timeout alone must not condemn
+                // an otherwise healthy tunnel.
+                if let Some(entry) = self.registry().get(id) {
+                    entry.health.record_success();
+                }
+                TunnelProbeOutcome {
+                    ok: true,
+                    rtt_ms: Some(start.elapsed().as_millis() as u64),
+                    message: "Handshake OK".to_string(),
+                }
+            }
             Ok(Err(e)) => TunnelProbeOutcome {
                 ok: false,
                 rtt_ms: None,

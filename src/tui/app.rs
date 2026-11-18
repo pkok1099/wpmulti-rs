@@ -26,6 +26,20 @@ pub enum TuiTab {
     Probe,
 }
 
+/// Overlay on top of the active tab. The overlays are mutually
+/// exclusive and own the keyboard while open, so a single enum — not
+/// one bool per overlay — keeps the state unambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TuiOverlay {
+    /// No overlay: the active tab owns the screen and the keyboard.
+    #[default]
+    None,
+    /// Help overlay, toggled by `?` on any tab.
+    Help,
+    /// Tunnel detail overlay, opened by `Enter` on the Tunnels tab.
+    TunnelDetail,
+}
+
 impl TuiTab {
     /// All tabs in display order.
     pub const ALL: [Self; 5] = [
@@ -494,6 +508,8 @@ pub struct TuiApp {
     pub anim_tick: u64,
     // Inline batch enable/disable prompt buffer (`-1-200`, `+1-200`, `A`, `all`)
     pub batch_prompt: Option<String>,
+    /// Overlay on top of the active tab (`?` help, `Enter` tunnel detail).
+    pub overlay: TuiOverlay,
 }
 
 impl TuiApp {
@@ -538,6 +554,7 @@ impl TuiApp {
             probe_scroll: 0,
             anim_tick: 0,
             batch_prompt: None,
+            overlay: TuiOverlay::None,
         }
     }
 

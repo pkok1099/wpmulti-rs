@@ -8,21 +8,23 @@ use std::sync::atomic::Ordering;
 
 use crate::core::{HealthStatus, TunnelEntry, TunnelManager};
 
-/// Count registered tunnels by health status: (healthy, unknown, unhealthy).
-/// Half-open tunnels count in none of the three buckets.
-fn count_health_statuses(entries: &[Arc<TunnelEntry>]) -> (usize, usize, usize) {
+/// Count registered tunnels by health status: (healthy, untested, unhealthy, dead).
+/// Half-open tunnels count in none of the four buckets.
+fn count_health_statuses(entries: &[Arc<TunnelEntry>]) -> (usize, usize, usize, usize) {
     let mut healthy = 0;
-    let mut unknown = 0;
+    let mut untested = 0;
     let mut unhealthy = 0;
+    let mut dead = 0;
     for entry in entries {
         match entry.health.current_status() {
             HealthStatus::Healthy => healthy += 1,
-            HealthStatus::Unknown => unknown += 1,
+            HealthStatus::Untested => untested += 1,
             HealthStatus::Unhealthy => unhealthy += 1,
+            HealthStatus::Dead => dead += 1,
             HealthStatus::HalfOpen => {}
         }
     }
-    (healthy, unknown, unhealthy)
+    (healthy, untested, unhealthy, dead)
 }
 
 fn write_scalar_gauge(out: &mut String, name: &str, help: &str, value: usize) {
@@ -63,13 +65,48 @@ fn write_tunnel_metric<T: std::fmt::Display>(
     }
 }
 
+/// Write the four per-health-status tunnel count gauges.
+fn write_health_count_gauges(
+    out: &mut String,
+    healthy: usize,
+    untested: usize,
+    unhealthy: usize,
+    dead: usize,
+) {
+    write_scalar_gauge(
+        out,
+        "wpmulti_tunnels_healthy",
+        "Number of healthy tunnels",
+        healthy,
+    );
+    write_scalar_gauge(
+        out,
+        "wpmulti_tunnels_untested",
+        "Number of tunnels that have never completed a successful handshake or probe",
+        untested,
+    );
+    write_scalar_gauge(
+        out,
+        "wpmulti_tunnels_unhealthy",
+        "Number of unhealthy tunnels",
+        unhealthy,
+    );
+    write_scalar_gauge(
+        out,
+        "wpmulti_tunnels_dead",
+        "Number of dead tunnels (circuit breaker tripped 3 times; no longer probed or routed to)",
+        dead,
+    );
+}
+
 /// Generate Prometheus / OpenMetrics exposition format text for the given [`TunnelManager`].
 pub fn generate_prometheus_metrics(manager: &TunnelManager) -> String {
     let entries = manager.registry().all_entries();
     let total_tunnels = entries.len();
     let mut active_tunnels = 0;
     let mut active_conns_total = 0;
-    let (healthy_tunnels, unknown_tunnels, unhealthy_tunnels) = count_health_statuses(&entries);
+    let (healthy_tunnels, untested_tunnels, unhealthy_tunnels, dead_tunnels) =
+        count_health_statuses(&entries);
 
     for entry in &entries {
         if entry.is_active() {
@@ -92,23 +129,12 @@ pub fn generate_prometheus_metrics(manager: &TunnelManager) -> String {
         "Number of currently active tunnels",
         active_tunnels,
     );
-    write_scalar_gauge(
+    write_health_count_gauges(
         &mut out,
-        "wpmulti_tunnels_healthy",
-        "Number of healthy tunnels",
         healthy_tunnels,
-    );
-    write_scalar_gauge(
-        &mut out,
-        "wpmulti_tunnels_unknown",
-        "Number of tunnels that have never completed a successful handshake or probe",
-        unknown_tunnels,
-    );
-    write_scalar_gauge(
-        &mut out,
-        "wpmulti_tunnels_unhealthy",
-        "Number of unhealthy tunnels",
+        untested_tunnels,
         unhealthy_tunnels,
+        dead_tunnels,
     );
     write_scalar_gauge(
         &mut out,

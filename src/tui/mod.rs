@@ -9,7 +9,7 @@ pub mod logs;
 pub mod tests;
 pub mod ui;
 
-pub use app::{TuiApp, TuiDataSource, TuiProbeResult, TuiTab};
+pub use app::{TuiApp, TuiDataSource, TuiOverlay, TuiProbeResult, TuiTab};
 pub use config_editor::{ConfigApplyScope, ConfigDiffSummary, ConfigField, ConfigSaveReport};
 pub use logs::TuiLogBuffer;
 pub use ui::{format_bytes, render_dashboard, run_terminal_tui};

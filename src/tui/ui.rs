@@ -12,12 +12,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::{CrosstermBackend, TestBackend};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, Gauge, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Sparkline, Table, Tabs,
+    Axis, Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, Chart, Clear, Dataset, Gauge,
+    GraphType, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, Tabs,
 };
 use ratatui::{Frame, Terminal};
 
@@ -27,9 +28,9 @@ const TX_AMBER: Color = Color::Rgb(255, 184, 108);
 const MUTED_SLATE: Color = Color::Rgb(98, 114, 164);
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-use crate::core::TunnelState;
 use crate::core::health::HealthStatus;
-use crate::tui::app::{TuiApp, TuiTab};
+use crate::core::{TunnelState, TunnelSummary};
+use crate::tui::app::{TuiApp, TuiOverlay, TuiTab};
 use crate::tui::config_editor::{ConfigApplyScope, ConfigField};
 
 /// Format a byte count into a human-readable string (`B`, `KB`, `MB`, `GB`).
@@ -45,6 +46,67 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+/// Compact byte count for the "Top 5 Tunnels" bar values.
+///
+/// Ratatui only draws a bar's `text_value` when it fits the 7-cell bar
+/// width, so a value like "12.50 MB" (8 chars) silently vanishes once
+/// traffic grows. Precision shrinks with magnitude so the result never
+/// exceeds 7 chars ("1.23 MB", "12.3 MB", "123 MB", "1.00 GB");
+/// rounding that would push it over (e.g. 9.99 -> "10.00") steps down
+/// one more decimal.
+pub fn format_bytes_compact(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    const TB: u64 = 1024 * GB;
+    let (value, unit) = if bytes >= TB {
+        (bytes as f64 / TB as f64, "TB")
+    } else if bytes >= GB {
+        (bytes as f64 / GB as f64, "GB")
+    } else if bytes >= MB {
+        (bytes as f64 / MB as f64, "MB")
+    } else if bytes >= KB {
+        (bytes as f64 / KB as f64, "KB")
+    } else {
+        return format!("{bytes} B");
+    };
+    let two_decimals = format!("{value:.2} {unit}");
+    if value < 10.0 && two_decimals.len() <= 7 {
+        two_decimals
+    } else if value < 100.0 {
+        let one_decimal = format!("{value:.1} {unit}");
+        if one_decimal.len() <= 7 {
+            one_decimal
+        } else {
+            format!("{value:.0} {unit}")
+        }
+    } else {
+        format!("{value:.0} {unit}")
+    }
+}
+
+/// Human age of a Unix timestamp, for the tunnel detail popup
+/// ("12s ago", "3m ago", "2h ago", "5d ago"). `None` means the event
+/// never happened.
+pub fn format_ago(timestamp: Option<u64>) -> String {
+    let Some(ts) = timestamp else {
+        return "never".to_string();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let secs = now.saturating_sub(ts);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
     }
 }
 
@@ -179,6 +241,13 @@ pub fn draw_dashboard(f: &mut Frame<'_>, app: &mut TuiApp) {
     }
 
     draw_footer(f, app, footer_area);
+
+    // Overlays render last so they sit on top of the active tab.
+    match app.overlay {
+        TuiOverlay::Help => draw_help_popup(f, area),
+        TuiOverlay::TunnelDetail => draw_tunnel_detail_popup(f, app, area),
+        TuiOverlay::None => {}
+    }
 }
 
 fn draw_header_and_tabs(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
@@ -252,42 +321,79 @@ fn draw_header_and_tabs(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     f.render_widget(tabs, area);
 }
 
-fn draw_overview_sparklines(f: &mut Frame<'_>, app: &TuiApp, spark_col: Rect) {
-    let [rx_spark_area, tx_spark_area] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Length(4)])
-        .areas(spark_col);
-    let rx_data: Vec<u64> = app.rx_rates.iter().copied().collect();
-    let tx_data: Vec<u64> = app.tx_rates.iter().copied().collect();
+/// Bandwidth chart: RX and TX as two line series on one shared B/s
+/// axis. The two sparklines it replaces had no scale at all — the only
+/// numbers were the current rates in their titles — so a reader could
+/// not tell whether a spike was 1 KB/s or 1 GB/s. `Chart` draws a real
+/// Y axis with byte-rate labels; the block title keeps the live rates.
+fn draw_overview_chart(f: &mut Frame<'_>, app: &TuiApp, chart_col: Rect) {
+    let rx_points: Vec<(f64, f64)> = app
+        .rx_rates
+        .iter()
+        .enumerate()
+        .map(|(i, rate)| (i as f64, *rate as f64))
+        .collect();
+    let tx_points: Vec<(f64, f64)> = app
+        .tx_rates
+        .iter()
+        .enumerate()
+        .map(|(i, rate)| (i as f64, *rate as f64))
+        .collect();
+    let max_rate = app
+        .rx_rates
+        .iter()
+        .chain(app.tx_rates.iter())
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1);
 
-    let rx_spark = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(MUTED_SLATE))
-                .title(Span::styled(
-                    format!(" ▼ RX {}/s ", format_bytes(app.current_rx_bps)),
-                    Style::default().fg(RX_EMERALD).add_modifier(Modifier::BOLD),
-                )),
-        )
-        .data(&rx_data)
-        .style(Style::default().fg(RX_EMERALD));
-    let tx_spark = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(MUTED_SLATE))
-                .title(Span::styled(
-                    format!(" ▲ TX {}/s ", format_bytes(app.current_tx_bps)),
-                    Style::default().fg(TX_AMBER).add_modifier(Modifier::BOLD),
-                )),
-        )
-        .data(&tx_data)
-        .style(Style::default().fg(TX_AMBER));
-    f.render_widget(rx_spark, rx_spark_area);
-    f.render_widget(tx_spark, tx_spark_area);
+    // The Y labels sit evenly spaced from the bottom (first) to the top
+    // (last) of the axis, so [0, mid, max] lines up with bounds [0, max].
+    let y_labels = vec![
+        Span::raw(format_bytes_compact(0)),
+        Span::raw(format_bytes_compact(max_rate / 2)),
+        Span::raw(format_bytes_compact(max_rate)),
+    ];
+    let title = Line::from(vec![
+        Span::styled(
+            " ▼ RX ",
+            Style::default().fg(RX_EMERALD).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("{}/s ", format_bytes(app.current_rx_bps))),
+        Span::styled(
+            "▲ TX ",
+            Style::default().fg(TX_AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("{}/s ", format_bytes(app.current_tx_bps))),
+    ]);
+
+    let chart = Chart::new(vec![
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(RX_EMERALD))
+            .data(&rx_points),
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(TX_AMBER))
+            .data(&tx_points),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(MUTED_SLATE))
+            .title(title),
+    )
+    .x_axis(Axis::default().bounds([0.0, 64.0]))
+    .y_axis(
+        Axis::default()
+            .bounds([0.0, max_rate as f64])
+            .labels(y_labels),
+    );
+    f.render_widget(chart, chart_col);
 }
 
 /// Longest common prefix of the given strings, compared char by char.
@@ -326,7 +432,7 @@ pub(crate) fn short_bar_label(id: &str, common: &str) -> String {
 }
 
 fn draw_tunnels_overview(f: &mut Frame<'_>, app: &TuiApp, t_area: Rect) {
-    let [spark_col, bar_col, gauge_col] = Layout::default()
+    let [chart_col, bar_col, gauge_col] = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(42),
@@ -335,7 +441,7 @@ fn draw_tunnels_overview(f: &mut Frame<'_>, app: &TuiApp, t_area: Rect) {
         ])
         .areas(t_area);
 
-    draw_overview_sparklines(f, app, spark_col);
+    draw_overview_chart(f, app, chart_col);
 
     let top = app.top_tunnels(5);
     let ids: Vec<&str> = top.iter().map(|(id, _)| *id).collect();
@@ -346,7 +452,7 @@ fn draw_tunnels_overview(f: &mut Frame<'_>, app: &TuiApp, t_area: Rect) {
             Bar::default()
                 .value(*total)
                 .label(Line::from(short_bar_label(id, &common)))
-                .text_value(format_bytes(*total))
+                .text_value(format_bytes_compact(*total))
                 .style(Style::default().fg(ACCENT_CYAN))
         })
         .collect();
@@ -431,10 +537,11 @@ fn build_tunnel_table_rows(
                 (format!("{:?}", t.state), state_style(t.state))
             };
             let health_str = match t.health {
-                HealthStatus::Unknown => "Unknown",
+                HealthStatus::Untested => "Untested",
                 HealthStatus::Healthy => "Healthy",
                 HealthStatus::HalfOpen => "HalfOpen",
                 HealthStatus::Unhealthy => "Unhealthy",
+                HealthStatus::Dead => "Dead",
             };
             let mut cells = vec![
                 Cell::from(sanitize_terminal_text(&t.id)),
@@ -908,9 +1015,9 @@ fn draw_footer(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
             // it — before this, the only clue was "Tunnel 1 of 1" in the
             // table title and `Esc` silently did nothing.
             if app.search_query.is_empty() {
-                "1-5/Tab:Tabs  j/k:Nav  /:Search  s:Sort  a:Activate  d:Suspend  x:Toggle  X:Batch  r:Reload  q:Quit"
+                "?:Help  1-5/Tab:Tabs  j/k:Nav  /:Search  s:Sort  a:Activate  d:Suspend  x:Toggle  X:Batch  r:Reload  q:Quit"
             } else {
-                "1-5/Tab:Tabs  j/k:Nav  /:Search  Esc:Clear filter  s:Sort  a:Activate  d:Suspend  x:Toggle  X:Batch  r:Reload  q:Quit"
+                "?:Help  1-5/Tab:Tabs  j/k:Nav  /:Search  Esc:Clear filter  s:Sort  a:Activate  d:Suspend  x:Toggle  X:Batch  r:Reload  q:Quit"
             }
         }
         TuiTab::Logs => "1-5/Tab:Tabs  j/k:Scroll  f:Filter Level  c:Clear  q:Quit",
@@ -969,6 +1076,109 @@ fn draw_footer(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// Centered rectangle for popups: a fixed-size area clamped to the
+/// frame and centered with `Flex::Center`, so the popup adapts to any
+/// terminal size instead of being anchored to a corner.
+fn popup_area(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let [area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .areas(area);
+    area
+}
+
+/// Render a popup on top of the dashboard: `Clear` wipes the cells
+/// underneath so the popup does not smear over the table, then a
+/// bordered `Paragraph` carries the content. The size follows the
+/// content, so a short popup is small and a long one grows.
+fn draw_popup(f: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
+    let height = (lines.len() as u16).saturating_add(2);
+    let width = lines
+        .iter()
+        .map(|line| line.width() as u16)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(4);
+    let popup = popup_area(area, width, height);
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT_CYAN))
+                .title(Span::styled(
+                    format!(" {title} "),
+                    Style::default()
+                        .fg(ACCENT_CYAN)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        ),
+        popup,
+    );
+}
+
+fn help_popup_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(" 1-5 / Tab   switch tabs    j/k  move    PgUp/PgDn  page "),
+        Line::from(" Tunnels: / search · s sort · a activate · d suspend "),
+        Line::from("          x toggle disabled · X batch · r reload "),
+        Line::from("          Enter  tunnel details "),
+        Line::from(" Logs: f filter level · c clear "),
+        Line::from(" Config: Enter edit / cycle · w save + apply "),
+        Line::from(" Probe: p probe selected · P probe all "),
+        Line::from(" ? this help · q quit "),
+    ]
+}
+
+fn draw_help_popup(f: &mut Frame<'_>, area: Rect) {
+    draw_popup(f, area, "Help", help_popup_lines());
+}
+
+fn detail_popup_lines(tunnel: &TunnelSummary) -> Vec<Line<'static>> {
+    let endpoint = tunnel.endpoint.as_deref().unwrap_or("—");
+    let port = tunnel
+        .assigned_port
+        .map_or_else(|| "—".to_string(), |p| p.to_string());
+    vec![
+        Line::from(format!(" ID: {}", tunnel.id)),
+        Line::from(format!(
+            " State: {:?}  ·  Health: {:?}",
+            tunnel.state, tunnel.health
+        )),
+        Line::from(format!(
+            " Mode: {:?}  ·  Conns: {} active / {} total",
+            tunnel.mode, tunnel.active_conns, tunnel.total_conns
+        )),
+        Line::from(format!(
+            " RX: {}  ·  TX: {}",
+            format_bytes(tunnel.rx_bytes),
+            format_bytes(tunnel.tx_bytes)
+        )),
+        Line::from(format!(" Endpoint: {endpoint}")),
+        Line::from(format!(" Port: {port}")),
+        Line::from(format!(
+            " Last handshake: {}",
+            format_ago(tunnel.last_handshake)
+        )),
+    ]
+}
+
+fn draw_tunnel_detail_popup(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
+    let Some(tunnel) = app.selected_tunnel() else {
+        return;
+    };
+    draw_popup(f, area, "Tunnel Detail", detail_popup_lines(tunnel));
+}
+
 fn state_style(state: TunnelState) -> Style {
     match state {
         TunnelState::Active => Style::default().fg(Color::Green),
@@ -980,10 +1190,11 @@ fn state_style(state: TunnelState) -> Style {
 
 fn health_style(health: HealthStatus) -> Style {
     match health {
-        HealthStatus::Unknown => Style::default().fg(Color::Gray),
+        HealthStatus::Untested => Style::default().fg(Color::Gray),
         HealthStatus::Healthy => Style::default().fg(Color::Green),
         HealthStatus::HalfOpen => Style::default().fg(Color::Yellow),
         HealthStatus::Unhealthy => Style::default().fg(Color::Red),
+        HealthStatus::Dead => Style::default().fg(Color::Magenta),
     }
 }
 
@@ -1320,12 +1531,14 @@ async fn handle_tunnels_tab_key(app: &mut TuiApp, key: TuiKey) {
                 app.set_status(format!("Reload error: {e}"));
             }
         }
-        TuiKey::Char(_)
-        | TuiKey::Left
-        | TuiKey::Right
-        | TuiKey::Enter
-        | TuiKey::Backspace
-        | TuiKey::Tab => {}
+        // `Enter` opens the tunnel detail overlay for the selected row.
+        // It is a no-op when nothing is selected (empty daemon).
+        TuiKey::Enter => {
+            if app.selected_tunnel().is_some() {
+                app.overlay = TuiOverlay::TunnelDetail;
+            }
+        }
+        TuiKey::Char(_) | TuiKey::Left | TuiKey::Right | TuiKey::Backspace | TuiKey::Tab => {}
     }
 }
 
@@ -1445,7 +1658,24 @@ pub(crate) async fn handle_tui_key(app: &mut TuiApp, key: TuiKey) {
         return;
     }
 
+    // While an overlay is open it owns the keyboard: only its close
+    // keys do anything, so `q` closes the overlay instead of quitting
+    // and `j`/`k` do not move the selection underneath it.
+    if app.overlay == TuiOverlay::Help {
+        if matches!(key, TuiKey::Esc | TuiKey::Char('?' | 'q')) {
+            app.overlay = TuiOverlay::None;
+        }
+        return;
+    }
+    if app.overlay == TuiOverlay::TunnelDetail {
+        if matches!(key, TuiKey::Esc | TuiKey::Enter | TuiKey::Char('q')) {
+            app.overlay = TuiOverlay::None;
+        }
+        return;
+    }
+
     match key {
+        TuiKey::Char('?') => app.overlay = TuiOverlay::Help,
         TuiKey::Char('q') => app.running = false,
         TuiKey::Char('1') => app.set_tab(TuiTab::Tunnels),
         TuiKey::Char('2') => app.set_tab(TuiTab::Logs),
