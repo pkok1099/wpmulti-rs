@@ -393,8 +393,11 @@ impl ActiveProber {
         mut settings_rx: watch::Receiver<HealthCheckSettings>,
     ) {
         let mut interval = Self::make_interval(initial_interval);
-        // Skip the immediate initial tick to allow startup initialization
-        interval.tick().await;
+        // No initial-tick skip: the prober starts only after every eager
+        // tunnel is already booted (TunnelManager::start boots first),
+        // so there is nothing left to wait for. The first probe pass
+        // runs immediately — waiting a full probe_interval (30s) before
+        // proving a single tunnel is what made activation feel slow.
 
         loop {
             tokio::select! {
