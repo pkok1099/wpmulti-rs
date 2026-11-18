@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::{AuthMode, PoolStrategy};
@@ -345,7 +346,7 @@ pub(crate) async fn connect_via_router(
     };
 
     let mut last_err: Option<RouterConnectError> = None;
-    let mut tried_ids: Vec<String> = Vec::with_capacity(max_attempts);
+    let mut tried_ids: SmallVec<[String; MAX_POOL_FAILOVER_ATTEMPTS]> = SmallVec::new();
     let failover_deadline = tokio::time::Instant::now() + MAX_POOL_FAILOVER_BUDGET;
     for attempt in 0..max_attempts {
         if !within_failover_budget(attempt, failover_deadline) {

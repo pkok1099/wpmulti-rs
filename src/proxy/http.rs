@@ -54,9 +54,13 @@ fn decode_basic_auth_header(header_val: &str) -> Option<(String, String)> {
         .strip_prefix("Basic ")
         .or_else(|| header_val.strip_prefix("basic "))?;
     let decoded = base64::prelude::BASE64_STANDARD.decode(b64.trim()).ok()?;
-    let s = String::from_utf8(decoded).ok()?;
-    let (user, pass) = s.split_once(':')?;
-    Some((user.to_string(), pass.to_string()))
+    let mut s = String::from_utf8(decoded).ok()?;
+    // Split the single decoded buffer in place instead of copying
+    // user and password out of it (two extra allocations per request).
+    let idx = s.find(':')?;
+    let pass = s.split_off(idx + 1);
+    s.truncate(idx);
+    Some((s, pass))
 }
 
 /// Extracts and decodes RFC 7617 Basic credentials from `Proxy-Authorization` header.
@@ -146,10 +150,10 @@ fn validate_request_framing(headers: &[(String, String)]) -> io::Result<()> {
         }
         if name == "connection"
             && val.split(',').any(|t| {
-                matches!(
-                    t.trim().to_ascii_lowercase().as_str(),
-                    "content-length" | "transfer-encoding" | "host"
-                )
+                let t = t.trim();
+                t.eq_ignore_ascii_case("content-length")
+                    || t.eq_ignore_ascii_case("transfer-encoding")
+                    || t.eq_ignore_ascii_case("host")
             })
         {
             return Err(io::Error::new(
@@ -683,12 +687,15 @@ fn build_forward_request_head(
     path: &str,
     synthesized_host: Option<&str>,
 ) -> String {
-    let conn_tokens: Vec<String> = req
+    // Borrowed token slices: header names are already lowercased at
+    // parse time, so compare case-insensitively instead of allocating
+    // a lowercased String per token.
+    let conn_tokens: Vec<&str> = req
         .headers
         .iter()
         .filter(|(k, _)| k == "connection")
         .flat_map(|(_, v)| v.split(','))
-        .map(|t| t.trim().to_ascii_lowercase())
+        .map(str::trim)
         .filter(|t| !t.is_empty())
         .collect();
 
@@ -708,7 +715,9 @@ fn build_forward_request_head(
                 | "upgrade"
                 | "trailer"
         ) || (!matches!(k.as_str(), "content-length" | "transfer-encoding" | "host")
-            && conn_tokens.iter().any(|t| t == k))
+            && conn_tokens
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(k.as_str())))
         {
             continue;
         }
