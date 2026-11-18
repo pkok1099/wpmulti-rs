@@ -428,7 +428,7 @@ impl ListenerSupervisor {
                 self.started.store(false, Ordering::Relaxed);
             }
             drop(handles);
-        }
+        };
         if let Some(reg) = registry {
             for info in started {
                 if let Some(ref tid) = info.tunnel_id

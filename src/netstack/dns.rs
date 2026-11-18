@@ -36,7 +36,10 @@ pub enum DnsError {
 }
 
 // Standard RFC 1035 / RFC 3596 DNS record type acronyms (`A`, `AAAA`).
-#[allow(clippy::upper_case_acronyms)]
+#[allow(
+    clippy::upper_case_acronyms,
+    reason = "standard RFC 1035 / RFC 3596 DNS record type acronyms (A, AAAA)"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryType {
     A = 1,
@@ -124,9 +127,11 @@ pub fn parse_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)
     let rcode = flags & 0x000F;
     if rcode == 3 {
         return Err(DnsError::NxDomain);
-    } else if rcode != 0 {
+    }
+    if rcode != 0 {
         return Err(DnsError::ServerError(rcode));
     }
+    // rcode 0: no error, continue parsing.
 
     let qdcount = read_u16_be(buf, 4)? as usize;
     let ancount = read_u16_be(buf, 6)? as usize;
@@ -181,6 +186,8 @@ pub fn parse_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)
             // AAAA Record (IPv6)
             ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
             min_ttl = min_ttl.min(ttl);
+        } else {
+            // Other record types are ignored.
         }
     }
 

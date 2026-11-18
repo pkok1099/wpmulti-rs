@@ -11,7 +11,8 @@
     clippy::large_futures,
     clippy::type_complexity,
     clippy::wildcard_enum_match_arm,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    reason = "test builds: fixtures and helpers need looser lints"
 )]
 #![warn(clippy::too_many_lines, clippy::cognitive_complexity)]
 
@@ -151,8 +152,11 @@ async fn test_pairwise_f2_toml_and_f10_shared_listener_pools() {
     );
 
     // Router 1: public anonymous allowed
-    let router1 =
-        MultiTenantRouter::from_settings(&cfg.shared_listeners[0], lc.clone(), reg.clone());
+    let router1 = MultiTenantRouter::from_settings(
+        &cfg.shared_listeners[0],
+        Arc::clone(&lc),
+        Arc::clone(&reg),
+    );
     let sel_anon = router1.authenticate(None).expect("anonymous allowed");
     assert_eq!(sel_anon, TunnelSelector::DefaultPool);
 

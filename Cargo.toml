@@ -111,6 +111,9 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 
+# no silent lint suppression: every #[allow] must carry a reason
+allow_attributes_without_reason = "deny"
+
 # pedantic noise allowances (keep safety & structure strict)
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
@@ -122,6 +125,10 @@ cast_precision_loss = "allow"
 module_name_repetitions = "allow"
 
 # code hygiene & complexity
+# deny, bukan forbid: derive clap mengeluarkan #[allow(clippy::restriction)]
+# dan forbid + allow = E0453 (terverifikasi 18 Nov 2026 saat flip dicoba).
+# deny sudah menggagalkan build bila dilanggar; forbid hanya menambah
+# "tidak bisa di-override", yang justru bentrok dengan derive clap.
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
@@ -156,6 +163,7 @@ await_holding_refcell_ref = "deny"
 large_futures = "warn"
 
 # anti-crash & destructor safety
+# unwrap_used tetap deny (bukan forbid): alasan sama, lihat komentar di atas.
 unwrap_used = "deny"
 expect_used = "warn"
 panic = "warn"
@@ -167,6 +175,14 @@ mem_forget = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
 
-# unsafe
-undocumented_unsafe_blocks = "deny"
+# restriction — paket konsensus 18 Nov 2026 (debat clippy ronde 2)
+# 0 temuan: self_named_module_files, empty_structs_with_brackets, pub_without_shorthand
+# kecil: clone_on_ref_ptr (5), if_then_some_else_none (3), semicolon_outside_block (13), else_if_without_else (15)
+self_named_module_files = "warn"
+empty_structs_with_brackets = "warn"
+pub_without_shorthand = "warn"
+clone_on_ref_ptr = "warn"
+if_then_some_else_none = "warn"
+semicolon_outside_block = "warn"
+else_if_without_else = "warn"
 

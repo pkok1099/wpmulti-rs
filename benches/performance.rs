@@ -20,7 +20,8 @@
     clippy::type_complexity,
     clippy::wildcard_enum_match_arm,
     clippy::too_many_arguments,
-    clippy::print_stdout
+    clippy::print_stdout,
+    reason = "bench code: measurement harnesses need looser lints"
 )]
 #![warn(clippy::too_many_lines, clippy::cognitive_complexity)]
 

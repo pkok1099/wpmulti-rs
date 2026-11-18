@@ -166,6 +166,8 @@ fn apply_iface_ip_mode(
                         );
                     } else if local_v4.is_none() {
                         local_v4 = Some(v4.ip());
+                    } else {
+                        // Address stored and first IPv4 already recorded.
                     }
                 }
                 ipnetwork::IpNetwork::V6(v6) if ip_mode != crate::config::IpMode::Ipv4Only => {
@@ -177,6 +179,8 @@ fn apply_iface_ip_mode(
                         );
                     } else if local_v6.is_none() {
                         local_v6 = Some(v6.ip());
+                    } else {
+                        // Address stored and first IPv6 already recorded.
                     }
                 }
                 ipnetwork::IpNetwork::V4(_) | ipnetwork::IpNetwork::V6(_) => {}
@@ -834,8 +838,8 @@ impl Drop for ConnectSocketGuard {
                     sock.abort();
                     inner.sockets.remove(h);
                 }
-                inner.shutdown_wakers.remove(&h);
-            }
+                inner.shutdown_wakers.remove(&h)
+            };
             self.notify.notify_one();
         }
     }

@@ -219,7 +219,10 @@ pub(crate) const fn is_destination_caused_error(
     // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; the
     // destination-caused ones are listed explicitly and all others stay
     // tunnel-side failures.
-    #[allow(clippy::wildcard_enum_match_arm)]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "io::ErrorKind is non_exhaustive with ~40 variants; unlisted kinds stay tunnel-side failures"
+    )]
     match kind {
         io::ErrorKind::ConnectionRefused
         | io::ErrorKind::AddrNotAvailable

@@ -506,7 +506,10 @@ where
 /// unreachable instead (see `handle_connect` below).
 fn select_failure_rep(e: &io::Error) -> u8 {
     // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; map all others to general failure.
-    #[allow(clippy::wildcard_enum_match_arm)]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "io::ErrorKind is non_exhaustive with ~40 variants; map all others to general failure"
+    )]
     match e.kind() {
         io::ErrorKind::NotConnected => REP_NETWORK_UNREACHABLE,
         _ => REP_GENERAL_FAILURE,
@@ -533,45 +536,52 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         ));
     }
 
-    let mut tunnel_stream: DynStream =
-        match connect_via_router(&router, selector, &target, credentials).await {
-            Ok(s) => s,
-            Err(RouterConnectError::SelectTunnel(e)) => {
-                tracing::warn!("Failed to select tunnel for {:?}: {}", selector, e);
-                // A tunnel that cannot even be selected is a server-side
-                // failure: a bad name reports general failure, an empty pool
-                // reports network unreachable (see `select_failure_rep`).
-                let _ = send_socks5_reply(&mut stream, select_failure_rep(&e), dummy_addr).await;
-                return Err(e);
-            }
-            Err(RouterConnectError::ForbiddenDestination(e)) => {
-                let _ = send_socks5_reply(&mut stream, REP_CONN_NOT_ALLOWED, dummy_addr).await;
-                return Err(e);
-            }
-            Err(RouterConnectError::DnsResolution(e)) => {
-                let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
-                return Err(e);
-            }
-            Err(RouterConnectError::TcpConnect(e)) => {
-                // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; map all others to general failure.
-                #[allow(clippy::wildcard_enum_match_arm)]
-                let rep = match e.kind() {
-                    io::ErrorKind::ConnectionRefused => REP_CONN_REFUSED,
-                    // A timeout while connecting through a tunnel means the
-                    // peer never completed its WireGuard handshake, i.e. the
-                    // host is unreachable — not that a packet's TTL expired.
-                    // TTL expiry never applies to this userspace stack, and
-                    // reporting 0x04 here keeps the reply code stable for
-                    // the same failure (DNS failure already reports 0x04).
-                    io::ErrorKind::TimedOut | io::ErrorKind::AddrNotAvailable => {
-                        REP_HOST_UNREACHABLE
-                    }
-                    _ => REP_GENERAL_FAILURE,
-                };
-                let _ = send_socks5_reply(&mut stream, rep, dummy_addr).await;
-                return Err(e);
-            }
-        };
+    let mut tunnel_stream: DynStream = match connect_via_router(
+        &router,
+        selector,
+        &target,
+        credentials,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(RouterConnectError::SelectTunnel(e)) => {
+            tracing::warn!("Failed to select tunnel for {:?}: {}", selector, e);
+            // A tunnel that cannot even be selected is a server-side
+            // failure: a bad name reports general failure, an empty pool
+            // reports network unreachable (see `select_failure_rep`).
+            let _ = send_socks5_reply(&mut stream, select_failure_rep(&e), dummy_addr).await;
+            return Err(e);
+        }
+        Err(RouterConnectError::ForbiddenDestination(e)) => {
+            let _ = send_socks5_reply(&mut stream, REP_CONN_NOT_ALLOWED, dummy_addr).await;
+            return Err(e);
+        }
+        Err(RouterConnectError::DnsResolution(e)) => {
+            let _ = send_socks5_reply(&mut stream, REP_HOST_UNREACHABLE, dummy_addr).await;
+            return Err(e);
+        }
+        Err(RouterConnectError::TcpConnect(e)) => {
+            // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; map all others to general failure.
+            #[allow(
+                clippy::wildcard_enum_match_arm,
+                reason = "io::ErrorKind is non_exhaustive with ~40 variants; map all others to general failure"
+            )]
+            let rep = match e.kind() {
+                io::ErrorKind::ConnectionRefused => REP_CONN_REFUSED,
+                // A timeout while connecting through a tunnel means the
+                // peer never completed its WireGuard handshake, i.e. the
+                // host is unreachable — not that a packet's TTL expired.
+                // TTL expiry never applies to this userspace stack, and
+                // reporting 0x04 here keeps the reply code stable for
+                // the same failure (DNS failure already reports 0x04).
+                io::ErrorKind::TimedOut | io::ErrorKind::AddrNotAvailable => REP_HOST_UNREACHABLE,
+                _ => REP_GENERAL_FAILURE,
+            };
+            let _ = send_socks5_reply(&mut stream, rep, dummy_addr).await;
+            return Err(e);
+        }
+    };
 
     // Send SOCKS5 success reply
     send_socks5_reply(&mut stream, REP_SUCCESS, dummy_addr).await?;
@@ -750,6 +760,8 @@ async fn forward_client_udp_datagram(
             expected_ip
         );
         return;
+    } else {
+        // Source matches (or is not locked yet); accept the packet.
     }
 
     let Some((target_addr, payload)) = parse_socks5_udp_packet(packet) else {

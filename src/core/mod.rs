@@ -437,6 +437,8 @@ impl TunnelManager {
                 && let Err(e) = self.lifecycle.activate_tunnel(&id).await
             {
                 tracing::warn!("Failed to activate re-enabled eager tunnel '{}': {}", id, e);
+            } else {
+                // No state transition required for this entry.
             }
         }
         Ok(())
@@ -835,8 +837,8 @@ fn try_atomic_replace_blocking(path: &std::path::Path, data: &str) -> std::io::R
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
+        opts.mode(0o600)
+    };
     let mut file = opts.open(&tmp_path)?;
     if let Err(e) = write_and_sync_file(&mut file, data) {
         let _ = std::fs::remove_file(&tmp_path);
@@ -873,8 +875,8 @@ fn try_in_place_fallback_blocking(path: &std::path::Path, data: &str) -> std::io
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
+        opts.custom_flags(libc::O_NOFOLLOW)
+    };
     let mut file = opts.open(path)?;
     #[cfg(unix)]
     {

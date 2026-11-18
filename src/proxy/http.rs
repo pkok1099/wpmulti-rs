@@ -188,6 +188,8 @@ fn validate_request_framing(headers: &[(String, String)]) -> io::Result<()> {
                 ));
             }
             content_length = Some(parsed);
+        } else {
+            // Other headers are not framing headers.
         }
     }
 
@@ -678,6 +680,8 @@ async fn forward_request_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
         }
         upstream_write.flush().await?;
+    } else {
+        // No body to forward.
     }
     Ok(())
 }
@@ -752,6 +756,8 @@ async fn validate_target_host_before_routing<S: AsyncWrite + Unpin>(
             io::ErrorKind::InvalidInput,
             "invalid domain in proxy target",
         ));
+    } else {
+        // Valid domain; continue to routing.
     }
     Ok(literal_ip)
 }

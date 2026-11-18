@@ -945,6 +945,8 @@ fn draw_footer(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
+    } else {
+        // No status line to show.
     }
     if lines.is_empty() {
         lines.push(Line::from(""));
@@ -1145,7 +1147,10 @@ fn tab_at_column(col: usize) -> Option<TuiTab> {
 }
 
 // `crossterm::event::KeyCode` is a large external input enum; unmapped keys return `None`.
-#[allow(clippy::wildcard_enum_match_arm)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "crossterm KeyCode is a large external input enum; unmapped keys return None"
+)]
 const fn map_crossterm_key(code: KeyCode) -> Option<TuiKey> {
     match code {
         KeyCode::Char(c) => Some(TuiKey::Char(c)),

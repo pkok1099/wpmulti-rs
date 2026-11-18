@@ -1136,8 +1136,8 @@ async fn test_stack_live_ip_mode_widening_and_narrowing() {
     {
         let inner = stack.inner().lock();
         assert!(inner.iface.routes().get_default_ipv4_route().is_some());
-        assert!(inner.iface.routes().get_default_ipv6_route().is_some());
-    }
+        assert!(inner.iface.routes().get_default_ipv6_route().is_some())
+    };
     assert_eq!(udp_sock.send_to(b"ok", v4_udp_dst).await.unwrap(), 2);
 
     let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);

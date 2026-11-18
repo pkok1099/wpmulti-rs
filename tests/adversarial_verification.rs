@@ -11,7 +11,8 @@
     clippy::large_futures,
     clippy::type_complexity,
     clippy::wildcard_enum_match_arm,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    reason = "test builds: fixtures and helpers need looser lints"
 )]
 #![warn(clippy::too_many_lines, clippy::cognitive_complexity)]
 
@@ -498,8 +499,8 @@ async fn test_adv_raw_malformed_socks5_packets() {
             res.is_err(),
             "Expected error for SOCKS4 version, got {:?}",
             res
-        );
-    }
+        )
+    };
 
     // Subtest B: Nmethods = 0
     {
@@ -510,8 +511,8 @@ async fn test_adv_raw_malformed_socks5_packets() {
         let mut cl = client;
         cl.write_all(&[0x05, 0x00]).await.unwrap();
         let res = srv_task.await.unwrap();
-        assert!(res.is_err(), "Expected error for nmethods=0, got {:?}", res);
-    }
+        assert!(res.is_err(), "Expected error for nmethods=0, got {:?}", res)
+    };
 
     // Subtest C: Unsupported method offered (0x01 GSSAPI only) -> reply must be [0x05, 0xFF]
     {
@@ -525,8 +526,8 @@ async fn test_adv_raw_malformed_socks5_packets() {
         cl.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply, [0x05, 0xFF]);
         let res = srv_task.await.unwrap();
-        assert!(res.is_err());
-    }
+        assert!(res.is_err())
+    };
 
     // Subtest D: User/Pass authentication with bad password -> reply must be [0x01, 0x01]
     {
@@ -650,8 +651,8 @@ async fn test_adv_raw_malformed_http_requests() {
         let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
         assert!(resp_str.contains("400 Bad Request"));
         let res = srv_task.await.unwrap();
-        assert!(res.is_err());
-    }
+        assert!(res.is_err())
+    };
 
     // Subtest D: Non-CONNECT origin-form request (e.g. GET /index.html) -> must reply 400 Bad Request
     {

@@ -450,16 +450,8 @@ impl TunnelEntry {
             total_conns: self.stats.total_conns.load(Ordering::Relaxed),
             rx_bytes: self.stats.rx_bytes.load(Ordering::Relaxed),
             tx_bytes: self.stats.tx_bytes.load(Ordering::Relaxed),
-            last_handshake: if last_handshake > 0 {
-                Some(last_handshake)
-            } else {
-                None
-            },
-            last_active_at: if last_active > 0 {
-                Some(last_active)
-            } else {
-                None
-            },
+            last_handshake: (last_handshake > 0).then_some(last_handshake),
+            last_active_at: (last_active > 0).then_some(last_active),
             assigned_port: *self.assigned_port.read(),
             endpoint,
             health: self.health.current_status(),
@@ -553,8 +545,8 @@ impl TunnelRegistry {
                 return Err(CoreError::DuplicateTunnel(id));
             }
             inner.keys.push(id.clone());
-            inner.entries.insert(id, Arc::clone(&arc_entry));
-        }
+            inner.entries.insert(id, Arc::clone(&arc_entry))
+        };
         Ok(arc_entry)
     }
 

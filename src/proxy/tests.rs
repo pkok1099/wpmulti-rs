@@ -333,8 +333,8 @@ async fn test_socks5_rfc1929_auth_success_and_failure() {
         let mut a_resp = [0u8; 2];
         client.read_exact(&mut a_resp).await.unwrap();
         assert_eq!(a_resp[0], RFC1929_VERSION);
-        assert_ne!(a_resp[1], 0x00); // Non-zero failure
-    }
+        assert_ne!(a_resp[1], 0x00) // Non-zero failure
+    };
 
     // Case 2: Correct password -> Auth success (0x00)
     {
@@ -1269,8 +1269,8 @@ async fn test_http_basic_auth_challenge_and_success() {
 
         let (status, _, headers, _) = read_http_headers_helper(&mut client).await.unwrap();
         assert_eq!(status, 407);
-        assert!(headers.contains_key("proxy-authenticate"));
-    }
+        assert!(headers.contains_key("proxy-authenticate"))
+    };
 
     // Case 2: Wrong credentials -> 407
     {
@@ -1288,8 +1288,8 @@ async fn test_http_basic_auth_challenge_and_success() {
         client.write_all(req.as_bytes()).await.unwrap();
 
         let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
-        assert_eq!(status, 407);
-    }
+        assert_eq!(status, 407)
+    };
 
     // Case 3: Valid credentials -> 200 OK
     {

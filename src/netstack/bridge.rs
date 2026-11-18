@@ -170,15 +170,10 @@ impl Device for VirtualTunBridge {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        if self.tx_sender.capacity() > 0 {
-            Some(VirtualTunTxToken {
-                tx_sender: &self.tx_sender,
-                packet_pool: self.packet_pool.clone(),
-            })
-        } else {
-            // Infallible token rule in smoltcp 0.14: return None to retain socket TX queue
-            None
-        }
+        (self.tx_sender.capacity() > 0).then(|| VirtualTunTxToken {
+            tx_sender: &self.tx_sender,
+            packet_pool: self.packet_pool.clone(),
+        })
     }
 }
 

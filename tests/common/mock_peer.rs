@@ -216,7 +216,7 @@ impl MockPeerContext {
             self.preshared_key,
             None,
             self.index_table.clone(),
-            self.rate_limiter.clone(),
+            Arc::clone(&self.rate_limiter),
         );
 
         if let TunnResult::WriteToNetwork(WgKind::HandshakeResp(resp)) =

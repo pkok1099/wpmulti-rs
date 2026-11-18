@@ -1,5 +1,11 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
+#![allow(
+    dead_code,
+    reason = "shared test helpers used by only some test targets"
+)]
+#![allow(
+    unused_imports,
+    reason = "shared test helpers used by only some test targets"
+)]
 
 pub mod admin_client;
 pub mod fixtures;

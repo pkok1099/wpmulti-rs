@@ -11,7 +11,8 @@
     clippy::large_futures,
     clippy::type_complexity,
     clippy::wildcard_enum_match_arm,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    reason = "test builds: fixtures and helpers need looser lints"
 )]
 #![warn(clippy::too_many_lines, clippy::cognitive_complexity)]
 
@@ -654,6 +655,8 @@ async fn test_admin_client_driver() {
                     body
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
+            } else {
+                // Unknown path: no response, the connection just closes.
             }
         }
     });

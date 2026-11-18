@@ -532,6 +532,8 @@ async fn build_probe_peers(config: &TunnelConfig, timeout: Duration) -> Vec<gota
             tokio::time::timeout(timeout, tokio::net::lookup_host(&p_cfg.endpoint)).await
         {
             peer.endpoint = addrs.next();
+        } else {
+            // Endpoint unresolvable; leave peer.endpoint as None.
         }
         peer.allowed_ips = p_cfg.allowed_ips.clone();
         peer.preshared_key = p_cfg.preshared_key;

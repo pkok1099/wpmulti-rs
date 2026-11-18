@@ -11,7 +11,8 @@
     clippy::large_futures,
     clippy::type_complexity,
     clippy::wildcard_enum_match_arm,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    reason = "test builds: fixtures and helpers need looser lints"
 )]
 #![warn(clippy::too_many_lines, clippy::cognitive_complexity)]
 
@@ -192,7 +193,8 @@ async fn test_scenario_2_shared_port_multi_user_socks5_and_http() {
         pool: TunnelPoolSelection::All,
         ip_mode: None,
     };
-    let s5_router = MultiTenantRouter::from_settings(&s5_settings, lc.clone(), reg.clone());
+    let s5_router =
+        MultiTenantRouter::from_settings(&s5_settings, Arc::clone(&lc), Arc::clone(&reg));
 
     // HTTP shared listener with least-conn default
     let http_settings = SharedListenerSettings {

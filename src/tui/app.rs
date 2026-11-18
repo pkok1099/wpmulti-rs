@@ -213,6 +213,8 @@ pub(crate) async fn admin_http_request_with_body(
         );
     } else if method == "POST" {
         req.push_str("Content-Length: 0\r\n");
+    } else {
+        // No body and not POST: no Content-Length header.
     }
     if let Some(token) = auth_token {
         let _ =
@@ -1101,6 +1103,8 @@ impl TuiApp {
             self.scroll_offset = 0;
         } else if self.selected_index >= self.filtered_indices.len() {
             self.selected_index = self.filtered_indices.len() - 1;
+        } else {
+            // Selection already within bounds.
         }
     }
 
@@ -1364,6 +1368,8 @@ impl TuiApp {
             self.scroll_offset = self.selected_index;
         } else if self.selected_index >= self.scroll_offset + viewport_height {
             self.scroll_offset = self.selected_index + 1 - viewport_height;
+        } else {
+            // Selected row already visible.
         }
     }
 }

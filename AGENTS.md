@@ -37,7 +37,8 @@ Requires the `llvm-tools` rustup component (`rustup component add llvm-tools-pre
   - Max cognitive complexity: `20`
   - Max function arguments: `6` (group related args into a struct or tuple)
   - Max `bool` parameters per function: `2` (use a small options struct or enum)
-  - No `#[allow(clippy::...)]` in production code unless genuinely unavoidable (e.g. RFC acronym like `AAAA`) with a brief comment explaining why.
+  - No `#[allow(clippy::...)]` in production code unless genuinely unavoidable (e.g. RFC acronym like `AAAA`); every `#[allow]` must carry `reason = "..."` — enforced by `allow_attributes_without_reason = "deny"` (deny, not forbid: clap derive macros emit a bare `#[allow(clippy::restriction)]` that forbid turns into a hard E0453). Never add an `#[allow]` to silence a lint; fix the code instead.
+- Do not edit `Cargo.toml`, `clippy.toml`, or `rustfmt.toml` without the operator's explicit permission.
 
 ## 3. Code Organization & Module Boundaries
 Keep each module focused and single-purpose:
