@@ -1098,7 +1098,13 @@ async fn test_f11_bnd_rapid_activate_suspend_cycles() {
 // =============================================================================
 
 #[tokio::test]
-async fn test_f12_bnd_admin_missing_bearer_token_returns_401() {
+async fn test_f12_bnd_admin_loopback_needs_no_bearer_token() {
+    // A loopback client (`wpmulti top` on the same machine) reads a
+    // running daemon without a password, even when the daemon has a
+    // token configured: the token gates remote peers, not the local
+    // operator. The 401-for-missing-token boundary still holds for
+    // non-loopback peers (covered at the `handle_admin_request` level
+    // in `src/api/tests.rs`).
     let port = allocate_ephemeral_port();
     let mut config = MainConfig::default();
     config.admin.enabled = true;
@@ -1115,7 +1121,7 @@ async fn test_f12_bnd_admin_missing_bearer_token_returns_401() {
 
     let client = AdminTestClient::new(bound, None);
     let res = client.get_health().await;
-    assert!(res.is_err());
+    assert!(res.is_ok(), "loopback without a token must be allowed");
 
     server.stop().await;
 }
@@ -1211,7 +1217,7 @@ async fn test_f12_bnd_admin_metric_not_found() {
 
 #[test]
 fn test_f13_bnd_tui_empty_tunnel_list_no_panic() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -1227,7 +1233,7 @@ fn test_f13_bnd_tui_empty_tunnel_list_no_panic() {
 
 #[test]
 fn test_f13_bnd_tui_search_query_no_matches() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -1260,7 +1266,7 @@ fn test_f13_bnd_tui_search_query_no_matches() {
 
 #[test]
 fn test_f13_bnd_tui_scroll_past_bounds() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -1306,7 +1312,7 @@ fn test_f13_bnd_tui_format_bytes_extreme_values() {
 
 #[test]
 fn test_f13_bnd_tui_zero_size_terminal_rendering() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };

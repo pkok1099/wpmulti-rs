@@ -18,7 +18,6 @@ fn test_cli_parse_run_defaults() {
         Commands::Run {
             config: None,
             dir: None,
-            tui: false,
         }
     );
 }
@@ -32,7 +31,6 @@ fn test_cli_parse_run_options() {
         "/etc/wpmulti/wpmulti.toml",
         "--dir",
         "/etc/wireguard",
-        "--tui",
     ];
     let cli = Cli::try_parse_from(args).expect("parse run with options");
     assert_eq!(
@@ -40,7 +38,6 @@ fn test_cli_parse_run_options() {
         Commands::Run {
             config: Some(PathBuf::from("/etc/wpmulti/wpmulti.toml")),
             dir: Some(PathBuf::from("/etc/wireguard")),
-            tui: true,
         }
     );
 }
@@ -437,14 +434,14 @@ async fn test_cli_probe_empty_dir_json_returns_empty_results() {
 #[tokio::test]
 async fn test_cmd_run_refuses_zero_tunnels() {
     let dir = tempfile::tempdir().unwrap();
-    let err = cmd_run(None, Some(dir.path().to_path_buf()), false)
+    let err = cmd_run(None, Some(dir.path().to_path_buf()))
         .await
         .expect_err("run with 0 tunnels must fail");
     assert!(err.to_string().contains("0 tunnels"), "error was: {err}");
 
     // A missing tunnel directory refuses the same way.
     let missing = dir.path().join("does-not-exist");
-    let err = cmd_run(None, Some(missing), false)
+    let err = cmd_run(None, Some(missing))
         .await
         .expect_err("run with missing dir must fail");
     assert!(err.to_string().contains("0 tunnels"), "error was: {err}");

@@ -199,6 +199,16 @@ fn draw_header_and_tabs(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     };
     let title = if area.width < 60 {
         format!(" {} wpmulti v{} ", spinner, env!("CARGO_PKG_VERSION"))
+    } else if app.data_source_error.is_some() {
+        // A dead data source must not look like a healthy daemon with
+        // no tunnels: show unknown counts, not 0. The footer carries
+        // the error itself.
+        format!(
+            " {} {} wpmulti v{} | Tunnels: ? | Conns: ? (data source error) ",
+            spinner,
+            live_dot,
+            env!("CARGO_PKG_VERSION"),
+        )
     } else {
         format!(
             " {} {} wpmulti v{} | Tunnels: {} ({} active) | Conns: {} ",
@@ -575,7 +585,7 @@ fn draw_logs_tab(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         .map_or_else(
             || {
                 vec![Line::from(Span::styled(
-                    "No logs captured yet (live logs are captured in `wpmulti run --tui`).",
+                    "No logs captured yet (the daemon keeps a ring buffer; `top` reads it via the Admin API).",
                     Style::default().fg(Color::DarkGray),
                 ))]
             },

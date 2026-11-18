@@ -467,18 +467,9 @@ impl ConfigField {
     }
 
     /// Parse and assign a text value into `cfg`, preserving redacted secrets when untouched.
+    /// The TUI always talks to the daemon over HTTP, so redacted sentinels are retained
+    /// cleanly and `POST /config` merges stored server secrets without overwriting them.
     pub fn apply_text(self, cfg: &mut MainConfig, raw: &str) -> Result<(), String> {
-        self.apply_text_with_mode(cfg, raw, false)
-    }
-
-    /// Parse and assign a text value into `cfg`; in `is_remote` mode retains redacted sentinels
-    /// cleanly so `POST /config` merges stored server secrets without overwriting them.
-    pub fn apply_text_with_mode(
-        self,
-        cfg: &mut MainConfig,
-        raw: &str,
-        is_remote: bool,
-    ) -> Result<(), String> {
         let trimmed = raw.trim();
         match self {
             Self::GlobalConfigDir => apply_config_dir(cfg, trimmed),
@@ -514,8 +505,8 @@ impl ConfigField {
                 cfg.per_tunnel.base_http_port = parse_optional_port(trimmed)?;
                 Ok(())
             }
-            Self::PerTunnelOverrides => apply_overrides_json(cfg, trimmed, is_remote),
-            Self::SharedListeners => apply_listeners_json(cfg, trimmed, is_remote),
+            Self::PerTunnelOverrides => apply_overrides_json(cfg, trimmed),
+            Self::SharedListeners => apply_listeners_json(cfg, trimmed),
             Self::AdminBind => {
                 cfg.admin.bind = parse_socket_addr(trimmed)?;
                 Ok(())
@@ -891,11 +882,7 @@ fn find_listener_for_secret<'a>(
         })
 }
 
-fn apply_overrides_json(
-    cfg: &mut MainConfig,
-    trimmed: &str,
-    is_remote: bool,
-) -> Result<(), String> {
+fn apply_overrides_json(cfg: &mut MainConfig, trimmed: &str) -> Result<(), String> {
     let mut parsed: HashMap<String, TunnelPortOverride> = serde_json::from_str(trimmed)
         .map_err(|e| format!("Invalid JSON for per_tunnel.overrides: {e}"))?;
     for (id, entry) in &mut parsed {
@@ -911,12 +898,10 @@ fn apply_overrides_json(
                 .and_then(|old| old.password.clone());
             if prev.is_some() {
                 entry.password = prev;
-            } else if is_remote {
-                entry.password = Some(REDACTED_PLACEHOLDER.to_string());
             } else {
-                return Err(format!(
-                    "Provide an explicit password for override '{id}' instead of {REDACTED_PLACEHOLDER}"
-                ));
+                // No stored secret for this override: keep the placeholder so
+                // `POST /config` leaves the server-side secret untouched.
+                entry.password = Some(REDACTED_PLACEHOLDER.to_string());
             }
         }
     }
@@ -924,11 +909,7 @@ fn apply_overrides_json(
     Ok(())
 }
 
-fn apply_listeners_json(
-    cfg: &mut MainConfig,
-    trimmed: &str,
-    is_remote: bool,
-) -> Result<(), String> {
+fn apply_listeners_json(cfg: &mut MainConfig, trimmed: &str) -> Result<(), String> {
     let mut parsed: Vec<SharedListenerSettings> = serde_json::from_str(trimmed)
         .map_err(|e| format!("Invalid JSON for shared_listeners: {e}"))?;
     for listener in &mut parsed {
@@ -941,13 +922,10 @@ fn apply_listeners_json(
                 .and_then(|old| old.global_password.clone());
             if prev.is_some() {
                 listener.global_password = prev;
-            } else if is_remote {
-                listener.global_password = Some(REDACTED_PLACEHOLDER.to_string());
             } else {
-                return Err(format!(
-                    "Provide an explicit global_password for listener '{}' instead of {REDACTED_PLACEHOLDER}",
-                    listener.name
-                ));
+                // No stored secret for this listener: keep the placeholder so
+                // `POST /config` leaves the server-side secret untouched.
+                listener.global_password = Some(REDACTED_PLACEHOLDER.to_string());
             }
         }
     }

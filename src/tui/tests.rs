@@ -60,6 +60,31 @@ fn make_dummy_summary(
     }
 }
 
+/// Start a real Admin API server for `mgr` on a loopback ephemeral port
+/// and return it together with a [`TuiDataSource`] pointing at it. This
+/// is how `top` talks to a running daemon, so TUI tests that need a live
+/// data source use this. Keep the returned server alive for the whole
+/// test; dropping it stops the API.
+async fn remote_data_source_for(
+    mgr: &Arc<TunnelManager>,
+    auth_token: Option<String>,
+) -> (crate::api::AdminServer, TuiDataSource) {
+    use crate::api::AdminServer;
+    let server = AdminServer::new(
+        "127.0.0.1:0".parse().expect("addr"),
+        Arc::clone(mgr),
+        auth_token.clone(),
+    );
+    let addr = server.start().await.expect("start admin");
+    (
+        server,
+        TuiDataSource {
+            admin_url: format!("http://{addr}"),
+            auth_token,
+        },
+    )
+}
+
 #[test]
 fn test_tui_format_bytes() {
     assert_eq!(format_bytes(500), "500 B");
@@ -70,7 +95,7 @@ fn test_tui_format_bytes() {
 
 #[test]
 fn test_tui_app_initial_state_and_navigation() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -119,7 +144,7 @@ async fn test_tui_refresh_records_unreachable_admin_api_error() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let dead_port = listener.local_addr().unwrap().port();
     drop(listener);
-    let source = TuiDataSource::Remote {
+    let source = TuiDataSource {
         admin_url: format!("http://127.0.0.1:{dead_port}"),
         auth_token: None,
     };
@@ -147,7 +172,7 @@ async fn test_tui_refresh_records_unreachable_admin_api_error() {
 
 #[test]
 fn test_tui_search_filtering() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -184,7 +209,7 @@ fn test_tui_search_filtering() {
 async fn test_tui_search_filter_can_be_cleared() {
     use crate::tui::ui::{TuiKey, handle_tui_key};
 
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -244,7 +269,7 @@ async fn test_tui_remote_logs_clear_sticks_across_refresh() {
     use crate::tui::TuiTab;
     use crate::tui::ui::{TuiKey, handle_tui_key};
 
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -292,7 +317,7 @@ async fn test_tui_remote_logs_clear_sticks_across_refresh() {
 
 #[test]
 fn test_tui_sorting() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -323,7 +348,7 @@ fn test_tui_sorting() {
 
 #[test]
 fn test_tui_render_dashboard_ansi() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -346,7 +371,7 @@ fn test_tui_render_dashboard_ansi() {
 
 #[test]
 fn test_tui_render_dashboard_shows_unknown_health() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -365,13 +390,14 @@ fn test_tui_render_dashboard_shows_unknown_health() {
 }
 
 #[tokio::test]
-async fn test_tui_in_process_activation_and_suspension() {
+async fn test_tui_remote_activation_and_suspension() {
     let mut config = MainConfig::default();
     config.per_tunnel.enabled = false;
     let tunnels = vec![make_test_tunnel_config("t-alpha", "127.0.0.1:51820")];
     let mgr = Arc::new(TunnelManager::new(config, tunnels).unwrap());
+    let (_server, source) = remote_data_source_for(&mgr, None).await;
 
-    let mut app = TuiApp::new(TuiDataSource::InProcess(Arc::clone(&mgr)), TuiSortField::Id);
+    let mut app = TuiApp::new(source, TuiSortField::Id);
     app.refresh().await.expect("initial refresh");
 
     assert_eq!(app.tunnels.len(), 1);
@@ -428,7 +454,7 @@ fn test_render_dashboard_small_terminal_auto_resize() {
     use crate::tui::ui::render_dashboard;
 
     let mut app = TuiApp::new(
-        TuiDataSource::Remote {
+        TuiDataSource {
             admin_url: "http://127.0.0.1:9090".to_string(),
             auth_token: None,
         },
@@ -495,7 +521,7 @@ fn test_multi_tab_switching_logs_and_rendering() {
     assert_eq!(log_buf.snapshot().len(), 3);
 
     let mut app = TuiApp::new(
-        TuiDataSource::Remote {
+        TuiDataSource {
             admin_url: "http://127.0.0.1:9090".to_string(),
             auth_token: None,
         },
@@ -545,7 +571,7 @@ fn test_multi_tab_switching_logs_and_rendering() {
 #[test]
 fn test_tui_disabled_badge_renders() {
     let mut app = TuiApp::new(
-        TuiDataSource::Remote {
+        TuiDataSource {
             admin_url: "http://127.0.0.1:9090".to_string(),
             auth_token: None,
         },
@@ -605,7 +631,7 @@ fn test_tui_config_covers_100_percent_main_config_fields_and_renders_badges() {
     let mut cfg = MainConfig::default();
     cfg.admin.auth_token = Some("super-secret-admin-token".to_string());
     let mut app = TuiApp::new(
-        TuiDataSource::Remote {
+        TuiDataSource {
             admin_url: "http://127.0.0.1:9090".to_string(),
             auth_token: None,
         },
@@ -640,7 +666,7 @@ async fn test_tui_config_all_editors_secret_preservation_and_validation() {
     use crate::config::{
         AuthMode, ListenerType, SharedListenerSettings, TunnelPoolSelection, TunnelPortOverride,
     };
-    use crate::tui::ConfigField;
+    use crate::tui::{ConfigField, TuiTab};
 
     let temp = tempfile::TempDir::new().expect("temp dir");
     let toml_path = temp.path().join("wpmulti.toml");
@@ -672,8 +698,12 @@ async fn test_tui_config_all_editors_secret_preservation_and_validation() {
     std::fs::write(&toml_path, &initial_toml).expect("write initial toml");
 
     let mgr = Arc::new(TunnelManager::new(cfg, Vec::new()).expect("mgr"));
-    let mut app = TuiApp::new(TuiDataSource::InProcess(Arc::clone(&mgr)), TuiSortField::Id)
-        .with_config_path(toml_path.clone());
+    let (_server, source) =
+        remote_data_source_for(&mgr, Some("admin-keep-secret".to_string())).await;
+    let mut app = TuiApp::new(source, TuiSortField::Id).with_config_path(toml_path.clone());
+    // Load the (redacted) config from the daemon before editing.
+    app.set_tab(TuiTab::Config);
+    app.refresh().await.expect("load config");
 
     // Editing auth_token starts with [KEEP], never raw secret
     select_config_field(&mut app, ConfigField::AdminAuthToken);
@@ -875,9 +905,11 @@ async fn test_tui_config_live_hot_reload_and_restart_warning_e2e() {
         Arc::clone(mgr.registry()),
     );
 
-    let mut app = TuiApp::new(TuiDataSource::InProcess(Arc::clone(&mgr)), TuiSortField::Id)
-        .with_config_path(toml_path.clone());
+    let (_server, source) = remote_data_source_for(&mgr, None).await;
+    let mut app = TuiApp::new(source, TuiSortField::Id).with_config_path(toml_path.clone());
     app.set_tab(TuiTab::Config);
+    // Load the config from the daemon before editing.
+    app.refresh().await.expect("load config");
     apply_live_test_edits(&mut app).await;
 
     let report = app
@@ -1042,9 +1074,11 @@ async fn test_tui_restart_edit_stays_staged_until_save() {
     let mgr = Arc::new(TunnelManager::new(cfg.clone(), tunnels).expect("mgr"));
     mgr.set_config_path(toml_path.clone());
 
-    let mut app = TuiApp::new(TuiDataSource::InProcess(Arc::clone(&mgr)), TuiSortField::Id)
-        .with_config_path(toml_path.clone());
+    let (_server, source) = remote_data_source_for(&mgr, None).await;
+    let mut app = TuiApp::new(source, TuiSortField::Id).with_config_path(toml_path.clone());
     app.set_tab(TuiTab::Config);
+    // Load the config from the daemon before editing.
+    app.refresh().await.expect("load config");
 
     // Stage a [RESTART] change (info -> warn) without saving.
     select_config_field(&mut app, ConfigField::GlobalLogLevel);
@@ -1141,7 +1175,7 @@ fn test_tui_config_editor_handles_server_redaction_sentinels() {
 
     for sentinel in ["[KEEP]", "[REDACTED]", "[SET]", "***REDACTED***"] {
         ConfigField::AdminAuthToken
-            .apply_text_with_mode(&mut cfg, sentinel, true)
+            .apply_text(&mut cfg, sentinel)
             .expect("sentinel tolerated");
         assert_eq!(cfg.admin.auth_token.as_deref(), Some("[REDACTED]"));
     }
@@ -1150,7 +1184,7 @@ fn test_tui_config_editor_handles_server_redaction_sentinels() {
         .initial_edit_buffer(&cfg)
         .replace("1080", "1085");
     ConfigField::SharedListeners
-        .apply_text_with_mode(&mut cfg, &listener_buf, true)
+        .apply_text(&mut cfg, &listener_buf)
         .expect("remote listener sentinel");
     assert_eq!(
         cfg.shared_listeners[0].global_password.as_deref(),
@@ -1159,10 +1193,9 @@ fn test_tui_config_editor_handles_server_redaction_sentinels() {
     assert_eq!(cfg.shared_listeners[0].bind.port(), 1085);
 
     ConfigField::PerTunnelOverrides
-        .apply_text_with_mode(
+        .apply_text(
             &mut cfg,
             r#"{"t1":{"socks5_port":10002,"http_port":null,"password":"[KEEP]"}}"#,
-            true,
         )
         .expect("remote override sentinel");
     assert_eq!(
@@ -1230,7 +1263,7 @@ async fn test_tui_remote_http_config_preserves_redacted_secrets_and_auth() {
     let addr = server.start().await.expect("start admin");
 
     let mut app = TuiApp::new(
-        TuiDataSource::Remote {
+        TuiDataSource {
             admin_url: format!("http://{addr}"),
             auth_token: Some("remote-tok-123".to_string()),
         },

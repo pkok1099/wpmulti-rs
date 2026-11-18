@@ -95,7 +95,7 @@ impl AdminServer {
                     }
                     res = listener.accept() => {
                         match res {
-                            Ok((stream, _peer_addr)) => {
+                            Ok((stream, peer_addr)) => {
                                 let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
                                     tracing::warn!("Admin server connection limit ({}) reached; dropping connection", MAX_ADMIN_CONNS);
                                     drop(stream);
@@ -105,7 +105,14 @@ impl AdminServer {
                                 let tok = auth_token.clone();
                                 client_tasks.spawn(async move {
                                     let _permit = permit;
-                                    handle_client_connection(stream, m, tok.as_deref(), start_time).await;
+                                    handle_client_connection(
+                                        stream,
+                                        peer_addr,
+                                        m,
+                                        tok.as_deref(),
+                                        start_time,
+                                    )
+                                    .await;
                                 });
                             }
                             Err(e) => {
@@ -343,6 +350,7 @@ async fn read_admin_request_body<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
 async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
+    peer_addr: SocketAddr,
     manager: Arc<TunnelManager>,
     auth_token: Option<&str>,
     start_time: Instant,
@@ -368,10 +376,29 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let uptime_secs = start_time.elapsed().as_secs();
 
     let dynamic_token = manager.config_snapshot().admin.auth_token;
-    let effective_auth_token = dynamic_token.as_deref().or(auth_token);
 
     let response = match parse_http_request(&buf) {
-        Ok(req) => handle_admin_request(&req, &manager, effective_auth_token, uptime_secs).await,
+        Ok(req) => {
+            // A loopback connection that sends no bearer token is the
+            // daemon's own operator (`wpmulti top` on the same machine):
+            // it needs no token even when one is configured, so `top`
+            // reads a running daemon without a password. A token still
+            // gates every non-loopback peer, and a loopback client that
+            // *does* send a token is validated normally. The Host-header
+            // check in `handle_admin_request` still applies to the
+            // unauthenticated path (DNS-rebinding guard).
+            let effective_auth_token = if peer_addr.ip().is_loopback()
+                && !req.headers.contains_key("authorization")
+            {
+                tracing::debug!(
+                    "Admin API: loopback connection from {peer_addr} without a token, no auth required"
+                );
+                None
+            } else {
+                dynamic_token.as_deref().or(auth_token)
+            };
+            handle_admin_request(&req, &manager, effective_auth_token, uptime_secs).await
+        }
         Err(e) => HttpResponse::bad_request(&e),
     };
 

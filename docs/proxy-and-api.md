@@ -123,16 +123,13 @@ curl -x http://random@127.0.0.1:8080 https://ifconfig.co
 
 ---
 
-## 2. Interactive TUI Monitor (`wpmulti top` / `--tui`)
+## 2. Interactive TUI Monitor (`wpmulti top`)
 
-Launch integrated with the daemon:
-```bash
-wpmulti run -c wpmulti.toml --tui
-```
-Or attach remotely to a running daemon (requires `[admin] enabled = true`):
+Attach to a running daemon (requires `[admin] enabled = true`):
 ```bash
 wpmulti top --admin-url http://127.0.0.1:9090
 ```
+A loopback Admin API needs no token, so `wpmulti top` on the same machine just works.
 
 ### Tabs
 
@@ -142,7 +139,7 @@ The TUI has five tabs. Switch with `1`–`5`, `Tab` / `→` for the next tab, `�
 - **2: Logs** — the daemon's recent log lines, color-coded by level (ERROR red, WARN yellow, INFO green, DEBUG cyan). Keys: `j`/`k` scroll, `f` cycles the level filter (ALL → ERROR → WARN → INFO → DEBUG), `c` clears the visible log buffer. The clear sticks in both modes: in remote `top` the lines cleared stay gone and only lines logged after the clear reappear on refresh.
 - **3: Listeners** — every active listener: NAME, TYPE, ADDRESS, MODE (Shared or Dedicated), TUNNEL. Keys: `j`/`k` scroll.
 - **4: Config** — the daemon's runtime configuration as an editable table (SCOPE, SETTING, VALUE, ACTION). Each row is tagged `Live` (applies immediately) or `Restart` (needs a daemon restart). Keys: `j`/`k` or `PgUp`/`PgDn`/`Home`/`End` move, `Enter` or `Space` edits/cycles the selected value, `w` saves and applies. While a text value is being edited, `Enter` confirms the new value and `Esc` cancels it; every other key, including `q`, types into the editor (the footer says so while editing). The title shows the config source (file path, or `remote/in-memory`), plus how many rows are unsaved and how many are restart-pending. A `[RESTART]` edit is only *staged* when you press `Enter`: it changes nothing on the daemon (or in its file) until you press `w`, and quitting with `q` discards it — a later `[LIVE]` edit never drags a staged restart value along with it. The `shared_listener` row shows a one-line summary per listener (name, type, `anon`/`auth`, pool strategy, bind address — in that order, so the informative tokens survive the cut in a narrow terminal); press `Enter` on it to see and edit the full per-listener JSON (passwords redacted), including `allow_anonymous`, `default_strategy`, `pool`, and `auth_mode`. A long value being edited shows its *tail* (the end, where the cursor is) instead of being cut off at the right edge — the editor is append-only, so what you type is always visible.
-- **5: Probe** — handshake probe results (TUNNEL, ENDPOINT, STATUS, RTT, MESSAGE). Keys: `p` probes the selected tunnel, `P` probes all tunnels, `j`/`k` scroll. A probe is a real WireGuard handshake check in both `run --tui` and `top` (remote probes run on the daemon through `POST /tunnels/<id>/probe`): a tunnel that activates but never completes a handshake reports `FAIL`, never `OK`.
+- **5: Probe** — handshake probe results (TUNNEL, ENDPOINT, STATUS, RTT, MESSAGE). Keys: `p` probes the selected tunnel, `P` probes all tunnels, `j`/`k` scroll. A probe is a real WireGuard handshake check that runs on the daemon through `POST /tunnels/<id>/probe`: a tunnel that activates but never completes a handshake reports `FAIL`, never `OK`.
 
 ---
 

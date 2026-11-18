@@ -54,11 +54,11 @@ wpmulti validate -d ./confs
 # Start the daemon (foreground; Ctrl-C to stop)
 wpmulti run -d ./confs
 ```
-Add `--tui` for the interactive monitor — it needs a real terminal, so it
-fails in scripts, CI, or any non-terminal session:
+To monitor a running daemon, use the interactive TUI (it needs a real terminal, so it
+fails in scripts, CI, or any non-terminal session):
 
 ```bash
-wpmulti run -d ./confs --tui
+wpmulti top
 ```
 By default (without a `wpmulti.toml`), `wpmulti` binds per-tunnel ports starting at **SOCKS5 `10000`** and **HTTP `20000`** in `lazy` mode. If a port in that range is already in use (for example by another running daemon), the daemon shifts that tunnel to the next free port and logs a warning with the actual port — the startup line lists the ports it really bound, so check it instead of assuming `10000`/`20000`. A tunnel whose port is set explicitly under `[per_tunnel.overrides]` gets no listener at all when that port is busy (same warning, no shift).
 
@@ -89,11 +89,11 @@ curl -x http://auto@127.0.0.1:8080 https://ifconfig.co
 
 | Command | Description |
 | :--- | :--- |
-| `wpmulti run [-c FILE] [-d DIR] [--tui]` | Start the daemon (`-d` alone starts dedicated ports only; `-c wpmulti.toml` enables shared ports & Admin API; with neither flag, a `wpmulti.toml` in the current directory is used if one exists). |
+| `wpmulti run [-c FILE] [-d DIR]` | Start the daemon (`-d` alone starts dedicated ports only; `-c wpmulti.toml` enables shared ports & Admin API; with neither flag, a `wpmulti.toml` in the current directory is used if one exists). |
+| `wpmulti top [--admin-url URL]` | Monitor a running daemon (tunnels, connections, logs, config) through its Admin API; a loopback Admin API needs no token. |
 | `wpmulti validate [-c FILE] [-d DIR]` | Validate `wpmulti.toml` and all `.conf` files without binding ports. |
 | `wpmulti probe [-c WG_CONF \| -d DIR] [--json]` | Actively probe WireGuard tunnel handshake, RTT, and exit IP. |
 | `wpmulti disable <TARGET>` / `enable <TARGET>` | Disable or re-enable tunnels by ID, 1-based index/range (`1`, `1-200`), comma list, or `all` via Admin API. |
-| `wpmulti top [--admin-url URL]` | Attach standalone `htop`-style TUI monitor to a running daemon's Admin API. |
 | `wpmulti status [--admin-url URL]` | Print JSON status from a running daemon's Admin API. |
 
 ## Documentation

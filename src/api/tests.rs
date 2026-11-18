@@ -519,6 +519,57 @@ async fn test_admin_server_e2e_tcp() {
 }
 
 #[tokio::test]
+async fn test_admin_server_loopback_needs_no_token() {
+    // `wpmulti top` on the same machine must read a running daemon
+    // without a password, even when the daemon has a token configured
+    // (the token gates remote peers). A loopback client that *does*
+    // send a token is still validated normally.
+    let manager = create_test_manager();
+    let server = AdminServer::new(
+        "127.0.0.1:0".parse().unwrap(),
+        manager,
+        Some("test_token".to_string()),
+    );
+    let bound_addr = server.start().await.expect("server started");
+
+    async fn get_health(addr: std::net::SocketAddr, auth: Option<&str>) -> String {
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        let auth_header =
+            auth.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
+        let req = format!(
+            "GET /health HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Connection: close\r\n\r\n"
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp_buf = Vec::new();
+        client.read_to_end(&mut resp_buf).await.unwrap();
+        String::from_utf8_lossy(&resp_buf).into_owned()
+    }
+
+    // Loopback, no token at all: allowed.
+    let resp_no_token = get_health(bound_addr, None).await;
+    assert!(
+        resp_no_token.starts_with("HTTP/1.1 200 OK"),
+        "loopback without a token must be allowed, got: {resp_no_token}"
+    );
+
+    // Loopback, wrong token: rejected (a sent token is validated).
+    let resp_wrong = get_health(bound_addr, Some("wrong-token")).await;
+    assert!(
+        resp_wrong.starts_with("HTTP/1.1 401"),
+        "loopback with a wrong token must be rejected, got: {resp_wrong}"
+    );
+
+    // Loopback, correct token: allowed.
+    let resp_good = get_health(bound_addr, Some("test_token")).await;
+    assert!(
+        resp_good.starts_with("HTTP/1.1 200 OK"),
+        "loopback with the right token must be allowed, got: {resp_good}"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn test_admin_server_content_length_limit() {
     let manager = create_test_manager();
     let server = AdminServer::new("127.0.0.1:0".parse().unwrap(), manager, None);
@@ -688,9 +739,11 @@ async fn test_config_endpoint_redacts_and_preserves_secrets_and_auth_rejects_emp
     assert_eq!(resp_get.status, 200);
 
     let returned_cfg: MainConfig = serde_json::from_slice(&resp_get.body).unwrap();
-    assert!(returned_cfg.admin.auth_token.is_none());
+    // A set secret comes back as the placeholder, not `null`, so a
+    // client can tell "set but hidden" from "not set".
+    assert_eq!(returned_cfg.admin.auth_token.as_deref(), Some("[REDACTED]"));
     if let Some(l) = returned_cfg.shared_listeners.first() {
-        assert!(l.global_password.is_none());
+        assert_eq!(l.global_password.as_deref(), Some("[REDACTED]"));
     }
 
     // Posting the redacted config back must preserve existing secrets.

@@ -1476,7 +1476,7 @@ async fn test_f12_admin_prometheus_metrics_exposition() {
 
 #[test]
 fn test_f13_tui_app_state_initialization() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -1489,7 +1489,7 @@ fn test_f13_tui_app_state_initialization() {
 
 #[test]
 fn test_f13_tui_app_navigation_key_events() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -1544,7 +1544,7 @@ fn test_f13_tui_app_navigation_key_events() {
 
 #[test]
 fn test_f13_tui_app_search_filtering() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -1599,7 +1599,7 @@ fn test_f13_tui_app_search_filtering() {
 
 #[test]
 fn test_f13_tui_app_column_sorting() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };
@@ -1659,7 +1659,7 @@ fn test_f13_tui_app_column_sorting() {
 
 #[test]
 fn test_f13_tui_render_dashboard_output() {
-    let dummy_source = TuiDataSource::Remote {
+    let dummy_source = TuiDataSource {
         admin_url: "http://127.0.0.1:9090".to_string(),
         auth_token: None,
     };

@@ -2,7 +2,6 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde::Deserialize;
 
 use crate::config::{MainConfig, TuiSortField};
-use crate::core::{ActiveListenerInfo, ReloadReport, TunnelManager, TunnelState, TunnelSummary};
+use crate::core::{ActiveListenerInfo, ReloadReport, TunnelState, TunnelSummary};
 use crate::tui::config_editor::{
     ConfigApplyScope, ConfigDiffSummary, ConfigField, ConfigSaveReport, diff_config_scopes,
     format_save_status,
@@ -92,29 +91,24 @@ struct AdminProbeResponse {
 /// Number of editable runtime configuration rows in the Config tab.
 pub const CONFIG_ROW_COUNT: usize = ConfigField::ALL.len();
 
-/// Data source powering the TUI dashboard: either an in-process manager or a remote Admin API.
+/// Data source powering the TUI dashboard: the Admin API of a running
+/// daemon. `top` is the only TUI now and always talks to the daemon over
+/// HTTP, never in-process — so this is a plain struct, not an enum.
 #[derive(Clone)]
-pub enum TuiDataSource {
-    InProcess(Arc<TunnelManager>),
-    Remote {
-        admin_url: String,
-        auth_token: Option<String>,
-    },
+pub struct TuiDataSource {
+    pub admin_url: String,
+    pub auth_token: Option<String>,
 }
 
 impl std::fmt::Debug for TuiDataSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InProcess(mgr) => f.debug_tuple("InProcess").field(mgr).finish(),
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => f
-                .debug_struct("Remote")
-                .field("admin_url", admin_url)
-                .field("auth_token", &auth_token.as_ref().map(|_| "[REDACTED]"))
-                .finish(),
-        }
+        f.debug_struct("TuiDataSource")
+            .field("admin_url", &self.admin_url)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
     }
 }
 
@@ -277,55 +271,34 @@ pub(crate) async fn admin_http_request_with_body(
 impl TuiDataSource {
     /// Retrieve list of all tunnels from the data source.
     pub async fn fetch_tunnels(&self) -> Result<Vec<TunnelSummary>, String> {
-        match self {
-            Self::InProcess(mgr) => Ok(mgr.get_tunnel_stats()),
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => {
-                let body =
-                    admin_http_request(admin_url, "GET", "/tunnels", auth_token.as_deref()).await?;
-                let tunnels: Vec<TunnelSummary> = serde_json::from_slice(&body)
-                    .map_err(|e| format!("Failed to deserialize tunnels response: {e}"))?;
-                Ok(tunnels)
-            }
-        }
+        let body = admin_http_request(
+            &self.admin_url,
+            "GET",
+            "/tunnels",
+            self.auth_token.as_deref(),
+        )
+        .await?;
+        let tunnels: Vec<TunnelSummary> = serde_json::from_slice(&body)
+            .map_err(|e| format!("Failed to deserialize tunnels response: {e}"))?;
+        Ok(tunnels)
     }
 
     /// Activate a dormant or suspended tunnel.
     pub async fn activate_tunnel(&self, id: &str) -> Result<(), String> {
-        match self {
-            Self::InProcess(mgr) => mgr
-                .activate_tunnel(id)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => {
-                validate_http_token_or_segment(id, "tunnel id")?;
-                let path = format!("/tunnels/{id}/activate");
-                let _ = admin_http_request(admin_url, "POST", &path, auth_token.as_deref()).await?;
-                Ok(())
-            }
-        }
+        validate_http_token_or_segment(id, "tunnel id")?;
+        let path = format!("/tunnels/{id}/activate");
+        let _ =
+            admin_http_request(&self.admin_url, "POST", &path, self.auth_token.as_deref()).await?;
+        Ok(())
     }
 
     /// Suspend an active tunnel.
     pub async fn suspend_tunnel(&self, id: &str) -> Result<(), String> {
-        match self {
-            Self::InProcess(mgr) => mgr.suspend_tunnel(id).await.map_err(|e| e.to_string()),
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => {
-                validate_http_token_or_segment(id, "tunnel id")?;
-                let path = format!("/tunnels/{id}/suspend");
-                let _ = admin_http_request(admin_url, "POST", &path, auth_token.as_deref()).await?;
-                Ok(())
-            }
-        }
+        validate_http_token_or_segment(id, "tunnel id")?;
+        let path = format!("/tunnels/{id}/suspend");
+        let _ =
+            admin_http_request(&self.admin_url, "POST", &path, self.auth_token.as_deref()).await?;
+        Ok(())
     }
 
     /// Trigger configuration reload.
@@ -335,195 +308,128 @@ impl TuiDataSource {
         target: &str,
         disabled: bool,
     ) -> Result<usize, String> {
-        match self {
-            Self::InProcess(mgr) => mgr
-                .set_tunnels_disabled(target, disabled)
-                .await
-                .map(|v| v.len())
-                .map_err(|e| format!("{e:?}")),
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => {
-                let path = if disabled {
-                    "/tunnels/batch/disable"
-                } else {
-                    "/tunnels/batch/enable"
-                };
-                let body = serde_json::to_vec(&serde_json::json!({ "target": target }))
-                    .map_err(|e| e.to_string())?;
-                let resp = admin_http_request_with_body(
-                    admin_url,
-                    "POST",
-                    path,
-                    auth_token.as_deref(),
-                    Some(&body),
-                )
-                .await?;
-                let val: serde_json::Value =
-                    serde_json::from_slice(&resp).map_err(|e| e.to_string())?;
-                Ok(val
-                    .get("count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize)
-            }
-        }
+        let path = if disabled {
+            "/tunnels/batch/disable"
+        } else {
+            "/tunnels/batch/enable"
+        };
+        let body = serde_json::to_vec(&serde_json::json!({ "target": target }))
+            .map_err(|e| e.to_string())?;
+        let resp = admin_http_request_with_body(
+            &self.admin_url,
+            "POST",
+            path,
+            self.auth_token.as_deref(),
+            Some(&body),
+        )
+        .await?;
+        let val: serde_json::Value = serde_json::from_slice(&resp).map_err(|e| e.to_string())?;
+        Ok(val
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize)
     }
 
     pub async fn reload(&self) -> Result<ReloadReport, String> {
-        match self {
-            Self::InProcess(mgr) => mgr.reload().await.map_err(|e| e.to_string()),
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => {
-                #[derive(serde::Deserialize)]
-                struct ReloadResp {
-                    report: Option<ReloadReport>,
-                }
-                let body =
-                    admin_http_request(admin_url, "POST", "/reload", auth_token.as_deref()).await?;
-                let parsed: ReloadResp = serde_json::from_slice(&body)
-                    .map_err(|e| format!("Failed to parse reload response: {e}"))?;
-                Ok(parsed.report.unwrap_or_default())
-            }
+        #[derive(serde::Deserialize)]
+        struct ReloadResp {
+            report: Option<ReloadReport>,
         }
+        let body = admin_http_request(
+            &self.admin_url,
+            "POST",
+            "/reload",
+            self.auth_token.as_deref(),
+        )
+        .await?;
+        let parsed: ReloadResp = serde_json::from_slice(&body)
+            .map_err(|e| format!("Failed to parse reload response: {e}"))?;
+        Ok(parsed.report.unwrap_or_default())
     }
 
-    /// Fetch daemon log lines (in-process buffer or `GET /logs`).
+    /// Fetch daemon log lines (`GET /logs`).
     pub async fn fetch_logs(&self) -> Result<Vec<String>, String> {
-        match self {
-            Self::InProcess(mgr) => Ok(mgr.log_buffer().snapshot()),
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => {
-                let body =
-                    admin_http_request(admin_url, "GET", "/logs", auth_token.as_deref()).await?;
-                serde_json::from_slice::<Vec<String>>(&body)
-                    .map_err(|e| format!("Invalid /logs JSON: {e}"))
-            }
-        }
+        let body =
+            admin_http_request(&self.admin_url, "GET", "/logs", self.auth_token.as_deref()).await?;
+        serde_json::from_slice::<Vec<String>>(&body).map_err(|e| format!("Invalid /logs JSON: {e}"))
     }
 
     /// Retrieve active listeners from the data source.
     pub async fn fetch_listeners(&self) -> Result<Vec<ActiveListenerInfo>, String> {
-        match self {
-            Self::InProcess(mgr) => Ok(mgr.listeners().list_listeners()),
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => {
-                let body =
-                    admin_http_request(admin_url, "GET", "/listeners", auth_token.as_deref())
-                        .await?;
-                serde_json::from_slice(&body)
-                    .map_err(|e| format!("Failed to deserialize listeners response: {e}"))
-            }
-        }
+        let body = admin_http_request(
+            &self.admin_url,
+            "GET",
+            "/listeners",
+            self.auth_token.as_deref(),
+        )
+        .await?;
+        serde_json::from_slice(&body)
+            .map_err(|e| format!("Failed to deserialize listeners response: {e}"))
     }
 
     /// Retrieve current configuration snapshot from the data source.
     pub async fn fetch_config(&self) -> Result<MainConfig, String> {
-        match self {
-            Self::InProcess(mgr) => Ok(mgr.config_snapshot()),
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => {
-                let body =
-                    admin_http_request(admin_url, "GET", "/config", auth_token.as_deref()).await?;
-                serde_json::from_slice(&body)
-                    .map_err(|e| format!("Failed to deserialize config response: {e}"))
-            }
-        }
+        let body = admin_http_request(
+            &self.admin_url,
+            "GET",
+            "/config",
+            self.auth_token.as_deref(),
+        )
+        .await?;
+        serde_json::from_slice(&body)
+            .map_err(|e| format!("Failed to deserialize config response: {e}"))
     }
 
     /// Apply updated runtime configuration to the data source.
     pub async fn apply_config(&self, cfg: &MainConfig) -> Result<(), String> {
-        match self {
-            Self::InProcess(mgr) => mgr
-                .apply_runtime_config(cfg.clone())
-                .await
-                .map_err(|e| e.to_string()),
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => {
-                let json_bytes =
-                    serde_json::to_vec(cfg).map_err(|e| format!("Serialize error: {e}"))?;
-                let _ = admin_http_request_with_body(
-                    admin_url,
-                    "POST",
-                    "/config",
-                    auth_token.as_deref(),
-                    Some(&json_bytes),
-                )
-                .await?;
-                Ok(())
-            }
-        }
+        let json_bytes = serde_json::to_vec(cfg).map_err(|e| format!("Serialize error: {e}"))?;
+        let _ = admin_http_request_with_body(
+            &self.admin_url,
+            "POST",
+            "/config",
+            self.auth_token.as_deref(),
+            Some(&json_bytes),
+        )
+        .await?;
+        Ok(())
     }
 
-    /// Return `true` when connected via the remote HTTP Admin API.
-    pub const fn is_remote(&self) -> bool {
-        matches!(self, Self::Remote { .. })
-    }
-
-    /// Update the remote Admin API bearer token after an explicit token rotation.
+    /// Update the Admin API bearer token after an explicit token rotation.
     pub fn set_remote_auth_token(&mut self, next: Option<String>) {
-        if let Self::Remote { auth_token, .. } = self {
-            *auth_token = next;
-        }
+        self.auth_token = next;
     }
 
-    /// Probe a single tunnel with a real WireGuard handshake check,
-    /// in-process or through the Admin API when remote. Activation
-    /// alone is not a probe result: a tunnel that activates but never
-    /// completes a handshake must report FAIL, not "Activated OK".
+    /// Probe a single tunnel with a real WireGuard handshake check
+    /// through the Admin API. Activation alone is not a probe result:
+    /// a tunnel that activates but never completes a handshake must
+    /// report FAIL, not "Activated OK".
     pub async fn probe_tunnel(&self, id: &str, endpoint: &str) -> TuiProbeResult {
-        match self {
-            Self::InProcess(mgr) => {
-                let outcome = mgr.probe_tunnel(id).await;
-                TuiProbeResult {
-                    id: id.to_string(),
-                    endpoint: endpoint.to_string(),
-                    ok: outcome.ok,
-                    rtt_ms: outcome.rtt_ms,
-                    message: outcome.message,
-                }
-            }
-            Self::Remote {
-                admin_url,
-                auth_token,
-            } => {
-                let outcome = async {
-                    validate_http_token_or_segment(id, "tunnel id")?;
-                    let path = format!("/tunnels/{id}/probe");
-                    let body =
-                        admin_http_request(admin_url, "POST", &path, auth_token.as_deref()).await?;
-                    let parsed: AdminProbeResponse = serde_json::from_slice(&body)
-                        .map_err(|e| format!("Failed to deserialize probe response: {e}"))?;
-                    Ok::<AdminProbeResponse, String>(parsed)
-                }
-                .await;
-                match outcome {
-                    Ok(parsed) => TuiProbeResult {
-                        id: id.to_string(),
-                        endpoint: endpoint.to_string(),
-                        ok: parsed.ok,
-                        rtt_ms: parsed.rtt_ms,
-                        message: parsed.message,
-                    },
-                    Err(e) => TuiProbeResult {
-                        id: id.to_string(),
-                        endpoint: endpoint.to_string(),
-                        ok: false,
-                        rtt_ms: None,
-                        message: e,
-                    },
-                }
-            }
+        let outcome = async {
+            validate_http_token_or_segment(id, "tunnel id")?;
+            let path = format!("/tunnels/{id}/probe");
+            let body =
+                admin_http_request(&self.admin_url, "POST", &path, self.auth_token.as_deref())
+                    .await?;
+            let parsed: AdminProbeResponse = serde_json::from_slice(&body)
+                .map_err(|e| format!("Failed to deserialize probe response: {e}"))?;
+            Ok::<AdminProbeResponse, String>(parsed)
+        }
+        .await;
+        match outcome {
+            Ok(parsed) => TuiProbeResult {
+                id: id.to_string(),
+                endpoint: endpoint.to_string(),
+                ok: parsed.ok,
+                rtt_ms: parsed.rtt_ms,
+                message: parsed.message,
+            },
+            Err(e) => TuiProbeResult {
+                id: id.to_string(),
+                endpoint: endpoint.to_string(),
+                ok: false,
+                rtt_ms: None,
+                message: e,
+            },
         }
     }
 }
@@ -593,13 +499,6 @@ pub struct TuiApp {
 impl TuiApp {
     /// Construct a new [`TuiApp`] with the given data source and initial sort field.
     pub fn new(data_source: TuiDataSource, sort_field: TuiSortField) -> Self {
-        let initial_cfg = match &data_source {
-            TuiDataSource::InProcess(mgr) => Some(mgr.config_snapshot()),
-            TuiDataSource::Remote { .. } => None,
-        };
-        let initial_refresh = initial_cfg
-            .as_ref()
-            .map_or(500, |cfg| cfg.tui.refresh_rate_ms);
         Self {
             data_source,
             active_tab: TuiTab::Tunnels,
@@ -628,13 +527,13 @@ impl TuiApp {
             log_level_filter: None,
             listeners: Vec::new(),
             listener_scroll: 0,
-            config_snapshot: initial_cfg.clone(),
-            config_startup_baseline: initial_cfg.clone(),
-            config_saved_baseline: initial_cfg,
+            config_snapshot: None,
+            config_startup_baseline: None,
+            config_saved_baseline: None,
             config_path: None,
             config_selected: 0,
             config_editing: None,
-            config_refresh_rate_ms: initial_refresh,
+            config_refresh_rate_ms: 500,
             probe_results: Vec::new(),
             probe_scroll: 0,
             anim_tick: 0,
@@ -785,10 +684,8 @@ impl TuiApp {
         field: ConfigField,
         cfg: MainConfig,
     ) -> Result<(), String> {
-        if !self.data_source.is_remote() {
-            cfg.validate()
-                .map_err(|e| format!("Validation failed for {}: {e}", field.key()))?;
-        }
+        // The Admin API validates the config server-side; `top` never
+        // validates locally.
         match field.scope() {
             ConfigApplyScope::Live => {
                 // Apply the live change now — but only that change. The
@@ -868,7 +765,7 @@ impl TuiApp {
         let Some(field) = ConfigField::from_index(self.config_selected) else {
             return Err("Invalid config field index".to_string());
         };
-        field.apply_text_with_mode(&mut cfg, &raw, self.data_source.is_remote())?;
+        field.apply_text(&mut cfg, &raw)?;
         self.commit_mutated_config(field, cfg).await
     }
 
@@ -888,7 +785,7 @@ impl TuiApp {
         let Some(cfg) = self.config_snapshot.clone() else {
             return Err("Config snapshot not loaded".to_string());
         };
-        if !self.data_source.is_remote() || self.config_path.is_some() {
+        if self.config_path.is_some() {
             cfg.validate()
                 .map_err(|e| format!("Config validation failed: {e}"))?;
         }
@@ -1288,21 +1185,6 @@ impl TuiApp {
         }
     }
 
-    fn sync_disabled_tunnels_from_manager(&mut self) {
-        if let TuiDataSource::InProcess(mgr) = &self.data_source {
-            let disabled = mgr.config_snapshot().disabled_tunnels;
-            if let Some(cfg) = &mut self.config_snapshot {
-                cfg.disabled_tunnels.clone_from(&disabled);
-            }
-            if let Some(cfg) = &mut self.config_saved_baseline {
-                cfg.disabled_tunnels.clone_from(&disabled);
-            }
-            if let Some(cfg) = &mut self.config_startup_baseline {
-                cfg.disabled_tunnels = disabled;
-            }
-        }
-    }
-
     /// Toggle enable/disable on the currently selected tunnel.
     pub async fn toggle_selected_disabled(&mut self) -> Result<(), String> {
         let Some(t) = self.selected_tunnel().cloned() else {
@@ -1312,7 +1194,6 @@ impl TuiApp {
         self.data_source
             .set_tunnels_disabled(&t.id, next_disabled)
             .await?;
-        self.sync_disabled_tunnels_from_manager();
         let action = if next_disabled { "Disabled" } else { "Enabled" };
         self.set_status(format!("{} '{}'", action, t.id));
         let _ = self.refresh().await;
@@ -1340,7 +1221,6 @@ impl TuiApp {
             .data_source
             .set_tunnels_disabled(target, disabled)
             .await?;
-        self.sync_disabled_tunnels_from_manager();
         let action = if disabled { "Disabled" } else { "Enabled" };
         self.set_status(format!("{action} {count} tunnel(s) ({target})"));
         let _ = self.refresh().await;

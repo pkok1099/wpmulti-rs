@@ -23,7 +23,7 @@ pub use commands::{
                   SOCKS5 (TCP + UDP ASSOCIATE) and HTTP/HTTPS CONNECT proxies.",
     after_help = "EXAMPLES:\n  \
                   wpmulti validate -d ./confs\n  \
-                  wpmulti run -d ./confs --tui\n  \
+                  wpmulti run -d ./confs\n  \
                   wpmulti run -c wpmulti.toml\n  \
                   wpmulti top --admin-url http://127.0.0.1:9090\n  \
                   wpmulti status --admin-url http://127.0.0.1:9090\n\n\
@@ -43,7 +43,6 @@ pub enum Commands {
     /// Start the multi-tunnel proxy daemon
     #[clap(after_help = "EXAMPLES:\n  \
                          wpmulti run -d ./confs\n  \
-                         wpmulti run -d ./confs --tui\n  \
                          wpmulti run -c wpmulti.toml")]
     Run {
         /// Path to main configuration file (e.g. wpmulti.toml)
@@ -53,12 +52,9 @@ pub enum Commands {
         /// Path to directory containing WireGuard .conf files (overrides global.config_dir)
         #[clap(short, long)]
         dir: Option<PathBuf>,
-
-        /// Launch integrated interactive TUI monitor alongside daemon
-        #[clap(long)]
-        tui: bool,
     },
-    /// Launch the standalone interactive TUI monitor
+    /// Monitor a running daemon's tunnels, connections and logs (reads the
+    /// daemon through its Admin API; a loopback Admin API needs no token)
     #[clap(after_help = "EXAMPLE:\n  wpmulti top --admin-url http://127.0.0.1:9090")]
     Top {
         /// Admin API URL to connect to (e.g. http://127.0.0.1:9090)
@@ -181,8 +177,8 @@ where
 /// Parse arguments and execute the selected subcommand.
 pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    if let Commands::Run { config, dir, tui } = cli.command {
-        return cmd_run(config, dir, tui).await;
+    if let Commands::Run { config, dir } = cli.command {
+        return cmd_run(config, dir).await;
     }
 
     if !matches!(cli.command, Commands::Top { .. }) {

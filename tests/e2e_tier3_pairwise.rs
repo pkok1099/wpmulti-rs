@@ -574,8 +574,12 @@ async fn test_pairwise_f13_tui_and_f12_admin_metrics() {
         .unwrap();
     assert_eq!(rx_val, 1048576.0);
 
-    // Verify TUI dashboard renders metrics
-    let ds = TuiDataSource::InProcess(Arc::clone(&manager));
+    // Verify TUI dashboard renders metrics (via the running Admin API,
+    // the way `top` reads a daemon).
+    let ds = TuiDataSource {
+        admin_url: format!("http://{bound}"),
+        auth_token: None,
+    };
     let mut app = TuiApp::new(ds, TuiSortField::Id);
     app.refresh().await.unwrap();
 

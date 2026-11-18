@@ -714,13 +714,28 @@ fn merge_config_json(
     }
 }
 
+/// Placeholder marking a secret that is set but hidden from API responses.
+const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
+
 fn redact_config_secrets(mut cfg: crate::config::MainConfig) -> crate::config::MainConfig {
-    cfg.admin.auth_token = None;
+    // Replace a set secret with a placeholder instead of removing it,
+    // so a client (e.g. `top`) can tell "a secret is set" from "no
+    // secret is set": the TUI shows `[KEEP]` / `[REDACTED]` for a set
+    // secret and an empty editor when none is set. Posting the
+    // placeholder back preserves the original secret (see
+    // `should_preserve_secret`).
+    if cfg.admin.auth_token.is_some() {
+        cfg.admin.auth_token = Some(REDACTED_PLACEHOLDER.to_string());
+    }
     for l in &mut cfg.shared_listeners {
-        l.global_password = None;
+        if l.global_password.is_some() {
+            l.global_password = Some(REDACTED_PLACEHOLDER.to_string());
+        }
     }
     for o in cfg.per_tunnel.overrides.values_mut() {
-        o.password = None;
+        if o.password.is_some() {
+            o.password = Some(REDACTED_PLACEHOLDER.to_string());
+        }
     }
     cfg
 }

@@ -19,11 +19,9 @@ use crate::core::TunnelManager;
 use crate::netstack::{DEFAULT_CHANNEL_CAPACITY, VirtualNetworkStack, VirtualTunBridge};
 use crate::tui::{TuiApp, TuiDataSource, run_terminal_tui};
 
-fn init_logging(
-    log_level: crate::config::LogLevel,
-    tui_mode: bool,
-    log_buffer: &crate::tui::TuiLogBuffer,
-) {
+fn init_logging(log_level: crate::config::LogLevel, log_buffer: &crate::tui::TuiLogBuffer) {
+    use std::io::IsTerminal;
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
     use tracing_subscriber::util::SubscriberInitExt;
     let max_level = match log_level {
         crate::config::LogLevel::Trace => tracing::Level::TRACE,
@@ -32,20 +30,13 @@ fn init_logging(
         crate::config::LogLevel::Warn => tracing::Level::WARN,
         crate::config::LogLevel::Error => tracing::Level::ERROR,
     };
-    if tui_mode {
-        let _ =
-            super::build_cli_tracing_subscriber(max_level, false, log_buffer.clone()).try_init();
-    } else {
-        use std::io::IsTerminal;
-        use tracing_subscriber::fmt::writer::MakeWriterExt;
-        let ansi = super::cli_log_ansi_enabled(false, std::io::stderr().is_terminal());
-        let _ = super::build_cli_tracing_subscriber(
-            max_level,
-            ansi,
-            log_buffer.clone().and(std::io::stderr),
-        )
-        .try_init();
-    }
+    let ansi = super::cli_log_ansi_enabled(false, std::io::stderr().is_terminal());
+    let _ = super::build_cli_tracing_subscriber(
+        max_level,
+        ansi,
+        log_buffer.clone().and(std::io::stderr),
+    )
+    .try_init();
 }
 
 const DEFAULT_DAEMON_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -153,11 +144,12 @@ pub(crate) fn discover_local_config_in(dir: &Path) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-/// Execute the `wpmulti run` command: starts multi-tunnel daemon and optional TUI.
+/// Execute the `wpmulti run` command: starts the multi-tunnel daemon.
+/// Monitoring a running daemon is done with `wpmulti top`, which reads
+/// it through the Admin API; `run` itself stays a plain daemon.
 pub async fn cmd_run(
     config_path: Option<PathBuf>,
     dir_path: Option<PathBuf>,
-    tui_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = if config_path.is_none() && dir_path.is_none() {
         discover_local_config_in(Path::new("."))
@@ -215,8 +207,7 @@ pub async fn cmd_run(
     if let Some(ref cfg_path) = saved_config_path {
         manager.set_config_path(cfg_path.clone());
     }
-    init_logging(config.global.log_level, tui_mode, &tui_log_buffer);
-    let tui_log_buffer = Some(tui_log_buffer);
+    init_logging(config.global.log_level, &tui_log_buffer);
 
     let admin_server = if config.admin.enabled {
         let srv = AdminServer::new(
@@ -246,15 +237,16 @@ pub async fn cmd_run(
     }
     log_active_listeners(&manager.listeners().list_listeners());
 
-    run_tui_or_wait(
-        tui_mode,
+    // The daemon runs until it receives SIGINT/SIGTERM; monitoring a
+    // running daemon is `wpmulti top`'s job, not `run`'s.
+    tracing::info!("Daemon running. Send SIGINT or SIGTERM to terminate.");
+    let _signal_guard = wait_for_shutdown_signal().await?;
+    graceful_shutdown(
         &manager,
-        &config,
-        tui_log_buffer,
-        saved_config_path,
         admin_server.as_ref(),
+        DEFAULT_DAEMON_DRAIN_TIMEOUT,
     )
-    .await?;
+    .await;
 
     tracing::info!("wpmulti stopped cleanly.");
     Ok(())
@@ -315,42 +307,6 @@ fn log_active_listeners(listeners: &[crate::core::ActiveListenerInfo]) {
             }
         }
     }
-}
-
-async fn run_tui_or_wait(
-    tui_mode: bool,
-    manager: &Arc<TunnelManager>,
-    config: &MainConfig,
-    tui_log_buffer: Option<crate::tui::TuiLogBuffer>,
-    saved_config_path: Option<PathBuf>,
-    admin_server: Option<&AdminServer>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if tui_mode {
-        let mut app = TuiApp::new(
-            TuiDataSource::InProcess(Arc::clone(manager)),
-            config.tui.default_sort,
-        );
-        if let Some(buf) = tui_log_buffer {
-            app = app.with_log_buffer(buf);
-        }
-        if let Some(path) = saved_config_path {
-            app = app.with_config_path(path);
-        }
-        let tui_res = run_terminal_tui(app, config.tui.refresh_rate_ms).await;
-        if let Err(e) = tui_res {
-            tracing::error!("TUI exited with error: {e}");
-            graceful_shutdown(manager, admin_server, DEFAULT_DAEMON_DRAIN_TIMEOUT).await;
-            return Err(e.into());
-        }
-        tracing::info!("TUI exited. Stopping daemon...");
-        graceful_shutdown(manager, admin_server, DEFAULT_DAEMON_DRAIN_TIMEOUT).await;
-    } else {
-        tracing::info!("Daemon running. Send SIGINT or SIGTERM to terminate.");
-        let _signal_guard = wait_for_shutdown_signal().await?;
-        graceful_shutdown(manager, admin_server, DEFAULT_DAEMON_DRAIN_TIMEOUT).await;
-    }
-
-    Ok(())
 }
 
 /// Execute the `wpmulti validate` command: validates config and tunnel files without binding ports.
@@ -427,7 +383,7 @@ pub async fn cmd_top(
     admin_url: String,
     auth_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let source = TuiDataSource::Remote {
+    let source = TuiDataSource {
         admin_url,
         auth_token,
     };
