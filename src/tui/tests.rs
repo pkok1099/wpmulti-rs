@@ -10,8 +10,8 @@ use crate::config::{
 use crate::core::{HealthStatus, TunnelManager, TunnelState, TunnelSummary};
 use crate::tui::app::{TuiApp, TuiDataSource};
 use crate::tui::ui::{
-    common_prefix, format_bytes, format_bytes_compact, render_dashboard, short_bar_label,
-    visible_edit_tail,
+    common_prefix, format_bar_value, format_bytes, format_bytes_compact, format_bytes_tiny,
+    gauge_label, render_dashboard, short_bar_label, top_bar_dims, visible_edit_tail,
 };
 
 fn make_test_tunnel_config(id: &str, endpoint: &str) -> TunnelConfig {
@@ -1531,4 +1531,161 @@ async fn test_tui_tunnel_detail_overlay() {
     assert_eq!(app.overlay, TuiOverlay::TunnelDetail);
     handle_tui_key(&mut app, TuiKey::Esc).await;
     assert_eq!(app.overlay, TuiOverlay::None);
+}
+
+#[test]
+fn test_tui_top_bar_dims_fits_five() {
+    // Full-size bars when there is room, shrinking to fit below that.
+    assert_eq!(top_bar_dims(39), (7, 1));
+    assert_eq!(top_bar_dims(40), (7, 1));
+    assert_eq!(top_bar_dims(38), (6, 1));
+    assert_eq!(top_bar_dims(24), (4, 1));
+    assert_eq!(top_bar_dims(18), (2, 1));
+    assert_eq!(top_bar_dims(9), (1, 1));
+    // Below 9 cells the gap drops to 0 so five 1-wide bars still fit.
+    assert_eq!(top_bar_dims(8), (1, 0));
+    assert_eq!(top_bar_dims(5), (1, 0));
+
+    // Five bars plus their gaps never exceed the inner width.
+    for inner in 9..=60 {
+        let (width, gap) = top_bar_dims(inner);
+        assert!(
+            5 * width + 4 * gap <= inner,
+            "five bars do not fit inner {inner}: width {width}, gap {gap}"
+        );
+    }
+}
+
+#[test]
+fn test_tui_format_bytes_tiny() {
+    assert_eq!(format_bytes_tiny(0), "0B");
+    assert_eq!(format_bytes_tiny(512), "512B");
+    assert_eq!(format_bytes_tiny(1023), "1.0K");
+    assert_eq!(format_bytes_tiny(1024), "1.0K");
+    assert_eq!(format_bytes_tiny(106_496), "104K");
+    assert_eq!(format_bytes_tiny(654_336), "639K");
+    assert_eq!(format_bytes_tiny(1_593_835), "1.5M");
+    assert_eq!(format_bytes_tiny(12_884_901), "12M");
+    assert_eq!(format_bytes_tiny(1_073_741_824), "1.0G");
+    // Just under 1 GiB promotes to the next unit instead of "1023M".
+    assert_eq!(format_bytes_tiny(1_072_693_248), "1.0G");
+    for bytes in [
+        0,
+        512,
+        1024,
+        106_496,
+        654_336,
+        1_593_835,
+        12_884_901,
+        1_073_741_824,
+    ] {
+        assert!(
+            format_bytes_tiny(bytes).len() <= 4,
+            "tiny form too long for {bytes}"
+        );
+    }
+}
+
+#[test]
+fn test_tui_format_bar_value_fits_width() {
+    // Full compact form, then the space dropped, then the tiny form.
+    assert_eq!(format_bar_value(1_593_835, 7), "1.52 MB");
+    assert_eq!(format_bar_value(1_593_835, 6), "1.52MB");
+    assert_eq!(format_bar_value(1_593_835, 4), "1.5M");
+    assert_eq!(format_bar_value(1_593_835, 3), "");
+    // The compact form ("639 KB") already fits in 7 cells, so it is
+    // used as-is; it only drops to the tiny form below 6 cells.
+    assert_eq!(format_bar_value(654_336, 7), "639 KB");
+    assert_eq!(format_bar_value(654_336, 6), "639 KB");
+    assert_eq!(format_bar_value(654_336, 4), "639K");
+    // The result never exceeds the bar width it was asked to fit.
+    for width in 0..=8 {
+        let value = format_bar_value(1_593_835, width);
+        assert!(
+            value.len() <= width as usize,
+            "bar value {value:?} exceeds width {width}"
+        );
+    }
+}
+
+#[test]
+fn test_tui_gauge_label_fits_width() {
+    assert_eq!(gauge_label(22, 173, 199, 0.87), "173/199 (87%)");
+    assert_eq!(gauge_label(14, 173, 199, 0.87), "173/199");
+    assert_eq!(gauge_label(8, 173, 199, 0.87), "87%");
+    // The label fits inside the panel (width minus its borders).
+    for (width, label) in [
+        (22, gauge_label(22, 173, 199, 0.87)),
+        (14, gauge_label(14, 173, 199, 0.87)),
+        (8, gauge_label(8, 173, 199, 0.87)),
+    ] {
+        assert!(
+            label.len() <= width - 2,
+            "gauge label {label:?} does not fit width {width}"
+        );
+    }
+}
+
+/// Five tunnels with distinct traffic, rendered at a narrow 56-column
+/// terminal: all five Top 5 bars must still show. The bar labels
+/// ("026", "003", ...) are checked inside the overview section only —
+/// the tunnel table below lists the same IDs, so a whole-screen
+/// search would not prove the bars drew. (The bar values are not
+/// asserted here: ratatui only draws a value as wide as its bar when
+/// that bar is at least one cell tall, so the shortest bars legitimately
+/// show the bar and label without a value; the exact totals are in the
+/// table.)
+#[test]
+fn test_tui_top_five_narrow_screen_shows_all_bars() {
+    let dummy_source = TuiDataSource {
+        admin_url: "http://127.0.0.1:9090".to_string(),
+        auth_token: None,
+    };
+    let mut app = TuiApp::new(dummy_source, TuiSortField::Id);
+    app.set_tunnels(vec![
+        make_dummy_summary("wgcf-026", TunnelState::Active, 0, 1_593_835, 0),
+        make_dummy_summary("wgcf-003", TunnelState::Active, 0, 654_336, 0),
+        make_dummy_summary("wgcf-011", TunnelState::Active, 0, 188_416, 0),
+        make_dummy_summary("wgcf-007", TunnelState::Active, 0, 106_496, 0),
+        make_dummy_summary("wgcf-042", TunnelState::Active, 0, 51_200, 0),
+    ]);
+
+    // The overview section: the "Top 5 Tunnels" title line plus the
+    // panel rows that follow it (the table starts after them).
+    let overview_section = |output: &str| -> String {
+        let lines: Vec<&str> = output.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.contains("Top 5 Tunnels"))
+            .expect("Top 5 panel missing");
+        lines[start..(start + 8).min(lines.len())].join("\n")
+    };
+
+    let output = render_dashboard(&mut app, 56, 24);
+    let overview = overview_section(&output);
+    for label in ["026", "003", "011", "007", "042"] {
+        assert!(
+            overview.contains(label),
+            "Top 5 bar label {label} missing on a 56-column screen:\n{output}"
+        );
+    }
+    // The tallest bars still show their values on a narrow screen.
+    assert!(
+        overview.contains("1.5M"),
+        "Top 5 bar value 1.5M missing on a 56-column screen:\n{output}"
+    );
+
+    // The same five bars at a wide 110 columns.
+    let output = render_dashboard(&mut app, 110, 24);
+    let overview = overview_section(&output);
+    for label in ["026", "003", "011", "007", "042"] {
+        assert!(
+            overview.contains(label),
+            "Top 5 bar label {label} missing on a 110-column screen:\n{output}"
+        );
+    }
+    assert!(
+        overview.contains("1.52MB"),
+        "Top 5 bar value 1.52MB missing on a 110-column screen:\n{output}"
+    );
 }

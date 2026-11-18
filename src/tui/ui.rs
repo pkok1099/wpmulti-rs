@@ -110,6 +110,84 @@ pub fn format_ago(timestamp: Option<u64>) -> String {
     }
 }
 
+/// Shortest byte count, at most 4 chars ("1.5M", "639K", "104K", "0B").
+///
+/// Used for Top 5 bar values when the bars are too narrow for the
+/// compact form. The unit is promoted while the value would round to
+/// 1000 or more, so the result stays within 4 chars for any traffic
+/// below a petabyte.
+pub fn format_bytes_tiny(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next in ["K", "M", "G", "T"] {
+        if value < 999.5 {
+            break;
+        }
+        value /= KB;
+        unit = next;
+    }
+    if unit == "B" {
+        format!("{bytes}B")
+    } else if value < 10.0 {
+        format!("{value:.1}{unit}")
+    } else {
+        format!("{value:.0}{unit}")
+    }
+}
+
+/// Top 5 bar value label that fits `width` cells.
+///
+/// The full compact form ("1.52 MB") when it fits, then the space
+/// dropped ("1.52MB"), then the tiny form ("1.5M"), and empty when
+/// even that does not fit — the bar still draws, and the exact value
+/// is in the tunnel table.
+pub fn format_bar_value(bytes: u64, width: u16) -> String {
+    let width = width as usize;
+    let compact = format_bytes_compact(bytes);
+    if compact.len() <= width {
+        return compact;
+    }
+    let nospace: String = compact.chars().filter(|c| *c != ' ').collect();
+    if nospace.len() <= width {
+        return nospace;
+    }
+    let tiny = format_bytes_tiny(bytes);
+    if tiny.len() <= width {
+        return tiny;
+    }
+    String::new()
+}
+
+/// (bar width, bar gap) so exactly five Top 5 bars fit `inner_width`.
+///
+/// `inner_width` is the panel width minus its borders: full 7-wide
+/// bars with a 1-cell gap when there is room, shrinking to fit when
+/// the panel is narrow. Below 9 cells even 1-wide bars with a gap do
+/// not fit, so the gap drops to 0.
+pub fn top_bar_dims(inner_width: u16) -> (u16, u16) {
+    if inner_width >= 39 {
+        (7, 1)
+    } else if inner_width >= 9 {
+        (((inner_width - 4) / 5).max(1), 1)
+    } else {
+        ((inner_width / 5).max(1), 0)
+    }
+}
+
+/// Pool Health gauge label that fits `width` cells (the panel width
+/// including its borders): the full "173/199 (87%)" when it fits,
+/// then just the counts, then just the percentage.
+pub fn gauge_label(width: u16, healthy: usize, total: usize, ratio: f64) -> String {
+    if width >= 16 {
+        format!("{healthy}/{total} ({:.0}%)", ratio * 100.0)
+    } else if width >= 9 {
+        format!("{healthy}/{total}")
+    } else {
+        format!("{:.0}%", ratio * 100.0)
+    }
+}
+
 /// Decoded terminal input key used by `wpmulti` TUI handlers and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiKey {
@@ -432,27 +510,45 @@ pub(crate) fn short_bar_label(id: &str, common: &str) -> String {
 }
 
 fn draw_tunnels_overview(f: &mut Frame<'_>, app: &TuiApp, t_area: Rect) {
-    let [chart_col, bar_col, gauge_col] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(42),
-            Constraint::Percentage(36),
-            Constraint::Percentage(22),
-        ])
-        .areas(t_area);
+    // The column split adapts to width. The 42/36/22 split only gives
+    // the Top 5 room for five bars at width >= 73; below that the Top
+    // 5 gets a fixed 26 and the gauge a fixed 14, so five thin bars
+    // still fit and the gauge label is not clipped. The two layouts
+    // meet at width 73 (both give the Top 5 26 cells), so there is no
+    // jump at the breakpoint.
+    let [chart_col, bar_col, gauge_col] = if t_area.width >= 73 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(42),
+                Constraint::Percentage(36),
+                Constraint::Percentage(22),
+            ])
+            .areas(t_area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(26),
+                Constraint::Length(14),
+            ])
+            .areas(t_area)
+    };
 
     draw_overview_chart(f, app, chart_col);
 
     let top = app.top_tunnels(5);
     let ids: Vec<&str> = top.iter().map(|(id, _)| *id).collect();
     let common = common_prefix(&ids);
+    let (bar_width, bar_gap) = top_bar_dims(bar_col.width.saturating_sub(2));
     let bars: Vec<Bar<'_>> = top
         .iter()
         .map(|(id, total)| {
             Bar::default()
                 .value(*total)
                 .label(Line::from(short_bar_label(id, &common)))
-                .text_value(format_bytes_compact(*total))
+                .text_value(format_bar_value(*total, bar_width))
                 .style(Style::default().fg(ACCENT_CYAN))
         })
         .collect();
@@ -470,8 +566,8 @@ fn draw_tunnels_overview(f: &mut Frame<'_>, app: &TuiApp, t_area: Rect) {
                 )),
         )
         .data(BarGroup::default().bars(&bars))
-        .bar_width(7)
-        .bar_gap(1)
+        .bar_width(bar_width)
+        .bar_gap(bar_gap)
         .value_style(Style::default().fg(Color::White))
         .label_style(Style::default().fg(Color::Gray));
     f.render_widget(barchart, bar_col);
@@ -500,11 +596,11 @@ fn draw_tunnels_overview(f: &mut Frame<'_>, app: &TuiApp, t_area: Rect) {
         )
         .gauge_style(Style::default().fg(gauge_color).bg(Color::Rgb(40, 42, 54)))
         .ratio(ratio)
-        .label(format!(
-            "{}/{} ({:.0}%)",
+        .label(gauge_label(
+            gauge_col.width,
             healthy,
             app.tunnels.len(),
-            ratio * 100.0
+            ratio,
         ));
     f.render_widget(gauge, gauge_col);
 }
