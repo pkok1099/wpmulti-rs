@@ -432,8 +432,8 @@ impl ConfigField {
                     LifecycleMode::Eager => LifecycleMode::Lazy,
                 };
             }
-            Self::PerTunnelEnabled => cfg.per_tunnel.enabled = !cfg.per_tunnel.enabled,
-            Self::AdminEnabled => cfg.admin.enabled = !cfg.admin.enabled,
+            Self::PerTunnelEnabled => cfg.per_tunnel.enabled.toggle(),
+            Self::AdminEnabled => cfg.admin.enabled.toggle(),
             Self::TuiDefaultSort => {
                 cfg.tui.default_sort = match cfg.tui.default_sort {
                     TuiSortField::Id => TuiSortField::Status,

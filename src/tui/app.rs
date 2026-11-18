@@ -1159,7 +1159,7 @@ impl TuiApp {
 
     /// Invert current sorting direction.
     pub fn toggle_sort_direction(&mut self) {
-        self.sort_ascending = !self.sort_ascending;
+        self.sort_ascending.toggle();
         self.apply_filter_and_sort();
     }
 

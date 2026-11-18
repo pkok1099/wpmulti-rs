@@ -1,7 +1,7 @@
 # Strict Clippy configuration for wpmulti
 # Enforced alongside [lints.clippy] in Cargo.toml and `-D warnings` in CI.
 
-msrv = "1.95"
+msrv = "1.100"
 cognitive-complexity-threshold = 20
 too-many-arguments-threshold = 6
 too-many-lines-threshold = 100

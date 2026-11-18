@@ -4,7 +4,7 @@
 name = "wpmulti"
 version = "0.2.9"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.100"
 license = "MPL-2.0"
 description = "High-concurrency multi-tunnel WireGuard proxy daemon for gotatun"
 repository = "https://github.com/pkok1099/wpmulti-rs"

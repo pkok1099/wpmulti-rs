@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/pkok1099/wpmulti-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/pkok1099/wpmulti-rs/actions/workflows/ci.yml)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](LICENSE)
-[![Rust: 1.95+](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust: 1.100+](https://img.shields.io/badge/Rust-1.100%2B-orange.svg)](https://www.rust-lang.org)
 
 High-concurrency multi-tunnel WireGuard SOCKS5 & HTTP proxy daemon in Rust, built on top of [`gotatun`](https://github.com/mullvad/gotatun) and [`smoltcp`](https://github.com/smoltcp-rs/smoltcp).
 
