@@ -7,6 +7,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proxy::router::{
@@ -678,13 +679,52 @@ const fn normalize_ip(ip: IpAddr) -> IpAddr {
 
 const MAX_UDP_DNS_TASKS: usize = 16;
 
+/// Reusable pool of datagram payload buffers for the UDP ASSOCIATE domain path.
+///
+/// A domain-targeted datagram must be owned by the spawned DNS-resolution task,
+/// but a fresh heap allocation per datagram is wasteful: the pool hands out a
+/// `BytesMut` whose allocation is returned after the resolved datagram is
+/// dispatched, so steady-state traffic reuses the same few buffers. The copy
+/// from the session `relay_buf` into the pooled buffer remains (that buffer is
+/// reused per session, so the payload cannot be borrowed across the await) —
+/// only the fresh heap allocation per datagram goes away.
+///
+/// The pool keeps at most `MAX_UDP_DNS_TASKS` buffers, the same bound as
+/// in-flight DNS tasks; further released buffers are dropped instead of
+/// retained, so retained memory stays bounded.
+#[derive(Default)]
+pub(crate) struct UdpPayloadPool {
+    free: Vec<BytesMut>,
+}
+
+impl UdpPayloadPool {
+    /// Copies `payload` into a pooled buffer and returns it as shared `Bytes`.
+    pub(crate) fn take(&mut self, payload: &[u8]) -> Bytes {
+        let mut buf = self.free.pop().unwrap_or_default();
+        buf.clear();
+        buf.put_slice(payload);
+        buf.freeze()
+    }
+
+    /// Returns a dispatched payload's buffer to the pool, if there is room.
+    pub(crate) fn release(&mut self, payload: Bytes) {
+        if self.free.len() >= MAX_UDP_DNS_TASKS {
+            return;
+        }
+        if let Ok(buf) = payload.try_into_mut() {
+            self.free.push(buf);
+        }
+    }
+}
+
 struct UdpRelayCtx<'a> {
     client_udp_addr: &'a mut Option<SocketAddr>,
     normalized_expected_ip: Option<IpAddr>,
     virtual_udp: &'a dyn ProxyUdpSocket,
     target_tunnel: &'a Arc<dyn ProxyTunnelTarget>,
     dns_tasks: &'a mut tokio::task::JoinSet<()>,
-    dns_tx: &'a tokio::sync::mpsc::Sender<(Vec<SocketAddr>, Vec<u8>)>,
+    dns_tx: &'a tokio::sync::mpsc::Sender<(Vec<SocketAddr>, Bytes)>,
+    payload_pool: &'a mut UdpPayloadPool,
 }
 
 async fn forward_client_udp_datagram(
@@ -734,7 +774,7 @@ async fn forward_client_udp_datagram(
             }
             let tunnel = Arc::clone(ctx.target_tunnel);
             let tx = ctx.dns_tx.clone();
-            let payload_owned = payload.to_vec();
+            let payload_owned = ctx.payload_pool.take(payload);
             ctx.dns_tasks.spawn(async move {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
@@ -808,7 +848,8 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
     let mut out_pkt_buf = vec![0u8; 65536 + 32];
     let idle_timeout = std::time::Duration::from_mins(5);
     let mut dns_tasks = tokio::task::JoinSet::new();
-    let (dns_tx, mut dns_rx) = tokio::sync::mpsc::channel::<(Vec<SocketAddr>, Vec<u8>)>(64);
+    let (dns_tx, mut dns_rx) = tokio::sync::mpsc::channel::<(Vec<SocketAddr>, Bytes)>(64);
+    let mut payload_pool = UdpPayloadPool::default();
 
     loop {
         while let Some(res) = dns_tasks.try_join_next() {
@@ -828,6 +869,7 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
 
             Some((target_socks, payload)) = dns_rx.recv() => {
                 dispatch_resolved_udp_datagram(virtual_udp.as_ref(), &payload, &target_socks).await;
+                payload_pool.release(payload);
             }
 
             relay_res = relay_socket.recv_from(&mut relay_buf) => {
@@ -843,6 +885,7 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
                         target_tunnel: &target_tunnel,
                         dns_tasks: &mut dns_tasks,
                         dns_tx: &dns_tx,
+                        payload_pool: &mut payload_pool,
                     };
                     forward_client_udp_datagram(pkt, from_addr, &mut ctx).await;
                 }

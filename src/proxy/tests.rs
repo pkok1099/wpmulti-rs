@@ -24,8 +24,8 @@ use crate::proxy::router::{
 use crate::proxy::socks5::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, CMD_CONNECT, CMD_UDP_ASSOCIATE, METHOD_NO_ACCEPTABLE,
     METHOD_NO_AUTH, METHOD_USER_PASS, REP_CONN_REFUSED, REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE,
-    REP_NETWORK_UNREACHABLE, REP_SUCCESS, RFC1929_VERSION, SOCKS5_VERSION, build_socks5_udp_packet,
-    handle_socks5, parse_socks5_udp_packet, send_socks5_reply,
+    REP_NETWORK_UNREACHABLE, REP_SUCCESS, RFC1929_VERSION, SOCKS5_VERSION, UdpPayloadPool,
+    build_socks5_udp_packet, handle_socks5, parse_socks5_udp_packet, send_socks5_reply,
 };
 
 /// Mock tunnel target with configurable DNS resolution table and connection interception.
@@ -935,6 +935,33 @@ fn test_socks5_udp_header_encode_decode() {
     assert!(parse_socks5_udp_packet(&packet[..3]).is_none());
 }
 
+#[test]
+fn test_udp_payload_pool_reuses_buffer() {
+    let mut pool = UdpPayloadPool::default();
+    let first = pool.take(b"hello");
+    assert_eq!(&first[..], b"hello");
+    let first_ptr = first.as_ptr();
+    pool.release(first);
+
+    // A same-size payload reuses the exact same allocation: no fresh heap
+    // allocation for the second datagram.
+    let second = pool.take(b"world");
+    assert_eq!(second.as_ptr(), first_ptr);
+    assert_eq!(&second[..], b"world");
+}
+
+#[test]
+fn test_udp_payload_pool_grows_for_larger_payload() {
+    let mut pool = UdpPayloadPool::default();
+    let small = pool.take(b"hi");
+    pool.release(small);
+
+    // A larger payload after a small one grows the pooled buffer instead of
+    // truncating.
+    let large = pool.take(b"hello_socks5_udp_relay!");
+    assert_eq!(&large[..], b"hello_socks5_udp_relay!");
+}
+
 #[tokio::test]
 async fn test_socks5_udp_associate_relay() {
     let echo_udp_addr = spawn_echo_udp_server().await;
@@ -1022,6 +1049,105 @@ async fn test_socks5_udp_associate_relay() {
         parse_socks5_udp_packet(&resp_buf[..n]).expect("Failed to parse echoed packet");
     assert_eq!(from_target, target_dest);
     assert_eq!(echoed_payload, payload);
+}
+
+#[tokio::test]
+async fn test_socks5_udp_associate_relay_domain() {
+    let echo_udp_addr = spawn_echo_udp_server().await;
+    let echo_ip = echo_udp_addr.ip();
+    let echo_port = echo_udp_addr.port();
+
+    // Mock tunnel resolves the domain to the echo server, so the domain branch
+    // (pooled payload + spawned DNS task) is exercised end to end.
+    let target =
+        Arc::new(MockTunnelTarget::new("udp-tunnel").with_dns("echo.tunnel.local", echo_ip));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("udp-tunnel", target, None));
+
+    // Bind real TCP listener for SOCKS5 server to exercise real UDP relay sockets
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s5_addr = listener.local_addr().unwrap();
+
+    let r = Arc::clone(&router);
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let _ = handle_socks5(stream, r).await;
+        }
+    });
+
+    // Client connects via TCP control connection
+    let mut tcp_client = TcpStream::connect(s5_addr).await.unwrap();
+
+    // 1. Greeting
+    tcp_client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
+    let mut g_resp = [0u8; 2];
+    tcp_client.read_exact(&mut g_resp).await.unwrap();
+    assert_eq!(g_resp[1], METHOD_NO_AUTH);
+
+    // 2. CMD_UDP_ASSOCIATE
+    let cmd = [
+        SOCKS5_VERSION,
+        CMD_UDP_ASSOCIATE,
+        0x00,
+        ATYP_IPV4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    tcp_client.write_all(&cmd).await.unwrap();
+
+    let mut reply_hdr = [0u8; 4];
+    tcp_client.read_exact(&mut reply_hdr).await.unwrap();
+    assert_eq!(reply_hdr[1], REP_SUCCESS);
+
+    let relay_addr = match reply_hdr[3] {
+        ATYP_IPV4 => {
+            let mut buf = [0u8; 6];
+            tcp_client.read_exact(&mut buf).await.unwrap();
+            let ip = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
+            let port = u16::from_be_bytes([buf[4], buf[5]]);
+            let ip = if ip.is_unspecified() {
+                s5_addr.ip()
+            } else {
+                IpAddr::V4(ip)
+            };
+            SocketAddr::new(ip, port)
+        }
+        _ => panic!("Expected IPv4 relay address"),
+    };
+
+    // 3. Client binds UDP socket and sends two datagrams targeting the echo
+    // server by domain name; both must come back echoed, proving the pooled
+    // payload survives DNS resolution and dispatch.
+    let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_dest = TargetAddr::Domain("echo.tunnel.local".to_string(), echo_port);
+    let payloads = [
+        b"first_domain_datagram!".as_slice(),
+        b"second_domain_datagram".as_slice(),
+    ];
+    for payload in payloads {
+        let encap_pkt = build_socks5_udp_packet(&target_dest, payload);
+        client_udp.send_to(&encap_pkt, relay_addr).await.unwrap();
+
+        let mut resp_buf = vec![0u8; 2048];
+        let (n, from_relay) =
+            tokio::time::timeout(Duration::from_secs(2), client_udp.recv_from(&mut resp_buf))
+                .await
+                .expect("Timeout waiting for relayed UDP")
+                .unwrap();
+
+        assert_eq!(from_relay, relay_addr);
+        let (from_target, echoed_payload) =
+            parse_socks5_udp_packet(&resp_buf[..n]).expect("Failed to parse echoed packet");
+        assert_eq!(from_target, TargetAddr::Ip(echo_udp_addr));
+        assert_eq!(echoed_payload, payload);
+    }
 }
 
 // -----------------------------------------------------------------------------
