@@ -655,6 +655,18 @@ pub struct HealthCheckSettings {
 
     #[serde(default = "default_probe_timeout", with = "duration_str_serde")]
     pub probe_timeout: Duration,
+
+    /// Maximum concurrent probe slots (toll-gate concurrency). A probe
+    /// that finishes releases its slot at once for the next unprobed
+    /// tunnel, so the pool fills continuously instead of in batches.
+    #[serde(default = "default_probe_concurrency")]
+    pub probe_concurrency: usize,
+
+    /// Handshake attempts per probe pass. Startup tries once per tunnel;
+    /// a failure is the retry loop's job — the tunnel is re-probed on
+    /// the next probe pass — so a slow peer does not hold a slot.
+    #[serde(default = "default_probe_attempts")]
+    pub probe_attempts: usize,
 }
 
 const fn default_failure_threshold() -> usize {
@@ -673,6 +685,14 @@ const fn default_probe_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
+const fn default_probe_concurrency() -> usize {
+    16
+}
+
+const fn default_probe_attempts() -> usize {
+    1
+}
+
 impl Default for HealthCheckSettings {
     fn default() -> Self {
         Self {
@@ -680,6 +700,8 @@ impl Default for HealthCheckSettings {
             cooldown: default_cooldown(),
             probe_interval: default_probe_interval(),
             probe_timeout: default_probe_timeout(),
+            probe_concurrency: default_probe_concurrency(),
+            probe_attempts: default_probe_attempts(),
         }
     }
 }
@@ -1153,6 +1175,16 @@ impl MainConfig {
         if self.health_check.probe_timeout.is_zero() {
             return Err(ConfigError::Validation(
                 "health_check.probe_timeout must be greater than 0".into(),
+            ));
+        }
+        if self.health_check.probe_concurrency == 0 {
+            return Err(ConfigError::Validation(
+                "health_check.probe_concurrency must be greater than 0".into(),
+            ));
+        }
+        if self.health_check.probe_attempts == 0 {
+            return Err(ConfigError::Validation(
+                "health_check.probe_attempts must be greater than 0".into(),
             ));
         }
 

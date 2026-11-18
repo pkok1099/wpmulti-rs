@@ -1008,6 +1008,70 @@ fn test_router_all_unhealthy_fails() {
 }
 
 #[test]
+fn test_pool_prefers_handshaked_tunnels() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let _e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e3 = registry
+        .register(TunnelEntry::new(
+            "t3",
+            make_test_tunnel_config("t3"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+
+    let candidates = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
+
+    // No tunnel has handshaked yet: fall back to all routable tunnels so
+    // a fresh daemon can still bring tunnels up through real traffic.
+    let healthy = router.filter_healthy_candidates(&candidates);
+    assert_eq!(healthy.len(), 3);
+
+    // t1 and t3 have handshaked; t2 never has. The unproven tunnel must
+    // not be selected while proven tunnels exist, or a real connection
+    // could burn its whole failover budget on a handshake that never
+    // completes (reproduced live: github.com failed in exactly 3.5s).
+    e1.stats.record_handshake(1_700_000_000);
+    e3.stats.record_handshake(1_700_000_000);
+    let healthy = router.filter_healthy_candidates(&candidates);
+    assert_eq!(healthy.len(), 2);
+    assert!(healthy.contains(&&"t1".to_string()));
+    assert!(healthy.contains(&&"t3".to_string()));
+    assert!(!healthy.contains(&&"t2".to_string()));
+
+    // When every proven tunnel goes unhealthy, the unproven tunnel is the
+    // only routable one left and must be returned (fallback).
+    e1.health.mark_unhealthy(Duration::from_secs(60));
+    e3.health.mark_unhealthy(Duration::from_secs(60));
+    let healthy = router.filter_healthy_candidates(&candidates);
+    assert_eq!(healthy, vec![&"t2".to_string()]);
+}
+
+#[test]
 fn test_per_tunnel_auth_override_and_global_fallback() {
     let registry = Arc::new(TunnelRegistry::new());
     registry

@@ -224,15 +224,30 @@ impl MultiTenantRouter {
     }
 
     /// Filter candidates to only those whose health status is routable.
+    /// Routable candidates, preferring tunnels that have completed at
+    /// least one WireGuard handshake. A tunnel that has never handshaked
+    /// is unproven and may be unreachable; routing real traffic to it
+    /// while proven tunnels exist burns the caller's failover budget on
+    /// a handshake that never completes (the in-tunnel DNS hangs for
+    /// its full timeout). Only fall back to unproven tunnels when no
+    /// proven tunnel is routable, so a fresh daemon whose tunnels have
+    /// not handshaked yet can still bring them up through real traffic.
     pub fn filter_healthy_candidates<'a>(&self, candidates: &'a [String]) -> Vec<&'a String> {
-        candidates
-            .iter()
-            .filter(|id| {
-                self.registry
-                    .get(id)
-                    .is_some_and(|entry| !entry.is_disabled() && entry.health.can_route())
-            })
-            .collect()
+        let mut proven: Vec<&'a String> = Vec::new();
+        let mut unproven: Vec<&'a String> = Vec::new();
+        for id in candidates {
+            if let Some(entry) = self.registry.get(id)
+                && !entry.is_disabled()
+                && entry.health.can_route()
+            {
+                if entry.has_handshaked() {
+                    proven.push(id);
+                } else {
+                    unproven.push(id);
+                }
+            }
+        }
+        if proven.is_empty() { unproven } else { proven }
     }
 
     fn try_claim_candidate(&self, id: &str) -> bool {
@@ -290,9 +305,20 @@ impl MultiTenantRouter {
     }
 
     fn select_least_conn_registry(&self, entries: &[Arc<TunnelEntry>]) -> Option<String> {
-        let mut candidates: Vec<(usize, &str)> = entries
+        let routable: Vec<_> = entries
             .iter()
             .filter(|e| !e.is_disabled() && e.health.can_route())
+            .collect();
+        // Prefer tunnels that have completed a handshake; a never-handshaked
+        // tunnel is only chosen when no proven tunnel is routable.
+        let proven: Vec<_> = routable
+            .iter()
+            .copied()
+            .filter(|e| e.has_handshaked())
+            .collect();
+        let pool: Vec<_> = if proven.is_empty() { routable } else { proven };
+        let mut candidates: Vec<(usize, &str)> = pool
+            .iter()
             .map(|e| (e.stats.active_conns.load(Ordering::Relaxed), e.id.as_str()))
             .collect();
         candidates.sort_by_key(|(conns, _)| *conns);
@@ -306,21 +332,29 @@ impl MultiTenantRouter {
         entries: &[Arc<TunnelEntry>],
         is_random: bool,
     ) -> Option<String> {
-        let healthy: Vec<_> = entries
+        let routable: Vec<_> = entries
             .iter()
             .filter(|e| !e.is_disabled() && e.health.can_route())
             .collect();
-        if healthy.is_empty() {
+        if routable.is_empty() {
             return None;
         }
+        // Prefer tunnels that have completed a handshake; a never-handshaked
+        // tunnel is only chosen when no proven tunnel is routable.
+        let proven: Vec<_> = routable
+            .iter()
+            .copied()
+            .filter(|e| e.has_handshaked())
+            .collect();
+        let pool: Vec<_> = if proven.is_empty() { routable } else { proven };
         let start_idx = if is_random {
-            (rand::random::<u32>() as usize) % healthy.len()
+            (rand::random::<u32>() as usize) % pool.len()
         } else {
-            self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len()
+            self.rr_counter.fetch_add(1, Ordering::Relaxed) % pool.len()
         };
-        for offset in 0..healthy.len() {
-            let idx = (start_idx + offset) % healthy.len();
-            if let Some(entry) = healthy.get(idx)
+        for offset in 0..pool.len() {
+            let idx = (start_idx + offset) % pool.len();
+            if let Some(entry) = pool.get(idx)
                 && !entry.is_disabled()
                 && entry.health.is_routable()
             {

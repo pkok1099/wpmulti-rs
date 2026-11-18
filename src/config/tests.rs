@@ -277,6 +277,8 @@ fn test_toml_config_full_schema() {
         cooldown = "45s"
         probe_interval = "1m"
         probe_timeout = "10s"
+        probe_concurrency = 24
+        probe_attempts = 2
     "#;
 
     let cfg = MainConfig::from_toml_str(toml_str).expect("parse full toml");
@@ -326,10 +328,23 @@ fn assert_full_schema_listeners_and_admin(cfg: &MainConfig) {
     assert_eq!(cfg.tui.refresh_rate_ms, 250);
     assert_eq!(cfg.tui.default_sort, TuiSortField::Conns);
 
-    assert_eq!(cfg.health_check.threshold, 5);
-    assert_eq!(cfg.health_check.cooldown, Duration::from_secs(45));
-    assert_eq!(cfg.health_check.probe_interval, Duration::from_secs(60));
-    assert_eq!(cfg.health_check.probe_timeout, Duration::from_secs(10));
+    assert_health_check(
+        cfg,
+        &HealthCheckSettings {
+            threshold: 5,
+            cooldown: Duration::from_secs(45),
+            probe_interval: Duration::from_secs(60),
+            probe_timeout: Duration::from_secs(10),
+            probe_concurrency: 24,
+            probe_attempts: 2,
+        },
+    );
+}
+
+/// Assert every `[health_check]` field in one place so the callers that
+/// check a full config stay under the cognitive-complexity limit.
+fn assert_health_check(cfg: &MainConfig, expected: &HealthCheckSettings) {
+    assert_eq!(cfg.health_check, *expected);
 }
 
 // =========================================================================
@@ -345,10 +360,7 @@ fn test_toml_config_minimal_and_defaults() {
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
     );
     assert_eq!(cfg.global.log_level, LogLevel::Info);
-    assert_eq!(cfg.health_check.threshold, 3);
-    assert_eq!(cfg.health_check.cooldown, Duration::from_secs(30));
-    assert_eq!(cfg.health_check.probe_interval, Duration::from_secs(30));
-    assert_eq!(cfg.health_check.probe_timeout, Duration::from_secs(5));
+    assert_health_check(&cfg, &HealthCheckSettings::default());
     assert_eq!(cfg.global.max_active_tunnels, 1000);
     assert_eq!(cfg.global.dns_strategy, DnsStrategy::TunnelOnly);
     assert_eq!(cfg.lifecycle.mode, LifecycleMode::Lazy);
@@ -935,6 +947,8 @@ fn test_health_check_settings_and_validation() {
     assert_eq!(cfg.health_check.cooldown, Duration::from_secs(30));
     assert_eq!(cfg.health_check.probe_interval, Duration::from_secs(30));
     assert_eq!(cfg.health_check.probe_timeout, Duration::from_secs(5));
+    assert_eq!(cfg.health_check.probe_concurrency, 16);
+    assert_eq!(cfg.health_check.probe_attempts, 1);
     assert!(cfg.validate().is_ok());
 
     cfg.health_check.threshold = 0;
@@ -950,6 +964,14 @@ fn test_health_check_settings_and_validation() {
 
     cfg.health_check.probe_interval = Duration::from_secs(10);
     cfg.health_check.probe_timeout = Duration::ZERO;
+    assert!(cfg.validate().is_err());
+
+    cfg.health_check.probe_timeout = Duration::from_secs(5);
+    cfg.health_check.probe_concurrency = 0;
+    assert!(cfg.validate().is_err());
+
+    cfg.health_check.probe_concurrency = 16;
+    cfg.health_check.probe_attempts = 0;
     assert!(cfg.validate().is_err());
 }
 

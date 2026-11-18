@@ -21,6 +21,8 @@ threshold = 3
 cooldown = "30s"
 probe_interval = "30s"
 probe_timeout = "5s"
+probe_concurrency = 16           # concurrent probe slots (toll-gate); a finished probe frees its slot at once
+probe_attempts = 1               # handshake attempts per probe pass; a failure is retried on the next pass
 
 [per_tunnel]
 enabled = true

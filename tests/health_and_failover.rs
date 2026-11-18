@@ -377,6 +377,8 @@ async fn test_active_prober_lifecycle() {
         cooldown: Duration::from_secs(30),
         probe_interval: Duration::from_millis(50),
         probe_timeout: Duration::from_millis(20),
+        probe_concurrency: 16,
+        probe_attempts: 1,
     };
 
     // Lazy tunnel is never probed by ActiveProber

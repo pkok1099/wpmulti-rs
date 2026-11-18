@@ -420,6 +420,18 @@ impl TunnelEntry {
         self.disabled.load(Ordering::Relaxed)
     }
 
+    /// Whether this tunnel has completed at least one WireGuard handshake.
+    ///
+    /// A tunnel that has never handshaked is unproven: it may be freshly
+    /// started (handshake still in flight) or permanently unreachable.
+    /// Pool selection prefers proven tunnels so a broken unproven tunnel
+    /// cannot burn a real connection's failover budget while proven
+    /// tunnels are available; the active prober still proves unproven
+    /// tunnels independently.
+    pub fn has_handshaked(&self) -> bool {
+        self.stats.last_handshake.load(Ordering::Relaxed) > 0
+    }
+
     /// Set whether the tunnel is administratively disabled.
     pub fn set_disabled(&self, disabled: bool) {
         self.disabled.store(disabled, Ordering::Relaxed);

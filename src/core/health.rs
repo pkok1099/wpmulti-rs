@@ -437,8 +437,12 @@ impl ActiveProber {
         settings: &HealthCheckSettings,
         shutdown_rx: &mut watch::Receiver<bool>,
     ) {
-        const MAX_CONCURRENT_PROBES: usize = 12;
-        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES));
+        // Toll-gate concurrency: a probe that finishes releases its slot
+        // at once for the next unprobed tunnel. Clamped to at least 1 so
+        // a misconfigured 0 cannot deadlock the prober.
+        let sem = Arc::new(tokio::sync::Semaphore::new(
+            settings.probe_concurrency.max(1),
+        ));
         let mut set = tokio::task::JoinSet::new();
 
         for entry in registry.all_entries() {
@@ -466,9 +470,7 @@ impl ActiveProber {
                 };
 
                 let entry_ref = Arc::clone(&entry);
-                let threshold = settings.threshold;
-                let cooldown = settings.cooldown;
-                let timeout = settings.probe_timeout;
+                let probe_settings = settings.clone();
                 let active_clone = Arc::clone(&active);
                 let sem_clone = Arc::clone(&sem);
 
@@ -480,9 +482,7 @@ impl ActiveProber {
                         &entry_ref,
                         &active_clone,
                         peer_pubkey,
-                        timeout,
-                        threshold,
-                        cooldown,
+                        probe_settings,
                     )
                     .await;
                 });
@@ -512,19 +512,27 @@ impl ActiveProber {
         entry_ref: &Arc<crate::core::registry::TunnelEntry>,
         active_clone: &Arc<crate::core::registry::ActiveTunnel>,
         peer_pubkey: x25519_dalek::PublicKey,
-        timeout: Duration,
-        threshold: usize,
-        cooldown: Duration,
+        settings: HealthCheckSettings,
     ) {
-        const MAX_PROBE_ATTEMPTS: usize = 3;
+        // Handshake attempts per probe pass come from config
+        // (`probe_attempts`, default 1): a failing tunnel must not hold
+        // a probe slot through retries. A failure is the retry loop's
+        // job — the tunnel is re-probed on the next probe pass
+        // (`run_prober_loop`), so a slow or dead peer only costs its
+        // timeouts here and the slot is freed at once for the next
+        // unprobed tunnel (toll-gate flow).
         if entry_ref.is_disabled()
             || entry_ref.health.current_status() == HealthStatus::Dead
             || *entry_ref.state.read() != crate::core::registry::TunnelState::Active
         {
             return;
         }
+        let attempts = settings.probe_attempts.max(1);
+        let timeout = settings.probe_timeout;
+        let threshold = settings.threshold;
+        let cooldown = settings.cooldown;
         let mut succeeded = false;
-        for attempt in 0..MAX_PROBE_ATTEMPTS {
+        for attempt in 0..attempts {
             let probe_res =
                 tokio::time::timeout(timeout, active_clone.device.force_handshake(&peer_pubkey))
                     .await;
@@ -545,7 +553,7 @@ impl ActiveProber {
                             tracing::debug!(
                                 "Active probe egress check failed (attempt {}/{}): {}",
                                 attempt + 1,
-                                MAX_PROBE_ATTEMPTS,
+                                attempts,
                                 e
                             );
                         }
@@ -555,7 +563,7 @@ impl ActiveProber {
                     tracing::debug!(
                         "Active probe handshake failed (attempt {}/{}): {}",
                         attempt + 1,
-                        MAX_PROBE_ATTEMPTS,
+                        attempts,
                         e
                     );
                 }
@@ -563,11 +571,11 @@ impl ActiveProber {
                     tracing::debug!(
                         "Active probe handshake timed out (attempt {}/{})",
                         attempt + 1,
-                        MAX_PROBE_ATTEMPTS
+                        attempts
                     );
                 }
             }
-            if attempt + 1 < MAX_PROBE_ATTEMPTS {
+            if attempt + 1 < attempts {
                 let backoff_ms = 200u64 << attempt; // 200ms, 400ms
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }

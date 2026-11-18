@@ -80,12 +80,14 @@ pub enum ConfigField {
     HealthCheckCooldown,
     HealthCheckProbeInterval,
     HealthCheckProbeTimeout,
+    HealthCheckProbeConcurrency,
+    HealthCheckProbeAttempts,
     DisabledTunnels,
 }
 
 impl ConfigField {
     /// Ordered list of all configuration rows rendered in the TUI Config tab.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 29] = [
         Self::GlobalConfigDir,
         Self::GlobalBindAddress,
         Self::GlobalLogLevel,
@@ -112,6 +114,8 @@ impl ConfigField {
         Self::HealthCheckCooldown,
         Self::HealthCheckProbeInterval,
         Self::HealthCheckProbeTimeout,
+        Self::HealthCheckProbeConcurrency,
+        Self::HealthCheckProbeAttempts,
         Self::DisabledTunnels,
     ];
 
@@ -152,6 +156,8 @@ impl ConfigField {
             Self::HealthCheckCooldown => "health_check.cooldown",
             Self::HealthCheckProbeInterval => "health_check.probe_interval",
             Self::HealthCheckProbeTimeout => "health_check.probe_timeout",
+            Self::HealthCheckProbeConcurrency => "health_check.probe_concurrency",
+            Self::HealthCheckProbeAttempts => "health_check.probe_attempts",
             Self::DisabledTunnels => "disabled_tunnels",
         }
     }
@@ -172,6 +178,8 @@ impl ConfigField {
             | Self::HealthCheckCooldown
             | Self::HealthCheckProbeInterval
             | Self::HealthCheckProbeTimeout
+            | Self::HealthCheckProbeConcurrency
+            | Self::HealthCheckProbeAttempts
             | Self::DisabledTunnels => ConfigApplyScope::Live,
             Self::GlobalConfigDir
             | Self::GlobalBindAddress
@@ -245,6 +253,12 @@ impl ConfigField {
             Self::HealthCheckProbeTimeout => {
                 a.health_check.probe_timeout != b.health_check.probe_timeout
             }
+            Self::HealthCheckProbeConcurrency => {
+                a.health_check.probe_concurrency != b.health_check.probe_concurrency
+            }
+            Self::HealthCheckProbeAttempts => {
+                a.health_check.probe_attempts != b.health_check.probe_attempts
+            }
             Self::DisabledTunnels => a.disabled_tunnels != b.disabled_tunnels,
         }
     }
@@ -304,6 +318,12 @@ impl ConfigField {
             Self::HealthCheckProbeTimeout => {
                 to.health_check.probe_timeout = from.health_check.probe_timeout;
             }
+            Self::HealthCheckProbeConcurrency => {
+                to.health_check.probe_concurrency = from.health_check.probe_concurrency;
+            }
+            Self::HealthCheckProbeAttempts => {
+                to.health_check.probe_attempts = from.health_check.probe_attempts;
+            }
             Self::DisabledTunnels => to.disabled_tunnels.clone_from(&from.disabled_tunnels),
         }
     }
@@ -351,6 +371,8 @@ impl ConfigField {
             Self::HealthCheckProbeTimeout => {
                 format_duration_compact(cfg.health_check.probe_timeout)
             }
+            Self::HealthCheckProbeConcurrency => cfg.health_check.probe_concurrency.to_string(),
+            Self::HealthCheckProbeAttempts => cfg.health_check.probe_attempts.to_string(),
             Self::DisabledTunnels => format_string_list(&cfg.disabled_tunnels),
         }
     }
@@ -390,7 +412,9 @@ impl ConfigField {
             | Self::HealthCheckThreshold
             | Self::HealthCheckCooldown
             | Self::HealthCheckProbeInterval
-            | Self::HealthCheckProbeTimeout => self.display_value(cfg),
+            | Self::HealthCheckProbeTimeout
+            | Self::HealthCheckProbeConcurrency
+            | Self::HealthCheckProbeAttempts => self.display_value(cfg),
         }
     }
 
@@ -461,6 +485,8 @@ impl ConfigField {
             | Self::HealthCheckCooldown
             | Self::HealthCheckProbeInterval
             | Self::HealthCheckProbeTimeout
+            | Self::HealthCheckProbeConcurrency
+            | Self::HealthCheckProbeAttempts
             | Self::DisabledTunnels => return false,
         }
         true
@@ -535,6 +561,14 @@ impl ConfigField {
             }
             Self::HealthCheckProbeTimeout => {
                 cfg.health_check.probe_timeout = parse_duration_str(trimmed)?;
+                Ok(())
+            }
+            Self::HealthCheckProbeConcurrency => {
+                cfg.health_check.probe_concurrency = parse_usize(trimmed)?;
+                Ok(())
+            }
+            Self::HealthCheckProbeAttempts => {
+                cfg.health_check.probe_attempts = parse_usize(trimmed)?;
                 Ok(())
             }
             Self::DisabledTunnels => {
