@@ -144,6 +144,58 @@ pub(crate) fn discover_local_config_in(dir: &Path) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
+/// Resolve the config file to use when no explicit `-c` was given, in
+/// priority order:
+/// 1. `wpmulti.toml` in the working directory (the historical behaviour).
+/// 2. The per-user `wpmulti.toml` under the XDG config directory
+///    (`$XDG_CONFIG_HOME/wpmulti/wpmulti.toml`, or
+///    `~/.config/wpmulti/wpmulti.toml` when `XDG_CONFIG_HOME` is unset) —
+///    the universal location, present on Termux, Ubuntu, Debian and other
+///    Unix systems.
+///
+/// Returns `None` when neither exists and the caller falls back to the
+/// compiled-in defaults.
+pub(crate) fn discover_default_config() -> Option<PathBuf> {
+    discover_default_config_in(
+        Path::new("."),
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Testable core of [`discover_default_config`]: `cwd` is the working
+/// directory, `xdg_config_home` / `home` the environment values (or
+/// `None` when unset).
+pub(crate) fn discover_default_config_in(
+    cwd: &Path,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(local) = discover_local_config_in(cwd) {
+        return Some(local);
+    }
+    user_config_file(xdg_config_home, home).filter(|path| path.exists())
+}
+
+/// Absolute path of the per-user config file:
+/// `$XDG_CONFIG_HOME/wpmulti/wpmulti.toml` when `XDG_CONFIG_HOME` names
+/// an absolute directory, otherwise `$HOME/.config/wpmulti/wpmulti.toml`.
+/// `None` when neither location can be determined (no `HOME` and no
+/// usable `XDG_CONFIG_HOME`).
+fn user_config_file(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home {
+        let base = PathBuf::from(xdg);
+        if !xdg.is_empty() && base.is_absolute() {
+            return Some(base.join("wpmulti").join("wpmulti.toml"));
+        }
+    }
+    let home = PathBuf::from(home?);
+    Some(home.join(".config").join("wpmulti").join("wpmulti.toml"))
+}
+
 /// Execute the `wpmulti run` command: starts the multi-tunnel daemon.
 /// Monitoring a running daemon is done with `wpmulti top`, which reads
 /// it through the Admin API; `run` itself stays a plain daemon.
@@ -151,11 +203,13 @@ pub async fn cmd_run(
     config_path: Option<PathBuf>,
     dir_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = if config_path.is_none() && dir_path.is_none() {
-        discover_local_config_in(Path::new("."))
-    } else {
-        config_path
-    };
+    // No explicit `-c`: a `wpmulti.toml` in the working directory wins,
+    // then the per-user config under the XDG config directory
+    // (`~/.config/wpmulti/wpmulti.toml` by default), then the compiled-in
+    // defaults. This applies with `-d` too: `-d` only overrides where the
+    // tunnel `.conf` files live, it must not silently discard the user's
+    // config.
+    let config_path = config_path.or_else(discover_default_config);
     let saved_config_path = config_path.clone();
     let mut config = if let Some(path) = config_path {
         let content = tokio::fs::read_to_string(&path)
@@ -232,7 +286,7 @@ pub async fn cmd_run(
     );
     if saved_config_path.is_none() {
         tracing::info!(
-            "Running without wpmulti.toml: dedicated per-tunnel ports active (pass -c wpmulti.toml for shared listeners & Admin API)."
+            "Running without a config file: dedicated per-tunnel ports active (pass -c <file>, or place wpmulti.toml at ~/.config/wpmulti/wpmulti.toml, for shared listeners & Admin API)."
         );
     }
     log_active_listeners(&manager.listeners().list_listeners());
@@ -314,6 +368,9 @@ pub fn cmd_validate(
     config_path: Option<PathBuf>,
     dir_path: Option<PathBuf>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    // Same discovery as `run`: an explicit `-c` wins, then
+    // `./wpmulti.toml`, then `~/.config/wpmulti/wpmulti.toml`.
+    let config_path = config_path.or_else(discover_default_config);
     let mut config = if let Some(path) = config_path {
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;

@@ -7,9 +7,11 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 
 use crate::netstack::stack::VirtualNetworkStack;
 
@@ -250,6 +252,10 @@ struct DnsCacheEntry {
     last_accessed: AtomicU64,
 }
 
+/// Cloneable DNS result shared by concurrent lookups of the same domain
+/// (singleflight). `io::Error` is not `Clone`, so both arms are `Arc`d.
+type SharedDnsResult = Result<Arc<Vec<IpAddr>>, Arc<io::Error>>;
+
 /// Thread-safe TTL-aware LRU cache for resolved DNS domain names.
 #[derive(Debug)]
 pub struct DnsLruCache {
@@ -258,6 +264,11 @@ pub struct DnsLruCache {
     access_counter: AtomicU64,
     min_ttl: Duration,
     max_ttl: Duration,
+    /// In-flight singleflight cells keyed by cache key. Concurrent lookups
+    /// for the same domain share one upstream query instead of each doing
+    /// its own slow in-tunnel query. Lives on the shared cache so it
+    /// coalesces across tunnels, not just within one resolver.
+    inflight: AsyncMutex<HashMap<String, Arc<OnceCell<SharedDnsResult>>>>,
 }
 
 impl DnsLruCache {
@@ -266,8 +277,35 @@ impl DnsLruCache {
             entries: RwLock::new(HashMap::with_capacity(capacity)),
             capacity,
             access_counter: AtomicU64::new(0),
-            min_ttl: Duration::from_secs(5),   // Clamped min TTL
+            // Clamped min TTL (60s): a resolved entry survives at least a minute,
+            // so a burst of fresh lookups for the same domain does not re-query
+            // the upstream on every request. Records with a longer TTL keep it.
+            min_ttl: Duration::from_secs(60),
             max_ttl: Duration::from_hours(24), // Clamped max TTL (24h)
+            inflight: AsyncMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Get or create the singleflight cell for a cache key.
+    async fn inflight_cell(&self, key: &str) -> Arc<OnceCell<SharedDnsResult>> {
+        {
+            let mut inflight = self.inflight.lock().await;
+            Arc::clone(
+                inflight
+                    .entry(key.to_string())
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        }
+    }
+
+    /// Remove the singleflight cell for a key, but only if it is still the
+    /// same cell (a newer lookup for the same key may have replaced it).
+    async fn remove_inflight(&self, key: &str, cell: &Arc<OnceCell<SharedDnsResult>>) {
+        let mut inflight = self.inflight.lock().await;
+        if let Some(existing) = inflight.get(key)
+            && Arc::ptr_eq(existing, cell)
+        {
+            inflight.remove(key);
         }
     }
 
@@ -363,11 +401,17 @@ fn build_fallback_servers(fallback: SocketAddr) -> Vec<SocketAddr> {
 }
 
 /// In-tunnel DNS resolver guaranteeing zero host DNS leaks.
+///
+/// The cache is reference-counted so one daemon-wide cache can be shared by
+/// every tunnel's resolver: with per-tunnel caches, round-robin across many
+/// tunnels re-resolves the same domain on nearly every connection (each
+/// tunnel's cache goes cold between its turns), while a shared cache stays
+/// warm as long as any tunnel resolved the domain recently.
 #[derive(Debug)]
 pub struct InTunnelDnsResolver {
     has_configured_dns: bool,
     dns_servers: RwLock<Vec<SocketAddr>>,
-    cache: DnsLruCache,
+    cache: Arc<DnsLruCache>,
     timeout: Duration,
     max_retries: usize,
     prefer_ipv6: std::sync::atomic::AtomicBool,
@@ -386,6 +430,15 @@ impl InTunnelDnsResolver {
 
     /// Construct resolver from configured tunnel DNS addresses and an explicit fallback server.
     pub fn with_fallback(configured_dns: &[IpAddr], fallback: SocketAddr) -> Self {
+        Self::with_fallback_and_cache(configured_dns, fallback, Arc::new(DnsLruCache::new(2048)))
+    }
+
+    /// Construct resolver sharing a daemon-wide DNS cache with other tunnels.
+    pub fn with_fallback_and_cache(
+        configured_dns: &[IpAddr],
+        fallback: SocketAddr,
+        cache: Arc<DnsLruCache>,
+    ) -> Self {
         let has_configured_dns = !configured_dns.is_empty();
         let servers = if has_configured_dns {
             configured_dns
@@ -399,7 +452,7 @@ impl InTunnelDnsResolver {
         Self {
             has_configured_dns,
             dns_servers: RwLock::new(servers),
-            cache: DnsLruCache::new(2048),
+            cache,
             timeout: Duration::from_secs(2),
             max_retries: 2,
             prefer_ipv6: std::sync::atomic::AtomicBool::new(false),
@@ -523,10 +576,46 @@ impl InTunnelDnsResolver {
             return Ok(cached);
         }
 
+        // Singleflight: concurrent lookups for the same domain share one
+        // upstream query instead of each doing its own slow in-tunnel query
+        // (a stampede when the cache entry expires under load).
+        let cell = self.cache.inflight_cell(&cache_key).await;
+        let shared = cell
+            .get_or_init(|| async {
+                match self
+                    .resolve_uncached(stack, trimmed, mode, prefer_v6, &cache_key)
+                    .await
+                {
+                    Ok(ips) => Ok(Arc::new(ips)),
+                    Err(err) => Err(Arc::new(err)),
+                }
+            })
+            .await
+            .clone();
+        self.cache.remove_inflight(&cache_key, &cell).await;
+
+        match shared {
+            Ok(ips) => Ok((*ips).clone()),
+            // Rebuild the error with the same kind and message; the
+            // original's source chain is not shareable across tasks.
+            Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
+        }
+    }
+
+    /// Perform the actual upstream lookup (host or in-tunnel) and populate
+    /// the cache on success. Called once per cache key via singleflight.
+    async fn resolve_uncached(
+        &self,
+        stack: &VirtualNetworkStack,
+        trimmed: &str,
+        mode: crate::config::IpMode,
+        prefer_v6: bool,
+        cache_key: &str,
+    ) -> Result<Vec<IpAddr>, io::Error> {
         let strategy = self.dns_strategy();
         if strategy == crate::config::toml_config::DnsStrategy::Host {
             let ips = self.resolve_via_host(trimmed, mode, prefer_v6).await?;
-            self.cache.insert(&cache_key, ips.clone(), 60);
+            self.cache.insert(cache_key, ips.clone(), 60);
             return Ok(ips);
         }
 
@@ -534,7 +623,10 @@ impl InTunnelDnsResolver {
 
         // Query tunnel DNS servers strictly inside the WireGuard tunnel
         let mut last_err = io::Error::new(io::ErrorKind::TimedOut, "DNS resolution timed out");
-        let dns_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        // Total DNS deadline (1s): a single slow lookup must fail fast so the
+        // router can try another tunnel within the 3.5s failover budget.
+        // A 3s deadline consumed nearly the whole budget on one tunnel.
+        let dns_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
 
         'servers: for &server in &servers {
             for retry in 0..self.max_retries {
@@ -553,7 +645,7 @@ impl InTunnelDnsResolver {
                 .await
                 {
                     Ok(Ok((ips, ttl))) => {
-                        self.cache.insert(&cache_key, ips.clone(), ttl);
+                        self.cache.insert(cache_key, ips.clone(), ttl);
                         return Ok(ips);
                     }
                     Ok(Err(e)) => {
@@ -593,7 +685,7 @@ impl InTunnelDnsResolver {
             && is_transport_err
             && let Ok(ips) = self.resolve_via_host(trimmed, mode, prefer_v6).await
         {
-            self.cache.insert(&cache_key, ips.clone(), 60);
+            self.cache.insert(cache_key, ips.clone(), 60);
             return Ok(ips);
         }
 

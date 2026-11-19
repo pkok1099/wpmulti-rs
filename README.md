@@ -89,7 +89,7 @@ curl -x http://auto@127.0.0.1:8080 https://ifconfig.co
 
 | Command | Description |
 | :--- | :--- |
-| `wpmulti run [-c FILE] [-d DIR]` | Start the daemon (`-d` alone starts dedicated ports only; `-c wpmulti.toml` enables shared ports & Admin API; with neither flag, a `wpmulti.toml` in the current directory is used if one exists). |
+| `wpmulti run [-c FILE] [-d DIR]` | Start the daemon (no `-c`: a `wpmulti.toml` in the current directory is used if one exists, else `~/.config/wpmulti/wpmulti.toml`; `-d` only overrides the tunnel directory, it no longer implies dedicated-only mode). |
 | `wpmulti top [--admin-url URL]` | Monitor a running daemon (tunnels, connections, logs, config) through its Admin API; a loopback Admin API needs no token. |
 | `wpmulti validate [-c FILE] [-d DIR]` | Validate `wpmulti.toml` and all `.conf` files without binding ports. |
 | `wpmulti probe [-c WG_CONF \| -d DIR] [--json]` | Actively probe WireGuard tunnel handshake, RTT, and exit IP. |

@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::WgInterfaceConfig;
 use crate::netstack::bridge::VirtualTunBridge;
-use crate::netstack::dns::InTunnelDnsResolver;
+use crate::netstack::dns::{DnsLruCache, InTunnelDnsResolver};
 use crate::netstack::stream::{VirtualTcpStream, VirtualUdpSocket, to_smoltcp_endpoint};
 
 /// Default TCP socket receive buffer size (64 KiB).
@@ -82,6 +82,47 @@ pub(crate) fn register_shutdown_waker(
 impl std::fmt::Debug for StackInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StackInner").finish_non_exhaustive()
+    }
+}
+
+/// DNS configuration for a virtual network stack.
+///
+/// `shared_cache` is the daemon-wide DNS cache: every tunnel built with the
+/// same cache instance shares resolutions, so round-robin across many tunnels
+/// does not re-resolve the same domain on every connection. One-off stacks
+/// (CLI probes, tests) use [`StackDnsConfig::new`], which creates a fresh
+/// private cache.
+#[derive(Debug)]
+pub struct StackDnsConfig {
+    /// Fallback DNS server used when the tunnel `.conf` omits `DNS`.
+    pub fallback: SocketAddr,
+    /// Resolution strategy (`TunnelOnly`, `TunnelFirst`, `Host`).
+    pub strategy: crate::config::toml_config::DnsStrategy,
+    /// DNS cache shared with other stacks (or a fresh private one).
+    pub shared_cache: Arc<DnsLruCache>,
+}
+
+impl StackDnsConfig {
+    /// Build DNS config with a fresh private cache.
+    pub fn new(fallback: SocketAddr, strategy: crate::config::toml_config::DnsStrategy) -> Self {
+        Self {
+            fallback,
+            strategy,
+            shared_cache: Arc::new(DnsLruCache::new(2048)),
+        }
+    }
+
+    /// Build DNS config sharing a daemon-wide cache with other stacks.
+    pub const fn with_shared_cache(
+        fallback: SocketAddr,
+        strategy: crate::config::toml_config::DnsStrategy,
+        shared_cache: Arc<DnsLruCache>,
+    ) -> Self {
+        Self {
+            fallback,
+            strategy,
+            shared_cache,
+        }
     }
 }
 
@@ -228,15 +269,16 @@ impl VirtualNetworkStack {
         ip_mode: crate::config::IpMode,
         prefer_ipv6: bool,
     ) -> Result<Self, io::Error> {
+        let dns = StackDnsConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+            crate::config::toml_config::DnsStrategy::TunnelOnly,
+        );
         Self::new_with_options(
             config,
             bridge,
             ip_mode,
             prefer_ipv6,
-            (
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
-                crate::config::toml_config::DnsStrategy::TunnelOnly,
-            ),
+            &dns,
             DEFAULT_CONNECT_TIMEOUT,
         )
     }
@@ -248,7 +290,7 @@ impl VirtualNetworkStack {
         mut bridge: VirtualTunBridge,
         ip_mode: crate::config::IpMode,
         prefer_ipv6: bool,
-        (dns_fallback, dns_strategy): (SocketAddr, crate::config::toml_config::DnsStrategy),
+        dns: &StackDnsConfig,
         connect_timeout: StdDuration,
     ) -> Result<Self, io::Error> {
         let notify = bridge.notify_handle();
@@ -299,10 +341,14 @@ impl VirtualNetworkStack {
         });
 
         let initial_port = 49152 + (rand::random::<u16>() % 1000);
-        let resolver = InTunnelDnsResolver::with_fallback(&config.dns, dns_fallback);
+        let resolver = InTunnelDnsResolver::with_fallback_and_cache(
+            &config.dns,
+            dns.fallback,
+            Arc::clone(&dns.shared_cache),
+        );
         resolver.set_ip_mode(effective_ip_mode);
         resolver.set_prefer_ipv6(prefer_ipv6);
-        resolver.set_dns_strategy(dns_strategy);
+        resolver.set_dns_strategy(dns.strategy);
         let timeout_ms = (connect_timeout.as_millis().min(u128::from(u64::MAX)) as u64).max(1);
         Ok(Self {
             inner,

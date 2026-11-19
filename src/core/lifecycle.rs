@@ -20,7 +20,9 @@ use crate::config::LifecycleMode;
 use crate::core::CoreError;
 use crate::core::health::TunnelHealthTracker;
 use crate::core::registry::{ActiveTunnel, TunnelEntry, TunnelRegistry, TunnelState, TunnelStats};
-use crate::netstack::{DEFAULT_CHANNEL_CAPACITY, VirtualNetworkStack, VirtualTunBridge};
+use crate::netstack::{
+    DEFAULT_CHANNEL_CAPACITY, DnsLruCache, StackDnsConfig, VirtualNetworkStack, VirtualTunBridge,
+};
 use crate::proxy::{DynStream, ProxyTunnelTarget, ProxyUdpSocket};
 
 /// RAII Guard tracking an active connection routed through a specific tunnel.
@@ -535,6 +537,11 @@ pub struct LifecycleController {
     prefer_ipv6: std::sync::atomic::AtomicBool,
     ip_mode: std::sync::atomic::AtomicU8,
     eviction_lock: tokio::sync::Mutex<()>,
+    /// Daemon-wide DNS cache shared by every tunnel's resolver, so
+    /// round-robin across many tunnels does not re-resolve the same domain
+    /// on every connection (each tunnel's own cache would go cold between
+    /// its turns).
+    shared_dns_cache: Arc<DnsLruCache>,
 }
 
 impl LifecycleController {
@@ -564,6 +571,7 @@ impl LifecycleController {
             prefer_ipv6: std::sync::atomic::AtomicBool::new(false),
             ip_mode: std::sync::atomic::AtomicU8::new(0),
             eviction_lock: tokio::sync::Mutex::new(()),
+            shared_dns_cache: Arc::new(DnsLruCache::new(2048)),
         })
     }
 
@@ -880,14 +888,17 @@ impl LifecycleController {
             }
             TunnelState::Dormant | TunnelState::Activating => {
                 let activating_guard = ActivatingGuard::new(&entry);
-                let dns_fallback = *self.dns_fallback.lock();
+                let dns = StackDnsConfig::with_shared_cache(
+                    *self.dns_fallback.lock(),
+                    self.dns_strategy(),
+                    Arc::clone(&self.shared_dns_cache),
+                );
                 match Self::boot_tunnel(
                     &entry,
                     self.ip_mode(),
                     self.prefer_ipv6.load(Ordering::Relaxed),
                     self.handshake_timeout(),
-                    dns_fallback,
-                    self.dns_strategy(),
+                    &dns,
                 )
                 .await
                 {
@@ -983,14 +994,17 @@ impl LifecycleController {
             }
             TunnelState::Dormant | TunnelState::Activating => {
                 let activating_guard = ActivatingGuard::new(&entry);
-                let dns_fallback = *self.dns_fallback.lock();
+                let dns = StackDnsConfig::with_shared_cache(
+                    *self.dns_fallback.lock(),
+                    self.dns_strategy(),
+                    Arc::clone(&self.shared_dns_cache),
+                );
                 match Self::boot_tunnel(
                     &entry,
                     self.ip_mode(),
                     self.prefer_ipv6.load(Ordering::Relaxed),
                     self.handshake_timeout(),
-                    dns_fallback,
-                    self.dns_strategy(),
+                    &dns,
                 )
                 .await
                 {
@@ -1049,8 +1063,7 @@ impl LifecycleController {
         ip_mode: crate::config::IpMode,
         prefer_ipv6: bool,
         handshake_timeout: Duration,
-        dns_fallback: SocketAddr,
-        dns_strategy: crate::config::toml_config::DnsStrategy,
+        dns: &StackDnsConfig,
     ) -> Result<Arc<ActiveTunnel>, CoreError> {
         let (config_interface, config_peers) = {
             let cfg = entry.config.read();
@@ -1123,13 +1136,13 @@ impl LifecycleController {
             )
         })?;
 
-        // Build smoltcp VirtualNetworkStack
+        // Build smoltcp VirtualNetworkStack (shares the daemon-wide DNS cache)
         let netstack = match VirtualNetworkStack::new_with_options(
             &config_interface,
             bridge,
             ip_mode,
             prefer_ipv6,
-            (dns_fallback, dns_strategy),
+            dns,
             handshake_timeout,
         ) {
             Ok(ns) => ns,

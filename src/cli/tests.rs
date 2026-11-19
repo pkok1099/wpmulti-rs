@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use clap::Parser;
 use tempfile::tempdir;
 
-use crate::cli::commands::{admin_api_call_error, cmd_run, cmd_validate, discover_local_config_in};
+use crate::cli::commands::{
+    admin_api_call_error, cmd_run, cmd_validate, discover_default_config_in,
+    discover_local_config_in,
+};
 use crate::cli::{Cli, Commands};
 
 #[test]
@@ -175,6 +178,106 @@ fn test_discover_local_config_finds_wpmulti_toml_in_dir() {
     let other = tempdir().expect("tempdir");
     fs::write(other.path().join("wpmulti.toml.example"), "[global]\n").expect("write example");
     assert_eq!(discover_local_config_in(other.path()), None);
+}
+
+#[test]
+fn test_discover_default_config_prefers_local_over_user_config() {
+    // A `wpmulti.toml` in the working directory wins over the per-user
+    // config under the XDG config directory, even when both exist.
+    let cwd = tempdir().expect("tempdir");
+    let local = cwd.path().join("wpmulti.toml");
+    fs::write(&local, "[global]\n").expect("write local toml");
+
+    let home = tempdir().expect("tempdir");
+    let user = home
+        .path()
+        .join(".config")
+        .join("wpmulti")
+        .join("wpmulti.toml");
+    fs::create_dir_all(user.parent().expect("user parent")).expect("create user config dir");
+    fs::write(&user, "[global]\n").expect("write user toml");
+
+    assert_eq!(
+        discover_default_config_in(cwd.path(), None, Some(home.path().as_os_str())),
+        Some(local)
+    );
+}
+
+#[test]
+fn test_discover_default_config_falls_back_to_user_config() {
+    // No local `wpmulti.toml`: the per-user config under `~/.config` is
+    // picked up.
+    let cwd = tempdir().expect("tempdir");
+    let home = tempdir().expect("tempdir");
+    let user = home
+        .path()
+        .join(".config")
+        .join("wpmulti")
+        .join("wpmulti.toml");
+    fs::create_dir_all(user.parent().expect("user parent")).expect("create user config dir");
+    fs::write(&user, "[global]\n").expect("write user toml");
+
+    assert_eq!(
+        discover_default_config_in(cwd.path(), None, Some(home.path().as_os_str())),
+        Some(user)
+    );
+}
+
+#[test]
+fn test_discover_default_config_prefers_xdg_over_home() {
+    // An absolute `XDG_CONFIG_HOME` replaces `~/.config` as the base.
+    let cwd = tempdir().expect("tempdir");
+    let xdg = tempdir().expect("tempdir");
+    let user = xdg.path().join("wpmulti").join("wpmulti.toml");
+    fs::create_dir_all(user.parent().expect("user parent")).expect("create xdg config dir");
+    fs::write(&user, "[global]\n").expect("write xdg toml");
+
+    let home = tempdir().expect("tempdir");
+    assert_eq!(
+        discover_default_config_in(
+            cwd.path(),
+            Some(xdg.path().as_os_str()),
+            Some(home.path().as_os_str())
+        ),
+        Some(user)
+    );
+}
+
+#[test]
+fn test_discover_default_config_ignores_relative_xdg() {
+    // A relative `XDG_CONFIG_HOME` is not a usable base (XDG requires an
+    // absolute path): fall back to `$HOME/.config`.
+    let cwd = tempdir().expect("tempdir");
+    let home = tempdir().expect("tempdir");
+    let user = home
+        .path()
+        .join(".config")
+        .join("wpmulti")
+        .join("wpmulti.toml");
+    fs::create_dir_all(user.parent().expect("user parent")).expect("create user config dir");
+    fs::write(&user, "[global]\n").expect("write user toml");
+
+    assert_eq!(
+        discover_default_config_in(
+            cwd.path(),
+            Some(std::ffi::OsStr::new("relative/config")),
+            Some(home.path().as_os_str())
+        ),
+        Some(user)
+    );
+}
+
+#[test]
+fn test_discover_default_config_none_when_nothing_exists() {
+    // Neither a local nor a per-user config exists: discovery returns
+    // `None` and the caller falls back to the compiled-in defaults.
+    let cwd = tempdir().expect("tempdir");
+    let home = tempdir().expect("tempdir");
+    assert_eq!(
+        discover_default_config_in(cwd.path(), None, Some(home.path().as_os_str())),
+        None
+    );
+    assert_eq!(discover_default_config_in(cwd.path(), None, None), None);
 }
 
 #[test]

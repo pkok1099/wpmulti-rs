@@ -12,7 +12,7 @@ use crate::netstack::bridge::{
     BridgeIpRecv, DEFAULT_CHANNEL_CAPACITY, DEFAULT_MTU, VirtualTunBridge,
 };
 use crate::netstack::dns::{DnsError, DnsLruCache, QueryType, build_query, parse_response};
-use crate::netstack::stack::VirtualNetworkStack;
+use crate::netstack::stack::{StackDnsConfig, VirtualNetworkStack};
 
 fn make_test_config(v4: &str, v6: Option<&str>) -> WgInterfaceConfig {
     let mut addrs = vec![v4.parse().unwrap()];
@@ -242,7 +242,7 @@ fn test_dns_cache_ttl_clamping() {
     let cache = DnsLruCache::new(10);
     let ip: IpAddr = "1.1.1.1".parse().unwrap();
 
-    // Inserting with TTL = 0 should be clamped to min_ttl (5 seconds)
+    // Inserting with TTL = 0 should be clamped to min_ttl (60 seconds)
     cache.insert("min.com", vec![ip], 0);
     assert_eq!(cache.get("min.com"), Some(vec![ip]));
 
@@ -658,6 +658,235 @@ async fn test_in_tunnel_dns_resolution_and_cache() {
     // Second resolution: served directly from LRU cache without network packet!
     let cached = stack.resolve_in_tunnel("example.com").await.unwrap();
     assert_eq!(cached, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+
+    stack.close().await;
+}
+
+#[tokio::test]
+async fn test_shared_dns_cache_across_stacks() {
+    use std::sync::Arc;
+
+    use crate::config::toml_config::DnsStrategy;
+
+    // One daemon-wide cache shared by both stacks.
+    let shared = Arc::new(DnsLruCache::new(2048));
+    let dns_a = StackDnsConfig::with_shared_cache(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+        DnsStrategy::TunnelOnly,
+        Arc::clone(&shared),
+    );
+    let dns_b = StackDnsConfig::with_shared_cache(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+        DnsStrategy::TunnelOnly,
+        Arc::clone(&shared),
+    );
+
+    let config = make_test_config("10.2.0.2/32", None);
+    let (bridge_a, mut ip_send_a, mut ip_recv_a) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack_a = VirtualNetworkStack::new_with_options(
+        &config,
+        bridge_a,
+        crate::config::IpMode::DualStack,
+        false,
+        &dns_a,
+        Duration::from_secs(15),
+    )
+    .unwrap();
+
+    // Stack B has no mock DNS responder on its bridge: if the cache were
+    // per-stack, resolving via B would have to query the (absent) upstream
+    // and time out. A shared cache serves it from A's earlier lookup.
+    let (bridge_b, _ip_send_b, _ip_recv_b) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack_b = VirtualNetworkStack::new_with_options(
+        &config,
+        bridge_b,
+        crate::config::IpMode::DualStack,
+        false,
+        &dns_b,
+        Duration::from_secs(15),
+    )
+    .unwrap();
+
+    let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+
+    // Spawn mock DNS responder task on stack A's bridge only.
+    let responder_task = tokio::spawn(async move {
+        use gotatun::tun::{IpRecv, IpSend};
+        use zerocopy::IntoBytes;
+
+        let mut packets = ip_recv_a.recv(&mut pool).await.unwrap();
+        let pkt = packets.next().unwrap();
+        let raw = (*pkt).as_bytes();
+
+        let parsed = etherparse::SlicedPacket::from_ip(raw).unwrap();
+        let udp_hdr = match &parsed.transport {
+            Some(etherparse::TransportSlice::Udp(u)) => u,
+            _ => panic!("expected udp"),
+        };
+        let dns_query = udp_hdr.payload();
+        let tx_id = u16::from_be_bytes([dns_query[0], dns_query[1]]);
+
+        // Build mock DNS response pointing to 93.184.216.34
+        let mut dns_resp = Vec::new();
+        dns_resp.extend_from_slice(&tx_id.to_be_bytes());
+        dns_resp.extend_from_slice(&[0x81, 0x80]); // Response
+        dns_resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+        dns_resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT=1
+        dns_resp.extend_from_slice(&[0x00, 0x00]);
+        dns_resp.extend_from_slice(&[0x00, 0x00]);
+        // Echo question
+        dns_resp.extend_from_slice(&dns_query[12..]);
+        // Answer: compression pointer to name
+        dns_resp.extend_from_slice(&[0xC0, 0x0C]);
+        dns_resp.extend_from_slice(&[0x00, 0x01]); // Type A
+        dns_resp.extend_from_slice(&[0x00, 0x01]); // Class IN
+        dns_resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL=60s
+        dns_resp.extend_from_slice(&[0x00, 0x04]); // Len=4
+        dns_resp.extend_from_slice(&[93, 184, 216, 34]);
+
+        let (src_ip, dst_ip) = match parsed.net.unwrap() {
+            etherparse::NetSlice::Ipv4(v4) => (v4.header().source(), v4.header().destination()),
+            _ => panic!("expected ipv4"),
+        };
+        let udp_ports = (udp_hdr.source_port(), udp_hdr.destination_port());
+
+        let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64).udp(udp_ports.1, udp_ports.0);
+        let mut reply_raw = Vec::new();
+        builder.write(&mut reply_raw, &dns_resp).unwrap();
+
+        let mut reply_pkt = pool.get();
+        reply_pkt.truncate(reply_raw.len());
+        reply_pkt.copy_from_slice(&reply_raw);
+        let ip_reply = reply_pkt.try_into_ip().unwrap();
+
+        ip_send_a.send(ip_reply).await.unwrap();
+    });
+
+    // First resolution via A: queries the mock DNS, populates the shared cache.
+    let resolved_a = stack_a.resolve_in_tunnel("example.com").await.unwrap();
+    assert_eq!(resolved_a, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+
+    responder_task.await.unwrap();
+
+    // Resolution via B: must be served from the shared cache without any
+    // network packet. Bounded so a regression (per-stack cache) fails fast
+    // instead of waiting out the 3s in-tunnel DNS deadline.
+    let resolved_b = tokio::time::timeout(
+        Duration::from_secs(2),
+        stack_b.resolve_in_tunnel("example.com"),
+    )
+    .await
+    .expect("stack B resolution timed out: shared DNS cache not used")
+    .unwrap();
+    assert_eq!(resolved_b, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+
+    stack_a.close().await;
+    stack_b.close().await;
+}
+
+#[tokio::test]
+async fn test_dns_singleflight_coalesces_concurrent_lookups() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let config = make_test_config("10.2.0.2/32", None);
+    let (bridge, mut ip_send, mut ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack = Arc::new(VirtualNetworkStack::new(&config, bridge).unwrap());
+
+    let query_count = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&query_count);
+
+    // Mock DNS responder: counts every query and answers 93.184.216.34.
+    // Stops after 300ms with no further query.
+    let responder_task = tokio::spawn(async move {
+        use gotatun::tun::{IpRecv, IpSend};
+        use zerocopy::IntoBytes;
+
+        let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+        loop {
+            let recv =
+                tokio::time::timeout(Duration::from_millis(300), ip_recv.recv(&mut pool)).await;
+            let Ok(Ok(mut packets)) = recv else {
+                break;
+            };
+            // Collect owned query bytes first; the packet iterator borrows
+            // the pool, so replies (which need `pool.get()`) go after it.
+            let mut queries = Vec::new();
+            for pkt in packets.by_ref() {
+                counter.fetch_add(1, Ordering::Relaxed);
+                queries.push((*pkt).as_bytes().to_vec());
+            }
+            drop(packets);
+
+            for raw in queries {
+                let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
+                let udp_hdr = match &parsed.transport {
+                    Some(etherparse::TransportSlice::Udp(u)) => u,
+                    _ => panic!("expected udp"),
+                };
+                let dns_query = udp_hdr.payload();
+                let tx_id = u16::from_be_bytes([dns_query[0], dns_query[1]]);
+
+                let mut dns_resp = Vec::new();
+                dns_resp.extend_from_slice(&tx_id.to_be_bytes());
+                dns_resp.extend_from_slice(&[0x81, 0x80]);
+                dns_resp.extend_from_slice(&[0x00, 0x01]);
+                dns_resp.extend_from_slice(&[0x00, 0x01]);
+                dns_resp.extend_from_slice(&[0x00, 0x00]);
+                dns_resp.extend_from_slice(&[0x00, 0x00]);
+                dns_resp.extend_from_slice(&dns_query[12..]);
+                dns_resp.extend_from_slice(&[0xC0, 0x0C]);
+                dns_resp.extend_from_slice(&[0x00, 0x01]);
+                dns_resp.extend_from_slice(&[0x00, 0x01]);
+                dns_resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]);
+                dns_resp.extend_from_slice(&[0x00, 0x04]);
+                dns_resp.extend_from_slice(&[93, 184, 216, 34]);
+
+                let (src_ip, dst_ip) = match parsed.net.unwrap() {
+                    etherparse::NetSlice::Ipv4(v4) => {
+                        (v4.header().source(), v4.header().destination())
+                    }
+                    _ => panic!("expected ipv4"),
+                };
+                let udp_ports = (udp_hdr.source_port(), udp_hdr.destination_port());
+
+                let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64).udp(udp_ports.1, udp_ports.0);
+                let mut reply_raw = Vec::new();
+                builder.write(&mut reply_raw, &dns_resp).unwrap();
+
+                let mut reply_pkt = pool.get();
+                reply_pkt.truncate(reply_raw.len());
+                reply_pkt.copy_from_slice(&reply_raw);
+                let ip_reply = reply_pkt.try_into_ip().unwrap();
+
+                ip_send.send(ip_reply).await.unwrap();
+            }
+        }
+    });
+
+    // 8 concurrent resolutions, released at once via a barrier so they overlap.
+    const N: usize = 8;
+    let barrier = Arc::new(tokio::sync::Barrier::new(N));
+    let mut handles = Vec::new();
+    for _ in 0..N {
+        let stack = Arc::clone(&stack);
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            stack.resolve_in_tunnel("example.com").await
+        }));
+    }
+    for handle in handles {
+        let ip = handle.await.unwrap().unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+    }
+
+    responder_task.await.unwrap();
+    assert_eq!(
+        query_count.load(Ordering::Relaxed),
+        1,
+        "singleflight must coalesce concurrent lookups into one upstream query"
+    );
 
     stack.close().await;
 }
