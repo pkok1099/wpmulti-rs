@@ -1617,8 +1617,9 @@ fn test_destination_caused_error_classification() {
     assert!(is_destination_caused_error(ErrorKind::NotFound, false));
     assert!(is_destination_caused_error(ErrorKind::InvalidInput, false));
     // Timeout: only destination-caused when the peer has handshaked
-    // before (a blackholing destination); a timeout against a peer that
-    // never handshaked points at the peer itself.
+    // recently (a blackholing destination); a timeout against a peer
+    // whose last handshake is stale — or that never handshaked — points
+    // at the peer itself.
     assert!(is_destination_caused_error(ErrorKind::TimedOut, true));
     assert!(!is_destination_caused_error(ErrorKind::TimedOut, false));
     // Tunnel-side / unexpected: still a failure.
@@ -1632,6 +1633,137 @@ fn test_destination_caused_error_classification() {
         true
     ));
     assert!(!is_destination_caused_error(ErrorKind::Other, true));
+}
+
+#[test]
+fn test_handshake_freshness_window() {
+    use crate::core::lifecycle::{HANDSHAKE_FRESHNESS_WINDOW_SECS, handshake_is_fresh};
+
+    let now = 1_700_000_000;
+    // Never handshaked: never fresh.
+    assert!(!handshake_is_fresh(0, now));
+    // Just now: fresh.
+    assert!(handshake_is_fresh(now, now));
+    // One second inside the window: still fresh.
+    assert!(handshake_is_fresh(
+        now - HANDSHAKE_FRESHNESS_WINDOW_SECS + 1,
+        now
+    ));
+    // Exactly at the window edge: stale.
+    assert!(!handshake_is_fresh(
+        now - HANDSHAKE_FRESHNESS_WINDOW_SECS,
+        now
+    ));
+    // Ten minutes ago: stale.
+    assert!(!handshake_is_fresh(now - 600, now));
+}
+
+#[tokio::test]
+async fn test_dns_timeout_with_stale_handshake_counts_as_failure() {
+    use crate::proxy::ProxyTunnelTarget;
+
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "tun-dns-timeout-stale",
+            make_test_tunnel_config("tun-dns-timeout-stale"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let (target, guard) = lifecycle
+        .get_or_activate("tun-dns-timeout-stale")
+        .await
+        .unwrap();
+    let tracker = Arc::new(TunnelHealthTracker::new());
+    let guarded = crate::core::lifecycle::GuardedTunnelTarget::new_with_health(
+        target,
+        guard,
+        Arc::clone(&tracker),
+        3,
+        Duration::from_secs(30),
+    );
+
+    // The peer handshaked ten minutes ago and has been silent since: a
+    // DNS timeout now points at the dead peer, not at a blackholing
+    // destination — it must count as a tunnel-side failure (the old
+    // "ever handshaked" rule excused it, so the tunnel kept being
+    // selected and burned the pool failover budget).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // `target` moved into `guarded` above; reach the shared stats
+    // through the guarded target's tunnel handle.
+    guarded.tunnel().stats.record_handshake(now - 600);
+
+    let err = guarded
+        .resolve_all_in_tunnel("nonexistent.invalid")
+        .await
+        .expect_err("in-tunnel DNS must time out without a peer");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(tracker.consecutive_failures(), 1);
+    assert_eq!(tracker.current_status(), HealthStatus::Untested);
+
+    drop(guarded);
+    lifecycle.stop().await;
+}
+
+#[tokio::test]
+async fn test_dns_timeout_with_fresh_handshake_is_inconclusive() {
+    use crate::proxy::ProxyTunnelTarget;
+
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "tun-dns-timeout-fresh",
+            make_test_tunnel_config("tun-dns-timeout-fresh"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let (target, guard) = lifecycle
+        .get_or_activate("tun-dns-timeout-fresh")
+        .await
+        .unwrap();
+    let tracker = Arc::new(TunnelHealthTracker::new());
+    let guarded = crate::core::lifecycle::GuardedTunnelTarget::new_with_health(
+        target,
+        guard,
+        Arc::clone(&tracker),
+        3,
+        Duration::from_secs(30),
+    );
+
+    // Control leg: the peer handshaked just now, so a DNS timeout is
+    // still plausibly the destination's fault — it must not count
+    // against the tunnel.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    guarded.tunnel().stats.record_handshake(now);
+
+    let err = guarded
+        .resolve_all_in_tunnel("nonexistent.invalid")
+        .await
+        .expect_err("in-tunnel DNS must time out without a peer");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(tracker.consecutive_failures(), 0);
+    assert_eq!(tracker.current_status(), HealthStatus::Untested);
+
+    drop(guarded);
+    lifecycle.stop().await;
 }
 
 #[tokio::test]

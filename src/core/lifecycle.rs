@@ -172,8 +172,11 @@ impl GuardedTunnelTarget {
                 Err(e) => {
                     trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
-                        let handshaked = tunnel.stats.last_handshake.load(Ordering::Relaxed) > 0;
-                        if is_destination_caused_error(e.kind(), handshaked) {
+                        let handshaked_recently = handshake_is_fresh(
+                            tunnel.stats.last_handshake.load(Ordering::Relaxed),
+                            now_unix_secs(),
+                        );
+                        if is_destination_caused_error(e.kind(), handshaked_recently) {
                             h.record_inconclusive();
                         } else {
                             h.record_failure(threshold, cooldown);
@@ -203,18 +206,41 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
+/// A WireGuard handshake counts as fresh for failure attribution when it
+/// completed within this window. The prober re-handshakes every healthy
+/// tunnel each `probe_interval` (30s by default), so a live tunnel's last
+/// handshake is at most one interval plus one slow probe pass old. A
+/// timeout against a tunnel whose last handshake is older than this
+/// points at the dead peer, not at a blackholing destination, so it must
+/// count as a tunnel-side failure (and trip the breaker) instead of being
+/// excused as destination-caused — otherwise a tunnel that died after
+/// proving itself once keeps being selected forever, burning the pool
+/// failover budget on DNS timeouts until the prober happens to re-mark
+/// it.
+pub(crate) const HANDSHAKE_FRESHNESS_WINDOW_SECS: u64 = 90;
+
+/// Whether the tunnel's last successful handshake is fresh enough that a
+/// timeout is more plausibly the destination's fault than the peer's.
+/// A tunnel that never handshaked (`last_handshake_secs == 0`) is never
+/// fresh.
+pub(crate) const fn handshake_is_fresh(last_handshake_secs: u64, now_secs: u64) -> bool {
+    last_handshake_secs > 0
+        && now_secs.saturating_sub(last_handshake_secs) < HANDSHAKE_FRESHNESS_WINDOW_SECS
+}
+
 /// Whether a failed attempt says nothing about the tunnel's health: the
 /// failure is attributable to the client-chosen destination, not to the
 /// WireGuard peer. Such attempts must not trip the circuit breaker
 /// (audit run-1, medium). A refused connection proves the tunnel carried
 /// the SYN and got an answer back; an unroutable address family or a
 /// nonexistent domain is a property of the request; a timeout against a
-/// peer that has handshaked before points at a blackholing destination,
-/// while a timeout against a peer that never handshaked points at the
-/// peer itself — so it stays a failure.
+/// peer that has handshaked recently points at a blackholing destination,
+/// while a timeout against a peer whose last handshake is stale — or
+/// that never handshaked — points at the peer itself, so it stays a
+/// failure.
 pub(crate) const fn is_destination_caused_error(
     kind: io::ErrorKind,
-    tunnel_handshaked: bool,
+    handshaked_recently: bool,
 ) -> bool {
     // `std::io::ErrorKind` is `#[non_exhaustive]` with ~40 variants; the
     // destination-caused ones are listed explicitly and all others stay
@@ -228,7 +254,7 @@ pub(crate) const fn is_destination_caused_error(
         | io::ErrorKind::AddrNotAvailable
         | io::ErrorKind::InvalidInput
         | io::ErrorKind::NotFound => true,
-        io::ErrorKind::TimedOut => tunnel_handshaked,
+        io::ErrorKind::TimedOut => handshaked_recently,
         _ => false,
     }
 }
@@ -261,8 +287,11 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
                 Err(e) => {
                     trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
-                        let handshaked = tunnel.stats.last_handshake.load(Ordering::Relaxed) > 0;
-                        if is_destination_caused_error(e.kind(), handshaked) {
+                        let handshaked_recently = handshake_is_fresh(
+                            tunnel.stats.last_handshake.load(Ordering::Relaxed),
+                            now_unix_secs(),
+                        );
+                        if is_destination_caused_error(e.kind(), handshaked_recently) {
                             h.record_inconclusive();
                         } else {
                             h.record_failure(threshold, cooldown);
