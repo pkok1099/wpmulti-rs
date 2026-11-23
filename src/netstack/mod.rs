@@ -2,6 +2,8 @@
 
 pub mod bridge;
 pub mod dns;
+#[cfg(test)]
+mod loopback_guard_tests;
 pub mod stack;
 pub mod stream;
 #[cfg(test)]
