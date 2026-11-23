@@ -17,7 +17,9 @@ use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint};
 use tokio::sync::Notify;
 
-use crate::netstack::stack::{StackInner, WakerSlot, register_shutdown_waker};
+use crate::netstack::stack::{
+    StackInner, WakerSlot, register_shutdown_waker, reject_loopback_dst,
+};
 
 impl std::fmt::Debug for VirtualTcpStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -425,6 +427,7 @@ impl VirtualUdpSocket {
 
     /// Send a UDP datagram to the specified destination.
     pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> Result<usize, io::Error> {
+        reject_loopback_dst(target)?;
         let endpoint = to_smoltcp_endpoint(target);
         std::future::poll_fn(|cx| {
             let mut inner = self.inner.lock();

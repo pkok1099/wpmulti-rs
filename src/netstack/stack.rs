@@ -255,6 +255,32 @@ fn select_local_ip(
     }
 }
 
+/// Rejects destinations that can never be reached inside the virtual stack:
+/// loopback addresses (`127.0.0.0/8`, `::1`, and IPv4-mapped `::ffff:127.0.0.1`).
+///
+/// Per RFC 1122 Section 3.2.1.3 loopback traffic must never leave the host, so
+/// WireGuard never carries it: a packet to a loopback destination either has no
+/// route in the tunnel interface or is dropped by the peer's `AllowedIPs` filter.
+/// Without this guard such a connect/send would hang until the (much longer)
+/// handshake timeout instead of failing fast, and it keeps destination handling
+/// symmetric with the IPv6 loopback block in the proxy layer's
+/// `is_forbidden_destination_ip`.
+pub(crate) fn reject_loopback_dst(dst: SocketAddr) -> io::Result<()> {
+    let loopback = match dst.ip() {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or_else(|| v6.is_loopback(), |v4| v4.is_loopback()),
+    };
+    if loopback {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("loopback destination {dst} is not reachable through the tunnel"),
+        ));
+    }
+    Ok(())
+}
+
 impl VirtualNetworkStack {
     /// Construct a new virtual network stack from WireGuard interface configuration
     /// and a [`VirtualTunBridge`] in `DualStack` mode.
@@ -461,6 +487,7 @@ impl VirtualNetworkStack {
     /// Initiate an asynchronous TCP connection to the destination address.
     pub async fn tcp_connect(&self, dst: SocketAddr) -> Result<VirtualTcpStream, io::Error> {
         // Pre-validate protocol compatibility before allocating socket buffers.
+        reject_loopback_dst(dst)?;
         let _ = select_local_ip(dst, self.local_v4(), self.local_v6())?;
 
         // Allocate socket buffers
