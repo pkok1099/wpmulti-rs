@@ -840,13 +840,16 @@ async fn test_f7_socks5_udp_associate_echo_roundtrip() {
         echo_udp.send_to(&buf[..n], client_addr).await.unwrap();
     });
 
-    let server_addr = spawn_real_socks5_server(None).await;
+    // The destination guard forbids loopback targets, so the client names
+    // the TEST-NET-1 stand-in and the redirect target delivers the datagram
+    // to the loopback echo listener (see `EchoRedirectTarget`).
+    let server_addr = spawn_real_socks5_server_with_echo(echo_addr).await;
 
     let mut client = Socks5TestClient::connect(server_addr).await.unwrap();
     client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
     let session = client.cmd_udp_associate(None).await.unwrap();
 
-    let target = Socks5Target::Ip(echo_addr);
+    let target = Socks5Target::Ip(test_echo_target(echo_addr));
     let echo = session
         .query_echo(&target, b"udp_ping_payload", Duration::from_secs(2))
         .await

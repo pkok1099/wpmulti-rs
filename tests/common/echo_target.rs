@@ -22,8 +22,60 @@ pub fn test_echo_target(echo_addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(TEST_ECHO_IP, echo_addr.port())
 }
 
+/// UDP socket that redirects the TEST-NET-1 stand-in to the loopback echo
+/// listener on send, and reports replies as coming from the stand-in on
+/// receive — so the relay's expected-destination check (which keys on the
+/// destination the client actually named) passes for the echoed reply.
+pub struct UdpEchoRedirectSocket {
+    inner: tokio::net::UdpSocket,
+    echo: SocketAddr,
+}
+
+impl UdpEchoRedirectSocket {
+    pub fn new(inner: tokio::net::UdpSocket, echo: SocketAddr) -> Self {
+        Self { inner, echo }
+    }
+}
+
+impl ProxyUdpSocket for UdpEchoRedirectSocket {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            let dst = if target.ip() == TEST_ECHO_IP {
+                SocketAddr::new(self.echo.ip(), target.port())
+            } else {
+                target
+            };
+            self.inner.send_to(buf, dst).await
+        })
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
+        Box::pin(async move {
+            let (n, peer) = self.inner.recv_from(buf).await?;
+            let peer = if peer.ip() == self.echo.ip() {
+                SocketAddr::new(TEST_ECHO_IP, peer.port())
+            } else {
+                peer
+            };
+            Ok((n, peer))
+        })
+    }
+
+    fn local_port(&self) -> u16 {
+        self.inner.local_addr().map_or(0, |a| a.port())
+    }
+}
+
 /// Tunnel target that dials a fixed loopback echo listener regardless of
-/// the destination the proxy client named.
+/// the destination the proxy client named (TCP) and redirects UDP
+/// datagrams named at the TEST-NET-1 stand-in to the same listener.
 pub struct EchoRedirectTarget {
     dial: SocketAddr,
 }
@@ -50,10 +102,12 @@ impl ProxyTunnelTarget for EchoRedirectTarget {
         &'a self,
         local_port: u16,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
+        let echo = self.dial;
         Box::pin(async move {
             let bind_addr = SocketAddr::from(([0, 0, 0, 0], local_port));
+            let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
             let socket: Box<dyn ProxyUdpSocket> =
-                Box::new(tokio::net::UdpSocket::bind(bind_addr).await?);
+                Box::new(UdpEchoRedirectSocket::new(socket, echo));
             Ok(socket)
         })
     }
