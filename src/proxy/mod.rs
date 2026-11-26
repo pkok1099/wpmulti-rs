@@ -48,9 +48,18 @@ pub(crate) const CONNECT_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 /// [`tokio::io::copy_bidirectional`] except for the idle bound: each
 /// direction's EOF half-closes the other side, traffic in either
 /// direction resets the idle deadline for the session, and I/O errors
-/// are returned. The idle bound applies to reads; writes follow
-/// `copy_bidirectional` (a stalled write blocks like a stalled read
-/// would there).
+/// are returned.
+///
+/// The two directions run as concurrent tasks: a stalled write in one
+/// direction must never starve reads in the other. A single `select!`
+/// loop that `await`s each `write_all` inline deadlocks on a sustained
+/// bidirectional bulk transfer once every socket buffer is full — the
+/// loop waits for the peer to read while the peer waits for this side
+/// to read, and neither side ever runs again (found by the offline
+/// throughput test, which stalled at 91% of an 8x8 MiB load).
+/// Idleness is therefore tracked session-wide: every forwarded chunk
+/// bumps a shared activity counter, and the session closes only when
+/// that counter is still for `idle_timeout`.
 pub(crate) async fn copy_bidirectional_with_idle_timeout<A, B>(
     a: &mut A,
     b: &mut B,
@@ -60,12 +69,11 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut a_read, mut a_write) = tokio::io::split(a);
-    let (mut b_read, mut b_write) = tokio::io::split(b);
-    // Heap buffers: two 8 KiB stack buffers would push this future
-    // (and every caller awaiting it) past the large-future threshold.
-    let mut buf_a = Box::new([0u8; 8192]);
-    let mut buf_b = Box::new([0u8; 8192]);
+    let (a_read, a_write) = tokio::io::split(a);
+    let (b_read, b_write) = tokio::io::split(b);
+    let (activity_tx, mut activity_rx) = tokio::sync::watch::channel(0u64);
+    let mut a_to_b = Box::pin(copy_direction(a_read, b_write, activity_tx.clone()));
+    let mut b_to_a = Box::pin(copy_direction(b_read, a_write, activity_tx));
     let mut a_done = false;
     let mut b_done = false;
     loop {
@@ -73,51 +81,59 @@ where
             return Ok(());
         }
         tokio::select! {
-            res = tokio::time::timeout(idle_timeout, a_read.read(&mut buf_a[..])), if !a_done => {
+            res = &mut a_to_b, if !a_done => {
                 match res {
-                    Ok(Ok(0)) => {
-                        a_done = true;
-                        let _ = b_write.shutdown().await;
-                    }
-                    Ok(Ok(n)) => {
-                        let Some(chunk) = buf_a.get(..n) else {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "relay read overran its buffer",
-                            ));
-                        };
-                        b_write.write_all(chunk).await?;
-                    }
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        tracing::debug!("CONNECT session closed after {:?} idle", idle_timeout);
-                        return Ok(());
-                    }
+                    Ok(()) => a_done = true,
+                    Err(e) => return Err(e),
                 }
             }
-            res = tokio::time::timeout(idle_timeout, b_read.read(&mut buf_b[..])), if !b_done => {
+            res = &mut b_to_a, if !b_done => {
                 match res {
-                    Ok(Ok(0)) => {
-                        b_done = true;
-                        let _ = a_write.shutdown().await;
-                    }
-                    Ok(Ok(n)) => {
-                        let Some(chunk) = buf_b.get(..n) else {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "relay read overran its buffer",
-                            ));
-                        };
-                        a_write.write_all(chunk).await?;
-                    }
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        tracing::debug!("CONNECT session closed after {:?} idle", idle_timeout);
-                        return Ok(());
-                    }
+                    Ok(()) => b_done = true,
+                    Err(e) => return Err(e),
+                }
+            }
+            res = tokio::time::timeout(idle_timeout, activity_rx.changed()), if !(a_done && b_done) => {
+                // Ok(_): activity in either direction, or all senders
+                // dropped: loop again with a fresh deadline.
+                if res.is_err() {
+                    tracing::debug!("CONNECT session closed after {:?} idle", idle_timeout);
+                    return Ok(());
                 }
             }
         }
+    }
+}
+
+/// Copy one direction until EOF (half-closing the far write side) or an
+/// I/O error, bumping `activity` after every forwarded chunk so the
+/// session-wide idle watchdog sees it.
+async fn copy_direction<R, W>(
+    mut read: R,
+    mut write: W,
+    activity: tokio::sync::watch::Sender<u64>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // Heap buffer: an 8 KiB stack buffer would push this future (and
+    // every caller awaiting it) past the large-future threshold.
+    let mut buf = Box::new([0u8; 8192]);
+    loop {
+        let n = read.read(&mut buf[..]).await?;
+        if n == 0 {
+            let _ = write.shutdown().await;
+            return Ok(());
+        }
+        let Some(chunk) = buf.get(..n) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "relay read overran its buffer",
+            ));
+        };
+        write.write_all(chunk).await?;
+        activity.send_modify(|count| *count += 1);
     }
 }
 
