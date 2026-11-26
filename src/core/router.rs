@@ -17,13 +17,22 @@ use std::time::Duration;
 use parking_lot::RwLock;
 
 use crate::config::{AuthMode, IpMode, PoolStrategy, SharedListenerSettings, TunnelPoolSelection};
-use crate::core::lifecycle::{GuardedTunnelTarget, LifecycleController};
+use crate::core::health::HealthStatus;
+use crate::core::lifecycle::{GuardedTunnelTarget, LifecycleController, handshake_is_fresh};
 use crate::core::registry::{TunnelEntry, TunnelRegistry};
+use crate::core::selection::{WarmList, dormant_jitter_ms, score_entry};
 use crate::proxy::router::{AuthChecker, constant_time_eq_str};
 use crate::proxy::{
     DynStream, PoolKeyword, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket, TunnelRouter,
     TunnelSelector,
 };
+
+/// Random draws spent looking for one routable second candidate
+/// before the stratified pick falls back to a tiered scan. Twelve
+/// draws miss a 50%-healthy pool with probability 0.5^12; a sparser
+/// pool falls back to the scan, which is the correct behaviour when
+/// almost nothing is routable.
+const P2C_DRAWS: usize = 12;
 
 /// Multi-tenant proxy router for shared listener ports.
 #[derive(Debug)]
@@ -39,6 +48,9 @@ pub struct MultiTenantRouter {
     listener_ip_mode: Option<IpMode>,
     rr_counter: AtomicUsize,
     health_override: Option<(usize, Duration)>,
+    /// Bounded warm list (see [`WarmList`]): the fast path samples
+    /// one candidate from here instead of scanning the pool.
+    warm_list: Arc<WarmList>,
 }
 
 impl MultiTenantRouter {
@@ -67,6 +79,7 @@ impl MultiTenantRouter {
             listener_ip_mode: settings.ip_mode,
             rr_counter: AtomicUsize::new(0),
             health_override: None,
+            warm_list: Arc::new(WarmList::new()),
         })
     }
 
@@ -101,6 +114,7 @@ impl MultiTenantRouter {
             listener_ip_mode: None,
             rr_counter: AtomicUsize::new(0),
             health_override: None,
+            warm_list: Arc::new(WarmList::new()),
         })
     }
 
@@ -222,6 +236,7 @@ impl MultiTenantRouter {
             listener_ip_mode: self.listener_ip_mode,
             rr_counter: AtomicUsize::new(self.rr_counter.load(Ordering::Relaxed)),
             health_override: self.health_override,
+            warm_list: Arc::clone(&self.warm_list),
         }
     }
 
@@ -231,16 +246,20 @@ impl MultiTenantRouter {
         allowed.map_or_else(|| self.registry.all_ids(), |list| list.to_vec())
     }
 
-    /// Filter candidates to only those whose health status is routable.
-    /// Routable candidates, preferring tunnels that have completed at
-    /// least one WireGuard handshake. A tunnel that has never handshaked
-    /// is unproven and may be unreachable; routing real traffic to it
-    /// while proven tunnels exist burns the caller's failover budget on
-    /// a handshake that never completes (the in-tunnel DNS hangs for
-    /// its full timeout). Only fall back to unproven tunnels when no
-    /// proven tunnel is routable, so a fresh daemon whose tunnels have
-    /// not handshaked yet can still bring them up through real traffic.
+    /// Filter candidates to only those whose health status is routable,
+    /// preferring live tunnels first: a tunnel that just proved itself
+    /// by moving real traffic has a live WireGuard session, so the next
+    /// packet flows without paying a fresh activation + handshake inside
+    /// the caller's failover budget. Only fall back to proven tunnels
+    /// (handshaked at some point) and then to unproven ones when no live
+    /// tunnel is routable, so a fresh daemon whose tunnels have not
+    /// handshaked yet can still bring them up through real traffic.
+    /// Within the best tier, tunnels at the per-tunnel connection cap
+    /// ([`MAX_LIVE_TUNNEL_CONNS`]) are skipped in favor of the next
+    /// tier, so load spreads instead of piling onto a few live tunnels.
     pub fn filter_healthy_candidates<'a>(&self, candidates: &'a [String]) -> Vec<&'a String> {
+        let now_secs = now_unix_secs();
+        let mut live: Vec<&'a String> = Vec::new();
         let mut proven: Vec<&'a String> = Vec::new();
         let mut unproven: Vec<&'a String> = Vec::new();
         for id in candidates {
@@ -248,14 +267,18 @@ impl MultiTenantRouter {
                 && !entry.is_disabled()
                 && entry.health.can_route()
             {
-                if entry.has_handshaked() {
-                    proven.push(id);
-                } else {
-                    unproven.push(id);
+                match selection_tier(&entry, now_secs) {
+                    SelectionTier::Live => live.push(id),
+                    SelectionTier::Proven => proven.push(id),
+                    SelectionTier::Unproven => unproven.push(id),
                 }
             }
         }
-        if proven.is_empty() { unproven } else { proven }
+        pick_tier(live, proven, unproven, |id| {
+            self.registry.get(id).map_or(usize::MAX, |entry| {
+                entry.stats.active_conns.load(Ordering::Relaxed)
+            })
+        })
     }
 
     fn try_claim_candidate(&self, id: &str) -> bool {
@@ -286,11 +309,19 @@ impl MultiTenantRouter {
     }
 
     /// Select a tunnel ID from slice based on keyword without cloning candidate lists.
+    ///
+    /// `Auto` is the adaptive selector (stratified P2C over the
+    /// Peak-EWMA score); the explicit keywords keep their historic
+    /// meanings. The P2C path returns before the tiered scan, so the
+    /// fast path never filters the whole candidate list.
     fn select_by_keyword_slice(
         &self,
         keyword: PoolKeyword,
         candidates: &[String],
     ) -> io::Result<String> {
+        if keyword == PoolKeyword::Auto {
+            return self.select_p2c(Some(candidates));
+        }
         let healthy = self.filter_healthy_candidates(candidates);
         if healthy.is_empty() {
             return Err(io::Error::new(
@@ -304,27 +335,21 @@ impl MultiTenantRouter {
                 let idx = (rand::random::<u32>() as usize) % healthy.len();
                 self.claim_from_healthy(&healthy, idx)
             }
-            PoolKeyword::RoundRobin | PoolKeyword::Auto => {
+            PoolKeyword::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len();
                 self.claim_from_healthy(&healthy, idx)
             }
             PoolKeyword::LeastConn => self.select_least_conn_refs(&healthy),
+            // Handled by the early return above; kept for exhaustiveness.
+            PoolKeyword::Auto => self.select_p2c(Some(candidates)),
         }
     }
 
     fn select_least_conn_registry(&self, entries: &[Arc<TunnelEntry>]) -> Option<String> {
-        let routable: Vec<_> = entries
-            .iter()
-            .filter(|e| !e.is_disabled() && e.health.can_route())
-            .collect();
-        // Prefer tunnels that have completed a handshake; a never-handshaked
-        // tunnel is only chosen when no proven tunnel is routable.
-        let proven: Vec<_> = routable
-            .iter()
-            .copied()
-            .filter(|e| e.has_handshaked())
-            .collect();
-        let pool: Vec<_> = if proven.is_empty() { routable } else { proven };
+        let pool = preferred_entries(entries);
+        if pool.is_empty() {
+            return None;
+        }
         let mut candidates: Vec<(usize, &str)> = pool
             .iter()
             .map(|e| (e.stats.active_conns.load(Ordering::Relaxed), e.id.as_str()))
@@ -340,21 +365,10 @@ impl MultiTenantRouter {
         entries: &[Arc<TunnelEntry>],
         is_random: bool,
     ) -> Option<String> {
-        let routable: Vec<_> = entries
-            .iter()
-            .filter(|e| !e.is_disabled() && e.health.can_route())
-            .collect();
-        if routable.is_empty() {
+        let pool = preferred_entries(entries);
+        if pool.is_empty() {
             return None;
         }
-        // Prefer tunnels that have completed a handshake; a never-handshaked
-        // tunnel is only chosen when no proven tunnel is routable.
-        let proven: Vec<_> = routable
-            .iter()
-            .copied()
-            .filter(|e| e.has_handshaked())
-            .collect();
-        let pool: Vec<_> = if proven.is_empty() { routable } else { proven };
         let start_idx = if is_random {
             (rand::random::<u32>() as usize) % pool.len()
         } else {
@@ -374,6 +388,9 @@ impl MultiTenantRouter {
 
     /// Select a tunnel ID directly from the registry without candidate vector or HashMap lookups.
     fn select_by_keyword_registry(&self, keyword: PoolKeyword) -> io::Result<String> {
+        if keyword == PoolKeyword::Auto {
+            return self.select_p2c(None);
+        }
         let entries = self.registry.all_entries();
         if entries.is_empty() {
             return Err(io::Error::new(
@@ -422,19 +439,104 @@ impl MultiTenantRouter {
         ))
     }
 
-    /// Select a candidate tunnel with lowest active connections from a slice.
-    fn select_least_conn_slice(&self, candidates: &[String]) -> io::Result<String> {
-        let healthy = self.filter_healthy_candidates(candidates);
-        if healthy.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "no healthy tunnels available in pool",
-            ));
+    /// Record that `id` proved itself by moving real traffic, seeding
+    /// the warm list. Tests use it to seed the list deterministically.
+    #[cfg(test)]
+    pub(crate) fn note_warm_success(&self, id: &str) {
+        self.warm_list.note_success(id);
+    }
+
+    /// Stratified Power-of-Two-Choices selection over the Peak-EWMA
+    /// score ([`score_entry`]).
+    ///
+    /// Candidate A is drawn O(1) from the warm list; candidate B is
+    /// drawn uniformly from the whole pool (or `allowed`, when a pool
+    /// restriction applies), retried until a routable tunnel distinct
+    /// from A turns up. The lower score wins. Ejected, disabled, and
+    /// unhealthy tunnels never enter either draw
+    /// ([`Self::try_claim_candidate`]).
+    ///
+    /// When both draws come up empty the pool is so unhealthy that
+    /// scoring order hardly matters, so selection falls back to the
+    /// tiered scan — the only full-pool scan on this path, and only
+    /// in that degraded case. It preserves the old "no healthy
+    /// tunnels" error instead of inventing a new one.
+    pub(crate) fn select_p2c(&self, allowed: Option<&[String]>) -> io::Result<String> {
+        let now_secs = now_unix_secs();
+        let best: Option<(f64, String)> = if let Some(id) = self.warm_list.pick()
+            && self.try_claim_candidate(&id)
+        {
+            Some((self.score_of(&id, now_secs), id))
+        } else {
+            None
+        };
+        let mut second: Option<(f64, String)> = None;
+        for _ in 0..P2C_DRAWS {
+            let Some(id) = self.draw_random_id(allowed) else {
+                break;
+            };
+            if best.as_ref().is_some_and(|(_, best_id)| best_id == &id) {
+                continue;
+            }
+            if !self.try_claim_candidate(&id) {
+                continue;
+            }
+            second = Some((self.score_of(&id, now_secs), id));
+            break;
         }
-        self.select_least_conn_refs(&healthy)
+        match (best, second) {
+            (Some((a_score, a)), Some((b_score, b))) => Ok(if b_score < a_score { b } else { a }),
+            (Some((_, a)), None) | (None, Some((_, a))) => Ok(a),
+            (None, None) => self.fallback_scan_select(allowed),
+        }
+    }
+
+    /// Degraded-pool fallback for [`Self::select_p2c`]: tiered scan
+    /// over the allowed candidates, claiming the first routable one.
+    fn fallback_scan_select(&self, allowed: Option<&[String]>) -> io::Result<String> {
+        let candidates: Vec<String> =
+            allowed.map_or_else(|| self.registry.all_ids(), ToOwned::to_owned);
+        let healthy = self.filter_healthy_candidates(&candidates);
+        self.claim_from_healthy(&healthy, 0)
+    }
+
+    /// Peak-EWMA selection score for one tunnel, or `f64::MAX` when
+    /// the entry vanished between the routability check and scoring
+    /// (so it sorts last instead of failing selection).
+    fn score_of(&self, id: &str, now_secs: u64) -> f64 {
+        self.registry.get(id).map_or(f64::MAX, |entry| {
+            score_entry(&entry, now_secs, dormant_jitter_ms())
+        })
+    }
+
+    /// Draw one tunnel ID uniformly at random: from `allowed` when a
+    /// pool restriction applies, else by registry index (O(1), no
+    /// ID-list allocation). Returns `None` for an empty pool.
+    fn draw_random_id(&self, allowed: Option<&[String]>) -> Option<String> {
+        if let Some(list) = allowed {
+            if list.is_empty() {
+                return None;
+            }
+            let idx = rand::random::<u32>() as usize % list.len();
+            return list.get(idx).cloned();
+        }
+        let count = self.registry.count();
+        if count == 0 {
+            return None;
+        }
+        self.registry
+            .id_by_index(rand::random::<u32>() as usize % count)
     }
 
     /// Select a tunnel ID using default pool strategy from slice.
+    ///
+    /// `Fallback` keeps its priority meaning (first routable
+    /// candidate in sequence). Every other configured default
+    /// strategy routes through the adaptive P2C selector: the
+    /// unnamed default pool is where the measured budget failures
+    /// happen, so it gets the latency-aware selector, while the
+    /// explicit `round-robin` / `random` / `least-conn` keywords
+    /// still offer the historic strategies on demand.
     fn select_default_pool_slice(&self, candidates: &[String]) -> io::Result<String> {
         if candidates.is_empty() {
             return Err(io::Error::new(
@@ -456,33 +558,151 @@ impl MultiTenantRouter {
                     "all tunnels in fallback pool are unhealthy",
                 ))
             }
-            PoolStrategy::RoundRobin => {
-                let healthy = self.filter_healthy_candidates(candidates);
-                let idx = if healthy.is_empty() {
-                    0
-                } else {
-                    self.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len()
-                };
-                self.claim_from_healthy(&healthy, idx)
+            PoolStrategy::RoundRobin | PoolStrategy::Random | PoolStrategy::LeastConn => {
+                self.select_p2c(Some(candidates))
             }
-            PoolStrategy::Random => {
-                let healthy = self.filter_healthy_candidates(candidates);
-                let idx = if healthy.is_empty() {
-                    0
-                } else {
-                    (rand::random::<u32>() as usize) % healthy.len()
-                };
-                self.claim_from_healthy(&healthy, idx)
-            }
-            PoolStrategy::LeastConn => self.select_least_conn_slice(candidates),
         }
     }
 
     /// Select a tunnel ID using default pool strategy from registry directly.
     fn select_default_pool_registry(&self) -> io::Result<String> {
-        let candidates = self.registry.all_ids();
-        self.select_default_pool_slice(&candidates)
+        if self.default_strategy == PoolStrategy::Fallback {
+            let candidates = self.registry.all_ids();
+            self.select_default_pool_slice(&candidates)
+        } else {
+            self.select_p2c(None)
+        }
     }
+}
+
+/// Preference tier of a routable tunnel for pool selection, best first.
+///
+/// A tunnel that just proved itself by moving real traffic has a live
+/// WireGuard session, so the next packet flows without paying a fresh
+/// activation + handshake inside the caller's failover budget. Tunnels
+/// below the live tier need a re-boot and possibly a fresh handshake —
+/// and a first handshake on a fresh device frequently goes unanswered
+/// within the budget — so they are only picked when no live tunnel
+/// exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionTier {
+    /// Currently active, Healthy, and handshaked within the freshness
+    /// window: a live session.
+    Live,
+    /// Completed a handshake at some point (possibly dormant or
+    /// stale): proven before, but needs a re-boot and possibly a
+    /// fresh handshake.
+    Proven,
+    /// Never completed a handshake: unproven, may be unreachable.
+    Unproven,
+}
+
+/// Classify a routable tunnel into a pool-selection preference tier.
+///
+/// The live tier needs all three signals at once. A fresh handshake
+/// alone is not enough: an in-tunnel DNS resolve records one even
+/// when the answer came from the shared cache without any packet
+/// crossing the tunnel. Healthy alone is not enough either: it
+/// persists until failures trip the breaker, while the session may
+/// have gone stale since the last success. Active alone proves even
+/// less: a freshly booted device has no session yet.
+pub(crate) fn selection_tier(entry: &TunnelEntry, now_secs: u64) -> SelectionTier {
+    let fresh_handshake =
+        handshake_is_fresh(entry.stats.last_handshake.load(Ordering::Relaxed), now_secs);
+    if entry.is_active()
+        && fresh_handshake
+        && entry.health.current_status() == HealthStatus::Healthy
+    {
+        SelectionTier::Live
+    } else if entry.has_handshaked() {
+        SelectionTier::Proven
+    } else {
+        SelectionTier::Unproven
+    }
+}
+
+/// Current Unix time in seconds, for handshake-freshness checks.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Maximum concurrent connections a single tunnel carries before pool
+/// selection spills over to the next preference tier.
+///
+/// Measured live (2000 requests, concurrency 32): with all traffic
+/// concentrated on 2 live tunnels (~16 connections each), ~1% of
+/// requests died right after the SOCKS grant with an empty reply; with
+/// the same load spread over ~32 active tunnels (~1-2 each), the same
+/// failure mode was 0.15%. The cap bounds per-tunnel load at half the
+/// observed failure point and lets the live set grow — spilled
+/// requests activate proven tunnels, which then join the live tier —
+/// until the cap no longer binds. It is a preference, never a hard
+/// limit: when every tunnel is at the cap, selection falls back to
+/// the best tier instead of failing.
+pub(crate) const MAX_LIVE_TUNNEL_CONNS: usize = 8;
+
+/// Pick the tier to draw pool selection from: the best tier (live,
+/// proven, unproven, in that order) that still has a tunnel under
+/// [`MAX_LIVE_TUNNEL_CONNS`]; the best non-empty tier when every tier
+/// is fully capped, so the cap never blocks selection outright.
+/// `conns_of` reads a tunnel's current active-connection count.
+fn pick_tier<T: Clone>(
+    live: Vec<T>,
+    proven: Vec<T>,
+    unproven: Vec<T>,
+    conns_of: impl Fn(&T) -> usize,
+) -> Vec<T> {
+    let fallback = if !live.is_empty() {
+        live.clone()
+    } else if !proven.is_empty() {
+        proven.clone()
+    } else {
+        unproven.clone()
+    };
+    for tier in [live, proven, unproven] {
+        if tier.is_empty() {
+            continue;
+        }
+        let under_cap: Vec<T> = tier
+            .into_iter()
+            .filter(|entry| conns_of(entry) < MAX_LIVE_TUNNEL_CONNS)
+            .collect();
+        if !under_cap.is_empty() {
+            return under_cap;
+        }
+    }
+    fallback
+}
+
+/// Routable entries in preference order: live tunnels first, then
+/// proven, then unproven. Returns an empty vec when nothing is
+/// routable. Callers pick within the first non-empty tier, so a
+/// fresh pool (no live or proven tunnel yet) still routes through
+/// real traffic — which is how tunnels prove themselves and become
+/// live in the first place.
+///
+/// `pub(crate)` so the tier selection can be unit-tested directly.
+pub(crate) fn preferred_entries(entries: &[Arc<TunnelEntry>]) -> Vec<&Arc<TunnelEntry>> {
+    let now_secs = now_unix_secs();
+    let mut live = Vec::new();
+    let mut proven = Vec::new();
+    let mut unproven = Vec::new();
+    for entry in entries {
+        if entry.is_disabled() || !entry.health.can_route() {
+            continue;
+        }
+        match selection_tier(entry, now_secs) {
+            SelectionTier::Live => live.push(entry),
+            SelectionTier::Proven => proven.push(entry),
+            SelectionTier::Unproven => unproven.push(entry),
+        }
+    }
+    pick_tier(live, proven, unproven, |entry| {
+        entry.stats.active_conns.load(Ordering::Relaxed)
+    })
 }
 
 /// Escape newline and control characters in a client-supplied value
@@ -693,12 +913,19 @@ impl TunnelRouter for MultiTenantRouter {
             let entry = self.registry.get(&target_id);
             let health = entry.as_ref().map(|e| Arc::clone(&e.health));
 
-            let guarded = if let Some(h) = health {
+            let mut guarded = if let Some(h) = health {
                 let (threshold, cooldown) = self.effective_health();
                 GuardedTunnelTarget::new_with_health(active_tunnel, guard, h, threshold, cooldown)
             } else {
                 GuardedTunnelTarget::new(active_tunnel, guard)
             };
+            guarded.set_warm_list(Arc::clone(&self.warm_list));
+            // A tunnel that is live right now joins the warm list at
+            // once, so the next selection can draw it O(1) instead of
+            // waiting for a dial to prove it again.
+            if guarded.is_live() {
+                self.warm_list.note_success(&target_id);
+            }
 
             let ip_mode = self.effective_ip_mode()?;
             let target: Arc<dyn ProxyTunnelTarget> = if ip_mode == IpMode::DualStack {
@@ -857,6 +1084,10 @@ impl ProxyTunnelTarget for IpFilteredTunnelTarget {
 
     fn note_attempt_aborted(&self) {
         self.inner.note_attempt_aborted();
+    }
+
+    fn is_live(&self) -> bool {
+        self.inner.is_live()
     }
 }
 

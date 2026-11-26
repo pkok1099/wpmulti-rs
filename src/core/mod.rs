@@ -10,6 +10,7 @@ pub mod listener;
 pub mod protector;
 pub mod registry;
 pub mod router;
+pub mod selection;
 #[cfg(test)]
 pub mod tests;
 
@@ -21,7 +22,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    LifecycleMode, MainConfig, TunnelConfig, load_tunnel_configs_from_dir_partial,
+    HealthCheckSettings, LifecycleMode, MainConfig, TunnelConfig,
+    load_tunnel_configs_from_dir_partial,
 };
 pub use health::{ActiveProber, HealthStatus, TunnelHealthTracker};
 pub use lifecycle::{GuardedStream, GuardedTunnelTarget, LifecycleController, TunnelConnGuard};
@@ -183,6 +185,32 @@ fn select_id_index(
     };
     add_unique(selected, id);
     Ok(())
+}
+
+/// Target size of the boot warm pool: eager tunnels plus complement
+/// (see [`warm_up_complement_ids`]) should leave at least this many
+/// tunnels with live sessions before listeners start accepting
+/// traffic, so the first requests do not pay activation + handshake
+/// inside the failover budget.
+pub(crate) const WARM_UP_TARGET_TUNNELS: usize = 8;
+
+/// Complement for the boot warm pool: the lowest tunnel ids needed to
+/// reach [`WARM_UP_TARGET_TUNNELS`] warm tunnels, skipping ids that
+/// are already eager. Pure, so the top-up rule is unit-testable.
+/// Disabled tunnels are not filtered here — booting one fails fast
+/// and only warns — so the complement stays a plain id computation.
+pub(crate) fn warm_up_complement_ids(eager_ids: &[String], all_ids: &[String]) -> Vec<String> {
+    if eager_ids.len() >= WARM_UP_TARGET_TUNNELS {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&String> = all_ids.iter().collect();
+    sorted.sort();
+    sorted
+        .into_iter()
+        .filter(|id| !eager_ids.iter().any(|eager| eager == *id))
+        .take(WARM_UP_TARGET_TUNNELS - eager_ids.len())
+        .cloned()
+        .collect()
 }
 
 impl TunnelManager {
@@ -699,12 +727,43 @@ impl TunnelManager {
 
     /// Start the tunnel manager without any proxy listeners.
     ///
-    /// Same steps as [`TunnelManager::start`] except step 4 (starting the
+    /// Same steps as [`TunnelManager::start`] except step 5 (starting the
     /// SOCKS5/HTTP listeners) is skipped. This is the entry point for the
     /// Android VPN engine, where traffic arrives from a TUN interface
     /// instead of local proxy listeners.
     pub async fn start_without_listeners(&self) -> Result<(), CoreError> {
         self.start_inner(false).await
+    }
+
+    /// Boot + probe the warm-up complement (step 2b of
+    /// [`Self::start_inner`]): staggered, failures only warn, never
+    /// fail startup.
+    async fn warm_up_complement(&self, ids: Vec<String>, health_check: &HealthCheckSettings) {
+        if ids.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "Warming up {} additional tunnel(s) to reach 8 warm tunnels",
+            ids.len()
+        );
+        let mut set = tokio::task::JoinSet::new();
+        for id in ids {
+            let lifecycle = Arc::clone(&self.lifecycle);
+            let registry = Arc::clone(&self.registry);
+            let health_check = health_check.clone();
+            set.spawn(async move {
+                if let Err(e) = lifecycle.activate_tunnel(&id).await {
+                    tracing::warn!("Failed to boot warm-up tunnel '{id}': {e}");
+                    return;
+                }
+                ActiveProber::probe_single_by_id(&registry, &id, &health_check).await;
+            });
+            // Stagger spawns: ~300 ms plus up to 200 ms jitter
+            // between handshakes, a few per second at most.
+            let stagger_ms = 300 + rand::random::<u64>() % 201;
+            tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+        }
+        while set.join_next().await.is_some() {}
     }
 
     async fn start_inner(&self, with_listeners: bool) -> Result<(), CoreError> {
@@ -719,6 +778,12 @@ impl TunnelManager {
             .filter(|e| e.lifecycle_mode == LifecycleMode::Eager && !e.is_disabled())
             .map(|e| e.id.clone())
             .collect();
+        // Captured before the boot loop below moves `eager_ids`.
+        let has_eager_tunnels = !eager_ids.is_empty();
+        let eager_tunnel_count = eager_ids.len();
+        // Computed before the boot loop moves `eager_ids` too: the
+        // top-up ids depend only on the eager list and the registry.
+        let complement_ids = warm_up_complement_ids(&eager_ids, &self.registry.all_ids());
 
         if !eager_ids.is_empty() {
             const MAX_CONCURRENT_BOOTS: usize = 64;
@@ -760,12 +825,42 @@ impl TunnelManager {
             }
         }
 
-        // 3. Start active prober for eager tunnels
+        // 2b. Top the warm pool up to 8 tunnels: when fewer eager
+        // tunnels are configured, the first requests still land on
+        // dormant tunnels and pay activation + handshake inside the
+        // failover budget. Complement with the lowest tunnel ids not
+        // already eager. Boots and probes run staggered (a few
+        // handshakes per second, jittered) so the burst cannot push
+        // the Cloudflare edge into cookie under-load mode — and a
+        // complement failure only warns: warm-up must never fail
+        // startup (unlike the eager boot above).
         let cfg = self.config.read().clone();
+        self.warm_up_complement(complement_ids, &cfg.health_check)
+            .await;
+
+        // 3. Warm up eager tunnels: one probe pass (handshake + egress
+        // check) before any listener accepts traffic, so the first
+        // request finds live sessions instead of paying activation +
+        // handshake inside its failover budget. A probe failure only
+        // records a health failure — it never fails startup (unlike
+        // the eager boot above, where one activation error aborts the
+        // whole start). Skipped when no eager tunnel is configured, so
+        // a pure-lazy daemon starts exactly as before. The prober loop
+        // started below re-probes on its first tick; that duplicate
+        // pass is harmless (health recording is idempotent). Bounded by
+        // one probe timeout per tunnel (`probe_timeout`, default 5s).
+        if has_eager_tunnels {
+            tracing::info!(
+                "Warming up {eager_tunnel_count} eager tunnel(s) before listeners start"
+            );
+            ActiveProber::probe_eager_tunnels(&self.registry, &cfg.health_check).await;
+        }
+
+        // 4. Start active prober for eager tunnels
         self.prober
             .start(Arc::clone(&self.registry), cfg.health_check.clone());
 
-        // 4. Start listeners (skipped for the Android VPN engine, which
+        // 5. Start listeners (skipped for the Android VPN engine, which
         // receives traffic from a TUN interface instead).
         if with_listeners
             && let Err(e) = self

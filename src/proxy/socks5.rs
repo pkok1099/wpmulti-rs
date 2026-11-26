@@ -537,11 +537,12 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         ));
     }
 
-    let mut tunnel_stream: DynStream = match connect_via_router(
+    let (tunnel_stream, mut tunnel_id): (DynStream, Option<String>) = match connect_via_router(
         &router,
         selector,
         &target,
         credentials,
+        None,
     )
     .await
     {
@@ -589,13 +590,37 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Bidirectional streaming, ending when either side closes or the
     // session idles past CONNECT_IDLE_TIMEOUT (audit run-1,
-    // `wpmulti/proxy:established-connect-no-idle-timeout`).
-    crate::proxy::copy_bidirectional_with_idle_timeout(
+    // `wpmulti/proxy:established-connect-no-idle-timeout`). A session
+    // that ends with no response bytes from the target is retried
+    // once through a different tunnel (see
+    // `copy_bidirectional_with_zero_response_retry`); if it still
+    // ends with no response bytes, it is a failed session even
+    // though the copy returns `Ok` — log it before returning, or
+    // the client's "empty reply" leaves no trace.
+    let retry = crate::proxy::ZeroResponseRetry::new(
+        &router,
+        selector,
+        &target,
+        credentials,
+        "SOCKS5",
+        Vec::new(),
+    );
+    let copy_result = crate::proxy::copy_bidirectional_with_zero_response_retry(
         &mut stream,
-        &mut tunnel_stream,
+        tunnel_stream,
         crate::proxy::CONNECT_IDLE_TIMEOUT,
+        Some(retry),
+        &mut tunnel_id,
     )
-    .await?;
+    .await;
+    crate::proxy::log_connect_session_end(
+        "SOCKS5",
+        selector,
+        &target,
+        tunnel_id.as_deref(),
+        &copy_result,
+    );
+    copy_result?;
 
     Ok(())
 }

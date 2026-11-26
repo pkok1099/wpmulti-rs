@@ -19,7 +19,7 @@ max_active_tunnels = 1000
 mode = "lazy"                       # lazy | eager
 idle_timeout = "5m"                 # ms, s, m, h, d or integer seconds
 handshake_timeout = "10s"
-eager_tunnels = []                  # e.g. ["wgcf-001"]
+eager_tunnels = []                  # e.g. ["wgcf-001", "wgcf-002", "wgcf-003"] — booted and probed at startup before listeners start, so the first request finds live sessions (startup warm-up); empty = pure-lazy daemon
 
 [health_check]
 threshold = 3                       # consecutive failures before marking unhealthy (circuit breaker)

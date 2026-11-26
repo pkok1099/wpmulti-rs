@@ -435,6 +435,34 @@ impl ActiveProber {
         Self::probe_eager_tunnels_with_shutdown(registry, settings, &mut rx).await;
     }
 
+    /// Probe one tunnel by id (handshake + egress check), without
+    /// the Eager-mode filter: the boot warm-up complement (see
+    /// [`crate::core::TunnelManager::start_inner`]) warms tunnels the
+    /// periodic prober never touches. A probe failure only records
+    /// health; it never fails the caller.
+    pub(crate) async fn probe_single_by_id(
+        registry: &Arc<TunnelRegistry>,
+        id: &str,
+        settings: &HealthCheckSettings,
+    ) {
+        let Some(entry) = registry.get(id) else {
+            return;
+        };
+        if entry.is_disabled()
+            || entry.health.current_status() == HealthStatus::Dead
+            || *entry.state.read() != crate::core::registry::TunnelState::Active
+        {
+            return;
+        }
+        let Some(active) = entry.active.read().clone() else {
+            return;
+        };
+        let Some(peer_pubkey) = entry.config.read().peers.first().map(|p| p.public_key) else {
+            return;
+        };
+        Self::probe_single_tunnel(&entry, &active, peer_pubkey, settings.clone()).await;
+    }
+
     async fn probe_eager_tunnels_with_shutdown(
         registry: &Arc<TunnelRegistry>,
         settings: &HealthCheckSettings,

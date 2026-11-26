@@ -117,6 +117,11 @@ impl std::fmt::Display for TunnelState {
     }
 }
 
+/// EWMA decay time constant, in milliseconds: a failed connect counts
+/// as a sample of this value (maximally slow), and latency samples are
+/// clamped to at most this value. See [`crate::core::selection`].
+pub(crate) const RTT_TAU_MS: u64 = 10_000;
+
 /// Dynamic statistical counters for a single tunnel.
 #[derive(Debug, Default)]
 pub struct TunnelStats {
@@ -132,6 +137,17 @@ pub struct TunnelStats {
     pub last_handshake: AtomicU64,
     /// Unix timestamp (seconds) when active connections last transitioned to zero.
     pub last_active_at: AtomicU64,
+    /// Peak-EWMA of TCP-connect latency in milliseconds (alpha 0.2),
+    /// recorded on connect success and as `tau` on tunnel-side
+    /// failure. `0` means no sample yet. Selection scores a tunnel
+    /// with no sample at a default RTT instead of zero.
+    pub rtt_ewma_ms: AtomicU64,
+    /// Unix timestamp (seconds) the tunnel was last (re)admitted to
+    /// the pool by a boot or resume. `0` means never admitted. The
+    /// slow-start weight ramps from this instant; it is deliberately
+    /// not refreshed by traffic, so a busy tunnel reaches full weight
+    /// instead of ramping forever.
+    pub activated_at: AtomicU64,
 }
 
 impl TunnelStats {
@@ -153,6 +169,41 @@ impl TunnelStats {
     /// Update the last handshake timestamp.
     pub fn record_handshake(&self, ts_secs: u64) {
         self.last_handshake.store(ts_secs, Ordering::Relaxed);
+    }
+
+    /// Record one TCP-connect latency sample (milliseconds) into the
+    /// Peak-EWMA: `ewma = 0.2 * sample + 0.8 * ewma`, with the first
+    /// sample taken as-is. The sample is clamped to 1 ms–`tau`
+    /// (10 s) first, so a single pathological dial cannot pin the
+    /// score at an extreme. Lock-free: concurrent updates retry the
+    /// compare-exchange until one wins, so no sample is silently lost.
+    /// Only callers with a real dial verdict record here — a cached
+    /// DNS answer is not a latency sample.
+    pub fn record_rtt_sample(&self, sample_ms: u64) {
+        let sample = sample_ms.clamp(1, RTT_TAU_MS);
+        let _ = self
+            .rtt_ewma_ms
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if current == 0 {
+                    sample
+                } else {
+                    (sample + 4 * current) / 5
+                })
+            });
+    }
+
+    /// Record a tunnel-side connect failure as a maximally slow
+    /// (`tau`) latency sample, so the tunnel's selection score jumps
+    /// instead of decaying quietly.
+    pub fn record_rtt_failure(&self) {
+        self.record_rtt_sample(RTT_TAU_MS);
+    }
+
+    /// Record the instant this tunnel was (re)admitted to the pool
+    /// (boot or resume). Selection ramps its slow-start weight from
+    /// this timestamp.
+    pub fn record_activated(&self, ts_secs: u64) {
+        self.activated_at.store(ts_secs, Ordering::Relaxed);
     }
 
     /// Record an active connection increment.

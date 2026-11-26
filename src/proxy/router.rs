@@ -28,6 +28,22 @@ pub(crate) const MAX_POOL_FAILOVER_ATTEMPTS: usize = 3;
 /// Maximum total elapsed time spent failing over across pool tunnels for a single connect request.
 pub(crate) const MAX_POOL_FAILOVER_BUDGET: Duration = Duration::from_millis(3500);
 
+/// Per-attempt deadline for one pool dial inside the failover budget.
+///
+/// A live tunnel's handshake + TCP connect normally finishes in well
+/// under a second (median ~90 ms in the 2000-request measurement), so
+/// 1.25 s leaves ample headroom while guaranteeing the outer failover
+/// loop still has budget for two more attempts. A dormant tunnel whose
+/// handshake is lost waits 5 s for the WireGuard rekey timer — far
+/// past this deadline — so capping the attempt is what lets the race
+/// (below) rescue the request instead of burning the whole budget.
+pub(crate) const FIRST_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1250);
+
+/// Stagger before hedging a dormant first leg (RFC 8305 Connection
+/// Attempt Delay, 250 ms). A live first leg is never hedged: only a
+/// dormant or unknown leg gets a second tunnel racing it.
+pub(crate) const RACE_STAGGER: Duration = Duration::from_millis(250);
+
 /// Minimum timeout budget allocated to each candidate dial/send attempt while budget remains.
 pub(crate) const MIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -256,6 +272,17 @@ pub trait ProxyTunnelTarget: Send + Sync {
     /// full budget again. The default implementation does nothing;
     /// targets without health tracking keep it.
     fn note_attempt_aborted(&self) {}
+
+    /// Whether this target is backed by a tunnel with a live session
+    /// right now — recently proven by real traffic, so selecting it
+    /// avoids paying a fresh activation + handshake inside the
+    /// caller's failover budget. Pool selection prefers live targets
+    /// and falls back to any registered target when none is live. The
+    /// default is `false`: targets without liveness knowledge are
+    /// eligible but never preferred.
+    fn is_live(&self) -> bool {
+        false
+    }
 }
 
 /// Filter out forbidden destination IPs and cap candidates at [`MAX_CANDIDATE_IPS`],
@@ -332,6 +359,7 @@ pub(crate) async fn resolve_and_validate_domain(
 }
 
 /// Categorized error from [`connect_via_router`] so protocol handlers can emit accurate status codes.
+#[derive(Debug)]
 pub(crate) enum RouterConnectError {
     SelectTunnel(io::Error),
     ForbiddenDestination(io::Error),
@@ -339,8 +367,78 @@ pub(crate) enum RouterConnectError {
     TcpConnect(io::Error),
 }
 
+/// Whether a terminal [`RouterConnectError`] deserves the WARN in
+/// [`log_terminal_connect_failure`]: only failures no other layer
+/// warns about. The listener warns on `TimedOut` errors (that is where
+/// the "pool failover budget exceeded" line comes from) and the
+/// protocol handlers warn on tunnel-selection failures, so those are
+/// excluded here — otherwise one failed connection would emit two WARN
+/// lines. A forbidden destination is a deterministic policy rejection,
+/// not a proxy failure, so it stays at the listener's debug line.
+///
+/// `pub(crate)` so the gating can be unit-tested directly.
+pub(crate) fn should_warn_terminal_failure(error: &RouterConnectError) -> bool {
+    match error {
+        RouterConnectError::TcpConnect(e) | RouterConnectError::DnsResolution(e) => {
+            e.kind() != io::ErrorKind::TimedOut
+        }
+        RouterConnectError::SelectTunnel(_) | RouterConnectError::ForbiddenDestination(_) => false,
+    }
+}
+
+/// Log a terminal proxy-connection failure with enough context to
+/// classify it in the next measurement run: which pool/tunnel
+/// selector, which target, which tunnels were tried, how many attempts
+/// ran, and the error itself. Without this line, a fast TCP refusal
+/// or reset (or a DNS failure after all attempts) surfaced only as a
+/// debug "connection ended" line with no target or tunnel context —
+/// which is why the 0.25s/0.35s failures in the 2000-request
+/// measurement could not be classified. One line per failed
+/// connection, never per attempt: at the measured 0.15% failure rate
+/// this is rare and actionable (WARN), not noise.
+fn log_terminal_connect_failure(
+    selector: &TunnelSelector,
+    target: &TargetAddr,
+    tried_ids: &[String],
+    attempts: usize,
+    error: &RouterConnectError,
+) {
+    if !should_warn_terminal_failure(error) {
+        return;
+    }
+    let (kind, inner) = match error {
+        RouterConnectError::TcpConnect(e) => ("tcp_connect", e),
+        RouterConnectError::DnsResolution(e) => ("dns_resolution", e),
+        RouterConnectError::SelectTunnel(_) | RouterConnectError::ForbiddenDestination(_) => {
+            return;
+        }
+    };
+    tracing::warn!(
+        selector = ?selector,
+        target = %target,
+        tried_tunnels = ?tried_ids,
+        attempts = attempts,
+        error_kind = kind,
+        "proxy connection failed: {inner}"
+    );
+}
+
 /// Select a tunnel (with failover across healthy pool tunnels on transient DNS/connect failures)
 /// and establish a validated TCP stream to `target`.
+///
+/// Returns the stream plus the id of the tunnel that served the
+/// connection (the last id in the attempt list), so protocol handlers
+/// can name the tunnel in post-grant session logging — a stream alone
+/// carries no tunnel identity.
+///
+/// `exclude_tunnel` names a tunnel that must never be selected on
+/// this call: a zero-response retry re-dials after that tunnel closed
+/// the session with no data, so reusing it would replay the request
+/// into the same dead session. An excluded tunnel is skipped before
+/// dialing (it is not counted as an attempt); the skip is bounded by
+/// the attempt budget, so a single-tunnel pool fails fast with
+/// `NotConnected` instead of selecting forever. `None` is the
+/// ordinary first dial.
 ///
 /// `credentials` are forwarded to [`TunnelRouter::select_tunnel`] so a
 /// router can verify them against the tunnel it finally selects.
@@ -349,7 +447,8 @@ pub(crate) async fn connect_via_router(
     selector: &TunnelSelector,
     target: &TargetAddr,
     credentials: Option<(&str, &str)>,
-) -> Result<DynStream, RouterConnectError> {
+    exclude_tunnel: Option<&str>,
+) -> Result<(DynStream, Option<String>), RouterConnectError> {
     let max_attempts = if matches!(selector, TunnelSelector::ById(_)) {
         1
     } else {
@@ -358,11 +457,14 @@ pub(crate) async fn connect_via_router(
 
     let mut last_err: Option<RouterConnectError> = None;
     let mut tried_ids: SmallVec<[String; MAX_POOL_FAILOVER_ATTEMPTS]> = SmallVec::new();
+    let mut attempts_run = 0;
+    let mut excluded_skips = 0;
     let failover_deadline = tokio::time::Instant::now() + MAX_POOL_FAILOVER_BUDGET;
     for attempt in 0..max_attempts {
         if !within_failover_budget(attempt, failover_deadline) {
             break;
         }
+        attempts_run += 1;
         let target_tunnel = match router.select_tunnel(selector, credentials).await {
             Ok(t) => t,
             Err(e) => {
@@ -372,11 +474,27 @@ pub(crate) async fn connect_via_router(
                 if e.kind() == io::ErrorKind::PermissionDenied {
                     return Err(RouterConnectError::SelectTunnel(e));
                 }
-                return Err(last_err.unwrap_or(RouterConnectError::SelectTunnel(e)));
+                let err = last_err.unwrap_or(RouterConnectError::SelectTunnel(e));
+                log_terminal_connect_failure(selector, target, &tried_ids, attempts_run, &err);
+                return Err(err);
             }
         };
 
         if let Some(id) = target_tunnel.tunnel_id() {
+            if Some(id) == exclude_tunnel {
+                // The pool returned the tunnel this call must not
+                // reuse. Select again instead of dialing it; the skip
+                // is bounded so a pool with no other tunnel fails
+                // fast instead of selecting forever.
+                excluded_skips += 1;
+                if excluded_skips >= max_attempts {
+                    return Err(RouterConnectError::SelectTunnel(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        format!("no healthy tunnels available excluding '{id}'"),
+                    )));
+                }
+                continue;
+            }
             if tried_ids.iter().any(|prev| prev == id) {
                 break;
             }
@@ -389,51 +507,25 @@ pub(crate) async fn connect_via_router(
             if remaining.is_zero() {
                 break;
             }
-            if let Ok(res) = tokio::time::timeout(
-                remaining,
-                connect_target(&target_tunnel, target, attempt, max_attempts),
-            )
-            .await
-            {
-                res
-            } else {
-                // The budget cut the attempt off mid-flight, so the
-                // attempt's future was dropped without delivering a
-                // verdict. Resolve the trial as a failure here: without
-                // this, a `HalfOpen` tunnel would keep its trial slot
-                // (released on drop, failure count frozen, no new
-                // cooldown) and every later pool request would burn
-                // the full budget again, forever, instead of ever
-                // reaching the fail-fast "no healthy tunnels" path.
-                target_tunnel.note_attempt_aborted();
-                // Keep the last attempt's error in the message so the
-                // failure is diagnosable from that line alone, instead
-                // of a bare "pool failover budget exceeded" with no
-                // hint which tunnel failed or why.
-                let cause = last_err.as_ref().map_or_else(
-                    || "no attempt completed".to_string(),
-                    |e| {
-                        let inner = match e {
-                            RouterConnectError::SelectTunnel(e)
-                            | RouterConnectError::ForbiddenDestination(e)
-                            | RouterConnectError::DnsResolution(e)
-                            | RouterConnectError::TcpConnect(e) => e,
-                        };
-                        format!("last error: {inner}")
-                    },
-                );
-                last_err = Some(RouterConnectError::TcpConnect(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("pool failover budget exceeded ({cause})"),
-                )));
-                break;
-            }
+            let race = LegRace {
+                router,
+                selector,
+                target,
+                credentials,
+                exclude_tunnel,
+                deadline: failover_deadline,
+                attempt,
+                max_attempts,
+            };
+            race.race(target_tunnel, &mut tried_ids).await
         } else {
-            connect_target(&target_tunnel, target, attempt, max_attempts).await
+            connect_target(&target_tunnel, target, attempt, max_attempts)
+                .await
+                .map(|stream| (stream, tried_ids.last().cloned()))
         };
 
         match attempt_res {
-            Ok(stream) => return Ok(stream),
+            Ok((stream, winner)) => return Ok((stream, winner)),
             Err(err @ RouterConnectError::ForbiddenDestination(_)) => return Err(err),
             Err(err) => {
                 last_err = Some(err);
@@ -441,12 +533,251 @@ pub(crate) async fn connect_via_router(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
+    let err = last_err.unwrap_or_else(|| {
         RouterConnectError::SelectTunnel(io::Error::new(
             io::ErrorKind::NotConnected,
             "no healthy tunnels available in pool",
         ))
-    }))
+    });
+    log_terminal_connect_failure(selector, target, &tried_ids, attempts_run, &err);
+    Err(err)
+}
+
+/// Which leg of a pool race an outcome belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RaceLeg {
+    First,
+    Second,
+}
+
+/// Outcome of one race leg: which leg it was, and its dial result.
+type LegOutcome = (RaceLeg, Result<DynStream, RouterConnectError>);
+
+/// Tries to select a second tunnel distinct from the first leg.
+const MAX_RACE_SELECT_TRIES: usize = 3;
+
+/// Everything one pool race needs, bundled so the race helpers stay
+/// under the argument limit.
+struct LegRace<'a> {
+    router: &'a Arc<dyn TunnelRouter>,
+    selector: &'a TunnelSelector,
+    target: &'a TargetAddr,
+    credentials: Option<(&'a str, &'a str)>,
+    exclude_tunnel: Option<&'a str>,
+    deadline: tokio::time::Instant,
+    attempt: usize,
+    max_attempts: usize,
+}
+
+impl LegRace<'_> {
+    /// Deadline for one race leg: the remaining failover budget,
+    /// capped at [`FIRST_ATTEMPT_TIMEOUT`].
+    fn first_leg_timeout(&self) -> Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(FIRST_ATTEMPT_TIMEOUT)
+    }
+
+    /// Spawn one race leg: the dial bounded by the per-attempt
+    /// deadline. A deadline cut resolves the attempt as aborted, so a
+    /// HalfOpen trial cannot linger undecided (the same guarantee the
+    /// old whole-budget timeout gave, now per leg).
+    fn spawn_leg(
+        &self,
+        set: &mut tokio::task::JoinSet<LegOutcome>,
+        tunnel: Arc<dyn ProxyTunnelTarget>,
+        leg: RaceLeg,
+    ) {
+        let target = self.target.clone();
+        let attempt = self.attempt;
+        let max_attempts = self.max_attempts;
+        let timeout = self.first_leg_timeout();
+        set.spawn(async move {
+            let result = tokio::time::timeout(
+                timeout,
+                connect_target(&tunnel, &target, attempt, max_attempts),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                tunnel.note_attempt_aborted();
+                Err(RouterConnectError::TcpConnect(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect attempt timed out after {timeout:?}"),
+                )))
+            });
+            (leg, result)
+        });
+    }
+
+    /// Select a tunnel distinct from the first leg (and from the
+    /// excluded tunnel) for the hedge. Retried a few times because
+    /// the router may return the first leg again; `None` means no
+    /// second leg is available and the first leg runs alone.
+    async fn select_distinct(&self, tried_ids: &[String]) -> Option<Arc<dyn ProxyTunnelTarget>> {
+        for _ in 0..MAX_RACE_SELECT_TRIES {
+            let Ok(target) = self
+                .router
+                .select_tunnel(self.selector, self.credentials)
+                .await
+            else {
+                continue;
+            };
+            let distinct = target.tunnel_id().is_none_or(|id| {
+                Some(id) != self.exclude_tunnel && !tried_ids.iter().any(|prev| prev == id)
+            });
+            if distinct {
+                return Some(target);
+            }
+        }
+        None
+    }
+
+    /// Start the hedge leg on a distinct tunnel, if one is available,
+    /// recording it so the race can cancel and resolve it on a win.
+    async fn spawn_hedge(
+        &self,
+        set: &mut tokio::task::JoinSet<LegOutcome>,
+        tried_ids: &[String],
+        second: &mut Option<Arc<dyn ProxyTunnelTarget>>,
+    ) {
+        let Some(distinct) = self.select_distinct(tried_ids).await else {
+            return;
+        };
+        self.spawn_leg(set, Arc::clone(&distinct), RaceLeg::Second);
+        *second = Some(distinct);
+    }
+
+    /// Race the first leg against a hedged second leg and return the
+    /// winner's stream and tunnel id.
+    ///
+    /// The first leg runs with a per-attempt deadline. If it has not
+    /// finished after [`RACE_STAGGER`] and its tunnel is not live, a
+    /// second leg starts on a different tunnel; the first success
+    /// wins and the loser is cancelled at once (its dial future is
+    /// dropped, the netstack socket guard removes the socket, and its
+    /// trial is resolved as inconclusive). A live first leg is never
+    /// hedged — hedging it would only double-spend a healthy tunnel
+    /// for a slow target. A leg that fails fast hedges immediately
+    /// instead of waiting out the stagger.
+    async fn race(
+        &self,
+        first: Arc<dyn ProxyTunnelTarget>,
+        tried_ids: &mut SmallVec<[String; MAX_POOL_FAILOVER_ATTEMPTS]>,
+    ) -> Result<(DynStream, Option<String>), RouterConnectError> {
+        let first_is_live = first.is_live();
+        let first_id = first.tunnel_id().map(str::to_string);
+        let mut set: tokio::task::JoinSet<LegOutcome> = tokio::task::JoinSet::new();
+        self.spawn_leg(&mut set, Arc::clone(&first), RaceLeg::First);
+        let mut second: Option<Arc<dyn ProxyTunnelTarget>> = None;
+        let mut first_done = false;
+        let mut second_done = false;
+        let mut hedge_spawned = false;
+        let mut last_err: Option<RouterConnectError> = None;
+        let hedge_deadline = tokio::time::sleep(RACE_STAGGER);
+        tokio::pin!(hedge_deadline);
+        loop {
+            if set.is_empty() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                res = set.join_next() => {
+                    let Some(joined) = res else { break };
+                    let Ok((leg, outcome)) = joined else {
+                        last_err = Some(RouterConnectError::TcpConnect(io::Error::other(
+                            "race leg task ended unexpectedly",
+                        )));
+                        continue;
+                    };
+                    match leg {
+                        RaceLeg::First => first_done = true,
+                        RaceLeg::Second => second_done = true,
+                    }
+                    match outcome {
+                        Ok(stream) => {
+                            abort_loser(
+                                &mut set,
+                                leg,
+                                &first,
+                                second.as_ref(),
+                                first_done,
+                                second_done,
+                            );
+                            match leg {
+                                RaceLeg::First => return Ok((stream, first_id)),
+                                RaceLeg::Second => {
+                                    let winner_id = second
+                                        .as_ref()
+                                        .and_then(|t| t.tunnel_id().map(str::to_string));
+                                    if let Some(id) = &winner_id {
+                                        tried_ids.push(id.clone());
+                                    }
+                                    return Ok((stream, winner_id));
+                                }
+                            }
+                        }
+                        Err(err @ RouterConnectError::ForbiddenDestination(_)) => {
+                            abort_loser(
+                                &mut set,
+                                leg,
+                                &first,
+                                second.as_ref(),
+                                first_done,
+                                second_done,
+                            );
+                            return Err(err);
+                        }
+                        Err(err) => {
+                            last_err = Some(err);
+                            if leg == RaceLeg::First && !hedge_spawned && !first_is_live {
+                                hedge_spawned = true;
+                                self.spawn_hedge(&mut set, tried_ids, &mut second).await;
+                            }
+                        }
+                    }
+                }
+                () = &mut hedge_deadline, if !hedge_spawned && !first_is_live => {
+                    hedge_spawned = true;
+                    self.spawn_hedge(&mut set, tried_ids, &mut second).await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            RouterConnectError::SelectTunnel(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no healthy tunnels available in pool",
+            ))
+        }))
+    }
+}
+
+/// Cancel the still-running leg after the race is decided and resolve
+/// its trial as inconclusive: it was cut off mid-flight, so it
+/// delivered no verdict about its tunnel. A leg that already finished
+/// resolved its own trial and is left alone. The aborted task's dial
+/// future is dropped, and the netstack socket guard removes its
+/// socket, so no socket or session leaks.
+fn abort_loser(
+    set: &mut tokio::task::JoinSet<LegOutcome>,
+    winner: RaceLeg,
+    first: &Arc<dyn ProxyTunnelTarget>,
+    second: Option<&Arc<dyn ProxyTunnelTarget>>,
+    first_done: bool,
+    second_done: bool,
+) {
+    set.abort_all();
+    match winner {
+        RaceLeg::First => {
+            if !second_done && let Some(loser) = second {
+                loser.note_attempt_aborted();
+            }
+        }
+        RaceLeg::Second => {
+            if !first_done {
+                first.note_attempt_aborted();
+            }
+        }
+    }
 }
 
 /// True while the pool-failover budget still allows another attempt.
@@ -687,6 +1018,10 @@ impl<T: ProxyTunnelTarget + ?Sized> ProxyTunnelTarget for Arc<T> {
 
     fn note_attempt_aborted(&self) {
         (**self).note_attempt_aborted();
+    }
+
+    fn is_live(&self) -> bool {
+        (**self).is_live()
     }
 }
 
@@ -1059,6 +1394,30 @@ impl std::fmt::Debug for PoolRouter {
     }
 }
 
+/// Tunnel IDs in preference order for pool selection: targets backed
+/// by a live session first, so a request does not pay a fresh
+/// activation + handshake while live tunnels sit unused. Falls back to
+/// the full key list when no target is live, so a fresh pool can still
+/// bring tunnels up through real traffic — which is how targets become
+/// live in the first place.
+fn preferred_pool_ids(inner: &PoolInner) -> Vec<&String> {
+    let live: Vec<&String> = inner
+        .keys
+        .iter()
+        .filter(|id| {
+            inner
+                .tunnels
+                .get(*id)
+                .is_some_and(ProxyTunnelTarget::is_live)
+        })
+        .collect();
+    if live.is_empty() {
+        inner.keys.iter().collect()
+    } else {
+        live
+    }
+}
+
 impl PoolRouter {
     /// Create a new pool router with the given strategy and anonymous access flag.
     pub fn new(strategy: PoolStrategy, allow_anonymous: bool) -> Self {
@@ -1115,15 +1474,16 @@ impl PoolRouter {
             ));
         }
 
+        let candidates = preferred_pool_ids(&inner);
         let selected_id = match self.strategy {
             PoolStrategy::RoundRobin | PoolStrategy::LeastConn => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % inner.keys.len();
-                inner.keys.get(idx)
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % candidates.len();
+                candidates.get(idx).copied()
             }
-            PoolStrategy::Fallback => inner.keys.first(),
+            PoolStrategy::Fallback => candidates.first().copied(),
             PoolStrategy::Random => {
-                let idx = (rand::random::<u32>() as usize) % inner.keys.len();
-                inner.keys.get(idx)
+                let idx = (rand::random::<u32>() as usize) % candidates.len();
+                candidates.get(idx).copied()
             }
         }
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "selected tunnel not found"))?;
@@ -1180,16 +1540,16 @@ impl TunnelRouter for PoolRouter {
                             "no tunnels registered in pool",
                         ));
                     }
+                    let candidates = preferred_pool_ids(&inner);
                     let idx = match keyword {
-                        PoolKeyword::Random => (rand::random::<u32>() as usize) % inner.keys.len(),
+                        PoolKeyword::Random => (rand::random::<u32>() as usize) % candidates.len(),
                         PoolKeyword::Auto | PoolKeyword::RoundRobin | PoolKeyword::LeastConn => {
-                            self.rr_counter.fetch_add(1, Ordering::Relaxed) % inner.keys.len()
+                            self.rr_counter.fetch_add(1, Ordering::Relaxed) % candidates.len()
                         }
                     };
-                    let target = inner
-                        .keys
+                    let target = candidates
                         .get(idx)
-                        .and_then(|id| inner.tunnels.get(id))
+                        .and_then(|id| inner.tunnels.get(id.as_str()))
                         .cloned();
                     drop(inner);
                     target

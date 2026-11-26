@@ -458,7 +458,7 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
         ));
     };
 
-    let mut tunnel_stream =
+    let (mut tunnel_stream, mut tunnel_id, target) =
         resolve_and_connect_http_target(&mut stream, &router, selector, &host, port, credentials)
             .await?;
 
@@ -476,13 +476,39 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Bidirectional byte streaming, ending when either side closes or
     // the session idles past CONNECT_IDLE_TIMEOUT (audit run-1,
-    // `wpmulti/proxy:established-connect-no-idle-timeout`).
-    crate::proxy::copy_bidirectional_with_idle_timeout(
+    // `wpmulti/proxy:established-connect-no-idle-timeout`). A session
+    // that ends with no response bytes from the target is retried
+    // once through a different tunnel (see
+    // `copy_bidirectional_with_zero_response_retry`); the pipelined
+    // leftover bytes are the seed of the replay prefix, so a retry
+    // replays the whole client-sent prefix. If the session still
+    // ends with no response bytes, it is a failed session even
+    // though the copy returns `Ok` — log it before returning, or
+    // the client's "empty reply" leaves no trace.
+    let retry = crate::proxy::ZeroResponseRetry::new(
+        &router,
+        selector,
+        &target,
+        credentials,
+        "HTTP",
+        leftover,
+    );
+    let copy_result = crate::proxy::copy_bidirectional_with_zero_response_retry(
         &mut stream,
-        &mut tunnel_stream,
+        tunnel_stream,
         crate::proxy::CONNECT_IDLE_TIMEOUT,
+        Some(retry),
+        &mut tunnel_id,
     )
-    .await?;
+    .await;
+    crate::proxy::log_connect_session_end(
+        "HTTP",
+        selector,
+        &target,
+        tunnel_id.as_deref(),
+        &copy_result,
+    );
+    copy_result?;
 
     Ok(())
 }
@@ -892,15 +918,15 @@ async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
     host: &str,
     port: u16,
     credentials: Option<(&str, &str)>,
-) -> io::Result<DynStream> {
+) -> io::Result<(DynStream, Option<String>, TargetAddr)> {
     let literal_ip = validate_target_host_before_routing(stream, host).await?;
     let target = literal_ip.map_or_else(
         || TargetAddr::Domain(host.to_string(), port),
         |ip| TargetAddr::Ip(SocketAddr::new(ip, port)),
     );
 
-    match connect_via_router(router, selector, &target, credentials).await {
-        Ok(s) => Ok(s),
+    match connect_via_router(router, selector, &target, credentials, None).await {
+        Ok((s, tunnel_id)) => Ok((s, tunnel_id, target)),
         Err(RouterConnectError::SelectTunnel(e)) => {
             // Log exactly like the SOCKS5 path: docs §4 promises this
             // line for the pool-empty case, and without it an HTTP user
@@ -1264,7 +1290,7 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
-    let mut tunnel_stream =
+    let (mut tunnel_stream, tunnel_id, target) =
         resolve_and_connect_http_target(&mut stream, &router, selector, &host, port, credentials)
             .await?;
 
@@ -1314,7 +1340,20 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
     );
     let resp_fut = forward_upstream_response(upstream_read, client_write);
 
-    tokio::try_join!(req_fut, resp_fut)?;
+    let join_result = tokio::try_join!(req_fut, resp_fut);
+    // A success here means a response head was read and the request
+    // head was written, so at least one byte flowed each way; exact
+    // counts are not tracked on the forward path, so the session-end
+    // log gets that lower bound and only warns on failure.
+    let session_result: io::Result<(u64, u64)> = join_result.map(|_| (1, 1));
+    crate::proxy::log_connect_session_end(
+        "HTTP",
+        selector,
+        &target,
+        tunnel_id.as_deref(),
+        &session_result,
+    );
+    session_result?;
 
     Ok(())
 }

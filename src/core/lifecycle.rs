@@ -3,13 +3,14 @@
 //! Provides [`LifecycleController`] managing on-demand boot, native `Device::suspend()` and `Device::resume()`,
 //! RAII active connection tracking via [`TunnelConnGuard`], and debounced background idle teardown.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use gotatun::device::{Device, DeviceBuilder, Peer};
 use gotatun::tun::{IpRecv, IpSend};
@@ -22,11 +23,12 @@ use x25519_dalek::StaticSecret;
 
 use crate::config::{LifecycleMode, WgInterfaceConfig, WgPeerConfig};
 use crate::core::CoreError;
-use crate::core::health::TunnelHealthTracker;
+use crate::core::health::{HealthStatus, TunnelHealthTracker};
 use crate::core::protector::{ProtectedUdpFactory, SocketProtector};
 use crate::core::registry::{
     ActiveTunnel, TunnelEntry, TunnelRegistry, TunnelState, TunnelStats, WgDevice,
 };
+use crate::core::selection::WarmList;
 use crate::netstack::tun::TunEndpoint;
 use crate::netstack::{
     DEFAULT_CHANNEL_CAPACITY, DnsLruCache, StackDnsConfig, VirtualNetworkStack, VirtualTunBridge,
@@ -38,6 +40,15 @@ use crate::proxy::{DynStream, ProxyTunnelTarget, ProxyUdpSocket};
 ///
 /// Increments the tunnel's `active_conns` count on creation and decrements it on drop.
 /// When the active count reaches zero, records `last_active_at` for idle teardown debouncing.
+///
+/// This is the pool's inflight guard: it is acquired at selection time
+/// ([`LifecycleController::get_or_activate`] creates one per selected
+/// tunnel, including each leg of a race) and released exactly once by
+/// `Drop` — there is no manual release path alongside it, so a
+/// cancelled Tokio task cannot leak a count and the counter cannot
+/// underflow ([`TunnelStats::dec_conns`] refuses to decrement past
+/// zero). A racing loser's guard is released when its target handle
+/// is dropped at the end of the race round.
 #[derive(Debug)]
 pub struct TunnelConnGuard {
     tunnel_id: String,
@@ -76,6 +87,10 @@ pub struct GuardedTunnelTarget {
     threshold: usize,
     cooldown: Duration,
     trial_resolved: Arc<std::sync::atomic::AtomicBool>,
+    /// Pool warm list to seed on a proven dial, if this target was
+    /// built by a pool router. `None` for dedicated routers and
+    /// test-built targets, which have no pool to seed.
+    warm_list: Option<Arc<WarmList>>,
 }
 
 impl Drop for GuardedTunnelTarget {
@@ -98,6 +113,7 @@ impl GuardedTunnelTarget {
             threshold: 3,
             cooldown: Duration::from_secs(30),
             trial_resolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warm_list: None,
         }
     }
 
@@ -116,7 +132,15 @@ impl GuardedTunnelTarget {
             threshold,
             cooldown,
             trial_resolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warm_list: None,
         }
+    }
+
+    /// Attach the pool warm list this target reports proven dials to.
+    /// Called by the pool router after construction; a target without
+    /// a warm list simply does not seed one.
+    pub(crate) fn set_warm_list(&mut self, warm_list: Arc<WarmList>) {
+        self.warm_list = Some(warm_list);
     }
 
     /// Attach health tracker, failure threshold, and cooldown duration.
@@ -281,13 +305,26 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         let threshold = self.threshold;
         let cooldown = self.cooldown;
         let trial_resolved = Arc::clone(&self.trial_resolved);
+        let warm_list = self.warm_list.clone();
         Box::pin(async move {
+            // Time the dial: the verdict feeds the Peak-EWMA latency
+            // score, so a tunnel that dials slowly (or not at all) is
+            // deprioritised by the next selection instead of being
+            // retried blindly. A cached DNS answer is not timed here —
+            // only the dial that actually crosses the tunnel counts.
+            let started = Instant::now();
             match tunnel.tcp_connect(dst).await {
                 Ok(stream) => {
                     tunnel.stats.record_handshake(now_unix_secs());
+                    let sample_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    tunnel.stats.record_rtt_sample(sample_ms);
                     trial_resolved.store(true, Ordering::Relaxed);
                     if let Some(h) = &health {
                         h.record_success();
+                    }
+                    if let Some(warm) = &warm_list {
+                        warm.note_success(guard.tunnel_id());
                     }
                     let guarded: DynStream = Box::new(GuardedStream {
                         inner: stream,
@@ -297,11 +334,21 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
                 }
                 Err(e) => {
                     trial_resolved.store(true, Ordering::Relaxed);
+                    let handshaked_recently = handshake_is_fresh(
+                        tunnel.stats.last_handshake.load(Ordering::Relaxed),
+                        now_unix_secs(),
+                    );
+                    // A tunnel-side failure counts as a maximally slow
+                    // latency sample, so the score jumps at once. A
+                    // destination-caused failure (refused, unroutable,
+                    // or a timeout against a freshly handshaked peer)
+                    // says nothing about the tunnel and must not
+                    // poison its score — one slow target would
+                    // otherwise demote every tunnel in turn.
+                    if !is_destination_caused_error(e.kind(), handshaked_recently) {
+                        tunnel.stats.record_rtt_failure();
+                    }
                     if let Some(h) = &health {
-                        let handshaked_recently = handshake_is_fresh(
-                            tunnel.stats.last_handshake.load(Ordering::Relaxed),
-                            now_unix_secs(),
-                        );
                         if is_destination_caused_error(e.kind(), handshaked_recently) {
                             h.record_inconclusive();
                         } else {
@@ -413,6 +460,29 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
             // count; the next request may trial the tunnel again.
             h.record_inconclusive();
         }
+    }
+
+    fn is_live(&self) -> bool {
+        // A live session means this tunnel moved real traffic recently.
+        // A fresh handshake alone is not enough: an in-tunnel DNS
+        // resolve records one even when the answer came from the shared
+        // cache without any packet crossing the tunnel. Healthy alone
+        // is not enough either: it persists until failures trip the
+        // breaker, while the session may have gone stale since the last
+        // success. Both together — Healthy plus a fresh handshake —
+        // mean the tunnel proved itself by moving traffic within the
+        // freshness window. Without a tracker there is no health
+        // signal, so a fresh handshake is the best available evidence.
+        let fresh = handshake_is_fresh(
+            self.tunnel.stats.last_handshake.load(Ordering::Relaxed),
+            now_unix_secs(),
+        );
+        if !fresh {
+            return false;
+        }
+        self.health
+            .as_ref()
+            .is_none_or(|h| h.current_status() == HealthStatus::Healthy)
     }
 }
 
@@ -529,6 +599,13 @@ impl Drop for ActivatingGuard<'_> {
     }
 }
 
+/// Floor for the suspended-tunnel close threshold (seconds). A suspended
+/// tunnel is only closed after `max(2 * idle_timeout, this)` seconds of
+/// idleness, so a short operator-configured idle timeout cannot close a
+/// tunnel whose WireGuard session is still resumable (session lifetime
+/// is ~180s; the P2C warm window is 120s).
+const MIN_CLOSE_AFTER_SECS: u64 = 300;
+
 /// Controller orchestrating lazy on-demand activation, native suspend/resume, and idle teardown.
 #[derive(Debug)]
 pub struct LifecycleController {
@@ -578,6 +655,92 @@ fn allowed_ips_of(entry: &TunnelEntry) -> Vec<ipnetwork::IpNetwork> {
 fn interface_addrs_of(entry: &TunnelEntry) -> Vec<ipnetwork::IpNetwork> {
     entry.config.read().interface.addresses.clone()
 }
+
+/// How long a resolved WireGuard endpoint address is reused before a
+/// fresh DNS lookup is required. Operators usually point every tunnel
+/// at one endpoint hostname, so a single cached answer serves all of
+/// them while it is fresh.
+const ENDPOINT_DNS_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// One cached WireGuard endpoint DNS answer.
+#[derive(Debug)]
+struct EndpointDnsCacheEntry {
+    addr: SocketAddr,
+    expires_at: Instant,
+}
+
+/// Small TTL cache for WireGuard endpoint DNS answers, shared by every
+/// tunnel activation.
+///
+/// This is separate from the target-domain cache in
+/// [`crate::netstack::DnsLruCache`]: that one resolves the *destination*
+/// of a proxied connection, while this one resolves the *endpoint* a
+/// tunnel itself dials (e.g. `engage.cloudflareclient.com:2408`).
+/// Without it, every dormant-tunnel activation pays a fresh OS-resolver
+/// round trip for the same hostname, and a slow lookup stalls the
+/// activation until the handshake timeout.
+///
+/// The map is keyed by the endpoint string as written in config and is
+/// bounded by the number of distinct configured endpoints; it is not
+/// an LRU because the key space is tiny and config-bound.
+#[derive(Debug)]
+struct EndpointDnsCache {
+    entries: RwLock<HashMap<String, EndpointDnsCacheEntry>>,
+}
+
+impl EndpointDnsCache {
+    fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// The cached address, but only while it is still fresh.
+    fn get(&self, endpoint: &str) -> Option<SocketAddr> {
+        let entries = self.entries.read();
+        entries
+            .get(endpoint)
+            .filter(|entry| Instant::now() < entry.expires_at)
+            .map(|entry| entry.addr)
+    }
+
+    /// The cached address regardless of freshness: the last-known-good
+    /// answer, served only when a fresh lookup times out.
+    fn get_stale(&self, endpoint: &str) -> Option<SocketAddr> {
+        let entries = self.entries.read();
+        entries.get(endpoint).map(|entry| entry.addr)
+    }
+
+    fn insert(&self, endpoint: &str, addr: SocketAddr) {
+        let mut entries = self.entries.write();
+        entries.insert(
+            endpoint.to_string(),
+            EndpointDnsCacheEntry {
+                addr,
+                expires_at: Instant::now() + ENDPOINT_DNS_CACHE_TTL,
+            },
+        );
+    }
+
+    /// Test-only: store an entry that is already expired, so tests can
+    /// force a fresh lookup without waiting out the TTL.
+    #[cfg(test)]
+    fn insert_expired(&self, endpoint: &str, addr: SocketAddr) {
+        let mut entries = self.entries.write();
+        entries.insert(
+            endpoint.to_string(),
+            EndpointDnsCacheEntry {
+                addr,
+                expires_at: Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now),
+            },
+        );
+    }
+}
+
+/// Daemon-wide endpoint DNS cache shared by every tunnel activation.
+static ENDPOINT_DNS_CACHE: LazyLock<EndpointDnsCache> = LazyLock::new(EndpointDnsCache::new);
 
 impl LifecycleController {
     /// Construct a new lifecycle controller.
@@ -1057,6 +1220,7 @@ impl LifecycleController {
                 *entry.state.write() = TunnelState::Active;
                 activating_guard.defuse();
                 self.attach_vpn_route(&entry);
+                entry.stats.record_activated(now_unix_secs());
                 let guard = TunnelConnGuard::new(id, Arc::clone(&entry.stats));
                 Ok((active, guard))
             }
@@ -1081,6 +1245,7 @@ impl LifecycleController {
                         *entry.active.write() = Some(Arc::clone(&active));
                         *entry.state.write() = TunnelState::Active;
                         activating_guard.defuse();
+                        entry.stats.record_activated(now_unix_secs());
 
                         let guard = TunnelConnGuard::new(id, Arc::clone(&entry.stats));
                         Ok((active, guard))
@@ -1166,6 +1331,7 @@ impl LifecycleController {
                 *entry.state.write() = TunnelState::Active;
                 activating_guard.defuse();
                 self.attach_vpn_route(&entry);
+                entry.stats.record_activated(now_unix_secs());
                 Ok(active)
             }
             TunnelState::Dormant | TunnelState::Activating => {
@@ -1189,6 +1355,7 @@ impl LifecycleController {
                         *entry.active.write() = Some(Arc::clone(&active));
                         *entry.state.write() = TunnelState::Active;
                         activating_guard.defuse();
+                        entry.stats.record_activated(now_unix_secs());
                         Ok(active)
                     }
                     Err(e) => {
@@ -1369,8 +1536,88 @@ impl LifecycleController {
         ))
     }
 
+    /// Resolve a non-literal WireGuard endpoint hostname through DNS,
+    /// reusing the shared endpoint cache while its answer is fresh.
+    ///
+    /// A lookup timeout is transient (slow or unreachable DNS), so the
+    /// last-known-good cached address is served instead and a warning
+    /// is logged: a wrong endpoint only fails the handshake. A hard
+    /// resolution error, an empty answer, or an answer of only
+    /// forbidden addresses keeps the existing strict failure: those
+    /// mean the name is gone or hijacked, and masking them would hide
+    /// a config problem.
+    ///
+    /// The cache lock is never held across the `.await`: the fresh
+    /// check, the lookup, and the store are three separate critical
+    /// sections.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::ActivationFailed`] when the endpoint
+    /// cannot be resolved and no cached address exists.
+    async fn resolve_endpoint_cached(
+        cache: &EndpointDnsCache,
+        endpoint: &str,
+        handshake_timeout: Duration,
+        tunnel_id: &str,
+    ) -> Result<SocketAddr, CoreError> {
+        if let Some(addr) = cache.get(endpoint) {
+            return Ok(addr);
+        }
+        match tokio::time::timeout(handshake_timeout, tokio::net::lookup_host(endpoint)).await {
+            Ok(Ok(addrs)) => {
+                let addrs: Vec<SocketAddr> = addrs.collect();
+                if addrs.is_empty() {
+                    return Err(CoreError::ActivationFailed(
+                        tunnel_id.to_string(),
+                        format!("endpoint DNS lookup returned no addresses for '{endpoint}'"),
+                    ));
+                }
+                // The host resolver's answer is third-party data, not
+                // operator config: never handshake an endpoint that
+                // resolves to a forbidden address (loopback/private/
+                // link-local/...). Take the first allowed answer; when
+                // every answer is forbidden, fail the tunnel instead
+                // of silently using a dangerous one (audit run-1,
+                // `lifecycle:build-peers-unchecked-dns-endpoint`).
+                let Some(addr) = addrs
+                    .iter()
+                    .copied()
+                    .find(|addr| !is_forbidden_destination_ip(addr.ip()))
+                else {
+                    return Err(CoreError::ActivationFailed(
+                        tunnel_id.to_string(),
+                        format!(
+                            "endpoint DNS lookup for '{endpoint}' resolved only to forbidden addresses"
+                        ),
+                    ));
+                };
+                cache.insert(endpoint, addr);
+                Ok(addr)
+            }
+            Ok(Err(e)) => Err(CoreError::ActivationFailed(
+                tunnel_id.to_string(),
+                format!("endpoint DNS lookup failed for '{endpoint}': {e}"),
+            )),
+            Err(_) => {
+                let Some(addr) = cache.get_stale(endpoint) else {
+                    return Err(CoreError::ActivationFailed(
+                        tunnel_id.to_string(),
+                        format!("endpoint DNS lookup timed out for '{endpoint}'"),
+                    ));
+                };
+                tracing::warn!(
+                    "Endpoint DNS lookup timed out for '{endpoint}'; using stale cached address {addr}"
+                );
+                Ok(addr)
+            }
+        }
+    }
+
     /// Build gotatun peers from the tunnel config, resolving
     /// non-literal endpoints through DNS under `handshake_timeout`.
+    /// Endpoint answers are shared through the daemon-wide
+    /// [`EndpointDnsCache`], so activating many tunnels that point at
+    /// one hostname does not re-query DNS for each of them.
     async fn build_peers(
         config_peers: &[WgPeerConfig],
         handshake_timeout: Duration,
@@ -1382,60 +1629,14 @@ impl LifecycleController {
             if let Ok(addr) = p_cfg.endpoint.parse::<SocketAddr>() {
                 peer.endpoint = Some(addr);
             } else {
-                match tokio::time::timeout(
+                let addr = Self::resolve_endpoint_cached(
+                    &ENDPOINT_DNS_CACHE,
+                    &p_cfg.endpoint,
                     handshake_timeout,
-                    tokio::net::lookup_host(&p_cfg.endpoint),
+                    tunnel_id,
                 )
-                .await
-                {
-                    Ok(Ok(addrs)) => {
-                        // The host resolver's answer is third-party
-                        // data, not operator config: never handshake
-                        // an endpoint that resolves to a forbidden
-                        // address (loopback/private/link-local/...).
-                        // Take the first allowed answer; when every
-                        // answer is forbidden, fail the tunnel instead
-                        // of silently using a dangerous one (audit
-                        // run-1,
-                        // `lifecycle:build-peers-unchecked-dns-endpoint`).
-                        let addrs: Vec<SocketAddr> = addrs.collect();
-                        if addrs.is_empty() {
-                            return Err(CoreError::ActivationFailed(
-                                tunnel_id.to_string(),
-                                format!(
-                                    "endpoint DNS lookup returned no addresses for '{}'",
-                                    p_cfg.endpoint
-                                ),
-                            ));
-                        }
-                        let Some(addr) = addrs
-                            .iter()
-                            .copied()
-                            .find(|addr| !is_forbidden_destination_ip(addr.ip()))
-                        else {
-                            return Err(CoreError::ActivationFailed(
-                                tunnel_id.to_string(),
-                                format!(
-                                    "endpoint DNS lookup for '{}' resolved only to forbidden addresses",
-                                    p_cfg.endpoint
-                                ),
-                            ));
-                        };
-                        peer.endpoint = Some(addr);
-                    }
-                    Ok(Err(e)) => {
-                        return Err(CoreError::ActivationFailed(
-                            tunnel_id.to_string(),
-                            format!("endpoint DNS lookup failed for '{}': {e}", p_cfg.endpoint),
-                        ));
-                    }
-                    Err(_) => {
-                        return Err(CoreError::ActivationFailed(
-                            tunnel_id.to_string(),
-                            format!("endpoint DNS lookup timed out for '{}'", p_cfg.endpoint),
-                        ));
-                    }
-                }
+                .await?;
+                peer.endpoint = Some(addr);
             }
             peer.allowed_ips = p_cfg.allowed_ips.clone();
             peer.preshared_key = p_cfg.preshared_key;
@@ -1475,6 +1676,59 @@ impl LifecycleController {
         })
     }
 
+    /// Seconds since the tunnel last carried traffic. A tunnel that never
+    /// recorded activity is stamped with `now` and treated as fresh, so
+    /// the caller never tears down a just-booted tunnel for a zero stamp.
+    fn idle_seconds(entry: &TunnelEntry, now: u64) -> u64 {
+        let last_active = entry.stats.last_active_at.load(Ordering::Relaxed);
+        if last_active > 0 {
+            now.saturating_sub(last_active)
+        } else {
+            entry.stats.last_active_at.store(now, Ordering::Relaxed);
+            0
+        }
+    }
+
+    /// Idle seconds after which a suspended tunnel is closed to free its
+    /// stack: twice the suspend timeout, floored at `MIN_CLOSE_AFTER_SECS`.
+    /// Any tunnel reaching this threshold is past both the WireGuard
+    /// session lifetime and the P2C warm window, so closing it only costs
+    /// a fresh handshake on next use.
+    fn close_after_secs(&self) -> u64 {
+        self.idle_timeout()
+            .as_secs()
+            .saturating_mul(2)
+            .max(MIN_CLOSE_AFTER_SECS)
+    }
+
+    /// Close a suspended tunnel that has sat unused past the close
+    /// threshold, freeing its smoltcp stack and gotatun device buffers.
+    /// Suspended tunnels are skipped by the suspend branch of
+    /// `check_idle_tunnels`, so without this their stacks would stay
+    /// allocated for the daemon's whole lifetime. Disabled tunnels are
+    /// left to the disable flow.
+    async fn close_if_long_idle(&self, entry: &TunnelEntry, now: u64) {
+        if entry.is_disable_pending() {
+            return;
+        }
+        if entry.stats.active_conns.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        let idle_secs = Self::idle_seconds(entry, now);
+        let close_after = self.close_after_secs();
+        if idle_secs >= close_after {
+            tracing::info!(
+                "Tunnel '{}' suspended idle for {}s (threshold: {}s); closing to free its stack",
+                entry.id,
+                idle_secs,
+                close_after
+            );
+            if let Err(e) = self.close_tunnel(&entry.id).await {
+                tracing::warn!("Failed to close tunnel '{}': {e}", entry.id);
+            }
+        }
+    }
+
     /// Periodically inspects all tunnels and suspends idle lazy tunnels.
     pub async fn check_idle_tunnels(&self) {
         let entries = self.registry.all_entries();
@@ -1490,6 +1744,13 @@ impl LifecycleController {
             // medium): a disabled eager tunnel must be re-attempted once
             // idle, or it stays Active forever.
             if entry.lifecycle_mode == LifecycleMode::Eager && !disable_pending {
+                continue;
+            }
+
+            // A suspended tunnel keeps its stack allocated, so after a
+            // longer idle stretch it is closed instead of kept.
+            if *entry.state.read() == TunnelState::Suspended {
+                self.close_if_long_idle(&entry, now).await;
                 continue;
             }
 
@@ -1510,13 +1771,7 @@ impl LifecycleController {
                     }
                     continue;
                 }
-                let last_active = entry.stats.last_active_at.load(Ordering::Relaxed);
-                let idle_secs = if last_active > 0 {
-                    now.saturating_sub(last_active)
-                } else {
-                    entry.stats.last_active_at.store(now, Ordering::Relaxed);
-                    0
-                };
+                let idle_secs = Self::idle_seconds(&entry, now);
 
                 let idle_timeout_secs = self.idle_timeout().as_secs();
                 if idle_secs >= idle_timeout_secs {
@@ -1580,5 +1835,72 @@ mod tests {
         .await
         .expect("literal endpoint must build");
         assert_eq!(peers[0].endpoint, Some("127.0.0.1:51820".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_endpoint_dns_cache_fresh_hit_skips_lookup() {
+        // A fresh cached entry is returned without touching DNS: the
+        // hostname below is bogus (`.invalid` never resolves), so any
+        // lookup attempt would fail the test.
+        let cache = EndpointDnsCache::new();
+        let endpoint = "endpoint-cache-fresh-hit.invalid:51820";
+        let cached: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        cache.insert(endpoint, cached);
+        let resolved = LifecycleController::resolve_endpoint_cached(
+            &cache,
+            endpoint,
+            Duration::from_secs(5),
+            "tunnel-test",
+        )
+        .await
+        .expect("fresh cache entry must be returned without a lookup");
+        assert_eq!(resolved, cached);
+    }
+
+    #[tokio::test]
+    async fn test_endpoint_dns_cache_expired_entry_forces_fresh_lookup() {
+        // An expired entry must not satisfy the request: the helper
+        // attempts a fresh lookup, and the lookup's hard resolution
+        // error surfaces instead of the stale address. The endpoint
+        // is the empty name on purpose: some environments (including
+        // this sandbox) synthesize DNS answers for any syntactically
+        // valid name, so only an empty name fails deterministically
+        // at the resolver with "Name or service not known".
+        let cache = EndpointDnsCache::new();
+        let endpoint = "";
+        let stale: SocketAddr = "192.0.2.2:51820".parse().unwrap();
+        cache.insert_expired(endpoint, stale);
+        let err = LifecycleController::resolve_endpoint_cached(
+            &cache,
+            endpoint,
+            Duration::from_secs(5),
+            "tunnel-test",
+        )
+        .await
+        .expect_err("expired entry must force a fresh lookup, which must fail here");
+        assert!(
+            err.to_string().contains("endpoint DNS lookup failed"),
+            "error must come from the fresh lookup, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_endpoint_dns_cache_timeout_serves_stale_entry() {
+        // A lookup that times out (1us is far below any real DNS round
+        // trip) serves the last-known-good address instead of failing
+        // the activation.
+        let cache = EndpointDnsCache::new();
+        let endpoint = "endpoint-cache-timeout-serves-stale.invalid:51820";
+        let stale: SocketAddr = "192.0.2.3:51820".parse().unwrap();
+        cache.insert_expired(endpoint, stale);
+        let resolved = LifecycleController::resolve_endpoint_cached(
+            &cache,
+            endpoint,
+            Duration::from_micros(1),
+            "tunnel-test",
+        )
+        .await
+        .expect("timed-out lookup must serve the stale entry");
+        assert_eq!(resolved, stale);
     }
 }

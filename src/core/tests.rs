@@ -18,7 +18,11 @@ use crate::core::health::{HealthStatus, TunnelHealthTracker};
 use crate::core::lifecycle::{LifecycleController, TunnelConnGuard};
 use crate::core::listener::ListenerSupervisor;
 use crate::core::registry::{TunnelEntry, TunnelRegistry, TunnelState, TunnelStats};
-use crate::core::router::MultiTenantRouter;
+use crate::core::router::{MAX_LIVE_TUNNEL_CONNS, MultiTenantRouter, preferred_entries};
+use crate::core::selection::{
+    WarmList, dormant_surcharge_ms, score_entry, slow_start_weight, tunnel_score,
+};
+use crate::core::warm_up_complement_ids;
 use crate::proxy::{PoolKeyword, ProxyAuthError, TunnelRouter, TunnelSelector};
 
 fn make_test_tunnel_config(id: &str) -> TunnelConfig {
@@ -185,18 +189,66 @@ async fn test_eager_tunnel_activation() {
     // Start manager
     manager.start().await.unwrap();
 
-    // Verify eager tunnel was automatically booted
-    assert_eq!(manager.active_tunnel_count(), 1);
+    // Verify eager tunnel was automatically booted — and the
+    // warm-up complement tops the pool up to 8 tunnels, so with
+    // only two registered the lazy tunnel is booted too (its
+    // lifecycle mode stays Lazy: warmed at startup, not
+    // reclassified).
+    assert_eq!(manager.active_tunnel_count(), 2);
     let eager_entry = manager.registry().get("wgcf-eager-01").unwrap();
     assert_eq!(*eager_entry.state.read(), TunnelState::Active);
     assert_eq!(eager_entry.lifecycle_mode, LifecycleMode::Eager);
 
-    // Verify lazy tunnel remains dormant
+    // Verify lazy tunnel was warmed by the complement
     let lazy_entry = manager.registry().get("wgcf-lazy-01").unwrap();
-    assert_eq!(*lazy_entry.state.read(), TunnelState::Dormant);
+    assert_eq!(*lazy_entry.state.read(), TunnelState::Active);
     assert_eq!(lazy_entry.lifecycle_mode, LifecycleMode::Lazy);
 
     // Stop manager cleanly
+    manager.stop().await.unwrap();
+    assert_eq!(manager.active_tunnel_count(), 0);
+}
+
+#[tokio::test]
+async fn test_boot_warm_up_complement_tops_up_to_eight_tunnels() {
+    let mut config = MainConfig::default();
+    config.lifecycle.mode = LifecycleMode::Lazy;
+    config.lifecycle.eager_tunnels = vec!["wgcf-eager-01".to_string()];
+    config.per_tunnel.enabled = false;
+    config.shared_listeners.clear();
+    // Dead endpoints: keep the probe pass short; the boot assertions
+    // do not depend on probe outcomes.
+    config.health_check.probe_timeout = Duration::from_millis(100);
+
+    let mut tunnels = vec![make_test_tunnel_config("wgcf-eager-01")];
+    for i in 1..=10 {
+        tunnels.push(make_test_tunnel_config(&format!("wgcf-lazy-{i:02}")));
+    }
+
+    let manager = TunnelManager::new(config, tunnels).unwrap();
+    assert_eq!(manager.tunnel_count(), 11);
+    manager.start().await.unwrap();
+
+    // One eager + seven lowest-id lazy tunnels = 8 warm tunnels.
+    assert_eq!(manager.active_tunnel_count(), 8);
+    for i in 1..=7 {
+        let id = format!("wgcf-lazy-{i:02}");
+        assert_eq!(
+            *manager.registry().get(&id).unwrap().state.read(),
+            TunnelState::Active,
+            "{id} must be warmed by the complement"
+        );
+    }
+    // The remaining lazy tunnels stay dormant.
+    for i in 8..=10 {
+        let id = format!("wgcf-lazy-{i:02}");
+        assert_eq!(
+            *manager.registry().get(&id).unwrap().state.read(),
+            TunnelState::Dormant,
+            "{id} must stay dormant past the 8-tunnel warm-up target"
+        );
+    }
+
     manager.stop().await.unwrap();
     assert_eq!(manager.active_tunnel_count(), 0);
 }
@@ -861,6 +913,137 @@ async fn test_manual_activation_does_not_prematurely_suspend() {
 }
 
 // =============================================================================
+// 9b. Idle Teardown Closes Long-Suspended Tunnels (fix7: peak RAM)
+// =============================================================================
+
+/// Build a lazy tunnel, activate it, then suspend it; returns the entry
+/// with `active` still held so the test can assert the close drops it.
+async fn suspended_tunnel_fixture(
+    registry: &Arc<TunnelRegistry>,
+    lifecycle: &LifecycleController,
+    id: &str,
+) -> Arc<TunnelEntry> {
+    let cfg = make_test_tunnel_config(id);
+    let entry = registry
+        .register(TunnelEntry::new(id, cfg, LifecycleMode::Lazy))
+        .unwrap();
+    let (_active, guard) = lifecycle
+        .get_or_activate(id)
+        .await
+        .expect("activation should succeed");
+    drop(guard);
+    lifecycle
+        .suspend_tunnel(id)
+        .await
+        .expect("suspension should succeed");
+    assert_eq!(*entry.state.read(), TunnelState::Suspended);
+    assert!(
+        entry.active.read().is_some(),
+        "suspended tunnel must still hold its stack"
+    );
+    entry
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[tokio::test]
+async fn test_idle_teardown_closes_long_suspended_tunnel() {
+    let registry = Arc::new(TunnelRegistry::new());
+    // 300s idle timeout -> close threshold max(2 * 300, 300) = 600s.
+    let idle_timeout = Duration::from_secs(300);
+    let check_interval = Duration::from_millis(10);
+    let lifecycle = LifecycleController::new(Arc::clone(&registry), idle_timeout, check_interval);
+
+    let entry = suspended_tunnel_fixture(&registry, &lifecycle, "wgcf-close-01").await;
+
+    // Fake 601s of idleness, past the 600s close threshold.
+    let now = unix_now_secs();
+    entry
+        .stats
+        .last_active_at
+        .store(now.saturating_sub(601), Ordering::Relaxed);
+
+    lifecycle.check_idle_tunnels().await;
+    assert_eq!(
+        *entry.state.read(),
+        TunnelState::Dormant,
+        "suspended tunnel idle past the close threshold must be closed"
+    );
+    assert!(
+        entry.active.read().is_none(),
+        "closed tunnel must drop its stack"
+    );
+}
+
+#[tokio::test]
+async fn test_idle_teardown_keeps_recently_suspended_tunnel() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let idle_timeout = Duration::from_secs(300);
+    let check_interval = Duration::from_millis(10);
+    let lifecycle = LifecycleController::new(Arc::clone(&registry), idle_timeout, check_interval);
+
+    let entry = suspended_tunnel_fixture(&registry, &lifecycle, "wgcf-close-02").await;
+
+    // 60s idle: inside the P2C warm window (120s) and far below the
+    // 600s close threshold — the stack must be kept for a cheap resume.
+    let now = unix_now_secs();
+    entry
+        .stats
+        .last_active_at
+        .store(now.saturating_sub(60), Ordering::Relaxed);
+
+    lifecycle.check_idle_tunnels().await;
+    assert_eq!(
+        *entry.state.read(),
+        TunnelState::Suspended,
+        "recently suspended tunnel must be kept, not closed"
+    );
+    assert!(
+        entry.active.read().is_some(),
+        "kept tunnel must still hold its stack"
+    );
+}
+
+#[tokio::test]
+async fn test_idle_teardown_close_threshold_is_twice_idle_timeout() {
+    let registry = Arc::new(TunnelRegistry::new());
+    // 400s idle timeout -> close threshold max(2 * 400, 300) = 800s.
+    let idle_timeout = Duration::from_secs(400);
+    let check_interval = Duration::from_millis(10);
+    let lifecycle = LifecycleController::new(Arc::clone(&registry), idle_timeout, check_interval);
+
+    let entry = suspended_tunnel_fixture(&registry, &lifecycle, "wgcf-close-03").await;
+
+    // 500s idle: past the suspend timeout but below the 800s close
+    // threshold — still suspended.
+    let now = unix_now_secs();
+    entry
+        .stats
+        .last_active_at
+        .store(now.saturating_sub(500), Ordering::Relaxed);
+    lifecycle.check_idle_tunnels().await;
+    assert_eq!(*entry.state.read(), TunnelState::Suspended);
+
+    // 801s idle: past the threshold — closed.
+    entry
+        .stats
+        .last_active_at
+        .store(now.saturating_sub(801), Ordering::Relaxed);
+    lifecycle.check_idle_tunnels().await;
+    assert_eq!(
+        *entry.state.read(),
+        TunnelState::Dormant,
+        "suspended tunnel idle past 2x idle_timeout must be closed"
+    );
+    assert!(entry.active.read().is_none());
+}
+
+// =============================================================================
 // 10. Regression: Multi-Tenant Pool Isolation Rejects Unallowed ById
 // =============================================================================
 
@@ -1337,7 +1520,10 @@ async fn test_router_failover_strategies() {
         assert!(!healthy.contains(&&"t1".to_string()));
     }
 
-    // 3. Least-Conn selects healthy even with higher connections
+    // 3. Least-Conn selects healthy even with higher connections.
+    // A tunnel at the per-tunnel cap is left out of the candidate
+    // list so load spills to the next tier instead of piling onto
+    // it; it stays selectable only when every tunnel is capped.
     e2.stats.active_conns.store(100, Ordering::Relaxed);
     e3.stats.active_conns.store(5, Ordering::Relaxed);
     let router_lc = MultiTenantRouter::new(
@@ -1348,14 +1534,25 @@ async fn test_router_failover_strategies() {
     );
     router_lc.set_allowed_tunnels(Some(vec!["t1".into(), "t2".into(), "t3".into()]));
 
-    // e1 has 0 conns, but is unhealthy! So e3 (5 conns) must be chosen over e2 (100 conns)
+    // e1 has 0 conns, but is unhealthy; e2 (100 conns) is over the
+    // per-tunnel cap, so only e3 (5 conns) is offered as a candidate.
     let candidates = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
     let filtered = router_lc.filter_healthy_candidates(&candidates);
-    assert_eq!(filtered.len(), 2);
+    assert_eq!(filtered, vec![&candidates[2]]);
+
+    // When every tunnel is capped the cap never blocks selection: the
+    // best tier is offered whole instead of failing.
+    e3.stats.active_conns.store(100, Ordering::Relaxed);
+    let filtered_capped = router_lc.filter_healthy_candidates(&candidates);
+    assert_eq!(filtered_capped.len(), 2);
 
     // 4. Fallback recovery: restore e1, verify it becomes primary again
     e1.health.record_success();
     assert!(e1.health.is_routable());
+    // §3 left e2/e3 at the cap; reset so recovery is measured on
+    // health alone.
+    e2.stats.active_conns.store(0, Ordering::Relaxed);
+    e3.stats.active_conns.store(0, Ordering::Relaxed);
     let filtered_after = router_fallback.filter_healthy_candidates(&candidates);
     assert_eq!(filtered_after.len(), 3);
 }
@@ -1461,6 +1658,302 @@ fn test_pool_prefers_handshaked_tunnels() {
     e3.health.mark_unhealthy(Duration::from_secs(60));
     let healthy = router.filter_healthy_candidates(&candidates);
     assert_eq!(healthy, vec![&"t2".to_string()]);
+}
+
+#[test]
+fn test_pool_prefers_live_tunnel_over_dormant_proven() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e3 = registry
+        .register(TunnelEntry::new(
+            "t3",
+            make_test_tunnel_config("t3"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+
+    let candidates = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // t1 and t3 handshaked long ago and are dormant (the old "proven"
+    // tier); t2 is active, Healthy, and handshaked just now (live).
+    // Only the live tunnel must be returned: the dormant ones would
+    // pay a fresh activation + handshake inside the caller's failover
+    // budget while a live session sits unused.
+    e1.stats.record_handshake(1_700_000_000);
+    e3.stats.record_handshake(1_700_000_000);
+    e2.stats.record_handshake(now_secs);
+    e2.health.record_success();
+    *e2.state.write() = TunnelState::Active;
+
+    let healthy = router.filter_healthy_candidates(&candidates);
+    assert_eq!(healthy, vec![&"t2".to_string()]);
+
+    // When the live tunnel goes dormant again, it is still proven, so
+    // selection falls back to the proven tier — all three tunnels —
+    // instead of failing.
+    *e2.state.write() = TunnelState::Dormant;
+    let healthy = router.filter_healthy_candidates(&candidates);
+    assert_eq!(healthy.len(), 3);
+    assert!(healthy.contains(&&"t1".to_string()));
+    assert!(healthy.contains(&&"t2".to_string()));
+    assert!(healthy.contains(&&"t3".to_string()));
+}
+
+#[test]
+fn test_pool_live_tier_needs_fresh_handshake() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let _e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+
+    let candidates = vec!["t1".to_string(), "t2".to_string()];
+
+    // t1 is active and Healthy but its handshake is stale (long ago),
+    // so it is proven, not live: the session may have gone stale since
+    // the last success. With no live tunnel, the proven tier is
+    // returned; the unproven tunnel is still excluded.
+    e1.stats.record_handshake(1_700_000_000);
+    e1.health.record_success();
+    *e1.state.write() = TunnelState::Active;
+
+    let healthy = router.filter_healthy_candidates(&candidates);
+    assert_eq!(healthy, vec![&"t1".to_string()]);
+}
+
+#[test]
+fn test_pool_spills_to_proven_when_live_tier_capped() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e3 = registry
+        .register(TunnelEntry::new(
+            "t3",
+            make_test_tunnel_config("t3"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+
+    let candidates = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // t1 and t2 are live but both carry MAX_LIVE_TUNNEL_CONNS
+    // connections; t3 is proven (handshaked long ago, dormant). All
+    // traffic piling onto the two live tunnels is what produced the
+    // ~1% post-grant empty replies live, so selection must spill to
+    // the proven tier — which also grows the live set, since a proven
+    // tunnel that carries traffic becomes live.
+    for e in [&e1, &e2] {
+        e.stats.record_handshake(now_secs);
+        e.health.record_success();
+        *e.state.write() = TunnelState::Active;
+        e.stats
+            .active_conns
+            .store(MAX_LIVE_TUNNEL_CONNS, Ordering::Relaxed);
+    }
+    e3.stats.record_handshake(1_700_000_000);
+
+    let healthy = router.filter_healthy_candidates(&candidates);
+    assert_eq!(healthy, vec![&"t3".to_string()]);
+
+    let entries = registry.all_entries();
+    let preferred = preferred_entries(&entries);
+    let ids: Vec<&str> = preferred.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, vec!["t3"]);
+}
+
+#[test]
+fn test_pool_prefers_under_cap_live_tunnel() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+
+    let candidates = vec!["t1".to_string(), "t2".to_string()];
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // t1 is live but at the cap; t2 is live with room. Only t2 may
+    // be returned — returning t1 as well would let round-robin keep
+    // piling connections onto the capped tunnel.
+    for e in [&e1, &e2] {
+        e.stats.record_handshake(now_secs);
+        e.health.record_success();
+        *e.state.write() = TunnelState::Active;
+    }
+    e1.stats
+        .active_conns
+        .store(MAX_LIVE_TUNNEL_CONNS, Ordering::Relaxed);
+    e2.stats.active_conns.store(2, Ordering::Relaxed);
+
+    let healthy = router.filter_healthy_candidates(&candidates);
+    assert_eq!(healthy, vec![&"t2".to_string()]);
+
+    let entries = registry.all_entries();
+    let preferred = preferred_entries(&entries);
+    let ids: Vec<&str> = preferred.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, vec!["t2"]);
+}
+
+#[test]
+fn test_pool_cap_never_blocks_selection() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+
+    let candidates = vec!["t1".to_string(), "t2".to_string()];
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Every live tunnel is at the cap and there is no lower tier to
+    // spill to: the cap is a preference, never a hard limit, so the
+    // best tier is returned whole instead of failing selection.
+    for e in [&e1, &e2] {
+        e.stats.record_handshake(now_secs);
+        e.health.record_success();
+        *e.state.write() = TunnelState::Active;
+        e.stats
+            .active_conns
+            .store(MAX_LIVE_TUNNEL_CONNS, Ordering::Relaxed);
+    }
+
+    let healthy = router.filter_healthy_candidates(&candidates);
+    assert_eq!(healthy.len(), 2);
+    assert!(healthy.contains(&&"t1".to_string()));
+    assert!(healthy.contains(&&"t2".to_string()));
+
+    let entries = registry.all_entries();
+    let preferred = preferred_entries(&entries);
+    assert_eq!(preferred.len(), 2);
 }
 
 #[test]
@@ -3245,4 +3738,279 @@ async fn test_vpn_mode_boot_without_protector_fails_closed() {
         "a failed boot must leave the tunnel dormant"
     );
     endpoint.shutdown().await;
+}
+
+// =============================================================================
+// Stratified P2C + Peak EWMA selection, warm list, inflight guard,
+// boot warm-up complement (racing + selection fixes, Fase 1)
+// =============================================================================
+
+#[test]
+fn test_dormant_surcharge_zones() {
+    assert_eq!(dormant_surcharge_ms(0, 0), 0);
+    assert_eq!(dormant_surcharge_ms(90, 0), 0);
+    assert_eq!(dormant_surcharge_ms(91, 0), 5);
+    assert_eq!(dormant_surcharge_ms(105, 0), 75);
+    assert_eq!(dormant_surcharge_ms(120, 0), 150);
+    assert_eq!(dormant_surcharge_ms(121, 0), 800);
+    assert_eq!(dormant_surcharge_ms(121, 200), 1000);
+    assert_eq!(dormant_surcharge_ms(10_000, 37), 837);
+}
+
+#[test]
+fn test_slow_start_weight_clamped_to_unit() {
+    assert!((slow_start_weight(0) - 0.1).abs() < f64::EPSILON);
+    assert!((slow_start_weight(30) - 0.5).abs() < f64::EPSILON);
+    assert!((slow_start_weight(60) - 1.0).abs() < f64::EPSILON);
+    // Without the clamp an old tunnel would weigh > 1 and score
+    // below its unweighted latency, dominating purely by age.
+    assert!((slow_start_weight(3600) - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn test_tunnel_score_combines_latency_surcharge_load_weight() {
+    // Warm, fast, idle: score is the raw EWMA.
+    assert!((tunnel_score(50, 10, 0, 1.0, 0) - 50.0).abs() < f64::EPSILON);
+    // Dormant: +800 surcharge.
+    assert!((tunnel_score(50, 1000, 0, 1.0, 0) - 850.0).abs() < f64::EPSILON);
+    // Three sessions in flight quadruple the score.
+    assert!((tunnel_score(50, 10, 3, 1.0, 0) - 200.0).abs() < f64::EPSILON);
+    // Slow-start at 10% weight multiplies the score by ten.
+    assert!((tunnel_score(50, 10, 0, 0.1, 0) - 500.0).abs() < f64::EPSILON);
+    // No sample yet falls back to the default RTT.
+    assert!((tunnel_score(0, 10, 0, 1.0, 0) - 100.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn test_peak_ewma_alpha_and_failure_tau() {
+    let stats = TunnelStats::new();
+    stats.record_rtt_sample(100);
+    assert_eq!(stats.rtt_ewma_ms.load(Ordering::Relaxed), 100);
+    stats.record_rtt_sample(200);
+    // alpha 0.2: 0.2*200 + 0.8*100 = 120.
+    assert_eq!(stats.rtt_ewma_ms.load(Ordering::Relaxed), 120);
+    stats.record_rtt_failure();
+    // Failure counts as a tau (10 s) sample: 0.2*10000 + 0.8*120 = 2096.
+    assert_eq!(stats.rtt_ewma_ms.load(Ordering::Relaxed), 2096);
+    stats.record_rtt_sample(0);
+    // Samples clamp to 1 ms: (1 + 4*2096) / 5 = 1677.
+    assert_eq!(stats.rtt_ewma_ms.load(Ordering::Relaxed), 1677);
+    stats.record_rtt_sample(99_999);
+    // Samples clamp to tau: (10000 + 4*1677) / 5 = 3341.
+    assert_eq!(stats.rtt_ewma_ms.load(Ordering::Relaxed), 3341);
+}
+
+#[test]
+fn test_warm_list_bounded_most_recent_first_and_o1_pick() {
+    let warm = WarmList::new();
+    assert!(warm.is_empty());
+    for i in 0..20 {
+        warm.note_success(&format!("wgcf-{i:03}"));
+    }
+    assert_eq!(warm.len(), 12);
+    let snapshot = warm.snapshot();
+    assert_eq!(snapshot[0], "wgcf-019");
+    assert_eq!(snapshot[11], "wgcf-008");
+    // Re-noting an existing member moves it to the front without growing.
+    warm.note_success("wgcf-010");
+    assert_eq!(warm.len(), 12);
+    assert_eq!(warm.snapshot()[0], "wgcf-010");
+    // Picks stay inside the membership.
+    for _ in 0..50 {
+        let picked = warm.pick().expect("non-empty warm list must pick");
+        assert!(warm.snapshot().contains(&picked));
+    }
+}
+
+#[test]
+fn test_inflight_guard_releases_exactly_once_and_never_underflows() {
+    let stats = Arc::new(TunnelStats::new());
+    assert_eq!(stats.active_conns.load(Ordering::SeqCst), 0);
+    let guard_a = TunnelConnGuard::new("tun-guard", Arc::clone(&stats));
+    let guard_b = TunnelConnGuard::new("tun-guard", Arc::clone(&stats));
+    assert_eq!(stats.active_conns.load(Ordering::SeqCst), 2);
+    drop(guard_a);
+    assert_eq!(stats.active_conns.load(Ordering::SeqCst), 1);
+    drop(guard_b);
+    assert_eq!(stats.active_conns.load(Ordering::SeqCst), 0);
+    // A stray decrement at zero stays at zero: the counter cannot
+    // underflow even if a release path runs twice.
+    stats.dec_conns();
+    assert_eq!(stats.active_conns.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn test_score_entry_slow_start_ramp_from_activation() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_secs();
+    let fresh = TunnelEntry::new(
+        "fresh",
+        make_test_tunnel_config("fresh"),
+        LifecycleMode::Lazy,
+    );
+    let old = TunnelEntry::new("old", make_test_tunnel_config("old"), LifecycleMode::Lazy);
+    for entry in [&fresh, &old] {
+        entry.stats.record_handshake(now);
+        entry.stats.record_rtt_sample(50);
+    }
+    // Same latency and freshness; only the admission instant differs.
+    fresh.stats.record_activated(now);
+    old.stats.record_activated(now - 3600);
+    let fresh_score = score_entry(&fresh, now, 0);
+    let old_score = score_entry(&old, now, 0);
+    // Freshly admitted: 10% weight, score 10x the old tunnel's.
+    assert!((fresh_score - 500.0).abs() < f64::EPSILON);
+    assert!((old_score - 50.0).abs() < f64::EPSILON);
+    assert!(fresh_score > old_score);
+}
+
+#[test]
+fn test_warm_up_complement_ids_tops_up_to_eight_sorted() {
+    let eager: Vec<String> = vec!["wgcf-001".into(), "wgcf-003".into()];
+    let all: Vec<String> = (1..=10).map(|i| format!("wgcf-{i:03}")).collect();
+    assert_eq!(
+        warm_up_complement_ids(&eager, &all),
+        vec![
+            "wgcf-002", "wgcf-004", "wgcf-005", "wgcf-006", "wgcf-007", "wgcf-008",
+        ]
+    );
+    // Eight or more eager tunnels need no complement.
+    let eager8: Vec<String> = (1..=8).map(|i| format!("wgcf-{i:03}")).collect();
+    assert!(warm_up_complement_ids(&eager8, &all).is_empty());
+    // No eager tunnels: the eight lowest ids.
+    assert_eq!(
+        warm_up_complement_ids(&[], &all),
+        (1..=8).map(|i| format!("wgcf-{i:03}")).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_p2c_prefers_warm_low_ewma_over_dormant() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_secs();
+    // t1: warm (fresh handshake, fast EWMA, admitted long ago).
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    e1.stats.record_handshake(now);
+    e1.stats.record_rtt_sample(50);
+    e1.stats.record_activated(now - 3600);
+    // t2: dormant (stale handshake) with the same EWMA.
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    e2.stats.record_handshake(now - 1000);
+    e2.stats.record_rtt_sample(50);
+    e2.stats.record_activated(now - 3600);
+    // t3: unproven, never handshaked.
+    let _e3 = registry
+        .register(TunnelEntry::new(
+            "t3",
+            make_test_tunnel_config("t3"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    _e3.stats.record_activated(now - 3600);
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+    router.note_warm_success("t1");
+
+    // The warm list always yields t1 as candidate A; candidate B
+    // draws t2/t3 at random, both scoring far worse (800 ms dormant
+    // surcharge), so t1 wins every draw.
+    for _ in 0..30 {
+        assert_eq!(router.select_p2c(None).unwrap(), "t1");
+    }
+
+    // Eject t1: it must never be selected again, and the pick falls
+    // to the remaining tunnels.
+    e1.health.mark_unhealthy(Duration::from_secs(60));
+    assert!(!e1.health.is_routable());
+    for _ in 0..30 {
+        let picked = router.select_p2c(None).unwrap();
+        assert!(
+            picked == "t2" || picked == "t3",
+            "ejected t1 must never be picked, got {picked}"
+        );
+    }
+
+    lifecycle.stop().await;
+}
+
+#[tokio::test]
+async fn test_p2c_auto_keyword_selects_warm_tunnel() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_secs();
+    let e1 = registry
+        .register(TunnelEntry::new(
+            "t1",
+            make_test_tunnel_config("t1"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    e1.stats.record_handshake(now);
+    e1.stats.record_rtt_sample(50);
+    e1.stats.record_activated(now - 3600);
+    let e2 = registry
+        .register(TunnelEntry::new(
+            "t2",
+            make_test_tunnel_config("t2"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    e2.stats.record_handshake(now - 1000);
+    e2.stats.record_rtt_sample(50);
+    e2.stats.record_activated(now - 3600);
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+    router.note_warm_success("t1");
+
+    // The `auto` keyword routes through P2C, so the warm tunnel is
+    // selected and activated; the dormant one stays dormant.
+    let target = router
+        .select_tunnel(&TunnelSelector::ByKeyword(PoolKeyword::Auto), None)
+        .await
+        .expect("auto selection must succeed");
+    assert_eq!(target.tunnel_id(), Some("t1"));
+    assert!(registry.get("t1").unwrap().is_active());
+    assert!(!registry.get("t2").unwrap().is_active());
+    drop(target);
+
+    lifecycle.stop().await;
 }

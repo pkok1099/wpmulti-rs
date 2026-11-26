@@ -1362,6 +1362,10 @@ async fn test_f11_eager_tunnel_starts_active() {
     config.lifecycle.eager_tunnels = vec!["eager-boot".to_string()];
     config.per_tunnel.enabled = false;
     config.shared_listeners.clear();
+    // The startup warm-up probe pass runs on the eager tunnel before
+    // `start()` returns; its endpoint is dead, so keep the probe
+    // timeout short — the boot assertions below do not depend on it.
+    config.health_check.probe_timeout = Duration::from_millis(100);
 
     let tunnels = vec![
         load_tunnel_config_from_str("lazy-stay", &make_valid_wg_conf()).unwrap(),
@@ -1371,12 +1375,59 @@ async fn test_f11_eager_tunnel_starts_active() {
     let manager = TunnelManager::new(config, tunnels).unwrap();
     manager.start().await.unwrap();
 
-    assert_eq!(manager.active_tunnel_count(), 1);
+    // The eager tunnel boots, and the warm-up complement tops the
+    // pool up to 8 tunnels — with only two registered, the lazy
+    // tunnel is booted too.
+    assert_eq!(manager.active_tunnel_count(), 2);
     let eager_entry = manager.registry().get("eager-boot").unwrap();
     assert_eq!(*eager_entry.state.read(), TunnelState::Active);
 
     let lazy_entry = manager.registry().get("lazy-stay").unwrap();
-    assert_eq!(*lazy_entry.state.read(), TunnelState::Dormant);
+    assert_eq!(*lazy_entry.state.read(), TunnelState::Active);
+
+    manager.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_f11_eager_warmup_probe_runs_before_start_returns() {
+    // The startup warm-up probe pass must run before `start()` returns
+    // (so the first request finds live sessions, not dormant tunnels),
+    // and a probe failure must not fail startup: the eager tunnel here
+    // points at a dead endpoint, so the probe records one failure and
+    // `start()` still succeeds. Proved without a live peer — the
+    // sandbox blocks UDP loopback, so a handshake-against-mock-peer
+    // assertion cannot run here; the live path is verified by the host
+    // measurement instead. The recorded failure count (>= 1, never 0)
+    // is the observable trace of the awaited probe pass: the prober
+    // loop started after it may record further failures concurrently,
+    // so the bound is one-sided.
+    let mut config = MainConfig::default();
+    config.lifecycle.mode = LifecycleMode::Lazy;
+    config.lifecycle.eager_tunnels = vec!["eager-boot".to_string()];
+    config.per_tunnel.enabled = false;
+    config.shared_listeners.clear();
+    config.health_check.probe_timeout = Duration::from_millis(100);
+    config.health_check.probe_attempts = 1;
+
+    let tunnels = vec![
+        load_tunnel_config_from_str("lazy-stay", &make_valid_wg_conf()).unwrap(),
+        load_tunnel_config_from_str("eager-boot", &make_valid_wg_conf()).unwrap(),
+    ];
+
+    let manager = TunnelManager::new(config, tunnels).unwrap();
+    manager.start().await.unwrap();
+
+    let eager_entry = manager.registry().get("eager-boot").unwrap();
+    assert_eq!(*eager_entry.state.read(), TunnelState::Active);
+    assert!(
+        eager_entry.health.consecutive_failures() >= 1,
+        "the warm-up probe pass must have run (and recorded its failure) before start() returned"
+    );
+
+    // The warm-up complement tops the pool up to 8 tunnels, so the
+    // lazy tunnel is booted (and probed) too.
+    let lazy_entry = manager.registry().get("lazy-stay").unwrap();
+    assert_eq!(*lazy_entry.state.read(), TunnelState::Active);
 
     manager.stop().await.unwrap();
 }

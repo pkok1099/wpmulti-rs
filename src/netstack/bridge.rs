@@ -27,7 +27,10 @@ pub const MAX_DRAIN_BATCH_SIZE: usize = 16;
 ///
 /// The pool only bounds *retained* buffers; [`PacketBufPool::get`] allocates a
 /// fresh buffer when the pool is empty, so this never blocks the TX path.
-const BRIDGE_PACKET_POOL_CAPACITY: usize = 64;
+/// Kept small (16 x 4 KiB = 64 KiB per stack): a retained buffer only
+/// avoids one allocation on the next packet, while every active and
+/// suspended tunnel holds its own pool for the daemon's lifetime.
+const BRIDGE_PACKET_POOL_CAPACITY: usize = 16;
 
 /// Userspace virtual network device implementing [`smoltcp::phy::Device`].
 pub struct VirtualTunBridge {
