@@ -198,3 +198,6 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # Tags with a pre-release identifier (e.g. v0.2.16-beta) are
+          # published as GitHub pre-releases; plain vX.Y.Z tags are full releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
