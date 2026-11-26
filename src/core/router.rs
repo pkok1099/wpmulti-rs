@@ -5,6 +5,7 @@
 //! Supports ById, ByKeyword (`auto`, `random`, `round-robin`, `least-conn`), tag selection,
 //! and unauthenticated pool defaults.
 
+use std::fmt::Write as _;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -154,6 +155,13 @@ impl MultiTenantRouter {
     /// selector, so a tag/keyword/default-pool selector cannot smuggle
     /// the global password into a password-protected tunnel (audit
     /// run-1, `proxy.auth.per-tunnel-password-bypass-via-tag-selector`).
+    /// One exception to the anonymous rule: a tunnel with its own
+    /// override password never admits a client presenting no
+    /// credentials at all, even when `allow_anonymous` is set (audit
+    /// run-1, `proxy.auth.anonymous-bypass-per-tunnel-password-via-default-pool`).
+    /// Only that tunnel's own password is accepted for it; the
+    /// documented anonymous passthrough survives only for tunnels
+    /// protected by the global password alone.
     fn verify_chosen_tunnel_password(
         &self,
         tunnel_id: &str,
@@ -162,12 +170,8 @@ impl MultiTenantRouter {
         if self.auth_mode != AuthMode::PerTunnel {
             return Ok(());
         }
-        let expected = self
-            .per_tunnel_passwords
-            .read()
-            .get(tunnel_id)
-            .cloned()
-            .or_else(|| self.global_password.clone());
+        let per_tunnel = self.per_tunnel_passwords.read().get(tunnel_id).cloned();
+        let expected = per_tunnel.clone().or_else(|| self.global_password.clone());
         match (expected, credentials) {
             (Some(expected), Some((_, pass))) if constant_time_eq_str(pass, &expected) => Ok(()),
             (Some(_), Some(_)) => Err(ProxyAuthError::InvalidCredentials),
@@ -181,6 +185,10 @@ impl MultiTenantRouter {
                     Err(ProxyAuthError::InvalidCredentials)
                 }
             }
+            // No credentials for a tunnel with its own override
+            // password: the anonymous rule must not open it — the
+            // override password is the only key to that tunnel.
+            (Some(_), None) if per_tunnel.is_some() => Err(ProxyAuthError::AuthRequired),
             (_, None) => {
                 if self.allow_anonymous {
                     Ok(())
@@ -477,6 +485,28 @@ impl MultiTenantRouter {
     }
 }
 
+/// Escape newline and control characters in a client-supplied value
+/// before it is interpolated into an error message (audit run-1,
+/// `proxy.log-injection.unescaped-selector-error-to-stderr-tracing`):
+/// the tracing formatter passes interior `\n`/`\r` through verbatim,
+/// so a raw selector could forge log lines in stderr and the TUI log
+/// buffer. ESC bytes need no handling here: tracing-subscriber escapes
+/// them by default (`ansi_sanitization`).
+pub(crate) fn escape_log_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{{{:x}}}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn resolve_selector(
     router: &MultiTenantRouter,
     selector: &TunnelSelector,
@@ -489,13 +519,13 @@ fn resolve_selector(
             {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("tunnel '{id}' not allowed in this pool"),
+                    format!("tunnel '{}' not allowed in this pool", escape_log_value(id)),
                 ));
             }
             if router.registry.get(id).is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("tunnel '{id}' not found in registry"),
+                    format!("tunnel '{}' not found in registry", escape_log_value(id)),
                 ));
             }
             Ok(id.clone())
@@ -524,7 +554,10 @@ fn resolve_selector(
             matched.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("no healthy tunnel found matching tag '{tag}'"),
+                    format!(
+                        "no healthy tunnel found matching tag '{}'",
+                        escape_log_value(tag)
+                    ),
                 )
             })
         }
@@ -599,13 +632,28 @@ impl TunnelRouter for MultiTenantRouter {
                 // with the same credentials would route the client to a
                 // tunnel it did not select. The error names no tunnel id,
                 // so a keyword selector cannot leak which tunnel was picked.
-                self.verify_chosen_tunnel_password(&target_id, credentials)
-                    .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "invalid proxy credentials for the selected tunnel",
-                        )
-                    })?;
+                if self
+                    .verify_chosen_tunnel_password(&target_id, credentials)
+                    .is_err()
+                {
+                    // The trial slot was claimed during selection
+                    // (`resolve_selector`); this path returns before any
+                    // `GuardedTunnelTarget` exists, so release the slot
+                    // here or the HalfOpen tunnel stays unroutable until
+                    // a probe or restart (audit run-1,
+                    // `lifecycle.halfopen-trial-slot-leak-on-password-verify`).
+                    // `ById` never claims a slot, so it releases none —
+                    // same guard as the activation-failure branch below.
+                    if !matches!(selector, TunnelSelector::ById(_))
+                        && let Some(entry) = self.registry.get(&target_id)
+                    {
+                        entry.health.release_trial_slot();
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "invalid proxy credentials for the selected tunnel",
+                    ));
+                }
 
                 match self.lifecycle.get_or_activate(&target_id).await {
                     Ok((active_tunnel, guard)) => {

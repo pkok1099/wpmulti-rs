@@ -48,6 +48,12 @@ impl AdminTestClient {
                 bytes
             }
             None => {
+                // A bodiless POST still declares `application/json`:
+                // the Admin API requires that content type on every
+                // state-changing POST.
+                if method == "POST" {
+                    req.push_str("Content-Type: application/json\r\n");
+                }
                 req.push_str("Content-Length: 0\r\n\r\n");
                 Vec::new()
             }

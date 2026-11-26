@@ -276,7 +276,7 @@ async fn test_activate_and_suspend_endpoints() {
         method: "POST".to_string(),
         path: "/tunnels/wgcf-001/activate".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: Vec::new(),
     };
     let resp_act = handle_admin_request(&req_act, &manager, None, 10).await;
@@ -291,7 +291,7 @@ async fn test_activate_and_suspend_endpoints() {
         method: "POST".to_string(),
         path: "/tunnels/wgcf-001/suspend".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: Vec::new(),
     };
     let resp_susp = handle_admin_request(&req_susp, &manager, None, 10).await;
@@ -305,7 +305,7 @@ async fn test_activate_and_suspend_endpoints() {
         method: "POST".to_string(),
         path: "/tunnels/wgcf-001/deactivate".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: Vec::new(),
     };
     let resp_deact = handle_admin_request(&req_deact, &manager, None, 10).await;
@@ -332,7 +332,7 @@ async fn test_probe_endpoint_reports_handshake_outcome_and_404_for_unknown() {
         method: "POST".to_string(),
         path: "/tunnels/wgcf-001/probe".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: Vec::new(),
     };
     let resp = handle_admin_request(&req, &manager, None, 10).await;
@@ -347,7 +347,7 @@ async fn test_probe_endpoint_reports_handshake_outcome_and_404_for_unknown() {
         method: "POST".to_string(),
         path: "/tunnels/wgcf-999/probe".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: Vec::new(),
     };
     let resp_unknown = handle_admin_request(&req_unknown, &manager, None, 10).await;
@@ -363,7 +363,7 @@ async fn test_suspend_dormant_tunnel_reports_already_dormant() {
         method: "POST".to_string(),
         path: "/tunnels/wgcf-001/suspend".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: Vec::new(),
     };
 
@@ -380,7 +380,7 @@ async fn test_suspend_dormant_tunnel_reports_already_dormant() {
         method: "POST".to_string(),
         path: "/tunnels/wgcf-001/activate".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: Vec::new(),
     };
     let resp_act = handle_admin_request(&req_act, &manager, None, 10).await;
@@ -402,7 +402,7 @@ async fn test_reload_endpoint() {
         method: "POST".to_string(),
         path: "/reload".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: Vec::new(),
     };
 
@@ -674,7 +674,7 @@ async fn test_batch_and_single_tunnel_disable_enable() {
         method: "POST".to_string(),
         path: "/tunnels/wgcf-002/disable".to_string(),
         query: None,
-        headers: HashMap::new(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: Vec::new(),
     };
     let resp2 = handle_admin_request(&req_single_disable, &manager, None, 10).await;
@@ -1043,6 +1043,42 @@ async fn test_admin_rejects_dns_rebinding_host_and_non_json_post() {
     };
     let resp2 = handle_admin_request(&csrf_post, &manager, None, 10).await;
     assert_eq!(resp2.status, 400);
+
+    // The same guard covers the bodiless state-changing POSTs: a
+    // cross-origin simple request to /reload or to a tunnel action
+    // carries `text/plain` (or no content type at all) and must be
+    // rejected before any mutation runs (audit run-1,
+    // `src/api/server.rs:loopback-bypass-cross-origin-admin-mutation`).
+    // The first-party client always sends `application/json`.
+    for path in ["/reload", "/tunnels/wgcf-001/activate"] {
+        let csrf_simple = HttpRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            query: None,
+            headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            body: Vec::new(),
+        };
+        let resp = handle_admin_request(&csrf_simple, &manager, None, 10).await;
+        assert_eq!(resp.status, 400, "{path} with text/plain must be rejected");
+
+        let csrf_bare = HttpRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            query: None,
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let resp = handle_admin_request(&csrf_bare, &manager, None, 10).await;
+        assert_eq!(
+            resp.status, 400,
+            "{path} without content-type must be rejected"
+        );
+    }
+    // The rejected activate must not have changed any tunnel state.
+    assert_eq!(
+        manager.registry().get("wgcf-001").unwrap().summary().state,
+        crate::core::TunnelState::Dormant
+    );
 }
 
 #[test]
@@ -1444,5 +1480,62 @@ async fn test_post_config_validates_post_merge_and_rotates_new_secrets() {
             .0,
         200
     );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn test_admin_server_per_ip_connection_cap() {
+    // One peer IP may hold at most MAX_ADMIN_CONNS_PER_IP (8) slots:
+    // 8 stalled partial requests from 127.0.0.1 must leave the 9th
+    // connection dropped, and freeing one slot must admit the next
+    // (audit run-1, `admin-http-parse:slowloris-connection-slot-exhaustion`).
+    let manager = create_test_manager();
+    let server = AdminServer::new("127.0.0.1:0".parse().unwrap(), manager, None);
+    let bound = server.start().await.unwrap();
+
+    let mut holders = Vec::new();
+    for _ in 0..8 {
+        let mut stream = TcpStream::connect(bound).await.unwrap();
+        // One byte, then stall: the slot is held but no request completes.
+        stream.write_all(b"G").await.unwrap();
+        holders.push(stream);
+    }
+    // Let the accept loop admit all 8 before probing the cap.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Ninth connection from the same IP: dropped without a response.
+    let mut ninth = TcpStream::connect(bound).await.unwrap();
+    ninth
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(2), ninth.read_to_end(&mut resp)).await;
+    assert!(read.is_ok(), "ninth connection must be dropped, not held");
+    assert!(
+        resp.is_empty(),
+        "dropped connection must send no response, got: {resp:?}"
+    );
+
+    // Free one slot: the next connection is admitted and served.
+    drop(holders.pop());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut tenth = TcpStream::connect(bound).await.unwrap();
+    tenth
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), tenth.read_to_end(&mut resp))
+        .await
+        .expect("tenth connection must be served")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200 OK"),
+        "tenth connection must get 200 OK, got: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    drop(holders);
     server.stop().await;
 }

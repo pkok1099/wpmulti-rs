@@ -535,6 +535,11 @@ impl ActiveProber {
         let threshold = settings.threshold;
         let cooldown = settings.cooldown;
         let mut succeeded = false;
+        // Set when the egress check reports "unverifiable" (VPN mode):
+        // the tunnel is neither proven nor condemned, so no success
+        // and no failure is recorded for this pass (audit run-1,
+        // `core/probe_egress:vpn-mode-noop-success`).
+        let mut unverified = false;
         for attempt in 0..attempts {
             let probe_res =
                 tokio::time::timeout(timeout, active_clone.device.force_handshake(&peer_pubkey))
@@ -546,10 +551,19 @@ impl ActiveProber {
                         .unwrap_or_default()
                         .as_secs();
                     entry_ref.stats.record_handshake(now);
-                    match active_clone.netstack.probe_egress(timeout).await {
-                        Ok(()) => {
+                    match active_clone.probe_egress(timeout).await {
+                        Ok(crate::core::EgressProbeOutcome::Verified) => {
                             entry_ref.health.record_success();
                             succeeded = true;
+                            break;
+                        }
+                        Ok(crate::core::EgressProbeOutcome::Unverified) => {
+                            tracing::debug!(
+                                "Active probe egress unverified (attempt {}/{}): VPN mode has no in-tunnel probe; recording neither success nor failure",
+                                attempt + 1,
+                                attempts,
+                            );
+                            unverified = true;
                             break;
                         }
                         Err(e) => {
@@ -584,6 +598,7 @@ impl ActiveProber {
             }
         }
         if !succeeded
+            && !unverified
             && !entry_ref.is_disabled()
             && *entry_ref.state.read() == crate::core::registry::TunnelState::Active
         {
@@ -593,11 +608,21 @@ impl ActiveProber {
 
     /// Stop the prober background task and wait for its clean shutdown.
     pub async fn stop(&self) {
-        let task = self.task.lock().take();
-        if let Some(t) = task {
-            let _ = t.shutdown_tx.send(true);
-            let _ = t.handle.await;
+        if let Some(handle) = self.stop_sync() {
+            let _ = handle.await;
         }
+    }
+
+    /// Synchronously signal the prober loop to stop and detach its
+    /// task without waiting for it. The caller may abort the returned
+    /// handle when waiting is impossible (e.g. `Drop` paths); the
+    /// signal alone stops the loop at its next tick or probe-pass
+    /// boundary (audit run-1,
+    /// `uniffi:engine-destroy-without-stop-detached-vpn`).
+    pub fn stop_sync(&self) -> Option<JoinHandle<()>> {
+        let task = self.task.lock().take()?;
+        let _ = task.shutdown_tx.send(true);
+        Some(task.handle)
     }
 }
 

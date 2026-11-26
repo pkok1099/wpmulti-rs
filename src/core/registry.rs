@@ -19,15 +19,78 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::config::{LifecycleMode, TunnelConfig};
 use crate::core::CoreError;
 use crate::core::health::{HealthStatus, TunnelHealthTracker};
-use crate::netstack::{BridgeIpRecv, BridgeIpSend, VirtualNetworkStack};
+use crate::core::protector::ProtectedUdpFactory;
+use crate::netstack::{
+    BridgeIpRecv, BridgeIpSend, DEFAULT_CONNECT_TIMEOUT, TunIpRecv, TunIpSend, VirtualNetworkStack,
+};
 use crate::proxy::{DynStream, ProxyTunnelTarget, ProxyUdpSocket};
 
-/// Concrete type alias for a WireGuard device integrated with virtual smoltcp bridges.
-pub type WgDevice = gotatun::device::Device<(
-    gotatun::udp::socket::UdpSocketFactory,
-    BridgeIpSend,
-    BridgeIpRecv,
-)>;
+/// A running WireGuard device, in either data-plane mode.
+///
+/// gotatun's `Device` is generic over its UDP factory and TUN pair,
+/// so proxy mode and VPN mode are different types. This enum erases
+/// that difference behind the three operations the lifecycle ever
+/// calls (`suspend`, `resume`, `force_handshake`); everything else
+/// about a tunnel (state, stats, netstack) lives on [`ActiveTunnel`].
+pub enum WgDevice {
+    /// Daemon proxy mode: default UDP factory, virtual smoltcp bridge.
+    Proxy(
+        gotatun::device::Device<(
+            gotatun::udp::socket::UdpSocketFactory,
+            BridgeIpSend,
+            BridgeIpRecv,
+        )>,
+    ),
+    /// Android VPN mode: protected UDP factory, shared TUN endpoint.
+    Vpn(gotatun::device::Device<(ProtectedUdpFactory, TunIpSend, TunIpRecv)>),
+}
+
+impl std::fmt::Debug for WgDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proxy(_) => f.debug_tuple("WgDevice::Proxy").finish_non_exhaustive(),
+            Self::Vpn(_) => f.debug_tuple("WgDevice::Vpn").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl WgDevice {
+    /// Suspend the device (no-op when already suspended).
+    pub async fn suspend(&self) {
+        match self {
+            Self::Proxy(device) => device.suspend().await,
+            Self::Vpn(device) => device.suspend().await,
+        }
+    }
+
+    /// Resume a suspended device.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gotatun device error when the resume fails.
+    pub async fn resume(&self) -> Result<(), gotatun::device::Error> {
+        match self {
+            Self::Proxy(device) => device.resume().await,
+            Self::Vpn(device) => device.resume().await,
+        }
+    }
+
+    /// Force a WireGuard handshake with one peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gotatun device error when the peer is unknown or
+    /// the handshake cannot start.
+    pub async fn force_handshake(
+        &self,
+        public_key: &x25519_dalek::PublicKey,
+    ) -> Result<(), gotatun::device::Error> {
+        match self {
+            Self::Proxy(device) => device.force_handshake(public_key).await,
+            Self::Vpn(device) => device.force_handshake(public_key).await,
+        }
+    }
+}
 
 /// Operational state of a WireGuard tunnel in the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -134,8 +197,11 @@ pub struct ActiveTunnel {
     pub id: String,
     /// Running WireGuard device.
     pub device: WgDevice,
-    /// Userspace smoltcp network stack.
-    pub netstack: Arc<VirtualNetworkStack>,
+    /// Userspace smoltcp network stack (proxy mode only).
+    ///
+    /// `None` in VPN mode: the shared TUN endpoint carries the data
+    /// plane and no smoltcp stack is built for the tunnel.
+    pub netstack: Option<Arc<VirtualNetworkStack>>,
     /// Shared statistics handle.
     pub stats: Arc<TunnelStats>,
 }
@@ -150,12 +216,39 @@ impl std::fmt::Debug for ActiveTunnel {
     }
 }
 
+/// Error for proxy-path operations on a tunnel without a netstack.
+fn no_netstack_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        "tunnel has no userspace netstack (VPN mode)",
+    )
+}
+
+/// Outcome of an egress probe.
+///
+/// `Verified` means the data plane was actually proven to carry
+/// traffic; `Unverified` means the check could not be performed at
+/// all. `Unverified` is deliberately distinct from both success and
+/// failure: a caller must neither treat it as egress proof nor
+/// condemn the tunnel for it (audit run-1,
+/// `core/probe_egress:vpn-mode-noop-success`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressProbeOutcome {
+    /// Observed in-tunnel traffic (e.g. a DNS query) succeeded.
+    Verified,
+    /// No data-plane check is available in this mode (VPN mode has
+    /// no smoltcp stack to probe through), so egress is unproven —
+    /// not healthy, not failed.
+    Unverified,
+}
+
 impl ActiveTunnel {
-    /// Create a new active tunnel handle.
+    /// Create a new active tunnel handle. `netstack` is `Some` in
+    /// proxy mode and `None` in VPN mode.
     pub fn new(
         id: impl Into<String>,
         device: WgDevice,
-        netstack: Arc<VirtualNetworkStack>,
+        netstack: Option<Arc<VirtualNetworkStack>>,
         stats: Arc<TunnelStats>,
     ) -> Self {
         Self {
@@ -166,23 +259,83 @@ impl ActiveTunnel {
         }
     }
 
+    /// Effective IP mode of the tunnel's netstack; `DualStack` when
+    /// the tunnel has no netstack (VPN mode), where the mode is
+    /// meaningless because no in-tunnel resolution happens.
+    pub fn effective_ip_mode(&self) -> crate::config::IpMode {
+        self.netstack
+            .as_ref()
+            .map_or(crate::config::IpMode::DualStack, |netstack| {
+                netstack.effective_ip_mode()
+            })
+    }
+
+    /// Close the netstack when present; no-op in VPN mode.
+    pub async fn close_netstack(&self) {
+        if let Some(netstack) = &self.netstack {
+            netstack.close().await;
+        }
+    }
+
+    /// Wake the netstack reactor when present; no-op in VPN mode.
+    pub fn notify_netstack(&self) {
+        if let Some(netstack) = &self.netstack {
+            netstack.notify().notify_one();
+        }
+    }
+
+    /// Probe egress through the netstack when present. In VPN mode
+    /// there is no smoltcp egress to probe, so the outcome is
+    /// [`EgressProbeOutcome::Unverified`]: the WireGuard handshake
+    /// proves the peer answers, not that it forwards traffic, and
+    /// callers must not treat "unverified" as proof of egress (nor
+    /// as a failure). Previously this returned `Ok(())` in VPN mode,
+    /// which the background prober took as egress proof and kept a
+    /// handshake-only tunnel Healthy forever.
+    pub async fn probe_egress(
+        &self,
+        timeout: std::time::Duration,
+    ) -> io::Result<EgressProbeOutcome> {
+        match &self.netstack {
+            Some(netstack) => {
+                netstack.probe_egress(timeout).await?;
+                Ok(EgressProbeOutcome::Verified)
+            }
+            None => Ok(EgressProbeOutcome::Unverified),
+        }
+    }
+
     /// Resolve a domain name inside the tunnel under an explicit [`IpMode`].
+    /// Fails with `NotConnected` in VPN mode (no netstack).
     pub fn resolve_in_tunnel_with_mode<'a>(
         &'a self,
         domain: &'a str,
         mode: crate::config::IpMode,
     ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
-        Box::pin(self.netstack.resolve_in_tunnel_with_mode(domain, mode))
+        match self.netstack.clone() {
+            Some(netstack) => {
+                Box::pin(async move { netstack.resolve_in_tunnel_with_mode(domain, mode).await })
+            }
+            None => Box::pin(async { Err(no_netstack_error()) }),
+        }
     }
 
     /// Resolve a domain name inside the tunnel under an explicit [`IpMode`],
     /// returning all candidate IP addresses.
+    /// Fails with `NotConnected` in VPN mode (no netstack).
     pub fn resolve_all_in_tunnel_with_mode<'a>(
         &'a self,
         domain: &'a str,
         mode: crate::config::IpMode,
     ) -> crate::proxy::router::ResolveAllFut<'a> {
-        Box::pin(self.netstack.resolve_all_in_tunnel_with_mode(domain, mode))
+        match self.netstack.clone() {
+            Some(netstack) => {
+                Box::pin(
+                    async move { netstack.resolve_all_in_tunnel_with_mode(domain, mode).await },
+                )
+            }
+            None => Box::pin(async { Err(no_netstack_error()) }),
+        }
     }
 }
 
@@ -191,7 +344,9 @@ impl ProxyTunnelTarget for ActiveTunnel {
         &'a self,
         dst: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
-        let netstack = Arc::clone(&self.netstack);
+        let Some(netstack) = self.netstack.clone() else {
+            return Box::pin(async { Err(no_netstack_error()) });
+        };
         let stats = Arc::clone(&self.stats);
         Box::pin(async move {
             let stream = netstack.tcp_connect(dst).await?;
@@ -207,7 +362,9 @@ impl ProxyTunnelTarget for ActiveTunnel {
         &'a self,
         local_port: u16,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
-        let netstack = Arc::clone(&self.netstack);
+        let Some(netstack) = self.netstack.clone() else {
+            return Box::pin(async { Err(no_netstack_error()) });
+        };
         let stats = Arc::clone(&self.stats);
         Box::pin(async move {
             let sock = netstack.udp_bind(local_port).await?;
@@ -221,18 +378,24 @@ impl ProxyTunnelTarget for ActiveTunnel {
         &'a self,
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
-        self.netstack.resolve_in_tunnel(domain)
+        let mode = self.effective_ip_mode();
+        self.resolve_in_tunnel_with_mode(domain, mode)
     }
 
     fn resolve_all_in_tunnel<'a>(
         &'a self,
         domain: &'a str,
     ) -> crate::proxy::router::ResolveAllFut<'a> {
-        Box::pin(self.netstack.resolve_all_in_tunnel(domain))
+        let mode = self.effective_ip_mode();
+        self.resolve_all_in_tunnel_with_mode(domain, mode)
     }
 
     fn connect_timeout(&self) -> std::time::Duration {
-        self.netstack.connect_timeout()
+        self.netstack
+            .as_ref()
+            .map_or(DEFAULT_CONNECT_TIMEOUT, |netstack| {
+                netstack.connect_timeout()
+            })
     }
 }
 

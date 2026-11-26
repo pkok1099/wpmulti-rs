@@ -1,6 +1,7 @@
 //! Embedded asynchronous HTTP Admin REST API server.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -77,6 +78,15 @@ impl AdminServer {
         let task = tokio::spawn(async move {
             const MAX_ADMIN_CONNS: usize = 64;
             let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_ADMIN_CONNS));
+            // Live per-IP connection counts: one peer may hold at most
+            // `MAX_ADMIN_CONNS_PER_IP` slots, so a single Slowloris peer
+            // cannot take all 64 slots (audit run-1,
+            // `admin-http-parse:slowloris-connection-slot-exhaustion`).
+            // The accept loop is a single task, but the counts are also
+            // decremented by the spawned client tasks, hence the shared
+            // map (lock is never held across an `.await`).
+            let per_ip_counts: Arc<Mutex<HashMap<IpAddr, usize>>> =
+                Arc::new(Mutex::new(HashMap::new()));
             let mut client_tasks = tokio::task::JoinSet::new();
 
             loop {
@@ -101,10 +111,25 @@ impl AdminServer {
                                     drop(stream);
                                     continue;
                                 };
+                                // Per-peer fairness: cap slots per IP before
+                                // spawning, so one peer cannot starve the
+                                // rest even while slots remain.
+                                let Some(per_ip_guard) =
+                                    try_admit_admin_ip(&per_ip_counts, peer_addr.ip())
+                                else {
+                                    tracing::warn!(
+                                        "Admin server per-IP connection limit ({}) reached for {}; dropping connection",
+                                        MAX_ADMIN_CONNS_PER_IP,
+                                        peer_addr.ip()
+                                    );
+                                    drop(stream);
+                                    continue;
+                                };
                                 let m = Arc::clone(&manager);
                                 let tok = auth_token.clone();
                                 client_tasks.spawn(async move {
                                     let _permit = permit;
+                                    let _per_ip_guard = per_ip_guard;
                                     handle_client_connection(
                                         stream,
                                         peer_addr,
@@ -137,22 +162,7 @@ impl AdminServer {
 
             drop(listener);
             let drain_dur = Duration::from_millis(drain_timeout_ms.load(Ordering::Relaxed));
-            if !client_tasks.is_empty() && !drain_dur.is_zero() {
-                let deadline = tokio::time::Instant::now() + drain_dur;
-                while !client_tasks.is_empty() {
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    match tokio::time::timeout(remaining, client_tasks.join_next()).await {
-                        Ok(Some(_)) => {}
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-            }
-
-            client_tasks.abort_all();
-            while client_tasks.join_next().await.is_some() {}
+            drain_admin_client_tasks(&mut client_tasks, drain_dur).await;
         });
 
         *self.task_handle.lock() = Some(task);
@@ -192,6 +202,84 @@ impl AdminServer {
 const ADMIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum time allowed to write an HTTP response to an Admin API client.
 const ADMIN_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum time allowed for one 1 KiB read chunk while reading an Admin
+/// request: a peer must make progress at least this often, so a Slowloris
+/// peer trickling one byte at a time cannot hold a slot for the whole
+/// `ADMIN_READ_TIMEOUT` (audit run-1,
+/// `admin-http-parse:slowloris-connection-slot-exhaustion`). The outer
+/// 10 s timeout remains as the absolute bound for the whole request.
+const ADMIN_READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum concurrent Admin connections from one peer IP: fairness so a
+/// single peer cannot take all `MAX_ADMIN_CONNS` (64) slots. 8 leaves
+/// room for the local operator and TUI polling from one address while
+/// still requiring at least 8 distinct IPs to exhaust the server.
+const MAX_ADMIN_CONNS_PER_IP: usize = 8;
+
+/// RAII decrement of a peer IP's live Admin-connection count; dropped
+/// when its client task ends (including on abort during shutdown).
+struct PerIpConnGuard {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for PerIpConnGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Admit one Admin connection from `peer_ip` under the per-IP cap,
+/// returning the RAII guard that releases the slot when the client task
+/// ends. `None` when the peer already holds `MAX_ADMIN_CONNS_PER_IP`
+/// slots (audit run-1, `admin-http-parse:slowloris-connection-slot-exhaustion`).
+fn try_admit_admin_ip(
+    counts: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+    peer_ip: IpAddr,
+) -> Option<PerIpConnGuard> {
+    let mut locked = counts.lock();
+    let slot = locked.entry(peer_ip).or_insert(0);
+    if *slot >= MAX_ADMIN_CONNS_PER_IP {
+        return None;
+    }
+    *slot += 1;
+    // Release the lock before building the guard: the count is already
+    // bumped, and the guard only carries the shared map for its Drop.
+    drop(locked);
+    Some(PerIpConnGuard {
+        counts: Arc::clone(counts),
+        ip: peer_ip,
+    })
+}
+
+/// Wait up to `drain_dur` for in-flight Admin client tasks to finish,
+/// then abort any that remain.
+async fn drain_admin_client_tasks(
+    client_tasks: &mut tokio::task::JoinSet<()>,
+    drain_dur: Duration,
+) {
+    if !client_tasks.is_empty() && !drain_dur.is_zero() {
+        let deadline = tokio::time::Instant::now() + drain_dur;
+        while !client_tasks.is_empty() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, client_tasks.join_next()).await {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
+
+    client_tasks.abort_all();
+    while client_tasks.join_next().await.is_some() {}
+}
 
 /// Handle a single incoming HTTP connection.
 fn parse_request_content_length(header_bytes: &[u8]) -> Result<usize, HttpResponse> {
@@ -234,6 +322,20 @@ fn parse_request_content_length(header_bytes: &[u8]) -> Result<usize, HttpRespon
     Ok(parsed_len.unwrap_or(0))
 }
 
+/// Read one chunk with a progress deadline: the peer must deliver each
+/// chunk within `ADMIN_READ_CHUNK_TIMEOUT`, so a Slowloris peer cannot
+/// hold a connection slot by trickling bytes (audit run-1,
+/// `admin-http-parse:slowloris-connection-slot-exhaustion`).
+async fn read_admin_chunk<S: AsyncReadExt + Unpin>(
+    stream: &mut S,
+    buf: &mut [u8],
+) -> Result<usize, ()> {
+    match tokio::time::timeout(ADMIN_READ_CHUNK_TIMEOUT, stream.read(buf)).await {
+        Ok(Ok(n)) => Ok(n),
+        Ok(Err(_)) | Err(_) => Err(()),
+    }
+}
+
 async fn read_admin_request_bytes<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
 ) -> Result<Vec<u8>, ()> {
@@ -244,10 +346,10 @@ async fn read_admin_request_bytes<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
     loop {
         let prev_len = buf.len();
-        let n = match stream.read(&mut temp).await {
+        let n = match read_admin_chunk(stream, &mut temp).await {
             Ok(0) => break,
             Ok(n) => n,
-            Err(_) => return Err(()),
+            Err(()) => return Err(()),
         };
         if let Some(chunk) = temp.get(..n) {
             buf.extend_from_slice(chunk);
@@ -328,13 +430,13 @@ async fn read_admin_request_body<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     }
 
     while buf.len() < required_total {
-        let n = match stream.read(&mut temp).await {
+        let n = match read_admin_chunk(stream, &mut temp).await {
             Ok(0) => {
                 send_admin_error(stream, HttpResponse::bad_request("Truncated request body")).await;
                 return Err(());
             }
             Ok(n) => n,
-            Err(_) => return Err(()),
+            Err(()) => return Err(()),
         };
         if let Some(chunk) = temp.get(..n) {
             buf.extend_from_slice(chunk);

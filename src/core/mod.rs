@@ -7,6 +7,7 @@
 pub mod health;
 pub mod lifecycle;
 pub mod listener;
+pub mod protector;
 pub mod registry;
 pub mod router;
 #[cfg(test)]
@@ -19,13 +20,16 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{LifecycleMode, MainConfig, TunnelConfig, load_tunnel_configs_from_dir};
+use crate::config::{
+    LifecycleMode, MainConfig, TunnelConfig, load_tunnel_configs_from_dir_partial,
+};
 pub use health::{ActiveProber, HealthStatus, TunnelHealthTracker};
 pub use lifecycle::{GuardedStream, GuardedTunnelTarget, LifecycleController, TunnelConnGuard};
 pub use listener::{ActiveListenerInfo, ListenerSupervisor};
+pub use protector::{ProtectedUdpFactory, SocketProtector};
 pub use registry::{
-    ActiveTunnel, MeteredStream, MeteredUdpSocket, TunnelEntry, TunnelRegistry, TunnelState,
-    TunnelStats, TunnelSummary, WgDevice,
+    ActiveTunnel, EgressProbeOutcome, MeteredStream, MeteredUdpSocket, TunnelEntry, TunnelRegistry,
+    TunnelState, TunnelStats, TunnelSummary, WgDevice,
 };
 pub use router::{DedicatedTunnelRouter, IpFilteredTunnelTarget, MultiTenantRouter};
 
@@ -79,11 +83,41 @@ pub struct TunnelManager {
     config: RwLock<MainConfig>,
     config_path: RwLock<Option<std::path::PathBuf>>,
     config_write_lock: tokio::sync::Mutex<()>,
+    /// Serializes whole config read-modify-write-apply cycles against
+    /// each other: `POST /config` (snapshot+merge+write+apply),
+    /// `set_tunnels_disabled`, `reload_with_tunnels`, and
+    /// `apply_runtime_config` (audit run-1, `core/reload-*`,
+    /// `src/api/routes.rs:post-config-*`,
+    /// `src/core/mod.rs:set_tunnels_disabled:lost-update-vs-post-config`).
+    /// Held across the full cycle, never just the file write: the
+    /// `config_write_lock` below only guards the TOML write itself and
+    /// is always taken *inside* this lock, never the reverse.
+    /// A `tokio::sync::Mutex` is used deliberately — the cycles await
+    /// lifecycle/listener work while holding it.
+    config_apply_lock: tokio::sync::Mutex<()>,
     registry: Arc<TunnelRegistry>,
     lifecycle: Arc<LifecycleController>,
     listeners: Arc<ListenerSupervisor>,
     prober: Arc<ActiveProber>,
     log_buffer: crate::tui::TuiLogBuffer,
+}
+
+/// Apply a disable/enable to the in-memory `disabled_tunnels` list.
+/// Sync helper so the config write guard never enters an async future:
+/// a `parking_lot` guard held across `.await` would make the future
+/// `!Send`.
+fn apply_disabled_flags(config: &RwLock<MainConfig>, targets: &[String], disabled: bool) {
+    let mut cfg = config.write();
+    if disabled {
+        for id in targets {
+            if !cfg.disabled_tunnels.contains(id) {
+                cfg.disabled_tunnels.push(id.clone());
+            }
+        }
+    } else {
+        cfg.disabled_tunnels.retain(|id| !targets.contains(id));
+    }
+    cfg.disabled_tunnels.sort();
 }
 
 /// Append `id` to `selected` unless it is already present.
@@ -115,7 +149,17 @@ fn select_id_range(
         ));
     }
     let start = a - 1;
-    let end = b.min(sorted_ids.len());
+    // Out-of-range bounds fail like `select_id_index` instead of
+    // silently clamping to an empty (or partial) selection (audit
+    // run-1, `src/core/mod.rs:select_id_range:silent-truncation`):
+    // a range naming no tunnel must error, never succeed with nothing.
+    if start >= sorted_ids.len() || b > sorted_ids.len() {
+        return Err(CoreError::TunnelNotFound(format!(
+            "tunnel range {tok} out of range (1..={})",
+            sorted_ids.len()
+        )));
+    }
+    let end = b;
     if let Some(slice) = sorted_ids.get(start..end) {
         for id in slice {
             add_unique(selected, id);
@@ -181,6 +225,7 @@ impl TunnelManager {
             config: RwLock::new(config),
             config_path: RwLock::new(None),
             config_write_lock: tokio::sync::Mutex::new(()),
+            config_apply_lock: tokio::sync::Mutex::new(()),
             registry,
             lifecycle,
             listeners,
@@ -197,6 +242,68 @@ impl TunnelManager {
     /// Access the underlying [`LifecycleController`].
     pub const fn lifecycle(&self) -> &Arc<LifecycleController> {
         &self.lifecycle
+    }
+
+    /// Enable or disable VPN mode on the lifecycle: newly booted
+    /// tunnels use the shared TUN endpoint instead of the smoltcp
+    /// bridge. Tunnels already active are migrated by
+    /// [`Engine::attach_tun`], not by this setter.
+    pub fn set_vpn_mode(&self, enabled: bool) {
+        self.lifecycle.set_vpn_mode(enabled);
+    }
+
+    /// Install the socket protector used for WireGuard UDP sockets
+    /// booted in VPN mode.
+    pub fn set_socket_protector(&self, protector: Arc<dyn SocketProtector>) {
+        self.lifecycle.set_socket_protector(protector);
+    }
+
+    /// True when a socket protector is installed for VPN-mode boots.
+    pub fn has_socket_protector(&self) -> bool {
+        self.lifecycle.socket_protector().is_some()
+    }
+
+    /// IDs of tunnels currently booted in proxy mode (see
+    /// [`LifecycleController::proxy_booted_tunnel_ids`]).
+    pub fn proxy_booted_tunnel_ids(&self) -> Vec<String> {
+        self.lifecycle.proxy_booted_tunnel_ids()
+    }
+
+    /// Re-boot every proxy-booted tunnel in VPN mode (see
+    /// [`LifecycleController::migrate_proxy_tunnels_to_vpn`]).
+    pub async fn migrate_proxy_tunnels_to_vpn(&self) -> Result<Vec<String>, CoreError> {
+        self.lifecycle.migrate_proxy_tunnels_to_vpn().await
+    }
+
+    /// Attach (or clear with `None`) the shared TUN endpoint used by
+    /// VPN-mode tunnels.
+    pub fn set_tun_endpoint(&self, endpoint: Option<Arc<crate::netstack::TunEndpoint>>) {
+        self.lifecycle.set_tun_endpoint(endpoint);
+    }
+
+    /// Return the attached TUN endpoint, if any.
+    pub fn tun_endpoint(&self) -> Option<Arc<crate::netstack::TunEndpoint>> {
+        self.lifecycle.tun_endpoint()
+    }
+
+    /// True when a tunnel may receive new VPN flows: registered,
+    /// active, not disabled, and its health tracker still routes to
+    /// it (untested and healthy count as usable; a tripped breaker
+    /// or dead tunnel does not).
+    pub fn is_tunnel_usable(&self, id: &str) -> bool {
+        let Some(entry) = self.registry.get(id) else {
+            return false;
+        };
+        !entry.is_disabled()
+            && matches!(*entry.state.read(), TunnelState::Active)
+            && entry.health.is_routable()
+    }
+
+    /// Leave VPN mode: disable it and drop the TUN endpoint reference.
+    /// Call after the engine stopped and its tunnels closed.
+    pub fn clear_vpn(&self) {
+        self.lifecycle.set_vpn_mode(false);
+        self.lifecycle.set_tun_endpoint(None);
     }
 
     /// Access the underlying [`ListenerSupervisor`].
@@ -225,8 +332,17 @@ impl TunnelManager {
     }
 
     /// Resolve a flexible tunnel target expression (`A`, `1`, `1-200`, `all`, or comma-separated)
-    /// against alphabetically sorted tunnel IDs.
+    /// against alphabetically sorted tunnel IDs. A literal registered
+    /// ID always wins over selector syntax (audit run-1,
+    /// `src/core/mod.rs:resolve_tunnel_token:literal-id-shadowed`):
+    /// the whole spec is tried as one literal ID first, so an ID
+    /// containing a comma (`a,b.conf`) is not split, and each token
+    /// is tried literally before `all` / range / index parsing.
     pub fn resolve_tunnel_targets(&self, spec: &str) -> Result<Vec<String>, CoreError> {
+        let trimmed = spec.trim();
+        if !trimmed.is_empty() && self.registry.get(trimmed).is_some() {
+            return Ok(vec![trimmed.to_string()]);
+        }
         let mut sorted_ids = self.registry.all_ids();
         sorted_ids.sort();
         let mut selected = Vec::new();
@@ -246,12 +362,19 @@ impl TunnelManager {
     }
 
     /// Resolve one comma-separated token (`all`, `1-200`, `1`, or a tunnel ID).
+    /// A literal registered ID wins over selector syntax: a tunnel
+    /// literally named `2`, `1-2`, or `all` is selected by identity,
+    /// never reinterpreted as an index, a range, or "every tunnel".
     fn resolve_tunnel_token(
         &self,
         tok: &str,
         sorted_ids: &[String],
         selected: &mut Vec<String>,
     ) -> Result<(), CoreError> {
+        if self.registry.get(tok).is_some() {
+            add_unique(selected, tok);
+            return Ok(());
+        }
         if tok.eq_ignore_ascii_case("all") || tok == "*" {
             add_all_ids(sorted_ids, selected);
             return Ok(());
@@ -264,11 +387,7 @@ impl TunnelManager {
         if let Ok(idx) = tok.parse::<usize>() {
             return select_id_index(idx, sorted_ids, selected);
         }
-        if self.registry.get(tok).is_none() {
-            return Err(CoreError::TunnelNotFound(tok.to_string()));
-        }
-        add_unique(selected, tok);
-        Ok(())
+        Err(CoreError::TunnelNotFound(tok.to_string()))
     }
 
     /// Enable or disable one or more tunnels (`A`, `1`, `1-200`, `all`) in runtime and persist
@@ -291,6 +410,12 @@ impl TunnelManager {
         spec: &str,
         disabled: bool,
     ) -> Result<Vec<String>, CoreError> {
+        // Serialize against POST /config and reload: the registry flags,
+        // the in-memory `disabled_tunnels`, and the on-disk file must all
+        // move together, or a concurrent config apply silently drops the
+        // disable (audit run-1,
+        // `src/core/mod.rs:set_tunnels_disabled:lost-update-vs-post-config`).
+        let _apply_guard = self.config_apply_lock.lock().await;
         let targets = self.resolve_tunnel_targets(spec)?;
         for id in &targets {
             if let Some(entry) = self.registry.get(id) {
@@ -308,20 +433,7 @@ impl TunnelManager {
             }
         }
 
-        let cfg_snapshot = {
-            let mut cfg = self.config.write();
-            if disabled {
-                for id in &targets {
-                    if !cfg.disabled_tunnels.contains(id) {
-                        cfg.disabled_tunnels.push(id.clone());
-                    }
-                }
-            } else {
-                cfg.disabled_tunnels.retain(|id| !targets.contains(id));
-            }
-            cfg.disabled_tunnels.sort();
-            cfg.clone()
-        };
+        apply_disabled_flags(&self.config, &targets, disabled);
 
         let maybe_path = self.config_path.read().clone();
         if let Some(path) = maybe_path {
@@ -336,16 +448,22 @@ impl TunnelManager {
                     .as_deref()
                     .and_then(|text| crate::config::merge_config_preserving_comments(text, &fresh))
                     .unwrap_or(fresh);
-                if let Err(e) = write_config_atomically(&path, &serialized).await {
-                    tracing::warn!(
-                        "Failed to persist disabled_tunnels to '{}': {}",
-                        path.display(),
-                        e
-                    );
-                }
+                // Fail closed (audit run-1,
+                // `src/core/mod.rs:set_tunnels_disabled:persist-failure-swallowed`):
+                // a caller told the disable succeeded must be able to
+                // trust it survives a restart. Swallowing the error
+                // here used to answer 200 while `wpmulti.toml` still
+                // held the old list.
+                write_config_atomically(&path, &serialized)
+                    .await
+                    .map_err(|e| {
+                        CoreError::Other(format!(
+                            "Failed to persist disabled_tunnels to '{}': {e}",
+                            path.display()
+                        ))
+                    })?;
             }
         }
-        let _ = cfg_snapshot;
 
         Ok(targets)
     }
@@ -357,6 +475,12 @@ impl TunnelManager {
 
     /// Validate and apply updated runtime settings synchronously across manager, lifecycle,
     /// active prober, and currently active virtual network stacks.
+    ///
+    /// Callers must hold the config-apply lock (see
+    /// [`TunnelManager::lock_config_apply`]): this swaps the live config
+    /// wholesale, so it must never interleave with a reload or another
+    /// config apply. [`TunnelManager::apply_runtime_config`] is the
+    /// locking entry point.
     pub fn update_runtime_config(&self, new_cfg: MainConfig) -> Result<(), CoreError> {
         new_cfg.validate()?;
         let prefer_ipv6 =
@@ -384,18 +508,14 @@ impl TunnelManager {
                 entry.set_disable_pending(false);
             }
             let maybe_active = entry.active.read().clone();
-            if let Some(active) = maybe_active {
-                active.netstack.set_prefer_ipv6(prefer_ipv6);
-                active
-                    .netstack
-                    .set_dns_strategy(new_cfg.global.dns_strategy);
-                active
-                    .netstack
-                    .set_dns_fallback(new_cfg.global.dns_fallback);
-                active
-                    .netstack
-                    .set_connect_timeout(new_cfg.lifecycle.handshake_timeout);
-                active.netstack.set_ip_mode(new_cfg.global.ip_mode);
+            if let Some(active) = maybe_active
+                && let Some(netstack) = active.netstack.as_ref()
+            {
+                netstack.set_prefer_ipv6(prefer_ipv6);
+                netstack.set_dns_strategy(new_cfg.global.dns_strategy);
+                netstack.set_dns_fallback(new_cfg.global.dns_fallback);
+                netstack.set_connect_timeout(new_cfg.lifecycle.handshake_timeout);
+                netstack.set_ip_mode(new_cfg.global.ip_mode);
             }
         }
 
@@ -403,9 +523,31 @@ impl TunnelManager {
         Ok(())
     }
 
+    /// Acquire the config-apply mutex for a whole read-modify-write-apply
+    /// cycle. `POST /config` holds the returned guard across
+    /// snapshot+merge+write+apply so two concurrent admin sessions
+    /// cannot lose each other's update or resurrect a revoked token
+    /// (audit run-1,
+    /// `src/api/routes.rs:post-config-concurrent-stale-snapshot-resurrection`).
+    /// The `*_locked` methods below run with the guard already held and
+    /// must not be called while holding any other config lock; the
+    /// `config_write_lock` is always taken inside this lock.
+    pub async fn lock_config_apply(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.config_apply_lock.lock().await
+    }
+
     /// Validate and apply updated runtime settings asynchronously, suspending newly disabled
-    /// tunnels and re-activating newly re-enabled eager tunnels.
+    /// tunnels, re-activating newly re-enabled eager tunnels, and
+    /// reconciling the live listener set with the new config.
     pub async fn apply_runtime_config(&self, new_cfg: MainConfig) -> Result<(), CoreError> {
+        let _apply_guard = self.config_apply_lock.lock().await;
+        self.apply_runtime_config_locked(new_cfg).await
+    }
+
+    /// [`TunnelManager::apply_runtime_config`] with the config-apply lock
+    /// already held (called by `save_and_apply_runtime_config_locked`
+    /// and by the locking wrapper above).
+    async fn apply_runtime_config_locked(&self, new_cfg: MainConfig) -> Result<(), CoreError> {
         // Reject configs that reference tunnel IDs the registry never
         // loaded (a typo in `pool`, `disabled_tunnels`, `eager_tunnels`,
         // or an override key) before anything is applied or saved. This
@@ -421,6 +563,7 @@ impl TunnelManager {
             .into_iter()
             .map(|e| (e.id.clone(), e.is_disabled()))
             .collect();
+        let old_cfg = self.config.read().clone();
         self.update_runtime_config(new_cfg)?;
 
         for (id, was_disabled) in prev_disabled {
@@ -441,12 +584,81 @@ impl TunnelManager {
                 // No state transition required for this entry.
             }
         }
+        self.reconcile_listeners_after_apply(&old_cfg).await;
         Ok(())
+    }
+
+    /// Reconcile the live listener set with the config just applied.
+    /// Listener identity (bind addresses, proxy credentials, dedicated
+    /// ports) is captured at listener start, so a config change that
+    /// moves it must restart the affected listeners — otherwise the old
+    /// password stays accepted and the new one rejected while `GET
+    /// /config` reports the new values (audit run-1, `core/listener:stale-proxy-credentials-after-config-rotation`,
+    /// `core/apply-runtime-config:per-tunnel-enabled-no-listener-reconcile`).
+    /// A restart failure is logged, not returned: the config is already
+    /// applied and persisted by the caller, so failing here would report
+    /// a failure while the new config is live.
+    async fn reconcile_listeners_after_apply(&self, old_cfg: &MainConfig) {
+        if !self.listeners.is_started() {
+            return;
+        }
+        let new_cfg = self.config.read().clone();
+        // Any shared-listener change (bind, global password, auth mode,
+        // pool) or a global bind change moves a live socket or a live
+        // router credential: restart every listener.
+        let shared_identity_changed = old_cfg.global.bind_address != new_cfg.global.bind_address
+            || old_cfg.shared_listeners != new_cfg.shared_listeners;
+        // Dedicated listeners are gated on `per_tunnel.enabled` and
+        // capture their credential and ports at start; a flip or a
+        // credential/port change restarts only the dedicated set.
+        let dedicated_changed = old_cfg.per_tunnel != new_cfg.per_tunnel;
+        if shared_identity_changed {
+            self.listeners.stop().await;
+            if let Err(e) = self
+                .listeners
+                .start_all(&new_cfg, &self.registry, &self.lifecycle)
+                .await
+            {
+                tracing::warn!("Failed to restart listeners after config apply: {e}");
+            }
+            return;
+        }
+        if dedicated_changed {
+            self.listeners.stop_all_dedicated(&self.registry).await;
+            if new_cfg.per_tunnel.enabled
+                && let Err(e) = self
+                    .listeners
+                    .start_dedicated_listeners(
+                        &new_cfg.per_tunnel,
+                        new_cfg.dedicated_fallback_password().as_deref(),
+                        new_cfg.global.bind_address,
+                        &self.registry,
+                        &self.lifecycle,
+                    )
+                    .await
+            {
+                tracing::warn!("Failed to start dedicated listeners after config apply: {e}");
+            }
+        }
     }
 
     /// Validate, atomically write `new_cfg` to `config_path` (when configured),
     /// and apply updated runtime settings cleanly.
     pub async fn save_and_apply_runtime_config(
+        &self,
+        new_cfg: MainConfig,
+    ) -> Result<(), CoreError> {
+        let _apply_guard = self.config_apply_lock.lock().await;
+        self.save_and_apply_runtime_config_locked(new_cfg).await
+    }
+
+    /// [`TunnelManager::save_and_apply_runtime_config`] with the
+    /// config-apply lock already held: the file write and the runtime
+    /// apply are one atomic step under that lock, so the disk and the
+    /// live config can never diverge across concurrent writers (audit
+    /// run-1,
+    /// `src/api/routes.rs:post-config-concurrent-stale-snapshot-resurrection`).
+    pub(crate) async fn save_and_apply_runtime_config_locked(
         &self,
         new_cfg: MainConfig,
     ) -> Result<(), CoreError> {
@@ -476,12 +688,26 @@ impl TunnelManager {
                     CoreError::Other(format!("Failed to write config '{}': {e}", path.display()))
                 })?;
         }
-        self.apply_runtime_config(new_cfg).await
+        self.apply_runtime_config_locked(new_cfg).await
     }
 
     /// Start the tunnel manager: launches lifecycle idle teardown, boots eager tunnels,
     /// starts active prober, and starts all configured listeners.
     pub async fn start(&self) -> Result<(), CoreError> {
+        self.start_inner(true).await
+    }
+
+    /// Start the tunnel manager without any proxy listeners.
+    ///
+    /// Same steps as [`TunnelManager::start`] except step 4 (starting the
+    /// SOCKS5/HTTP listeners) is skipped. This is the entry point for the
+    /// Android VPN engine, where traffic arrives from a TUN interface
+    /// instead of local proxy listeners.
+    pub async fn start_without_listeners(&self) -> Result<(), CoreError> {
+        self.start_inner(false).await
+    }
+
+    async fn start_inner(&self, with_listeners: bool) -> Result<(), CoreError> {
         // 1. Start lifecycle teardown background task
         self.lifecycle.start();
 
@@ -539,11 +765,13 @@ impl TunnelManager {
         self.prober
             .start(Arc::clone(&self.registry), cfg.health_check.clone());
 
-        // 4. Start listeners
-        if let Err(e) = self
-            .listeners
-            .start_all(&cfg, &self.registry, &self.lifecycle)
-            .await
+        // 4. Start listeners (skipped for the Android VPN engine, which
+        // receives traffic from a TUN interface instead).
+        if with_listeners
+            && let Err(e) = self
+                .listeners
+                .start_all(&cfg, &self.registry, &self.lifecycle)
+                .await
         {
             let _ = self.stop().await;
             return Err(e);
@@ -577,6 +805,22 @@ impl TunnelManager {
             .await
     }
 
+    /// Synchronously stop the background workers (active prober,
+    /// idle-teardown task) without waiting for them: signal each loop
+    /// to exit and abort its task. Used by `Drop` paths (the UniFFI
+    /// engine destroyed without `stop()`), where awaiting is
+    /// impossible (audit run-1,
+    /// `uniffi:engine-destroy-without-stop-detached-vpn`).
+    /// Listeners are untouched: the engine path never starts them.
+    pub fn stop_background_tasks_sync(&self) {
+        if let Some(handle) = self.prober.stop_sync() {
+            handle.abort();
+        }
+        if let Some(handle) = self.lifecycle.stop_background_tasks_sync() {
+            handle.abort();
+        }
+    }
+
     /// Returns the total number of tunnels registered in memory.
     pub fn tunnel_count(&self) -> usize {
         self.registry.count()
@@ -598,12 +842,12 @@ impl TunnelManager {
     }
 
     /// Probe one tunnel: activate it, then force a WireGuard handshake
-    /// with its first peer and report whether it completes within the
-    /// configured probe timeout. Activation alone proves nothing about
-    /// the tunnel, so the outcome is the handshake result, never the
-    /// activation result. The Admin API exposes this so `wpmulti top`
-    /// can probe a remote daemon honestly instead of reporting
-    /// activation as a probe result.
+    /// with its first peer and verify the data plane with an egress
+    /// probe before reporting success. A handshake alone proves only
+    /// that the peer answers; it never revives a Dead tunnel (audit
+    /// run-1, `core/probe_tunnel:handshake-only-revives-dead`). The
+    /// Admin API exposes this so `wpmulti top` can probe a remote
+    /// daemon honestly instead of reporting activation as a probe result.
     pub async fn probe_tunnel(&self, id: &str) -> TunnelProbeOutcome {
         let start = Instant::now();
         let active = match self.activate_tunnel(id).await {
@@ -630,18 +874,35 @@ impl TunnelManager {
         };
         match tokio::time::timeout(probe_timeout, active.device.force_handshake(&pubkey)).await {
             Ok(Ok(())) => {
-                // A successful handshake proves the tunnel works: record
-                // it, so a Dead tunnel is revived to Healthy and failure
-                // counts reset. A failed probe records nothing — a probe
-                // is diagnostic, and a timeout alone must not condemn
-                // an otherwise healthy tunnel.
-                if let Some(entry) = self.registry().get(id) {
-                    entry.health.record_success();
-                }
-                TunnelProbeOutcome {
-                    ok: true,
-                    rtt_ms: Some(start.elapsed().as_millis() as u64),
-                    message: "Handshake OK".to_string(),
+                // The handshake only proves the peer answers. Egress
+                // is verified separately; only a verified data plane
+                // records success, so a Dead tunnel is revived only by
+                // proof the tunnel carries traffic. A probe is
+                // diagnostic: an unverified or failed egress records
+                // no failure either.
+                match active.probe_egress(probe_timeout).await {
+                    Ok(EgressProbeOutcome::Verified) => {
+                        if let Some(entry) = self.registry().get(id) {
+                            entry.health.record_success();
+                        }
+                        TunnelProbeOutcome {
+                            ok: true,
+                            rtt_ms: Some(start.elapsed().as_millis() as u64),
+                            message: "Handshake OK, egress verified".to_string(),
+                        }
+                    }
+                    Ok(EgressProbeOutcome::Unverified) => TunnelProbeOutcome {
+                        ok: false,
+                        rtt_ms: Some(start.elapsed().as_millis() as u64),
+                        message: "Handshake OK, but data-plane egress not verified \
+                            (VPN mode: no in-tunnel probe available)"
+                            .to_string(),
+                    },
+                    Err(e) => TunnelProbeOutcome {
+                        ok: false,
+                        rtt_ms: Some(start.elapsed().as_millis() as u64),
+                        message: format!("Handshake OK, but egress probe failed: {e}"),
+                    },
                 }
             }
             Ok(Err(e)) => TunnelProbeOutcome {
@@ -672,7 +933,27 @@ impl TunnelManager {
             )));
         }
 
-        let new_tunnels = load_tunnel_configs_from_dir(&dir)?;
+        // Degraded reload (audit run-1,
+        // `config/load-dir-single-bad-conf-fails-all`): one broken `.conf`
+        // must not fail the whole reload. Apply the valid set and
+        // quarantine the broken files — but a tunnel whose file failed to
+        // load keeps its current config instead of being removed, so a
+        // corrupt file cannot delete a live tunnel from the registry.
+        let partial = load_tunnel_configs_from_dir_partial(&dir)?;
+        let mut new_tunnels = partial.configs;
+        for failure in &partial.failures {
+            tracing::warn!(
+                "Reload skipping broken tunnel config '{}': {}",
+                failure.path.display(),
+                failure.error
+            );
+            if let Some(id) = &failure.id
+                && !new_tunnels.iter().any(|t| &t.id == id)
+                && let Some(entry) = self.registry.get(id)
+            {
+                new_tunnels.push(entry.config.read().clone());
+            }
+        }
         self.reload_with_tunnels(new_tunnels).await
     }
 
@@ -681,6 +962,14 @@ impl TunnelManager {
         &self,
         new_tunnels: Vec<TunnelConfig>,
     ) -> Result<ReloadReport, CoreError> {
+        // Serialize against config applies and other reloads (audit
+        // run-1, `core/reload-with-tunnels-unserialized-concurrent-reload`,
+        // `core/reload-stale-snapshot-disabled-tunnel-activated`): the
+        // snapshot below stays live for the whole reload, so a concurrent
+        // apply cannot clear a disabled flag mid-reload only for this
+        // reload to resurrect it, and two concurrent reloads apply their
+        // sets one after the other instead of interleaving into a union.
+        let _apply_guard = self.config_apply_lock.lock().await;
         let mut report = ReloadReport::default();
         let cfg_snapshot = self.config.read().clone();
         let default_mode = cfg_snapshot.lifecycle.mode;
@@ -784,7 +1073,7 @@ impl TunnelManager {
             if active_conns == 0 {
                 if let Some(active) = maybe_active {
                     active.device.suspend().await;
-                    active.netstack.close().await;
+                    active.close_netstack().await;
                 }
             } else {
                 // Existing connections retain their Arc<ActiveTunnel> until completion;

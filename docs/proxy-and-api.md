@@ -90,7 +90,11 @@ method with credentials (SOCKS5) was sent at all. With
 `allow_anonymous = true` (the default in the provided
 `wpmulti.toml`), a request with no credentials at all goes
 straight to the listener's default strategy — it is never asked for
-the password, even when `global_password` is set. But a request that
+the password, even when `global_password` is set. The one exception
+is a tunnel with its own override password (in
+`[per_tunnel.overrides.<id>]`): an anonymous request is never routed
+to that tunnel — only that tunnel's own password opens it, whichever
+selector picked it. But a request that
 *does* present credentials — even empty ones, such as HTTP
 `Basic Og==` — has its password verified, and is rejected with `407`
 when it does not match the configured password. To actually require a

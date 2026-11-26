@@ -331,8 +331,12 @@ async fn run_mock_peer_loop(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let rate_limiter = Arc::new(RateLimiter::new(&server_public, 1000));
+    // The mock DNS answer must be a public address: the proxy destination
+    // guard forbids loopback and RFC1918 targets, and the in-tunnel DNS
+    // answer is the proxy-visible destination for domain CONNECTs. The
+    // mock TCP echo answers by 4-tuple, so the address itself is arbitrary.
     let ip_engine = Arc::new(Mutex::new(MockIpEngine::new(
-        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(192, 0, 2, 1),
         "2606:4700:4700::1111".parse().unwrap(),
         Arc::clone(&stats),
     )));

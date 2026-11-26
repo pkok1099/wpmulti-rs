@@ -41,15 +41,46 @@ impl std::str::FromStr for WgConfig {
     }
 }
 
+/// Open `path` for reading without following a trailing symlink, so a
+/// symlink swapped into a config directory between enumeration and read
+/// cannot redirect the read outside the directory (audit run-1,
+/// `config/wg-conf-dir-loader-symlink-toctou`). Callers must still
+/// verify the opened file with `fstat` (`File::metadata`) before
+/// reading: the open alone does not prove the target is a regular file
+/// of bounded size.
+pub(crate) fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW)
+    };
+    opts.open(path)
+}
+
 fn read_wg_conf_bounded(path: &Path) -> Result<String, WgConfError> {
-    let meta = std::fs::symlink_metadata(path)?;
+    use std::io::Read as _;
+    let mut file = open_no_follow(path)?;
+    // Post-open `fstat` on the opened file descriptor: the size and
+    // file-type checks describe the inode actually read, not the path
+    // as it existed when it was enumerated.
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(WgConfError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{}' is not a regular file", path.display()),
+        )));
+    }
     if meta.len() > MAX_WG_CONF_SIZE as u64 {
         return Err(WgConfError::InputTooLarge {
             size: usize::try_from(meta.len()).unwrap_or(usize::MAX),
             max: MAX_WG_CONF_SIZE,
         });
     }
-    std::fs::read_to_string(path).map_err(WgConfError::from)
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
 }
 
 impl WgConfig {

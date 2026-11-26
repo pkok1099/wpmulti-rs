@@ -1,4 +1,5 @@
 [workspace]
+members = ["crates/wpmulti-uniffi"]
 
 [package]
 name = "wpmulti"
@@ -47,6 +48,9 @@ parking_lot = "0.13.0"
 rand = "0.10.4"
 zerocopy = { version = "0.8.27", features = ["derive", "std"] }
 libc = "0.2"
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+tokio-rustls = "0.26"
+webpki-roots = "1"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 
@@ -72,6 +76,19 @@ strip = "symbols"
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Android (UniFFI) profile: panic must unwind so a Rust panic at the FFI
+# boundary becomes a Kotlin exception instead of crashing the process.
+# The daemon's [profile.release] stays panic=abort and is untouched.
+[profile.release-android]
+inherits = "release"
+panic = "unwind"
+lto = "thin"
+codegen-units = 16
+# Do not strip: UniFFI metadata lives in the symbol table and
+# uniffi-bindgen reads it from the .so to generate bindings.
+# The Android Gradle build strips the .so at packaging time.
+strip = false
 
 [profile.profiling]
 inherits = "release"

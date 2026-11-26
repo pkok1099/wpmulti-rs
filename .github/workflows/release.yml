@@ -83,9 +83,16 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cargo_args }}
 
+      # Pinned: an unpinned install resolves whatever cargo-deb crates.io
+      # serves at release time, and that tool builds the .deb installed as
+      # root. 3.8.0 was the latest stable on crates.io when pinned (2026-11-26).
       - name: Install cargo-deb
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cargo-deb --locked
+        run: cargo install cargo-deb --version 3.8.0 --locked
+
+      - name: Verify cargo-deb version
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
+        run: test "$(cargo deb --version)" = "cargo-deb 3.8.0"
 
       - name: Build Debian .deb package
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
@@ -114,12 +121,58 @@ jobs:
             *.tar.gz
             *.deb
 
+  # Android UniFFI cdylib: the only in-repo build that selects the
+  # `release-android` profile (panic=unwind so a Rust panic at the
+  # FFI boundary becomes a Kotlin exception instead of crashing the
+  # process, strip=false so uniffi-bindgen can read the metadata).
+  # The daemon jobs above keep using `--release` (panic=abort).
+  android-uniffi:
+    name: Android UniFFI cdylib (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: 1.100.0
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release-android-uniffi
+          shared-key: release-android-uniffi
+          cache-on-failure: true
+          cache-all-crates: true
+
+      - name: Configure Android NDK env
+        run: |
+          NDK_DIR="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+          if [ -z "$NDK_DIR" ] && [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk" ]; then
+            NDK_DIR="$(ls -d "$ANDROID_HOME/ndk"/* | sort -V | tail -n 1)"
+          fi
+          echo "Using NDK: $NDK_DIR"
+          TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+
+      - name: Build UniFFI cdylib with the release-android profile
+        run: cargo build -p wpmulti-uniffi --profile release-android --locked --target aarch64-linux-android --lib
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-uniffi
+          path: target/aarch64-linux-android/release-android/libwpmulti_uniffi.so
+
   release:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -129,6 +182,16 @@ jobs:
       - name: Generate SHA256 checksums
         working-directory: dist
         run: sha256sum ./*.tar.gz ./*.deb > SHA256SUMS.txt
+
+      # SLSA build provenance attestation (Sigstore-signed, no new secret):
+      # SHA256SUMS.txt alone is self-verifying — it ships in the same release
+      # as the artifacts it checksums. The attestation binds each artifact
+      # digest to this workflow run; verify with
+      # `gh attestation verify <artifact> --repo pkok1099/wpmulti-rs`.
+      - name: Attest release artifacts
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: 'dist/*.tar.gz, dist/*.deb'
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4

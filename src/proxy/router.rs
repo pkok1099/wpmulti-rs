@@ -34,13 +34,24 @@ pub(crate) const MIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 /// Default overall timeout budget for validated multi-address UDP datagram sends.
 pub(crate) const DEFAULT_UDP_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Returns `true` if `v4` is a forbidden IPv4 destination (unspecified, link-local, multicast, or broadcast).
+/// Returns `true` if `v4` is a forbidden IPv4 destination (unspecified, loopback, private
+/// (RFC1918), link-local, multicast, or broadcast).
 pub(crate) const fn is_forbidden_ipv4(v4: Ipv4Addr) -> bool {
-    v4.is_unspecified() || v4.is_link_local() || v4.is_multicast() || v4.is_broadcast()
+    v4.is_unspecified()
+        || v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_broadcast()
 }
 
 /// Returns `true` if `ip` is an unsafe/forbidden proxy destination:
-/// - IPv4: unspecified (`0.0.0.0/8`), link-local (`169.254.0.0/16`), multicast (`224.0.0.0/4`), broadcast (`255.255.255.255`).
+/// - IPv4: unspecified (`0.0.0.0/8`), loopback (`127.0.0.0/8`), private/RFC1918 (`10/8`,
+///   `172.16/12`, `192.168/16`), link-local (`169.254.0.0/16`), multicast (`224.0.0.0/4`),
+///   broadcast (`255.255.255.255`). Loopback and RFC1918 destinations would reach services
+///   on the tunnel peer's loopback/LAN, not the public internet, so a proxy client must
+///   not be able to name them (audit run-1,
+///   `proxy.destination.ipv4-loopback-rfc1918-not-forbidden`).
 /// - IPv6: loopback (`::1`), unspecified (`::`), link-local (`fe80::/10`), Unique Local (`fc00::/7`),
 ///   multicast (`ff00::/8`), IPv4-mapped IPv6 (`::ffff:0:0/96`), and NAT64 well-known prefix (`64:ff9b::/96`)
 ///   when embedding a forbidden IPv4 address.

@@ -204,6 +204,54 @@ pub fn parse_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)
     Ok((ips, min_ttl))
 }
 
+/// Builds a DNS response message answering `query` with `answers`.
+///
+/// The question section is echoed verbatim, each answer name is a
+/// compression pointer to it, and the RD bit is copied from the query
+/// with RA set. The caller guarantees the answers match the query's
+/// QTYPE.
+pub fn build_response(query: &[u8], answers: &[(IpAddr, u32)]) -> Result<Vec<u8>, DnsError> {
+    if query.len() < 12 {
+        return Err(DnsError::PacketTooShort);
+    }
+    let qdcount = read_u16_be(query, 4)?;
+    if qdcount == 0 {
+        return Err(DnsError::InvalidDomain("query has no question"));
+    }
+    let question_end = skip_name(query, 12)?;
+    let question_end = question_end
+        .checked_add(4)
+        .filter(|end| *end <= query.len())
+        .ok_or(DnsError::PacketTooShort)?;
+    let mut resp = Vec::with_capacity(question_end + answers.len() * 28);
+    resp.extend_from_slice(query.get(..2).ok_or(DnsError::PacketTooShort)?);
+    let query_flags = read_u16_be(query, 2)?;
+    let flags = 0x8180 | (query_flags & 0x0100);
+    resp.extend_from_slice(&flags.to_be_bytes());
+    resp.extend_from_slice(&qdcount.to_be_bytes());
+    resp.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    resp.extend_from_slice(
+        query
+            .get(12..question_end)
+            .ok_or(DnsError::PacketTooShort)?,
+    );
+    for (ip, ttl) in answers {
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        let (record_type, rdata): (u16, Vec<u8>) = match ip {
+            IpAddr::V4(addr) => (1, addr.octets().to_vec()),
+            IpAddr::V6(addr) => (28, addr.octets().to_vec()),
+        };
+        resp.extend_from_slice(&record_type.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&ttl.to_be_bytes());
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&rdata);
+    }
+    Ok(resp)
+}
+
 /// Skips a DNS domain name in wire format, handling RFC 1035 compression pointers safely.
 fn skip_name(buf: &[u8], offset: usize) -> Result<usize, DnsError> {
     let mut end_offset = None;
@@ -265,9 +313,10 @@ pub struct DnsLruCache {
     min_ttl: Duration,
     max_ttl: Duration,
     /// In-flight singleflight cells keyed by cache key. Concurrent lookups
-    /// for the same domain share one upstream query instead of each doing
-    /// its own slow in-tunnel query. Lives on the shared cache so it
-    /// coalesces across tunnels, not just within one resolver.
+    /// for the same key share one upstream query instead of each doing
+    /// its own slow in-tunnel query. The key carries the resolver's
+    /// upstream scope (see [`InTunnelDnsResolver::cache_key`]), so the
+    /// cell only coalesces lookups that would hit the same servers.
     inflight: AsyncMutex<HashMap<String, Arc<OnceCell<SharedDnsResult>>>>,
 }
 
@@ -403,10 +452,15 @@ fn build_fallback_servers(fallback: SocketAddr) -> Vec<SocketAddr> {
 /// In-tunnel DNS resolver guaranteeing zero host DNS leaks.
 ///
 /// The cache is reference-counted so one daemon-wide cache can be shared by
-/// every tunnel's resolver: with per-tunnel caches, round-robin across many
-/// tunnels re-resolves the same domain on nearly every connection (each
-/// tunnel's cache goes cold between its turns), while a shared cache stays
-/// warm as long as any tunnel resolved the domain recently.
+/// every tunnel's resolver — but entries are keyed by the resolver's
+/// upstream DNS servers (see [`Self::cache_key`]), so a shared cache
+/// never serves one tunnel's DNS answer to a resolver with different
+/// upstreams; host-fallback answers live under a separate `host|`
+/// namespace. With per-tunnel caches, round-robin across many tunnels
+/// re-resolves the same domain on nearly every connection (each
+/// tunnel's cache goes cold between its turns), while a scoped shared
+/// cache stays warm as long as any tunnel with the same upstreams
+/// resolved the domain recently.
 #[derive(Debug)]
 pub struct InTunnelDnsResolver {
     has_configured_dns: bool,
@@ -544,6 +598,49 @@ impl InTunnelDnsResolver {
             .await
     }
 
+    /// Cache key for a lookup, scoped so one tunnel's DNS answer can
+    /// never poison another tunnel's resolution (audit run-1,
+    /// `dns-shared-cache-cross-tunnel-poisoning`): the key carries the
+    /// resolver's upstream DNS server list, so only resolvers with
+    /// identical upstreams share entries (and the singleflight cell,
+    /// which is keyed the same way). Host-strategy lookups use the
+    /// separate `host|` namespace instead, so a host-resolver answer
+    /// is never served as a tunnel answer.
+    fn cache_key(&self, mode: crate::config::IpMode, prefer_v6: bool, domain: &str) -> String {
+        if self.dns_strategy() == crate::config::toml_config::DnsStrategy::Host {
+            return Self::host_cache_key(mode, prefer_v6, domain);
+        }
+        let mut servers = self.dns_servers();
+        servers.sort();
+        let scope = servers
+            .iter()
+            .map(SocketAddr::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{scope}|{}", Self::mode_cache_key(mode, prefer_v6, domain))
+    }
+
+    /// Cache key for a host-resolver answer: its own namespace, never
+    /// shared with tunnel answers.
+    fn host_cache_key(mode: crate::config::IpMode, prefer_v6: bool, domain: &str) -> String {
+        format!("host|{}", Self::mode_cache_key(mode, prefer_v6, domain))
+    }
+
+    /// Mode/domain part of a cache key.
+    fn mode_cache_key(mode: crate::config::IpMode, prefer_v6: bool, domain: &str) -> String {
+        match mode {
+            crate::config::IpMode::DualStack => {
+                if prefer_v6 {
+                    format!("ds6:{domain}")
+                } else {
+                    format!("ds4:{domain}")
+                }
+            }
+            crate::config::IpMode::Ipv4Only => format!("v4:{domain}"),
+            crate::config::IpMode::Ipv6Only => format!("v6:{domain}"),
+        }
+    }
+
     /// Resolve domain to all resolved addresses permitted by `mode`.
     pub async fn resolve_all_with_mode(
         &self,
@@ -559,17 +656,7 @@ impl InTunnelDnsResolver {
         }
 
         let prefer_v6 = self.prefer_ipv6.load(Ordering::Relaxed);
-        let cache_key = match mode {
-            crate::config::IpMode::DualStack => {
-                if prefer_v6 {
-                    format!("ds6:{trimmed}")
-                } else {
-                    format!("ds4:{trimmed}")
-                }
-            }
-            crate::config::IpMode::Ipv4Only => format!("v4:{trimmed}"),
-            crate::config::IpMode::Ipv6Only => format!("v6:{trimmed}"),
-        };
+        let cache_key = self.cache_key(mode, prefer_v6, trimmed);
 
         // Check LRU cache
         if let Some(cached) = self.cache.get(&cache_key) {
@@ -640,7 +727,7 @@ impl InTunnelDnsResolver {
                 }
                 match tokio::time::timeout(
                     remaining,
-                    self.query_server(stack, trimmed, server, mode),
+                    self.query_server(stack, trimmed, server, mode, dns_deadline),
                 )
                 .await
                 {
@@ -681,12 +768,19 @@ impl InTunnelDnsResolver {
                 | io::ErrorKind::NetworkUnreachable
                 | io::ErrorKind::HostUnreachable
         );
-        if strategy == crate::config::toml_config::DnsStrategy::TunnelFirst
-            && is_transport_err
-            && let Ok(ips) = self.resolve_via_host(trimmed, mode, prefer_v6).await
-        {
-            self.cache.insert(cache_key, ips.clone(), 60);
-            return Ok(ips);
+        if strategy == crate::config::toml_config::DnsStrategy::TunnelFirst && is_transport_err {
+            // Host-fallback answers live under the separate `host|`
+            // namespace: a host answer must never be served as a
+            // tunnel answer, and a tunnel lookup must never be
+            // satisfied from the host cache.
+            let host_key = Self::host_cache_key(mode, prefer_v6, trimmed);
+            if let Some(ips) = self.cache.get(&host_key) {
+                return Ok(ips);
+            }
+            if let Ok(ips) = self.resolve_via_host(trimmed, mode, prefer_v6).await {
+                self.cache.insert(&host_key, ips.clone(), 60);
+                return Ok(ips);
+            }
         }
 
         Err(last_err)
@@ -750,7 +844,13 @@ impl InTunnelDnsResolver {
         };
         tokio::time::timeout(
             timeout,
-            self.query_record(stack, "one.one.one.one", server, qtype),
+            self.query_record(
+                stack,
+                "one.one.one.one",
+                server,
+                qtype,
+                tokio::time::Instant::now() + timeout,
+            ),
         )
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "egress DNS probe timed out"))??;
@@ -787,12 +887,15 @@ impl InTunnelDnsResolver {
     }
 
     /// Query a single upstream DNS server according to `IpMode` and `prefer_ipv6`.
+    /// `deadline` is the caller's overall budget; a TCP fallback after a
+    /// truncated UDP answer fails against it (see [`Self::query_record`]).
     async fn query_server(
         &self,
         stack: &VirtualNetworkStack,
         domain: &str,
         server: SocketAddr,
         mode: crate::config::IpMode,
+        deadline: tokio::time::Instant,
     ) -> Result<(Vec<IpAddr>, u32), io::Error> {
         let qtypes: &[QueryType] = match mode {
             crate::config::IpMode::Ipv4Only => &[QueryType::A],
@@ -810,7 +913,10 @@ impl InTunnelDnsResolver {
         let mut min_ttl = u32::MAX;
         let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no DNS records found");
         for &qtype in qtypes {
-            match self.query_record(stack, domain, server, qtype).await {
+            match self
+                .query_record(stack, domain, server, qtype, deadline)
+                .await
+            {
                 Ok((mut ips, ttl)) => {
                     ips.retain(|ip| mode.allows_ip(*ip));
                     if !ips.is_empty() {
@@ -833,50 +939,94 @@ impl InTunnelDnsResolver {
         domain: &str,
         server: SocketAddr,
         qtype: QueryType,
+        deadline: tokio::time::Instant,
     ) -> Result<(Vec<IpAddr>, u32), io::Error> {
-        tokio::time::timeout(self.timeout, async {
-            let socket = stack.udp_bind_with_size(0, 4096, 4096, 2)?;
-            let tx_id = rand::random::<u16>();
+        let socket = stack.udp_bind_with_size(0, 4096, 4096, 2)?;
+        let tx_id = rand::random::<u16>();
 
-            let query = build_query(domain, qtype, tx_id)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let query = build_query(domain, qtype, tx_id)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-            socket.send_to(&query, server).await?;
-
-            let mut buf = [0u8; 1500];
-            loop {
-                let (len, from) = socket.recv_from(&mut buf).await?;
-                if from != server {
-                    continue;
-                }
-                let resp_slice = buf.get(..len).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "short DNS buffer")
-                })?;
-                if let (Ok(id), Ok(flags)) =
-                    (read_u16_be(resp_slice, 0), read_u16_be(resp_slice, 2))
-                {
-                    if id != tx_id || (flags & 0x8000) == 0 {
-                        continue;
-                    }
-                    if !response_matches_question(resp_slice, domain, qtype) {
-                        continue;
-                    }
-                    // TC (Truncated) bit set -> fall back to DNS-over-TCP
-                    if flags & 0x0200 != 0 {
-                        return self
-                            .query_record_tcp(stack, server, &query, domain, qtype)
-                            .await;
-                    }
-                } else {
-                    continue;
-                }
-                let (ips, ttl) = parse_response(resp_slice, tx_id)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-                return Ok((ips, ttl));
-            }
-        })
+        // UDP phase. A truncated (TC) response ends the phase with
+        // `None` instead of an answer: the server already proved
+        // reachable over UDP, so the TCP retry below runs under its
+        // own budget and its failure must not look like a tunnel
+        // transport failure (audit run-1,
+        // `dns-tcp-fallback-failure-triggers-host-dns-leak`).
+        let answered = tokio::time::timeout(
+            self.timeout,
+            Self::query_record_udp(&socket, server, &query, domain, qtype, tx_id),
+        )
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))??;
+        let Some(answer) = answered else {
+            // TCP fallback after a truncated UDP answer: any failure
+            // here (refused/reset/timed-out TCP/53) is a failure of
+            // the already-proven DNS server, not of the tunnel
+            // transport, so report it with `Other` — a kind
+            // `resolve_uncached` never treats as a host-fallback
+            // trigger — instead of the raw transport kind. The
+            // fallback runs against the caller's shared `deadline`
+            // (not a fresh budget), so even a hung TCP/53 surfaces
+            // here as `Other` instead of expiring as `TimedOut` in
+            // the caller's timeout and leaking the domain to host DNS.
+            return tokio::time::timeout_at(
+                deadline,
+                self.query_record_tcp(stack, server, &query, domain, qtype),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::other("DNS TCP fallback timed out after truncated UDP response")
+            })?
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "DNS TCP fallback failed after truncated UDP response: {e}"
+                ))
+            });
+        };
+        Ok(answer)
+    }
+
+    /// One UDP DNS exchange: send `query` to `server` and wait for the
+    /// matching response. Returns `Ok(None)` when the response has the
+    /// TC (Truncated) bit set and the caller must retry over TCP.
+    async fn query_record_udp(
+        socket: &crate::netstack::VirtualUdpSocket,
+        server: SocketAddr,
+        query: &[u8],
+        domain: &str,
+        qtype: QueryType,
+        tx_id: u16,
+    ) -> Result<Option<(Vec<IpAddr>, u32)>, io::Error> {
+        socket.send_to(query, server).await?;
+
+        let mut buf = [0u8; 1500];
+        loop {
+            let (len, from) = socket.recv_from(&mut buf).await?;
+            if from != server {
+                continue;
+            }
+            let resp_slice = buf
+                .get(..len)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short DNS buffer"))?;
+            if let (Ok(id), Ok(flags)) = (read_u16_be(resp_slice, 0), read_u16_be(resp_slice, 2)) {
+                if id != tx_id || (flags & 0x8000) == 0 {
+                    continue;
+                }
+                if !response_matches_question(resp_slice, domain, qtype) {
+                    continue;
+                }
+                // TC (Truncated) bit set -> fall back to DNS-over-TCP
+                if flags & 0x0200 != 0 {
+                    return Ok(None);
+                }
+            } else {
+                continue;
+            }
+            let (ips, ttl) =
+                parse_response(resp_slice, tx_id).map_err(|e| io::Error::other(e.to_string()))?;
+            return Ok(Some((ips, ttl)));
+        }
     }
 
     async fn query_record_tcp(
@@ -919,7 +1069,13 @@ impl InTunnelDnsResolver {
     }
 }
 
-fn response_matches_question(buf: &[u8], expected_domain: &str, expected_qtype: QueryType) -> bool {
+/// Whether a DNS response's question section matches the expected
+/// domain, question type, and IN class.
+pub(crate) fn response_matches_question(
+    buf: &[u8],
+    expected_domain: &str,
+    expected_qtype: QueryType,
+) -> bool {
     let Ok(qdcount) = read_u16_be(buf, 4) else {
         return false;
     };

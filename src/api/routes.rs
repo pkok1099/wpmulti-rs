@@ -580,27 +580,41 @@ pub async fn handle_admin_request(
             }
             handle_post_config(&req.body, manager).await
         }
-        ("POST", "/reload") => match manager.reload().await {
-            Ok(report) => HttpResponse::ok_json(&json!({
-                "status": "reloaded",
-                "report": {
-                    "added": report.added,
-                    "removed": report.removed,
-                    "updated": report.updated,
-                    "total": report.total
-                },
-                "reloaded": report.total
-            })),
-            Err(e) => {
-                tracing::error!("Admin API /reload failed: {}", e);
-                let msg = if e.to_string().contains("does not exist") {
-                    "Reload failed: config directory does not exist"
-                } else {
-                    "Reload failed"
-                };
-                HttpResponse::internal_error(msg)
+        ("POST", "/reload") => {
+            // A cross-origin simple request (HTML form, no-cors fetch)
+            // cannot carry `application/json`: the browser either sends
+            // a simple content type or fires a CORS preflight this
+            // server does not answer. Requiring JSON here is what keeps
+            // a website visited by the operator from firing a reload
+            // through the loopback no-token bypass, exactly like
+            // `POST /config` and the batch toggle already do. The
+            // first-party client sends this header on every POST
+            // (see `admin_http_request_with_body`).
+            if !has_json_content_type(req) {
+                return HttpResponse::bad_request("Content-Type must be application/json");
             }
-        },
+            match manager.reload().await {
+                Ok(report) => HttpResponse::ok_json(&json!({
+                    "status": "reloaded",
+                    "report": {
+                        "added": report.added,
+                        "removed": report.removed,
+                        "updated": report.updated,
+                        "total": report.total
+                    },
+                    "reloaded": report.total
+                })),
+                Err(e) => {
+                    tracing::error!("Admin API /reload failed: {}", e);
+                    let msg = if e.to_string().contains("does not exist") {
+                        "Reload failed: config directory does not exist"
+                    } else {
+                        "Reload failed"
+                    };
+                    HttpResponse::internal_error(msg)
+                }
+            }
+        }
         ("GET", "/metrics") => HttpResponse::ok_text(
             generate_prometheus_metrics(manager),
             "text/plain; version=0.0.4; charset=utf-8",
@@ -613,6 +627,13 @@ pub async fn handle_admin_request(
         }
         _ => {
             if let Some(subpath) = path.strip_prefix("/tunnels/") {
+                // Same cross-origin guard as `POST /reload` above: a
+                // state-changing tunnel action must not be reachable as
+                // a cross-origin simple request. Read-only `GET` on a
+                // single tunnel is unaffected.
+                if method == "POST" && !has_json_content_type(req) {
+                    return HttpResponse::bad_request("Content-Type must be application/json");
+                }
                 handle_tunnel_subroute(method, subpath, manager).await
             } else {
                 HttpResponse::not_found("Not found")
@@ -636,6 +657,14 @@ async fn handle_post_config(body: &[u8], manager: &Arc<TunnelManager>) -> HttpRe
     let Some(patch) = incoming.as_object() else {
         return HttpResponse::bad_request("Invalid JSON config: expected a JSON object");
     };
+    // Serialize the whole snapshot+merge+write+apply cycle against
+    // concurrent POST /config, batch disables, and reloads (audit run-1,
+    // `src/api/routes.rs:post-config-concurrent-stale-snapshot-resurrection`):
+    // without the guard two requests can merge from the same stale base
+    // and the last applier — not the last writer — decides the live
+    // config, silently losing an update or resurrecting a revoked token
+    // that the stale snapshot round-tripped as `[REDACTED]`.
+    let _apply_guard = manager.lock_config_apply().await;
     let existing = manager.config_snapshot();
     let mut merged = match serde_json::to_value(&existing) {
         Ok(v) => v,
@@ -684,7 +713,7 @@ async fn handle_post_config(body: &[u8], manager: &Arc<TunnelManager>) -> HttpRe
     // scope table the TUI Config tab shows (`[LIVE]` / `[RESTART]`).
     let restart_pending =
         crate::tui::config_editor::diff_config_scopes(&existing, &new_cfg).restart_changed;
-    match manager.save_and_apply_runtime_config(new_cfg).await {
+    match manager.save_and_apply_runtime_config_locked(new_cfg).await {
         Ok(()) => HttpResponse::ok_json(&json!({
             "status": "updated",
             "restart_pending": restart_pending,

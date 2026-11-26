@@ -10,7 +10,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::config::{
     AuthMode, LifecycleMode, ListenerType, MainConfig, PerTunnelSettings, PoolStrategy,
-    TunnelConfig, TunnelPortOverride, WgInterfaceConfig, WgPeerConfig,
+    SharedListenerSettings, TunnelConfig, TunnelPoolSelection, TunnelPortOverride,
+    WgInterfaceConfig, WgPeerConfig,
 };
 use crate::core::TunnelManager;
 use crate::core::health::{HealthStatus, TunnelHealthTracker};
@@ -394,6 +395,343 @@ async fn test_manager_reload_add_remove_update() {
     assert!(manager.registry().get("wgcf-reload-03").is_some());
 }
 
+#[tokio::test]
+async fn test_concurrent_reloads_apply_exactly_one_set() {
+    // Serialization (audit run-1,
+    // `core/reload-with-tunnels-unserialized-concurrent-reload`): two
+    // reloads racing must leave exactly one caller's set, never the
+    // union of both. Repeated with fresh managers: the interleave is
+    // timing-dependent, but the invariant must hold on every run.
+    for _ in 0..5 {
+        let mut config = MainConfig::default();
+        config.per_tunnel.enabled = false;
+        config.shared_listeners.clear();
+        let manager = TunnelManager::new(config, vec![make_test_tunnel_config("wgcf-a")]).unwrap();
+
+        let (r1, r2) = tokio::join!(
+            manager.reload_with_tunnels(vec![make_test_tunnel_config("wgcf-a")]),
+            manager.reload_with_tunnels(vec![make_test_tunnel_config("wgcf-b")]),
+        );
+        r1.expect("reload A should succeed");
+        r2.expect("reload B should succeed");
+        let ids = manager.registry().all_ids();
+        assert!(
+            ids == vec!["wgcf-a".to_string()] || ids == vec!["wgcf-b".to_string()],
+            "concurrent reloads must leave exactly one caller's set, got: {ids:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_concurrent_reloads_adding_same_tunnel_do_not_duplicate() {
+    // Two reloads adding the same new tunnel must not fail with
+    // DuplicateTunnel mid-apply (audit run-1,
+    // `core/reload-with-tunnels-unserialized-concurrent-reload`).
+    let mut config = MainConfig::default();
+    config.per_tunnel.enabled = false;
+    config.shared_listeners.clear();
+    let manager = TunnelManager::new(config, Vec::new()).unwrap();
+
+    let (r1, r2) = tokio::join!(
+        manager.reload_with_tunnels(vec![make_test_tunnel_config("wgcf-x")]),
+        manager.reload_with_tunnels(vec![make_test_tunnel_config("wgcf-x")]),
+    );
+    r1.expect("first reload adding X should succeed");
+    r2.expect("second reload adding X should succeed");
+    assert_eq!(manager.tunnel_count(), 1);
+    assert!(manager.registry().get("wgcf-x").is_some());
+}
+
+#[tokio::test]
+async fn test_set_tunnels_disabled_and_post_config_do_not_lose_updates() {
+    // Serialization (audit run-1,
+    // `src/core/mod.rs:set_tunnels_disabled:lost-update-vs-post-config`,
+    // `src/api/routes.rs:post-config-concurrent-stale-snapshot-resurrection`):
+    // a disable racing a config apply must not be silently lost, and
+    // the registry, the live config, and the on-disk file must agree
+    // afterwards — whichever writer wins, all three follow it.
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let toml_path = temp_dir.path().join("wpmulti.toml");
+    std::fs::write(&toml_path, "[global]\n").expect("write toml");
+    let mut config = MainConfig::default();
+    config.per_tunnel.enabled = false;
+    config.shared_listeners.clear();
+    let manager = TunnelManager::new(config, vec![make_test_tunnel_config("wgcf-001")]).unwrap();
+    manager.set_config_path(toml_path.clone());
+
+    let mut new_cfg = manager.config_snapshot();
+    new_cfg.global.max_active_tunnels = 7;
+    let (disable_res, apply_res) = tokio::join!(
+        manager.set_tunnels_disabled("wgcf-001", true),
+        manager.save_and_apply_runtime_config(new_cfg),
+    );
+    disable_res.expect("disable should succeed");
+    apply_res.expect("config apply should succeed");
+
+    let entry_disabled = manager
+        .registry()
+        .get("wgcf-001")
+        .expect("tunnel present")
+        .is_disabled();
+    let cfg_disabled = manager
+        .config_snapshot()
+        .disabled_tunnels
+        .contains(&"wgcf-001".to_string());
+    let on_disk = MainConfig::from_file(&toml_path).expect("read persisted toml");
+    let disk_disabled = on_disk.disabled_tunnels.contains(&"wgcf-001".to_string());
+    assert_eq!(
+        entry_disabled, cfg_disabled,
+        "registry flag and live config disagree after concurrent disable/apply"
+    );
+    assert_eq!(
+        entry_disabled, disk_disabled,
+        "live config and on-disk config disagree after concurrent disable/apply"
+    );
+}
+
+#[tokio::test]
+async fn test_set_tunnels_disabled_reports_persist_failure() {
+    // Fail closed (audit run-1,
+    // `src/core/mod.rs:set_tunnels_disabled:persist-failure-swallowed`):
+    // a disable whose write to disk fails must return Err, not Ok with
+    // a success the next restart silently undoes.
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let mut config = MainConfig::default();
+    config.per_tunnel.enabled = false;
+    config.shared_listeners.clear();
+    let manager = TunnelManager::new(config, vec![make_test_tunnel_config("wgcf-001")]).unwrap();
+    manager.set_config_path(temp_dir.path().join("missing-dir").join("wpmulti.toml"));
+
+    let res = manager.set_tunnels_disabled("wgcf-001", true).await;
+    assert!(
+        res.is_err(),
+        "persist failure must be reported, got: {res:?}"
+    );
+}
+
+#[test]
+fn test_resolve_tunnel_targets_literal_id_wins_over_syntax() {
+    // Audit run-1,
+    // `src/core/mod.rs:resolve_tunnel_token:literal-id-shadowed`: a
+    // tunnel literally named `2`, `1-2`, `all`, or `a,b` is selected
+    // by identity, never reinterpreted as an index, a range, `all`,
+    // or split at the comma.
+    let ids = ["1", "2", "10", "1-2", "all", "a,b", "wgcf-001"];
+    let tunnels: Vec<TunnelConfig> = ids.iter().map(|id| make_test_tunnel_config(id)).collect();
+    let manager = TunnelManager::new(MainConfig::default(), tunnels).unwrap();
+    assert_eq!(
+        manager.resolve_tunnel_targets("2").unwrap(),
+        vec!["2".to_string()]
+    );
+    assert_eq!(
+        manager.resolve_tunnel_targets("1-2").unwrap(),
+        vec!["1-2".to_string()]
+    );
+    assert_eq!(
+        manager.resolve_tunnel_targets("all").unwrap(),
+        vec!["all".to_string()]
+    );
+    assert_eq!(
+        manager.resolve_tunnel_targets("a,b").unwrap(),
+        vec!["a,b".to_string()]
+    );
+}
+
+#[test]
+fn test_resolve_tunnel_targets_syntax_and_out_of_range_errors() {
+    // Selector syntax still works when no literal collides, and an
+    // out-of-range index or range errors like `select_id_index`
+    // (audit run-1, `src/core/mod.rs:select_id_range:silent-truncation`).
+    let ids = ["wgcf-001", "wgcf-002", "wgcf-003"];
+    let tunnels: Vec<TunnelConfig> = ids.iter().map(|id| make_test_tunnel_config(id)).collect();
+    let manager = TunnelManager::new(MainConfig::default(), tunnels).unwrap();
+    assert_eq!(
+        manager.resolve_tunnel_targets("1").unwrap(),
+        vec!["wgcf-001".to_string()]
+    );
+    assert_eq!(
+        manager.resolve_tunnel_targets("1-2").unwrap(),
+        vec!["wgcf-001".to_string(), "wgcf-002".to_string()]
+    );
+    assert_eq!(manager.resolve_tunnel_targets("all").unwrap().len(), 3);
+    assert_eq!(manager.resolve_tunnel_targets("*").unwrap().len(), 3);
+    assert!(
+        manager.resolve_tunnel_targets("5").is_err(),
+        "index past the registry must error"
+    );
+    assert!(
+        manager.resolve_tunnel_targets("2-9").is_err(),
+        "range with end past the registry must error, not clamp"
+    );
+    assert!(
+        manager.resolve_tunnel_targets("9-10").is_err(),
+        "range starting past the registry must error, not return empty"
+    );
+    assert!(
+        manager.resolve_tunnel_targets("3-2").is_err(),
+        "reversed range must error"
+    );
+    assert!(
+        manager.resolve_tunnel_targets("nope").is_err(),
+        "unknown literal must error"
+    );
+}
+
+#[tokio::test]
+async fn test_apply_runtime_config_reconciles_dedicated_listeners_on_enabled_flip() {
+    // A `per_tunnel.enabled` flip must start/stop the dedicated
+    // listeners, not just change what `GET /config` reports (audit
+    // run-1, `core/apply-runtime-config:per-tunnel-enabled-no-listener-reconcile`).
+    // Stopping must also clear the assigned port.
+    let temp_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let port = temp_listener.local_addr().expect("local addr").port();
+    drop(temp_listener);
+
+    let mut config = MainConfig::default();
+    config.shared_listeners.clear();
+    config.per_tunnel.enabled = true;
+    config.per_tunnel.base_socks5_port = Some(port);
+    config.per_tunnel.base_http_port = None;
+    let manager = TunnelManager::new(config, vec![make_test_tunnel_config("wgcf-flip")]).unwrap();
+    manager.start().await.expect("start manager");
+    assert!(
+        manager
+            .listeners()
+            .list_listeners()
+            .iter()
+            .any(|l| !l.is_shared && l.tunnel_id.as_deref() == Some("wgcf-flip")),
+        "dedicated listener must exist while enabled"
+    );
+    assert_eq!(
+        *manager
+            .registry()
+            .get("wgcf-flip")
+            .expect("tunnel present")
+            .assigned_port
+            .read(),
+        Some(port)
+    );
+
+    let mut new_cfg = manager.config_snapshot();
+    new_cfg.per_tunnel.enabled = false;
+    manager
+        .apply_runtime_config(new_cfg)
+        .await
+        .expect("apply disabled");
+    assert!(
+        manager
+            .listeners()
+            .list_listeners()
+            .iter()
+            .all(|l| l.is_shared),
+        "no dedicated listener may survive the flip to disabled"
+    );
+    assert_eq!(
+        *manager
+            .registry()
+            .get("wgcf-flip")
+            .expect("tunnel present")
+            .assigned_port
+            .read(),
+        None,
+        "stopping a dedicated listener must clear its assigned port"
+    );
+
+    let mut new_cfg = manager.config_snapshot();
+    new_cfg.per_tunnel.enabled = true;
+    manager
+        .apply_runtime_config(new_cfg)
+        .await
+        .expect("apply enabled");
+    assert!(
+        manager
+            .listeners()
+            .list_listeners()
+            .iter()
+            .any(|l| !l.is_shared && l.tunnel_id.as_deref() == Some("wgcf-flip")),
+        "dedicated listener must come back on the flip to enabled"
+    );
+
+    manager.stop().await.expect("stop manager");
+}
+
+#[tokio::test]
+async fn test_apply_runtime_config_restarts_shared_listener_on_bind_change() {
+    // A rotated bind address (same restart path as a rotated proxy
+    // password: both are captured at listener start) must move the
+    // live socket — the old port stops accepting and the new one
+    // starts (audit run-1,
+    // `core/listener:stale-proxy-credentials-after-config-rotation`).
+    let temp_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let port_old = temp_listener.local_addr().expect("local addr").port();
+    drop(temp_listener);
+    let temp_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let port_new = temp_listener.local_addr().expect("local addr").port();
+    drop(temp_listener);
+    assert_ne!(port_old, port_new);
+
+    let mut config = MainConfig::default();
+    config.per_tunnel.enabled = false;
+    config.shared_listeners = vec![SharedListenerSettings {
+        name: "s5".to_string(),
+        listener_type: ListenerType::Socks5,
+        bind: SocketAddr::new("127.0.0.1".parse().expect("loopback"), port_old),
+        auth_mode: AuthMode::None,
+        global_password: None,
+        default_strategy: PoolStrategy::RoundRobin,
+        allow_anonymous: true,
+        pool: TunnelPoolSelection::All,
+        ip_mode: None,
+    }];
+    let manager = TunnelManager::new(config, vec![make_test_tunnel_config("wgcf-bind")]).unwrap();
+    manager.start().await.expect("start manager");
+    assert!(
+        tokio::net::TcpStream::connect(SocketAddr::new(
+            "127.0.0.1".parse().expect("loopback"),
+            port_old
+        ))
+        .await
+        .is_ok(),
+        "old shared listener must accept before rotation"
+    );
+
+    let mut new_cfg = manager.config_snapshot();
+    new_cfg.shared_listeners[0].bind =
+        SocketAddr::new("127.0.0.1".parse().expect("loopback"), port_new);
+    manager
+        .apply_runtime_config(new_cfg)
+        .await
+        .expect("apply bind change");
+    assert!(
+        manager
+            .listeners()
+            .list_listeners()
+            .iter()
+            .any(|l| l.is_shared && l.address.port() == port_new),
+        "new shared listener must be listed after rotation"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(SocketAddr::new(
+            "127.0.0.1".parse().expect("loopback"),
+            port_new
+        ))
+        .await
+        .is_ok(),
+        "new shared listener must accept after rotation"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(SocketAddr::new(
+            "127.0.0.1".parse().expect("loopback"),
+            port_old
+        ))
+        .await
+        .is_err(),
+        "old shared listener must stop accepting after rotation"
+    );
+
+    manager.stop().await.expect("stop manager");
+}
+
 // =============================================================================
 // 7. Metered Stream and Traffic Statistics Verification
 // =============================================================================
@@ -581,6 +919,60 @@ async fn test_pool_isolation_rejects_unallowed_by_id() {
     assert!(
         res_allowed.is_ok(),
         "selecting allowed tunnel ById must succeed"
+    );
+}
+
+#[tokio::test]
+async fn test_selector_error_escapes_newlines_for_log_safety() {
+    // Audit run-1,
+    // `proxy.log-injection.unescaped-selector-error-to-stderr-tracing`:
+    // a selector carrying `\n`/`\r` must not smuggle a forged log line
+    // into the error Display string the proxy handler logs.
+    use crate::core::router::escape_log_value;
+    assert_eq!(escape_log_value("a\nb\rc"), "a\\nb\\rc");
+    assert_eq!(escape_log_value("plain-id"), "plain-id");
+    assert_eq!(escape_log_value("a\x07b"), "a\\u{7}b");
+
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-001",
+            make_test_tunnel_config("wgcf-001"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+    let selector = TunnelSelector::ById("nope\nFAKE-WARN forged line".to_string());
+    let Err(err) = router.select_tunnel(&selector, None).await else {
+        panic!("unknown tunnel id must fail");
+    };
+    let text = err.to_string();
+    assert!(
+        !text.contains('\n') && !text.contains('\r'),
+        "error must contain no raw newline: {text:?}"
+    );
+    assert!(
+        text.contains("nope\\nFAKE-WARN forged line"),
+        "newline must be escaped, got: {text:?}"
+    );
+    let tag_selector = TunnelSelector::ByTag("x\rOVERWRITE".to_string());
+    let Err(tag_err) = router.select_tunnel(&tag_selector, None).await else {
+        panic!("unknown tag must fail");
+    };
+    assert!(
+        !tag_err.to_string().contains('\r'),
+        "tag error must contain no raw CR: {:?}",
+        tag_err.to_string()
     );
 }
 
@@ -1324,6 +1716,77 @@ async fn test_per_tunnel_keyword_selector_rejects_global_password() {
     drop(target);
 }
 
+/// Regression (audit run-1,
+/// `proxy.auth.anonymous-bypass-per-tunnel-password-via-default-pool`):
+/// in PerTunnel mode with `allow_anonymous = true`, a client presenting
+/// no credentials must not reach a tunnel with its own override
+/// password through the default pool — only that tunnel's own password
+/// opens it. A tunnel protected only by the global password keeps the
+/// documented anonymous behaviour.
+#[tokio::test]
+async fn test_per_tunnel_default_pool_rejects_anonymous_for_override_tunnel() {
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-premium-01",
+            make_test_tunnel_config("wgcf-premium-01"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let mut passwords = std::collections::HashMap::new();
+    passwords.insert("wgcf-premium-01".to_string(), "premium-secret".to_string());
+
+    let router = MultiTenantRouter::new(
+        lifecycle,
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    )
+    .with_auth(AuthMode::PerTunnel, Some("global-secret".to_string()))
+    .with_per_tunnel_passwords(passwords);
+
+    let selector = TunnelSelector::DefaultPool;
+    let Err(err) = router.select_tunnel(&selector, None).await else {
+        panic!("anonymous client must not reach the override-protected tunnel via DefaultPool");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+    // Control: the same anonymous DefaultPool request reaches a tunnel
+    // protected only by the global password — the documented
+    // "a configured password does not block anonymous requests" rule.
+    let open_registry = Arc::new(TunnelRegistry::new());
+    open_registry
+        .register(TunnelEntry::new(
+            "wgcf-open-01",
+            make_test_tunnel_config("wgcf-open-01"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let open_router = MultiTenantRouter::new(
+        LifecycleController::new(
+            Arc::clone(&open_registry),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+        ),
+        Arc::clone(&open_registry),
+        PoolStrategy::RoundRobin,
+        true,
+    )
+    .with_auth(AuthMode::PerTunnel, Some("global-secret".to_string()));
+    let target = open_router
+        .select_tunnel(&selector, None)
+        .await
+        .expect("anonymous client still reaches a global-password-only tunnel");
+    assert_eq!(target.tunnel_id(), Some("wgcf-open-01"));
+    drop(target);
+}
+
 #[test]
 fn test_health_tracker_half_open_single_trial_and_failure_rearms_cooldown() {
     use crate::core::health::{HealthStatus, TunnelHealthTracker};
@@ -1595,6 +2058,75 @@ async fn test_half_open_trial_resolves_as_inconclusive_when_attempt_aborted() {
     assert_eq!(entry.health.consecutive_failures(), 0);
 
     drop(guarded);
+    lifecycle.stop().await;
+}
+
+#[tokio::test]
+async fn test_half_open_trial_slot_released_on_password_verify_failure() {
+    // A wrong per-tunnel password on a HalfOpen tunnel selected by tag
+    // claims the trial slot during selection and then fails verification
+    // before any `GuardedTunnelTarget` exists — the slot must be
+    // released here, or the tunnel stays unroutable until a probe or
+    // restart (audit run-1,
+    // `lifecycle.halfopen-trial-slot-leak-on-password-verify`).
+    let registry = Arc::new(TunnelRegistry::new());
+    let entry = registry
+        .register(TunnelEntry::new(
+            "tun-halfopen",
+            make_test_tunnel_config("tun-halfopen"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+
+    // Force Unhealthy with expired cooldown; `current_status()` observes
+    // the lazy HalfOpen transition without claiming the trial slot —
+    // selection below must be the claim.
+    entry.health.mark_unhealthy(Duration::from_millis(1));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        entry.health.current_status(),
+        crate::core::HealthStatus::HalfOpen
+    );
+    assert!(
+        entry.health.can_route(),
+        "HalfOpen tunnel with no trial in flight must be routable"
+    );
+
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let mut passwords = std::collections::HashMap::new();
+    passwords.insert("tun-halfopen".to_string(), "tun-pass".to_string());
+    let router = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        false,
+    )
+    .with_auth(AuthMode::PerTunnel, Some("global-pass".to_string()))
+    .with_per_tunnel_passwords(passwords);
+
+    let err = match router
+        .select_tunnel(
+            &TunnelSelector::ByTag("halfopen".to_string()),
+            Some(("user", "wrong-pass")),
+        )
+        .await
+    {
+        Ok(_) => panic!("wrong per-tunnel password must be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        entry.health.current_status(),
+        crate::core::HealthStatus::HalfOpen
+    );
+    assert!(
+        entry.health.can_route(),
+        "HalfOpen trial slot must be released when password verification fails"
+    );
     lifecycle.stop().await;
 }
 
@@ -2368,4 +2900,349 @@ async fn test_dedicated_listener_fails_closed_when_tunnel_has_no_password() {
 
     supervisor.stop().await;
     lifecycle.stop().await;
+}
+
+#[tokio::test]
+async fn test_start_without_listeners_skips_proxy_listeners() {
+    let config = MainConfig::default();
+    let manager = TunnelManager::new(config, vec![make_test_tunnel_config("wgcf-001")]).unwrap();
+    manager
+        .start_without_listeners()
+        .await
+        .expect("start without listeners should succeed");
+    assert!(
+        !manager.listeners().is_started(),
+        "no proxy listener may start in VPN mode"
+    );
+    assert_eq!(manager.tunnel_count(), 1);
+    manager.stop().await.expect("stop should succeed");
+    assert!(!manager.listeners().is_started());
+}
+
+// =============================================================================
+// VPN mode: protected UDP factory + TUN-endpoint boot
+// =============================================================================
+
+#[tokio::test]
+async fn test_protected_udp_factory_protects_bound_socket() {
+    use std::sync::Mutex as StdMutex;
+
+    use gotatun::udp::{UdpTransportFactory, UdpTransportFactoryParams};
+
+    use crate::core::protector::{ProtectedUdpFactory, SocketProtector};
+
+    #[derive(Debug)]
+    struct RecordingProtector {
+        fds: Arc<StdMutex<Vec<i32>>>,
+        accept: bool,
+    }
+
+    impl SocketProtector for RecordingProtector {
+        fn protect(&self, fd: i32) -> bool {
+            if let Ok(mut fds) = self.fds.lock() {
+                fds.push(fd);
+            }
+            self.accept
+        }
+    }
+
+    let params = UdpTransportFactoryParams {
+        addr: Some("127.0.0.1".parse().unwrap()),
+        port: 0,
+        #[cfg(target_os = "linux")]
+        fwmark: None,
+    };
+
+    // Accepting protector: bind succeeds and the socket fd is reported once.
+    let recorded_fds: Arc<StdMutex<Vec<i32>>> = Arc::new(StdMutex::new(Vec::new()));
+    let protector: Arc<dyn SocketProtector> = Arc::new(RecordingProtector {
+        fds: Arc::clone(&recorded_fds),
+        accept: true,
+    });
+    let mut factory = ProtectedUdpFactory::new(Arc::clone(&protector));
+    let (_send, _recv) = factory.bind(&params).await.expect("bind must succeed");
+    {
+        let fds = recorded_fds.lock().expect("fds lock");
+        assert_eq!(fds.len(), 1, "protect must be called exactly once per bind");
+        assert!(fds[0] >= 0, "protected fd must be valid");
+    };
+
+    // Rejecting protector: bind fails, the socket is never handed out.
+    let rejecting: Arc<dyn SocketProtector> = Arc::new(RecordingProtector {
+        fds: Arc::new(StdMutex::new(Vec::new())),
+        accept: false,
+    });
+    let mut factory = ProtectedUdpFactory::new(rejecting);
+    assert!(
+        factory.bind(&params).await.is_err(),
+        "a rejected protect must fail the bind"
+    );
+
+    // No protector: bind succeeds unprotected.
+    let mut factory = ProtectedUdpFactory::unprotected();
+    assert!(
+        factory.bind(&params).await.is_ok(),
+        "unprotected factory must bind"
+    );
+}
+
+#[tokio::test]
+async fn test_protected_udp_factory_panicking_protector_fails_bind() {
+    // Audit run-1, `uniffi:socket-protector-kotlin-exception-panics`:
+    // a protector that panics (how a Kotlin exception surfaces
+    // through the UniFFI callback) must fail the bind like a `false`
+    // return, not unwind past the caller's cleanup.
+    use gotatun::udp::{UdpTransportFactory, UdpTransportFactoryParams};
+
+    use crate::core::protector::{ProtectedUdpFactory, SocketProtector};
+
+    #[derive(Debug)]
+    struct PanickingProtector;
+    impl SocketProtector for PanickingProtector {
+        fn protect(&self, _fd: i32) -> bool {
+            panic!("simulated Kotlin exception in protect()");
+        }
+    }
+
+    let params = UdpTransportFactoryParams {
+        addr: Some("127.0.0.1".parse().unwrap()),
+        port: 0,
+        #[cfg(target_os = "linux")]
+        fwmark: None,
+    };
+    let panicking: Arc<dyn SocketProtector> = Arc::new(PanickingProtector);
+    let mut factory = ProtectedUdpFactory::new(panicking);
+    let err = match factory.bind(&params).await {
+        Ok(_) => panic!("a panicking protect must fail the bind"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("panicked"),
+        "error must name the panic, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_vpn_mode_boot_has_no_netstack_and_uses_tun_endpoint() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    use crate::core::protector::SocketProtector;
+    use crate::core::{EgressProbeOutcome, WgDevice};
+    use crate::netstack::TunEndpoint;
+
+    #[derive(Debug)]
+    struct AcceptingProtector;
+    impl SocketProtector for AcceptingProtector {
+        fn protect(&self, _fd: i32) -> bool {
+            true
+        }
+    }
+
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-vpn-01",
+            make_test_tunnel_config("wgcf-vpn-01"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+
+    // A socketpair stands in for the Android TUN fd.
+    let (tun_side, _peer_side) = UnixStream::pair().expect("socketpair for TUN test");
+    let endpoint =
+        TunEndpoint::from_owned_fd(OwnedFd::from(tun_side), 1420).expect("endpoint from fd");
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    lifecycle.set_vpn_mode(true);
+    lifecycle.set_tun_endpoint(Some(Arc::clone(&endpoint)));
+    // VPN-mode boot fails closed without a protector (audit run-1,
+    // `uniffi:vpn-mode-unprotected-udp-fallback`).
+    lifecycle.set_socket_protector(Arc::new(AcceptingProtector));
+    assert!(lifecycle.vpn_mode());
+
+    let active = lifecycle
+        .activate_tunnel("wgcf-vpn-01")
+        .await
+        .expect("VPN-mode activation must succeed");
+    assert!(
+        active.netstack.is_none(),
+        "VPN mode builds no smoltcp stack"
+    );
+    assert!(
+        matches!(active.device, WgDevice::Vpn(_)),
+        "VPN mode must boot the TUN device variant"
+    );
+    // No netstack means no data-plane check is available: egress is
+    // unverified, never a vacuous success (audit run-1,
+    // `core/probe_egress:vpn-mode-noop-success`).
+    assert_eq!(
+        active
+            .probe_egress(Duration::from_secs(1))
+            .await
+            .expect("probe_egress must not fail"),
+        EgressProbeOutcome::Unverified
+    );
+
+    // Suspend drops the route; resume re-adds it on the same device.
+    lifecycle
+        .suspend_tunnel("wgcf-vpn-01")
+        .await
+        .expect("suspend must succeed");
+    assert_eq!(
+        *registry
+            .get("wgcf-vpn-01")
+            .expect("tunnel must exist")
+            .state
+            .read(),
+        TunnelState::Suspended
+    );
+    let resumed = lifecycle
+        .activate_tunnel("wgcf-vpn-01")
+        .await
+        .expect("resume must succeed");
+    assert!(
+        Arc::ptr_eq(&active, &resumed),
+        "resume keeps the same device"
+    );
+    assert!(resumed.netstack.is_none());
+
+    lifecycle
+        .close_tunnel("wgcf-vpn-01")
+        .await
+        .expect("close must succeed");
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_migrate_proxy_tunnels_to_vpn_reboots_active_tunnel() {
+    // Audit run-1,
+    // `uniffi:attach-order-pre-attach-proxy-boot-never-migrates-to-tun`:
+    // a tunnel booted in proxy mode before `attach_tun` must be
+    // closed and re-booted on the TUN endpoint, not left proxy-booted
+    // forever.
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    use crate::core::WgDevice;
+    use crate::core::protector::SocketProtector;
+    use crate::netstack::TunEndpoint;
+
+    #[derive(Debug)]
+    struct AcceptingProtector;
+    impl SocketProtector for AcceptingProtector {
+        fn protect(&self, _fd: i32) -> bool {
+            true
+        }
+    }
+
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-mig-01",
+            make_test_tunnel_config("wgcf-mig-01"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+
+    let active = lifecycle
+        .activate_tunnel("wgcf-mig-01")
+        .await
+        .expect("proxy activation must succeed");
+    assert!(
+        matches!(active.device, WgDevice::Proxy(_)),
+        "tunnel must start proxy-booted"
+    );
+    assert!(active.netstack.is_some(), "proxy mode builds a netstack");
+
+    let (tun_side, _peer_side) = UnixStream::pair().expect("socketpair for TUN test");
+    let endpoint =
+        TunEndpoint::from_owned_fd(OwnedFd::from(tun_side), 1420).expect("endpoint from fd");
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    lifecycle.set_socket_protector(Arc::new(AcceptingProtector));
+    lifecycle.set_vpn_mode(true);
+    lifecycle.set_tun_endpoint(Some(Arc::clone(&endpoint)));
+
+    let migrated = lifecycle
+        .migrate_proxy_tunnels_to_vpn()
+        .await
+        .expect("migration must succeed");
+    assert_eq!(migrated, vec!["wgcf-mig-01".to_string()]);
+    let active = registry
+        .get("wgcf-mig-01")
+        .expect("tunnel must exist")
+        .active
+        .read()
+        .clone()
+        .expect("tunnel must still be active after migration");
+    assert!(
+        matches!(active.device, WgDevice::Vpn(_)),
+        "tunnel must be VPN-booted after migration"
+    );
+    assert!(active.netstack.is_none(), "VPN mode builds no netstack");
+
+    lifecycle
+        .close_tunnel("wgcf-mig-01")
+        .await
+        .expect("close must succeed");
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_vpn_mode_boot_without_protector_fails_closed() {
+    // Audit run-1, `uniffi:vpn-mode-unprotected-udp-fallback`:
+    // booting a VPN-mode tunnel with no socket protector installed
+    // must fail activation instead of binding unprotected sockets.
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    use crate::netstack::TunEndpoint;
+
+    let registry = Arc::new(TunnelRegistry::new());
+    registry
+        .register(TunnelEntry::new(
+            "wgcf-vpn-02",
+            make_test_tunnel_config("wgcf-vpn-02"),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let (tun_side, _peer_side) = UnixStream::pair().expect("socketpair for TUN test");
+    let endpoint =
+        TunEndpoint::from_owned_fd(OwnedFd::from(tun_side), 1420).expect("endpoint from fd");
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    lifecycle.set_vpn_mode(true);
+    lifecycle.set_tun_endpoint(Some(Arc::clone(&endpoint)));
+
+    let err = lifecycle
+        .activate_tunnel("wgcf-vpn-02")
+        .await
+        .expect_err("VPN-mode activation without a protector must fail");
+    assert!(
+        err.to_string().contains("protector"),
+        "error must name the missing protector, got: {err}"
+    );
+    assert_eq!(
+        *registry
+            .get("wgcf-vpn-02")
+            .expect("tunnel must exist")
+            .state
+            .read(),
+        TunnelState::Dormant,
+        "a failed boot must leave the tunnel dormant"
+    );
+    endpoint.shutdown().await;
 }

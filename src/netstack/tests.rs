@@ -11,7 +11,9 @@ use crate::config::WgInterfaceConfig;
 use crate::netstack::bridge::{
     BridgeIpRecv, DEFAULT_CHANNEL_CAPACITY, DEFAULT_MTU, VirtualTunBridge,
 };
-use crate::netstack::dns::{DnsError, DnsLruCache, QueryType, build_query, parse_response};
+use crate::netstack::dns::{
+    DnsError, DnsLruCache, QueryType, build_query, build_response, parse_response,
+};
 use crate::netstack::stack::{StackDnsConfig, VirtualNetworkStack};
 
 fn make_test_config(v4: &str, v6: Option<&str>) -> WgInterfaceConfig {
@@ -785,6 +787,135 @@ async fn test_shared_dns_cache_across_stacks() {
 }
 
 #[tokio::test]
+async fn test_shared_dns_cache_scoped_by_upstream_servers() {
+    use std::sync::Arc;
+
+    use crate::config::toml_config::DnsStrategy;
+
+    // Same daemon-wide cache, but the stacks resolve through different
+    // configured DNS servers: an answer learned via A must not be
+    // served to B (audit run-1, `dns-shared-cache-cross-tunnel-poisoning`).
+    let shared = Arc::new(DnsLruCache::new(2048));
+    let dns_a = StackDnsConfig::with_shared_cache(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+        DnsStrategy::TunnelOnly,
+        Arc::clone(&shared),
+    );
+    let dns_b = StackDnsConfig::with_shared_cache(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+        DnsStrategy::TunnelOnly,
+        Arc::clone(&shared),
+    );
+
+    let config_a = make_test_config("10.2.0.2/32", None);
+    let mut config_b = make_test_config("10.3.0.2/32", None);
+    config_b.dns = vec!["8.8.8.8".parse().unwrap()];
+    let (bridge_a, mut ip_send_a, mut ip_recv_a) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack_a = VirtualNetworkStack::new_with_options(
+        &config_a,
+        bridge_a,
+        crate::config::IpMode::DualStack,
+        false,
+        &dns_a,
+        Duration::from_secs(15),
+    )
+    .unwrap();
+
+    // Stack B has no mock DNS responder on its bridge: if the cache
+    // were keyed by domain only, resolving via B would return A's
+    // answer from the shared cache. Scoped keys force B to query its
+    // own (absent) upstream and fail.
+    let (bridge_b, _ip_send_b, _ip_recv_b) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack_b = VirtualNetworkStack::new_with_options(
+        &config_b,
+        bridge_b,
+        crate::config::IpMode::DualStack,
+        false,
+        &dns_b,
+        Duration::from_secs(15),
+    )
+    .unwrap();
+
+    let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+
+    // Spawn mock DNS responder task on stack A's bridge only.
+    let responder_task = tokio::spawn(async move {
+        use gotatun::tun::{IpRecv, IpSend};
+        use zerocopy::IntoBytes;
+
+        let mut packets = ip_recv_a.recv(&mut pool).await.unwrap();
+        let pkt = packets.next().unwrap();
+        let raw = (*pkt).as_bytes();
+
+        let parsed = etherparse::SlicedPacket::from_ip(raw).unwrap();
+        let udp_hdr = match &parsed.transport {
+            Some(etherparse::TransportSlice::Udp(u)) => u,
+            _ => panic!("expected udp"),
+        };
+        let dns_query = udp_hdr.payload();
+        let tx_id = u16::from_be_bytes([dns_query[0], dns_query[1]]);
+
+        // Build mock DNS response pointing to 93.184.216.34
+        let mut dns_resp = Vec::new();
+        dns_resp.extend_from_slice(&tx_id.to_be_bytes());
+        dns_resp.extend_from_slice(&[0x81, 0x80]); // Response
+        dns_resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+        dns_resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT=1
+        dns_resp.extend_from_slice(&[0x00, 0x00]);
+        dns_resp.extend_from_slice(&[0x00, 0x00]);
+        // Echo question
+        dns_resp.extend_from_slice(&dns_query[12..]);
+        // Answer: compression pointer to name
+        dns_resp.extend_from_slice(&[0xC0, 0x0C]);
+        dns_resp.extend_from_slice(&[0x00, 0x01]); // Type A
+        dns_resp.extend_from_slice(&[0x00, 0x01]); // Class IN
+        dns_resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL=60s
+        dns_resp.extend_from_slice(&[0x00, 0x04]); // Len=4
+        dns_resp.extend_from_slice(&[93, 184, 216, 34]);
+
+        let (src_ip, dst_ip) = match parsed.net.unwrap() {
+            etherparse::NetSlice::Ipv4(v4) => (v4.header().source(), v4.header().destination()),
+            _ => panic!("expected ipv4"),
+        };
+        let udp_ports = (udp_hdr.source_port(), udp_hdr.destination_port());
+
+        let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64).udp(udp_ports.1, udp_ports.0);
+        let mut reply_raw = Vec::new();
+        builder.write(&mut reply_raw, &dns_resp).unwrap();
+
+        let mut reply_pkt = pool.get();
+        reply_pkt.truncate(reply_raw.len());
+        reply_pkt.copy_from_slice(&reply_raw);
+        let ip_reply = reply_pkt.try_into_ip().unwrap();
+
+        ip_send_a.send(ip_reply).await.unwrap();
+    });
+
+    // First resolution via A: queries the mock DNS, populates the shared cache.
+    let resolved_a = stack_a.resolve_in_tunnel("example.com").await.unwrap();
+    assert_eq!(resolved_a, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+
+    responder_task.await.unwrap();
+
+    // Resolution via B: must NOT be served from the shared cache, so it
+    // fails against its own (absent) upstream instead of returning A's
+    // answer. Bounded so the failure is observed fast.
+    let resolved_b = tokio::time::timeout(
+        Duration::from_secs(5),
+        stack_b.resolve_in_tunnel("example.com"),
+    )
+    .await
+    .expect("stack B resolution must finish within the timeout");
+    assert!(
+        resolved_b.is_err(),
+        "stack B must not reuse stack A's cached answer for a different upstream"
+    );
+
+    stack_a.close().await;
+    stack_b.close().await;
+}
+
+#[tokio::test]
 async fn test_dns_singleflight_coalesces_concurrent_lookups() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1459,4 +1590,1319 @@ async fn test_stack_live_ip_mode_clamps_single_stack_on_widening() {
     );
 
     stack.close().await;
+}
+
+// =========================================================================
+// 13. TUN adapter: dispatcher routing, suspend/resume/detach
+// =========================================================================
+
+/// Build a minimal IPv4 packet for TUN tests. Layout matches the
+/// parser in `tun.rs`: version/IHL, protocol, addresses, ports.
+fn tun_test_ipv4_packet(
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: u8,
+    src_port: u16,
+    dst_port: u16,
+) -> Vec<u8> {
+    let mut packet = vec![0u8; 24];
+    packet[0] = 0x45;
+    packet[2] = 0;
+    packet[3] = 24;
+    packet[8] = 64;
+    packet[9] = proto;
+    packet[12..16].copy_from_slice(&src);
+    packet[16..20].copy_from_slice(&dst);
+    packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+    packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    packet
+}
+
+/// A socketpair stands in for the Android TUN fd: the endpoint only
+/// reads/writes raw bytes, so any byte-stream fd works for the test.
+fn tun_test_endpoint() -> (
+    std::sync::Arc<crate::netstack::TunEndpoint>,
+    std::os::unix::net::UnixStream,
+) {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let (tun_side, peer_side) = UnixStream::pair().expect("socketpair for TUN test");
+    let endpoint = crate::netstack::TunEndpoint::from_owned_fd(OwnedFd::from(tun_side), 1500)
+        .expect("endpoint from socketpair fd");
+    (endpoint, peer_side)
+}
+
+#[tokio::test]
+async fn test_tun_dispatcher_routes_packet_to_attached_tunnel() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::{IpRecv, IpSend};
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    use zerocopy::IntoBytes;
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    let (mut ip_send, mut ip_recv) =
+        endpoint.attach_tunnel("wgcf-001", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+
+    // Outbound: write a DNS packet into the "TUN" fd, expect it on
+    // the tunnel's receiver with the same destination.
+    let packet = tun_test_ipv4_packet([10, 0, 0, 2], [8, 8, 8, 8], 17, 12345, 53);
+    peer.write_all(&packet).expect("write packet to TUN fd");
+    let mut pool = PacketBufPool::new(8);
+    let received = tokio::time::timeout(Duration::from_secs(2), ip_recv.recv(&mut pool))
+        .await
+        .expect("packet must arrive within timeout")
+        .expect("recv must succeed");
+    let mut packets: Vec<_> = received.collect();
+    assert_eq!(packets.len(), 1);
+    let routed = packets.pop().expect("one packet");
+    assert_eq!(
+        routed.destination(),
+        Some("8.8.8.8".parse().unwrap()),
+        "routed packet keeps its destination"
+    );
+    assert!(
+        crate::netstack::parse_flow_key((*routed).as_bytes())
+            .expect("routed packet parses")
+            .is_dns(),
+        "the routed packet is the DNS query"
+    );
+
+    // Inbound: send the same packet back through TunIpSend and read
+    // the raw bytes off the "TUN" fd.
+    peer.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    ip_send.send(routed).await.expect("send to TUN fd");
+    let mut buf = vec![0u8; 64];
+    let n = peer.read(&mut buf).expect("read packet from TUN fd");
+    assert_eq!(&buf[..n], &packet[..], "round-tripped packet is unchanged");
+
+    // The VPN data plane counts its own bytes: TX is the packet read
+    // from TUN into the tunnel, RX is the packet written back.
+    let counts = endpoint.byte_counts();
+    let (rx, tx) = counts
+        .get("wgcf-001")
+        .copied()
+        .expect("byte counts exist for the attached tunnel");
+    assert_eq!(tx, packet.len() as u64, "TX counts the outbound packet");
+    assert_eq!(rx, packet.len() as u64, "RX counts the returned packet");
+
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tun_dispatcher_counters() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::IpRecv;
+    use std::io::Write;
+    use std::time::Duration;
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    let (_ip_send, mut ip_recv) =
+        endpoint.attach_tunnel("wgcf-001", vec!["10.0.0.0/8".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // One routed packet, then one with no route. Written separately:
+    // the socketpair is a stream, so back-to-back writes can coalesce
+    // into a single dispatcher read.
+    let routed = tun_test_ipv4_packet([10, 0, 0, 2], [10, 1, 2, 3], 6, 40000, 443);
+    peer.write_all(&routed).expect("write routed packet");
+    let received = tokio::time::timeout(Duration::from_secs(2), ip_recv.recv(&mut pool))
+        .await
+        .expect("routed packet must arrive")
+        .expect("recv must succeed");
+    assert_eq!(received.count(), 1);
+    let unrouted = tun_test_ipv4_packet([10, 0, 0, 2], [8, 8, 8, 8], 17, 1001, 53);
+    peer.write_all(&unrouted).expect("write unrouted packet");
+
+    // The dispatcher is async: wait until both reads are counted.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let stats = loop {
+        let stats = endpoint.stats_snapshot();
+        if stats.packets_read >= 2 {
+            break stats;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dispatcher must count both packets, got {}",
+            stats.packets_read
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(stats.packets_queued, 1, "one packet reaches a tunnel");
+    assert_eq!(stats.packets_no_route, 1, "one packet has no route");
+    assert_eq!(stats.read_errors, 0);
+    assert!(stats.dispatcher_running, "dispatcher still running");
+    assert!(stats.last_read_error.is_none());
+
+    endpoint.shutdown().await;
+    assert!(
+        !endpoint.stats_snapshot().dispatcher_running,
+        "dispatcher reports stopped after shutdown"
+    );
+}
+
+#[tokio::test]
+async fn test_tun_dispatcher_suspend_resume_detach() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::IpRecv;
+    use std::io::Write;
+    use std::time::Duration;
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    let (_ip_send, mut ip_recv) =
+        endpoint.attach_tunnel("wgcf-001", vec!["10.0.0.0/8".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // No route for 8.8.8.8: the packet is dropped, nothing arrives.
+    let unrouted = tun_test_ipv4_packet([10, 0, 0, 2], [8, 8, 8, 8], 17, 1001, 53);
+    peer.write_all(&unrouted).expect("write unrouted packet");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), ip_recv.recv(&mut pool))
+            .await
+            .is_err(),
+        "unrouted packet must not arrive"
+    );
+
+    // A routed packet arrives.
+    let routed = tun_test_ipv4_packet([10, 0, 0, 2], [10, 1, 2, 3], 6, 40000, 443);
+    peer.write_all(&routed).expect("write routed packet");
+    let got = tokio::time::timeout(Duration::from_secs(2), ip_recv.recv(&mut pool))
+        .await
+        .expect("routed packet must arrive")
+        .expect("recv must succeed");
+    assert_eq!(got.count(), 1);
+
+    // Suspend: a NEW flow is dropped (no route), while the old flow
+    // stays pinned and would keep buffering into the kept channel.
+    endpoint.suspend_tunnel("wgcf-001");
+    let new_flow = tun_test_ipv4_packet([10, 0, 0, 2], [10, 1, 2, 3], 6, 40001, 443);
+    peer.write_all(&new_flow)
+        .expect("write packet while suspended");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), ip_recv.recv(&mut pool))
+            .await
+            .is_err(),
+        "new flow while suspended must not arrive"
+    );
+
+    // Resume: the new flow routes again on the same receiver.
+    endpoint.resume_tunnel("wgcf-001", vec!["10.0.0.0/8".parse().unwrap()], vec![]);
+    peer.write_all(&new_flow)
+        .expect("write packet after resume");
+    let got = tokio::time::timeout(Duration::from_secs(2), ip_recv.recv(&mut pool))
+        .await
+        .expect("packet after resume must arrive")
+        .expect("recv must succeed");
+    assert_eq!(got.count(), 1);
+
+    // Detach: routing stops and the receiver fails with EOF.
+    endpoint.detach_tunnel("wgcf-001");
+    let after_detach = tun_test_ipv4_packet([10, 0, 0, 2], [10, 1, 2, 3], 6, 40002, 443);
+    peer.write_all(&after_detach)
+        .expect("write packet after detach");
+    let err = match tokio::time::timeout(Duration::from_secs(2), ip_recv.recv(&mut pool))
+        .await
+        .expect("detached recv must resolve")
+    {
+        Ok(_) => panic!("detached receiver must fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+    endpoint.shutdown().await;
+}
+
+// =========================================================================
+// 14. TUN adapter: multi-tunnel routing and source NAT
+// =========================================================================
+
+/// Receive one packet from a tunnel receiver, or fail the test.
+async fn tun_recv_one(
+    recv: &mut crate::netstack::TunIpRecv,
+    pool: &mut gotatun::packet::PacketBufPool,
+) -> gotatun::packet::Packet<gotatun::packet::Ip> {
+    use gotatun::tun::IpRecv;
+    let received = tokio::time::timeout(Duration::from_secs(2), recv.recv(pool))
+        .await
+        .expect("packet must arrive within timeout")
+        .expect("recv must succeed");
+    let mut packets: Vec<_> = received.collect();
+    assert_eq!(packets.len(), 1, "exactly one packet per write");
+    packets.pop().expect("one packet")
+}
+
+/// Recompute an IPv4 header checksum (field zeroed) for test checks.
+fn test_ipv4_header_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let (pairs, _) = header.as_chunks::<2>();
+    for pair in pairs {
+        sum += u32::from(u16::from_be_bytes(*pair));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// True when the IPv4 header checksum stored in `packet` is valid.
+fn test_ipv4_checksum_valid(packet: &[u8]) -> bool {
+    let ihl = (packet[0] & 0x0f) as usize * 4;
+    if packet.len() < ihl || ihl < 20 {
+        return false;
+    }
+    let stored = u16::from_be_bytes([packet[10], packet[11]]);
+    let mut header = packet[..ihl].to_vec();
+    header[10] = 0;
+    header[11] = 0;
+    test_ipv4_header_checksum(&header) == stored
+}
+
+/// Checker that marks a set of tunnel ids unusable (test double for
+/// the manager's health/state check).
+struct TestUsableChecker {
+    unusable: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl TestUsableChecker {
+    fn new(unusable: &[&str]) -> Self {
+        Self {
+            unusable: std::sync::Mutex::new(unusable.iter().map(|id| (*id).to_string()).collect()),
+        }
+    }
+
+    fn mark_unusable(&self, id: &str) {
+        self.unusable
+            .lock()
+            .expect("checker lock")
+            .insert(id.to_string());
+    }
+}
+
+impl crate::netstack::TunnelUsable for TestUsableChecker {
+    fn is_usable(&self, id: &str) -> bool {
+        !self.unusable.lock().expect("checker lock").contains(id)
+    }
+}
+
+#[tokio::test]
+async fn test_tun_multi_tunnel_round_robin() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::IpRecv;
+    use std::io::Write;
+    use zerocopy::IntoBytes;
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_strategy(crate::netstack::VpnRouteStrategy::RoundRobin);
+    let (_send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let (_send_b, mut recv_b) =
+        endpoint.attach_tunnel("tunnel-b", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // Four distinct flows, one packet each, received before the next
+    // write (the socketpair is a stream and coalesces back-to-back
+    // writes). Round Robin must alternate tunnels per new flow.
+    for (index, sport) in [40000u16, 40001, 40002, 40003].iter().enumerate() {
+        let packet = tun_test_ipv4_packet([10, 0, 0, 2], [1, 2, 3, 4], 6, *sport, 443);
+        peer.write_all(&packet).expect("write packet to TUN fd");
+        if index % 2 == 0 {
+            let got = tun_recv_one(&mut recv_a, &mut pool).await;
+            assert_eq!(
+                crate::netstack::parse_flow_key((*got).as_bytes())
+                    .expect("packet parses")
+                    .src_port,
+                *sport,
+                "even flow {index} goes to tunnel-a"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), recv_b.recv(&mut pool))
+                    .await
+                    .is_err(),
+                "tunnel-b must not see flow {index}"
+            );
+        } else {
+            let got = tun_recv_one(&mut recv_b, &mut pool).await;
+            assert_eq!(
+                crate::netstack::parse_flow_key((*got).as_bytes())
+                    .expect("packet parses")
+                    .src_port,
+                *sport,
+                "odd flow {index} goes to tunnel-b"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), recv_a.recv(&mut pool))
+                    .await
+                    .is_err(),
+                "tunnel-a must not see flow {index}"
+            );
+        }
+    }
+
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tun_multi_tunnel_fallback_and_failover() {
+    use gotatun::packet::PacketBufPool;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_strategy(crate::netstack::VpnRouteStrategy::Fallback);
+    let checker = Arc::new(TestUsableChecker::new(&[]));
+    endpoint.set_usable_checker(Some(
+        Arc::clone(&checker) as Arc<dyn crate::netstack::TunnelUsable>
+    ));
+    let (_send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let (_send_b, mut recv_b) =
+        endpoint.attach_tunnel("tunnel-b", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // Fallback: every new flow goes to the first usable tunnel.
+    let first = tun_test_ipv4_packet([10, 0, 0, 2], [1, 2, 3, 4], 6, 40000, 443);
+    peer.write_all(&first).expect("write first flow");
+    tun_recv_one(&mut recv_a, &mut pool).await;
+    let second = tun_test_ipv4_packet([10, 0, 0, 2], [1, 2, 3, 4], 6, 40001, 443);
+    peer.write_all(&second).expect("write second flow");
+    tun_recv_one(&mut recv_a, &mut pool).await;
+
+    // Failover: tunnel-a becomes unusable, so the pinned first flow
+    // re-routes to tunnel-b on its next packet, and new flows follow.
+    checker.mark_unusable("tunnel-a");
+    peer.write_all(&first).expect("write first flow again");
+    tun_recv_one(&mut recv_b, &mut pool).await;
+    peer.write_all(&second).expect("write second flow again");
+    tun_recv_one(&mut recv_b, &mut pool).await;
+
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tun_source_nat_rewrites_and_restores() {
+    use gotatun::packet::PacketBufPool;
+    use std::io::{Read, Write};
+    use zerocopy::IntoBytes;
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    let (mut ip_send, mut ip_recv) = endpoint.attach_tunnel(
+        "wgcf-001",
+        vec!["0.0.0.0/0".parse().unwrap()],
+        vec!["172.16.0.2/32".parse().unwrap()],
+    );
+    let mut pool = PacketBufPool::new(8);
+
+    // Outbound: the kernel stamps the TUN address 10.8.0.2, but the
+    // peer only accepts 172.16.0.2, so the dispatcher rewrites it.
+    let packet = tun_test_ipv4_packet([10, 8, 0, 2], [1, 2, 3, 4], 6, 40000, 443);
+    peer.write_all(&packet).expect("write packet to TUN fd");
+    let routed = tun_recv_one(&mut ip_recv, &mut pool).await;
+    let routed_bytes = (*routed).as_bytes().to_vec();
+    assert_eq!(
+        &routed_bytes[12..16],
+        &[172, 16, 0, 2],
+        "source is rewritten to the tunnel's Interface address"
+    );
+    assert_eq!(
+        &routed_bytes[16..20],
+        &[1, 2, 3, 4],
+        "destination is unchanged"
+    );
+    assert!(
+        test_ipv4_checksum_valid(&routed_bytes),
+        "rewritten packet carries a valid IPv4 header checksum"
+    );
+
+    // Inbound: the reply comes back addressed to 172.16.0.2; the
+    // return path restores the original source as the destination.
+    let mut reply = routed_bytes.clone();
+    reply[12..16].copy_from_slice(&[1, 2, 3, 4]);
+    reply[16..20].copy_from_slice(&[172, 16, 0, 2]);
+    reply[20..22].copy_from_slice(&443u16.to_be_bytes());
+    reply[22..24].copy_from_slice(&40000u16.to_be_bytes());
+    let mut reply_raw = pool.get();
+    reply_raw.buf_mut().resize(reply.len(), 0);
+    reply_raw.buf_mut().copy_from_slice(&reply);
+    let reply_packet = reply_raw.try_into_ip().expect("reply parses");
+    peer.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    ip_send
+        .send(reply_packet)
+        .await
+        .expect("send reply to TUN fd");
+    let mut buf = vec![0u8; 64];
+    let n = peer.read(&mut buf).expect("read reply from TUN fd");
+    let written = &buf[..n];
+    assert_eq!(
+        &written[16..20],
+        &[10, 8, 0, 2],
+        "destination is restored to the original TUN address"
+    );
+    assert_eq!(
+        &written[12..16],
+        &[1, 2, 3, 4],
+        "source is unchanged on the return path"
+    );
+    assert!(
+        test_ipv4_checksum_valid(written),
+        "restored packet carries a valid IPv4 header checksum"
+    );
+
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tun_multi_tunnel_weighted() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::IpRecv;
+    use std::io::Write;
+    use zerocopy::IntoBytes;
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_strategy(crate::netstack::VpnRouteStrategy::Weighted);
+    endpoint.set_weight("tunnel-a", 3);
+    endpoint.set_weight("tunnel-b", 1);
+    let (_send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let (_send_b, mut recv_b) =
+        endpoint.attach_tunnel("tunnel-b", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // Weights 3:1 over 8 new flows must split 6:2. One packet per
+    // write, received before the next write (stream coalescing).
+    let mut counts = [0usize; 2];
+    for sport in 40000u16..40008 {
+        let packet = tun_test_ipv4_packet([10, 0, 0, 2], [1, 2, 3, 4], 6, sport, 443);
+        peer.write_all(&packet).expect("write packet to TUN fd");
+        let got_a = tokio::time::timeout(Duration::from_millis(100), recv_a.recv(&mut pool)).await;
+        let got_b = tokio::time::timeout(Duration::from_millis(100), recv_b.recv(&mut pool)).await;
+        match (got_a, got_b) {
+            (Ok(_), Err(_)) => counts[0] += 1,
+            (Err(_), Ok(_)) => counts[1] += 1,
+            _ => panic!("flow {sport} must arrive on exactly one tunnel"),
+        }
+    }
+    assert_eq!(counts, [6, 2], "weights 3:1 split 8 flows 6:2");
+
+    // Weight 0: tunnel-b is never picked for new flows.
+    endpoint.set_weight("tunnel-b", 0);
+    for sport in 40100u16..40104 {
+        let packet = tun_test_ipv4_packet([10, 0, 0, 2], [1, 2, 3, 4], 6, sport, 443);
+        peer.write_all(&packet).expect("write packet to TUN fd");
+        let got = tun_recv_one(&mut recv_a, &mut pool).await;
+        assert_eq!(
+            crate::netstack::parse_flow_key((*got).as_bytes())
+                .expect("packet parses")
+                .src_port,
+            sport,
+            "weight-0 tunnel gets no new flows"
+        );
+    }
+
+    endpoint.shutdown().await;
+}
+
+/// Build a minimal IPv4/UDP packet carrying `payload` (no checksum).
+fn tun_test_udp_packet(
+    src: [u8; 4],
+    dst: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let total = 20 + 8 + payload.len();
+    let mut packet = vec![0u8; total];
+    packet[0] = 0x45;
+    packet[2] = (total >> 8) as u8;
+    packet[3] = total as u8;
+    packet[8] = 64;
+    packet[9] = 17;
+    packet[12..16].copy_from_slice(&src);
+    packet[16..20].copy_from_slice(&dst);
+    packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+    packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    packet[28..].copy_from_slice(payload);
+    packet
+}
+
+/// Build a minimal DNS response: one A answer for `domain` -> `ip`.
+fn tun_test_dns_response(id: u16, domain: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
+    let mut resp = Vec::new();
+    resp.extend_from_slice(&id.to_be_bytes());
+    resp.extend_from_slice(&0x8180u16.to_be_bytes()); // QR=1, RD=1, RA=1, RCODE=0
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    resp.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    for label in domain.split('.') {
+        resp.push(label.len() as u8);
+        resp.extend_from_slice(label.as_bytes());
+    }
+    resp.push(0);
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+    resp.extend_from_slice(&0xC00Cu16.to_be_bytes()); // NAME: pointer to offset 12
+    resp.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+    resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+    resp.extend_from_slice(&ttl.to_be_bytes());
+    resp.extend_from_slice(&4u16.to_be_bytes());
+    resp.extend_from_slice(&ip);
+    resp
+}
+
+#[tokio::test]
+async fn test_tun_domain_routing() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::{IpRecv, IpSend};
+    use std::io::{Read, Write};
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_domain_rule("example.com", "tunnel-b");
+    let (mut send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let (mut send_b, mut recv_b) =
+        endpoint.attach_tunnel("tunnel-b", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // 1. DNS query for video.example.com goes out through a tunnel.
+    let query = crate::netstack::dns::build_query(
+        "video.example.com",
+        crate::netstack::QueryType::A,
+        0x1234,
+    )
+    .expect("query builds");
+    let query_packet = tun_test_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 12345, 53, &query);
+    peer.write_all(&query_packet)
+        .expect("write query to TUN fd");
+    let got_a = tokio::time::timeout(Duration::from_millis(200), recv_a.recv(&mut pool)).await;
+    let got_b = tokio::time::timeout(Duration::from_millis(200), recv_b.recv(&mut pool)).await;
+    let (query_sender, query_receiver) = match (got_a, got_b) {
+        (Ok(_), Err(_)) => ("tunnel-a", "a"),
+        (Err(_), Ok(_)) => ("tunnel-b", "b"),
+        _ => panic!("DNS query must arrive on exactly one tunnel"),
+    };
+    assert_eq!(
+        query_receiver, "a",
+        "first flow takes tunnel-a under round robin"
+    );
+
+    // 2. The answer comes back through the same tunnel and is written
+    // into TUN; snooping learns 93.184.216.34 -> video.example.com.
+    let answer = tun_test_dns_response(0x1234, "video.example.com", [93, 184, 216, 34], 300);
+    let answer_packet = tun_test_udp_packet([1, 1, 1, 1], [10, 0, 0, 2], 53, 12345, &answer);
+    let mut raw = pool.get();
+    raw.buf_mut().resize(answer_packet.len(), 0);
+    raw.buf_mut().copy_from_slice(&answer_packet);
+    let packet = raw.try_into_ip().expect("answer parses");
+    if query_sender == "tunnel-a" {
+        send_a.send(packet).await.expect("answer back to TUN");
+    } else {
+        send_b.send(packet).await.expect("answer back to TUN");
+    }
+    peer.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let mut buf = vec![0u8; 512];
+    let n = peer.read(&mut buf).expect("read answer from TUN fd");
+    assert_eq!(&buf[..n], &answer_packet[..], "answer round-trips into TUN");
+
+    // 3. A new TCP flow to the learned IP must take tunnel-b (the
+    // domain rule), not the round-robin pick.
+    let flow = tun_test_ipv4_packet([10, 0, 0, 2], [93, 184, 216, 34], 6, 50000, 443);
+    peer.write_all(&flow).expect("write flow to TUN fd");
+    let got_b = tokio::time::timeout(Duration::from_millis(200), recv_b.recv(&mut pool)).await;
+    let got_a = tokio::time::timeout(Duration::from_millis(200), recv_a.recv(&mut pool)).await;
+    assert!(got_b.is_ok(), "ruled flow must arrive on tunnel-b");
+    assert!(got_a.is_err(), "ruled flow must not arrive on tunnel-a");
+
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tun_dns_snoop_rejects_unbound_answers() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::{IpRecv, IpSend};
+    use std::io::{Read, Write};
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_domain_rule("example.com", "tunnel-b");
+    let (mut send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let (_send_b, mut recv_b) =
+        endpoint.attach_tunnel("tunnel-b", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // DNS query for video.example.com to 1.1.1.1.
+    let query = crate::netstack::dns::build_query(
+        "video.example.com",
+        crate::netstack::QueryType::A,
+        0x1234,
+    )
+    .expect("query builds");
+    let query_packet = tun_test_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 12345, 53, &query);
+    peer.write_all(&query_packet)
+        .expect("write query to TUN fd");
+    // The query flow takes tunnel-a (round robin, first pick).
+    let got_a = tokio::time::timeout(Duration::from_millis(200), recv_a.recv(&mut pool)).await;
+    assert!(got_a.is_ok(), "DNS query must arrive on tunnel-a");
+    drop(got_a);
+
+    // Spoof attempt 1: an answer for the same TXID from a server that
+    // was never asked (8.8.8.8 instead of 1.1.1.1). It still
+    // round-trips into TUN (snooping observes only) but must not be
+    // learned.
+    let spoof = tun_test_dns_response(0x1234, "video.example.com", [93, 184, 216, 34], 300);
+    let spoof_packet = tun_test_udp_packet([8, 8, 8, 8], [10, 0, 0, 2], 53, 12345, &spoof);
+    let mut raw = pool.get();
+    raw.buf_mut().resize(spoof_packet.len(), 0);
+    raw.buf_mut().copy_from_slice(&spoof_packet);
+    send_a
+        .send(raw.try_into_ip().expect("spoof parses"))
+        .await
+        .expect("spoof back to TUN");
+    peer.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let mut buf = vec![0u8; 512];
+    let n = peer.read(&mut buf).expect("read spoof from TUN fd");
+    assert_eq!(&buf[..n], &spoof_packet[..], "spoof round-trips into TUN");
+
+    // Spoof attempt 2: an answer from the right server but for a
+    // different name (same TXID). Also must not be learned.
+    let wrong_q = tun_test_dns_response(0x1234, "other.example.com", [93, 184, 216, 34], 300);
+    let wrong_q_packet = tun_test_udp_packet([1, 1, 1, 1], [10, 0, 0, 2], 53, 12345, &wrong_q);
+    let mut raw = pool.get();
+    raw.buf_mut().resize(wrong_q_packet.len(), 0);
+    raw.buf_mut().copy_from_slice(&wrong_q_packet);
+    send_a
+        .send(raw.try_into_ip().expect("wrong-question parses"))
+        .await
+        .expect("wrong-question back to TUN");
+    let n = peer
+        .read(&mut buf)
+        .expect("read wrong-question from TUN fd");
+    assert_eq!(
+        &buf[..n],
+        &wrong_q_packet[..],
+        "wrong-question round-trips into TUN"
+    );
+
+    // Flows to 93.184.216.34 must follow round robin, not the rule:
+    // the first takes tunnel-b (second round-robin pick), the second
+    // must take tunnel-a. Had either spoof been learned, the rule
+    // would pin both flows to tunnel-b.
+    let flow1 = tun_test_ipv4_packet([10, 0, 0, 2], [93, 184, 216, 34], 6, 50000, 443);
+    peer.write_all(&flow1).expect("write flow 1 to TUN fd");
+    let got_b = tokio::time::timeout(Duration::from_millis(200), recv_b.recv(&mut pool)).await;
+    assert!(got_b.is_ok(), "flow 1 must arrive on tunnel-b");
+    drop(got_b);
+    let flow2 = tun_test_ipv4_packet([10, 0, 0, 2], [93, 184, 216, 34], 6, 50001, 443);
+    peer.write_all(&flow2).expect("write flow 2 to TUN fd");
+    let got_a = tokio::time::timeout(Duration::from_millis(200), recv_a.recv(&mut pool)).await;
+    let got_b = tokio::time::timeout(Duration::from_millis(200), recv_b.recv(&mut pool)).await;
+    assert!(got_a.is_ok(), "flow 2 must arrive on tunnel-a");
+    assert!(
+        got_b.is_err(),
+        "flow 2 must not be pinned to tunnel-b by an unbound answer"
+    );
+
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tun_dns_snoop_rejects_forbidden_learned_ip() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::{IpRecv, IpSend};
+    use std::io::{Read, Write};
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_domain_rule("example.com", "tunnel-b");
+    let (mut send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let (_send_b, mut recv_b) =
+        endpoint.attach_tunnel("tunnel-b", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // DNS query for video.example.com to 1.1.1.1.
+    let query = crate::netstack::dns::build_query(
+        "video.example.com",
+        crate::netstack::QueryType::A,
+        0x1234,
+    )
+    .expect("query builds");
+    let query_packet = tun_test_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 12345, 53, &query);
+    peer.write_all(&query_packet)
+        .expect("write query to TUN fd");
+    let got_a = tokio::time::timeout(Duration::from_millis(200), recv_a.recv(&mut pool)).await;
+    assert!(got_a.is_ok(), "DNS query must arrive on tunnel-a");
+    drop(got_a);
+
+    // Bound answer (right server, right question) but pointing at a
+    // private IP: must not be learned as a routing pin.
+    let answer = tun_test_dns_response(0x1234, "video.example.com", [10, 0, 0, 99], 300);
+    let answer_packet = tun_test_udp_packet([1, 1, 1, 1], [10, 0, 0, 2], 53, 12345, &answer);
+    let mut raw = pool.get();
+    raw.buf_mut().resize(answer_packet.len(), 0);
+    raw.buf_mut().copy_from_slice(&answer_packet);
+    send_a
+        .send(raw.try_into_ip().expect("answer parses"))
+        .await
+        .expect("answer back to TUN");
+    peer.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let mut buf = vec![0u8; 512];
+    let n = peer.read(&mut buf).expect("read answer from TUN fd");
+    assert_eq!(&buf[..n], &answer_packet[..], "answer round-trips into TUN");
+
+    // Flows to 10.0.0.99 follow round robin (tunnel-b then
+    // tunnel-a); a learned pin would send both to tunnel-b.
+    let flow1 = tun_test_ipv4_packet([10, 0, 0, 2], [10, 0, 0, 99], 6, 50000, 443);
+    peer.write_all(&flow1).expect("write flow 1 to TUN fd");
+    let got_b = tokio::time::timeout(Duration::from_millis(200), recv_b.recv(&mut pool)).await;
+    assert!(got_b.is_ok(), "flow 1 must arrive on tunnel-b");
+    drop(got_b);
+    let flow2 = tun_test_ipv4_packet([10, 0, 0, 2], [10, 0, 0, 99], 6, 50001, 443);
+    peer.write_all(&flow2).expect("write flow 2 to TUN fd");
+    let got_a = tokio::time::timeout(Duration::from_millis(200), recv_a.recv(&mut pool)).await;
+    let got_b = tokio::time::timeout(Duration::from_millis(200), recv_b.recv(&mut pool)).await;
+    assert!(got_a.is_ok(), "flow 2 must arrive on tunnel-a");
+    assert!(
+        got_b.is_err(),
+        "flow 2 must not be pinned to tunnel-b by a forbidden learned IP"
+    );
+
+    endpoint.shutdown().await;
+}
+
+#[test]
+fn test_dns_response_synthesis() {
+    let query = build_query("example.com", QueryType::A, 0x1234).unwrap();
+    let resp = build_response(
+        &query,
+        &[(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 300)],
+    )
+    .unwrap();
+    // Question echoed verbatim after the 12-byte header.
+    assert_eq!(&resp[12..query.len()], &query[12..]);
+    let (ips, ttl) = parse_response(&resp, 0x1234).unwrap();
+    assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+    assert_eq!(ttl, 300);
+
+    // AAAA answer round-trips the same way.
+    let query6 = build_query("ipv6.example.com", QueryType::AAAA, 0xabcd).unwrap();
+    let v6: Ipv6Addr = "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap();
+    let resp6 = build_response(&query6, &[(IpAddr::V6(v6), 3600)]).unwrap();
+    let (ips6, ttl6) = parse_response(&resp6, 0xabcd).unwrap();
+    assert_eq!(ips6, vec![IpAddr::V6(v6)]);
+    assert_eq!(ttl6, 3600);
+}
+
+#[tokio::test]
+async fn test_doh_exchange_http() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    let query = build_query("example.com", QueryType::A, 0x4321).unwrap();
+    let response_msg = build_response(
+        &query,
+        &[(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 300)],
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let expected_body = response_msg.clone();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = socket.read(&mut byte).await.unwrap();
+            assert_eq!(n, 1, "mock server reads the request");
+            head.push(byte[0]);
+        }
+        let head_text = String::from_utf8_lossy(&head).into_owned();
+        assert!(
+            head_text.starts_with("POST /dns-query HTTP/1.1\r\n"),
+            "DoH request line: {head_text}"
+        );
+        assert!(
+            head_text.contains("Content-Type: application/dns-message\r\n"),
+            "DoH content type: {head_text}"
+        );
+        let len: usize = head_text
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("Content-Length") {
+                    value.trim().parse().ok()
+                } else {
+                    None
+                }
+            })
+            .next()
+            .unwrap();
+        let mut body = vec![0u8; len];
+        socket.read_exact(&mut body).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            expected_body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.write_all(&expected_body).await.unwrap();
+        socket.flush().await.unwrap();
+    });
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let message = crate::netstack::doh::exchange_http(&mut stream, &query)
+        .await
+        .expect("DoH exchange succeeds");
+    assert_eq!(message, response_msg, "exchange returns the DNS message");
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_doh_tls_failure_is_distinguished_from_transient() {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use crate::netstack::doh::{DohClient, DohError, DohTcpConnector};
+    use crate::proxy::router::DynStream;
+
+    /// Connector handing the client a stream whose peer is already
+    /// gone, so the TLS handshake fails immediately.
+    struct DeadStreamConnector;
+
+    impl DohTcpConnector for DeadStreamConnector {
+        fn connect(
+            &self,
+            _dst: std::net::SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<DynStream>> + Send>> {
+            Box::pin(async move {
+                let (client_side, server_side) = tokio::io::duplex(1024);
+                drop(server_side);
+                Ok(Box::new(client_side) as DynStream)
+            })
+        }
+    }
+
+    let client = DohClient::new(std::sync::Arc::new(DeadStreamConnector)).unwrap();
+    let detailed = client.resolve_detailed("example.com", QueryType::A).await;
+    assert!(
+        matches!(detailed, Err(DohError::Tls(_))),
+        "TLS handshake failure must surface as DohError::Tls, got {detailed:?}"
+    );
+    // The collapsing `resolve` keeps its old contract (None on any
+    // failure); only the detailed path carries the TLS signal.
+    assert!(
+        client.resolve("example.com", QueryType::A).await.is_none(),
+        "plain resolve still collapses failures to None"
+    );
+}
+
+/// Stub DoH resolver for dispatcher tests: answers example.com A
+/// with a canned IP, nothing else.
+struct StubDohResolver;
+
+/// Stub DoH resolver that always fails at TLS: the dispatcher must
+/// fail closed and never forward the query as plain DNS.
+struct TlsFailingResolver;
+
+/// Stub DoH resolver that blocks inside `resolve` until released,
+/// counting how many resolutions started: proves the answer-task
+/// concurrency bound (no more than `MAX_CONCURRENT_DNS_ANSWERS`
+/// tasks start while all permits are held).
+struct CountingBlockingResolver {
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl crate::netstack::tun::DnsResolver for CountingBlockingResolver {
+    fn resolve(
+        &self,
+        _domain: String,
+        _qtype: QueryType,
+    ) -> crate::netstack::tun::DnsResolveFuture<'_> {
+        let count = std::sync::Arc::clone(&self.count);
+        let release = std::sync::Arc::clone(&self.release);
+        Box::pin(async move {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            release.notified().await;
+            crate::netstack::tun::DnsResolveOutcome::Answered(
+                vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                300,
+            )
+        })
+    }
+}
+
+/// Stub DoH resolver that blocks inside `resolve` until released:
+/// proves `shutdown` aborts an in-flight answer task instead of
+/// letting it write a stale response into TUN afterwards.
+struct BlockingResolver {
+    entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl crate::netstack::tun::DnsResolver for BlockingResolver {
+    fn resolve(
+        &self,
+        _domain: String,
+        _qtype: QueryType,
+    ) -> crate::netstack::tun::DnsResolveFuture<'_> {
+        let entered = std::sync::Arc::clone(&self.entered);
+        let release = std::sync::Arc::clone(&self.release);
+        Box::pin(async move {
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            release.notified().await;
+            crate::netstack::tun::DnsResolveOutcome::Answered(
+                vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                300,
+            )
+        })
+    }
+}
+
+impl crate::netstack::tun::DnsResolver for TlsFailingResolver {
+    fn resolve(
+        &self,
+        _domain: String,
+        _qtype: QueryType,
+    ) -> crate::netstack::tun::DnsResolveFuture<'_> {
+        Box::pin(async move { crate::netstack::tun::DnsResolveOutcome::TlsFailed })
+    }
+}
+
+impl crate::netstack::tun::DnsResolver for StubDohResolver {
+    fn resolve(
+        &self,
+        domain: String,
+        qtype: QueryType,
+    ) -> crate::netstack::tun::DnsResolveFuture<'_> {
+        Box::pin(async move {
+            if domain == "example.com" && qtype == QueryType::A {
+                crate::netstack::tun::DnsResolveOutcome::Answered(
+                    vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                    300,
+                )
+            } else {
+                crate::netstack::tun::DnsResolveOutcome::Unavailable
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_tun_doh_answers_query() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::IpRecv;
+    use std::io::{Read, Write};
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_dns_resolver(Some(std::sync::Arc::new(StubDohResolver)));
+    let (_send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let (_send_b, mut recv_b) =
+        endpoint.attach_tunnel("tunnel-b", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+
+    let query = build_query("example.com", QueryType::A, 0x2222).unwrap();
+    let query_packet = tun_test_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 12345, 53, &query);
+    peer.write_all(&query_packet)
+        .expect("write query to TUN fd");
+    // The blocking read below would starve the current-thread
+    // runtime, so let the dispatcher and the answer task run first.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    peer.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let mut buf = vec![0u8; 512];
+    let n = peer.read(&mut buf).expect("read answer from TUN fd");
+    let answer_packet = &buf[..n];
+    // Response comes back from the DNS server to the phone, same ports.
+    let key = crate::netstack::parse_flow_key(answer_packet).expect("answer parses");
+    assert_eq!(key.src, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    assert_eq!(key.dst, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+    assert_eq!(key.src_port, 53);
+    assert_eq!(key.dst_port, 12345);
+    let (ips, ttl) = parse_response(&answer_packet[28..], 0x2222).unwrap();
+    assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+    assert_eq!(ttl, 300);
+    // The query never entered a tunnel.
+    let mut pool = PacketBufPool::new(8);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), recv_a.recv(&mut pool))
+            .await
+            .is_err(),
+        "answered query must not reach tunnel-a"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), recv_b.recv(&mut pool))
+            .await
+            .is_err(),
+        "answered query must not reach tunnel-b"
+    );
+
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tun_doh_tls_failure_fails_closed() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::IpRecv;
+    use std::io::{Read, Write};
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_dns_resolver(Some(std::sync::Arc::new(TlsFailingResolver)));
+    let (_send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let (_send_b, mut recv_b) =
+        endpoint.attach_tunnel("tunnel-b", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+
+    let query = build_query("example.com", QueryType::A, 0x2223).unwrap();
+    let query_packet = tun_test_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 12345, 53, &query);
+    peer.write_all(&query_packet)
+        .expect("write query to TUN fd");
+    // Let the dispatcher and the answer task run first.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The query must NOT be forwarded to any tunnel (no plaintext
+    // downgrade on a TLS failure).
+    let mut pool = PacketBufPool::new(8);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), recv_a.recv(&mut pool))
+            .await
+            .is_err(),
+        "TLS-failed query must not reach tunnel-a"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), recv_b.recv(&mut pool))
+            .await
+            .is_err(),
+        "TLS-failed query must not reach tunnel-b"
+    );
+    // And no synthesized answer is written back into TUN either.
+    peer.set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set read timeout");
+    let mut buf = vec![0u8; 512];
+    let read = peer.read(&mut buf);
+    assert!(
+        read.is_err(),
+        "TLS-failed query must not produce a TUN answer, got {read:?}"
+    );
+
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tun_doh_answer_task_aborted_on_shutdown() {
+    use std::io::{Read, Write};
+
+    let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let resolver = BlockingResolver {
+        entered: std::sync::Arc::clone(&entered),
+        release: std::sync::Arc::clone(&release),
+    };
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_dns_resolver(Some(std::sync::Arc::new(resolver)));
+    let (_send_a, _recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+
+    let query = build_query("example.com", QueryType::A, 0x2224).unwrap();
+    let query_packet = tun_test_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 12345, 53, &query);
+    peer.write_all(&query_packet)
+        .expect("write query to TUN fd");
+
+    // Wait until the answer task has entered the (blocked) resolve.
+    let started = tokio::time::timeout(Duration::from_secs(2), async {
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(started.is_ok(), "answer task must start resolving");
+
+    // Shutdown must return promptly even though the resolve is still
+    // blocked: the answer task is aborted, not awaited.
+    tokio::time::timeout(Duration::from_secs(2), endpoint.shutdown())
+        .await
+        .expect("shutdown must not hang on a blocked DNS answer task");
+
+    // Release the resolver: a detached task would now answer into TUN.
+    release.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    peer.set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set read timeout");
+    let mut buf = vec![0u8; 512];
+    let read = peer.read(&mut buf);
+    assert!(
+        read.is_err(),
+        "aborted answer task must not write a stale response into TUN after shutdown, got {read:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_tun_doh_answer_concurrency_bounded() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::IpRecv;
+    use std::io::Write;
+
+    // 32 is `MAX_CONCURRENT_DNS_ANSWERS` in tun.rs; keep in sync.
+    const ANSWER_LIMIT: usize = 32;
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let resolver = CountingBlockingResolver {
+        count: std::sync::Arc::clone(&count),
+        release: std::sync::Arc::clone(&release),
+    };
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_dns_resolver(Some(std::sync::Arc::new(resolver)));
+    let (_send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // Fill every answer slot with a blocked resolution. Each write
+    // waits until its answer task has started: the test TUN fd is a
+    // stream socket, so a burst of writes can coalesce into one read
+    // and lose packets.
+    for i in 0..ANSWER_LIMIT as u16 {
+        let query = build_query("example.com", QueryType::A, 0x3000 + i).unwrap();
+        let query_packet = tun_test_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 12345 + i, 53, &query);
+        peer.write_all(&query_packet)
+            .expect("write query to TUN fd");
+        let started = tokio::time::timeout(Duration::from_secs(2), async {
+            while count.load(std::sync::atomic::Ordering::SeqCst) < usize::from(i) + 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "answer task {i} must start");
+    }
+
+    // One more query: no permit is left, so it must fall through to
+    // normal routing instead of spawning a 33rd task.
+    let query = build_query("example.com", QueryType::A, 0x4000).unwrap();
+    let query_packet = tun_test_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 12400, 53, &query);
+    peer.write_all(&query_packet)
+        .expect("write overflow query to TUN fd");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), recv_a.recv(&mut pool))
+            .await
+            .is_ok(),
+        "query past the answer limit must route through the tunnel instead of spawning"
+    );
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        ANSWER_LIMIT,
+        "no 33rd answer task may start while all permits are held"
+    );
+
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tun_doh_forwards_other_types_and_failures() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::IpRecv;
+    use std::io::Write;
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_dns_resolver(Some(std::sync::Arc::new(StubDohResolver)));
+    let (_send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let (_send_b, mut recv_b) =
+        endpoint.attach_tunnel("tunnel-b", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // MX query: not A/AAAA, so it forwards through the tunnel.
+    let mut mx = build_query("example.com", QueryType::A, 0x3333).unwrap();
+    let qtype_at = mx.len() - 4;
+    mx[qtype_at..qtype_at + 2].copy_from_slice(&15u16.to_be_bytes());
+    let mx_packet = tun_test_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 12346, 53, &mx);
+    peer.write_all(&mx_packet)
+        .expect("write MX query to TUN fd");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), recv_a.recv(&mut pool))
+            .await
+            .is_ok(),
+        "MX query must forward to a tunnel"
+    );
+
+    // A query the resolver cannot answer: forwarded, not dropped.
+    let other = build_query("other.com", QueryType::A, 0x4444).unwrap();
+    let other_packet = tun_test_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 12347, 53, &other);
+    peer.write_all(&other_packet)
+        .expect("write other query to TUN fd");
+    let got_a = tokio::time::timeout(Duration::from_millis(500), recv_a.recv(&mut pool)).await;
+    let got_b = tokio::time::timeout(Duration::from_millis(500), recv_b.recv(&mut pool)).await;
+    assert!(
+        got_a.is_ok() || got_b.is_ok(),
+        "unanswered query must forward to a tunnel"
+    );
+
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tun_drops_local_destinations() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::IpRecv;
+    use std::io::Write;
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    // AllowedIPs 0.0.0.0/0 would match every IPv4 destination, so
+    // without the local-destination drop these packets would queue.
+    let (_send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // mDNS multicast, link-local, broadcast, unspecified.
+    // The TUN side is a byte-stream socketpair, so consecutive writes
+    // can coalesce into one read (and the tail would be ignored):
+    // pause between writes so the dispatcher reads one packet each.
+    for dst in [
+        [224, 0, 0, 251],
+        [169, 254, 1, 1],
+        [255, 255, 255, 255],
+        [0, 0, 0, 0],
+    ] {
+        let packet = tun_test_udp_packet([10, 0, 0, 2], dst, 12345, 5353, &[]);
+        peer.write_all(&packet)
+            .expect("write local packet to TUN fd");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Wait until all four are counted (or time out and fail below).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while endpoint.stats_snapshot().packets_dropped_local < 4
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snapshot = endpoint.stats_snapshot();
+    assert_eq!(snapshot.packets_dropped_local, 4);
+    assert_eq!(snapshot.packets_no_route, 0);
+    assert_eq!(snapshot.packets_queued, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), recv_a.recv(&mut pool))
+            .await
+            .is_err(),
+        "local packets must not reach a tunnel"
+    );
+
+    endpoint.shutdown().await;
 }

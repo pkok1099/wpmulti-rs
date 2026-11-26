@@ -3,6 +3,7 @@
 //! Implements RFC 1928 greeting handshake, RFC 1929 username/password authentication,
 //! TCP stream tunneling via `CMD_CONNECT`, and UDP datagram relaying via `CMD_UDP_ASSOCIATE`.
 
+use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
@@ -586,8 +587,15 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     // Send SOCKS5 success reply
     send_socks5_reply(&mut stream, REP_SUCCESS, dummy_addr).await?;
 
-    // Bidirectional streaming
-    tokio::io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
+    // Bidirectional streaming, ending when either side closes or the
+    // session idles past CONNECT_IDLE_TIMEOUT (audit run-1,
+    // `wpmulti/proxy:established-connect-no-idle-timeout`).
+    crate::proxy::copy_bidirectional_with_idle_timeout(
+        &mut stream,
+        &mut tunnel_stream,
+        crate::proxy::CONNECT_IDLE_TIMEOUT,
+    )
+    .await?;
 
     Ok(())
 }
@@ -689,6 +697,65 @@ const fn normalize_ip(ip: IpAddr) -> IpAddr {
 
 const MAX_UDP_DNS_TASKS: usize = 16;
 
+/// UDP port used for DNS: replies from a DNS server must also carry a
+/// TXID the client actually used (see [`ExpectedUdpReplies`]).
+const DNS_PORT: u16 = 53;
+
+/// Destinations a UDP ASSOCIATE session's client actually asked for, so
+/// tunnel replies can be checked against them (audit run-1,
+/// `socks5-udp-relay-unvalidated-tunnel-reply-source`).
+///
+/// Before this, every datagram arriving on the session's unconnected
+/// virtual socket was forwarded to the client stamped with the
+/// datagram sender's address, so any host able to address the tunnel
+/// interface could inject a spoofed reply (e.g. a forged DNS answer
+/// from the real resolver's IP:53). Now a reply is forwarded only when
+/// its source matches a destination the client sent to in this session;
+/// for port 53 the reply must additionally carry a DNS TXID from an
+/// outstanding query to that server, and each TXID is single-use.
+///
+/// Non-DNS destinations stay expected for the session: several queries
+/// to one server may be in flight at once, so a reply cannot consume
+/// the entry. A spoof is therefore still possible from a destination
+/// the client already contacted, but no longer from an arbitrary
+/// sender.
+#[derive(Debug, Default)]
+pub(crate) struct ExpectedUdpReplies {
+    /// Destinations the client sent datagrams to (any port).
+    addrs: HashSet<SocketAddr>,
+    /// (server, DNS TXID) pairs for datagrams sent to port 53.
+    dns_txids: HashSet<(SocketAddr, u16)>,
+}
+
+impl ExpectedUdpReplies {
+    /// Record a datagram the client sent to `addr`.
+    pub(crate) fn note_sent(&mut self, addr: SocketAddr, payload: &[u8]) {
+        self.addrs.insert(addr);
+        if addr.port() == DNS_PORT
+            && let Some(txid_bytes) = payload.get(..2)
+            && let Ok(txid) = <[u8; 2]>::try_from(txid_bytes)
+        {
+            self.dns_txids.insert((addr, u16::from_be_bytes(txid)));
+        }
+    }
+
+    /// True when a datagram from `peer` with `payload` answers an
+    /// outstanding request: any datagram from a contacted destination,
+    /// and for port 53 only one carrying an outstanding TXID (which is
+    /// consumed, so a replayed answer is dropped).
+    pub(crate) fn is_expected(&mut self, peer: SocketAddr, payload: &[u8]) -> bool {
+        if peer.port() == DNS_PORT {
+            if let Some(txid_bytes) = payload.get(..2)
+                && let Ok(txid) = <[u8; 2]>::try_from(txid_bytes)
+            {
+                return self.dns_txids.remove(&(peer, u16::from_be_bytes(txid)));
+            }
+            return false;
+        }
+        self.addrs.contains(&peer)
+    }
+}
+
 /// Reusable pool of datagram payload buffers for the UDP ASSOCIATE domain path.
 ///
 /// A domain-targeted datagram must be owned by the spawned DNS-resolution task,
@@ -735,6 +802,7 @@ struct UdpRelayCtx<'a> {
     dns_tasks: &'a mut tokio::task::JoinSet<()>,
     dns_tx: &'a tokio::sync::mpsc::Sender<(Vec<SocketAddr>, Bytes)>,
     payload_pool: &'a mut UdpPayloadPool,
+    expected: &'a mut ExpectedUdpReplies,
 }
 
 async fn forward_client_udp_datagram(
@@ -773,6 +841,9 @@ async fn forward_client_udp_datagram(
     match target_addr {
         TargetAddr::Ip(addr) => {
             if !is_forbidden_destination_ip(addr.ip()) {
+                // Record the destination before sending, so the reply
+                // can be checked against it (see `ExpectedUdpReplies`).
+                ctx.expected.note_sent(addr, payload);
                 let _ = ctx.virtual_udp.send_to(payload, addr).await;
             }
         }
@@ -833,10 +904,133 @@ async fn dispatch_resolved_udp_datagram(
     virtual_udp: &dyn ProxyUdpSocket,
     payload: &[u8],
     addrs: &[SocketAddr],
+    expected: &mut ExpectedUdpReplies,
 ) {
+    // Record every resolved destination before sending, so replies can
+    // be checked against them (see `ExpectedUdpReplies`).
+    for addr in addrs {
+        expected.note_sent(*addr, payload);
+    }
     if let Err(e) = send_udp_to_validated_addrs(virtual_udp, payload, addrs).await {
         tracing::debug!("UDP relay send to validated candidates failed: {:?}", e);
     }
+}
+
+/// Grace period for the first UDP datagram of an ASSOCIATE session
+/// (audit run-1, `src/proxy/socks5.rs:UDP_ASSOCIATE_IP_ONLY_FIRST_DATAGRAM_LOCK`):
+/// while the session is unpinned, any sender on the control peer's IP
+/// can win the race for the first datagram, so the window is bounded to
+/// this instead of the full 5-minute idle timeout. A client that
+/// declares its UDP address in the ASSOCIATE request is pinned to that
+/// exact address from the start and is unaffected. Residual risk: a
+/// same-IP attacker racing inside the grace window can still hijack
+/// the session — the protocol cannot authenticate the first datagram of
+/// an undeclared client, whose UDP port legitimately differs from its
+/// TCP control port, so exact pinning to the control peer is not
+/// possible for that case.
+const UDP_FIRST_DATAGRAM_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Sleep duration for the first-datagram grace branch: the time left
+/// until the grace deadline while the session is unpinned; once the
+/// session is pinned the branch is parked far in the future (the idle
+/// timeout ends the session first).
+pub(crate) fn udp_first_datagram_grace_sleep(
+    pinned: bool,
+    deadline: tokio::time::Instant,
+) -> std::time::Duration {
+    if pinned {
+        std::time::Duration::from_secs(3600)
+    } else {
+        deadline.saturating_duration_since(tokio::time::Instant::now())
+    }
+}
+
+/// True when the first-datagram grace period expired while the session
+/// is still unpinned (see `UDP_FIRST_DATAGRAM_GRACE`): no datagram
+/// arrived in time, so the session is closed instead of waiting the
+/// full idle timeout for a hijacker.
+fn udp_first_datagram_expired(client_udp_addr: Option<SocketAddr>) -> bool {
+    if client_udp_addr.is_none() {
+        tracing::debug!(
+            "SOCKS5 UDP ASSOCIATE relay closed: no datagram within first-datagram grace period"
+        );
+        true
+    } else {
+        false
+    }
+}
+/// Relay one datagram received on the virtual socket, but only when it
+/// answers a destination this session asked for; anything else (e.g. a
+/// spoofed source) is dropped, never stamped into a SOCKS5 header for
+/// the client (audit run-1, `socks5-udp-relay-unvalidated-tunnel-reply-source`).
+async fn forward_virtual_datagram(
+    payload: &[u8],
+    peer_addr: SocketAddr,
+    client_udp_addr: Option<SocketAddr>,
+    expected: &mut ExpectedUdpReplies,
+    out_pkt_buf: &mut [u8],
+    relay_socket: &tokio::net::UdpSocket,
+) {
+    if expected.is_expected(peer_addr, payload) {
+        forward_virtual_to_relay(
+            payload,
+            peer_addr,
+            client_udp_addr,
+            out_pkt_buf,
+            relay_socket,
+        )
+        .await;
+    } else {
+        tracing::warn!(
+            "Dropping tunnel UDP datagram from unexpected source {}; no outstanding request to it in this session",
+            peer_addr
+        );
+    }
+}
+
+/// Handle one datagram received on the client-facing relay socket.
+/// Returns false when the loop should stop (socket error).
+async fn handle_relay_recv(
+    relay_res: io::Result<(usize, SocketAddr)>,
+    relay_buf: &[u8],
+    ctx: &mut UdpRelayCtx<'_>,
+) -> bool {
+    let Ok((n, from_addr)) = relay_res else {
+        tracing::debug!("Tokio UDP relay socket recv error: {:?}", relay_res.err());
+        return false;
+    };
+    if let Some(pkt) = relay_buf.get(..n) {
+        forward_client_udp_datagram(pkt, from_addr, ctx).await;
+    }
+    true
+}
+
+/// Handle one datagram received on the virtual (tunnel) socket.
+/// Returns false when the loop should stop (socket error).
+async fn handle_virtual_recv(
+    virtual_res: io::Result<(usize, SocketAddr)>,
+    virtual_buf: &[u8],
+    client_udp_addr: Option<SocketAddr>,
+    expected: &mut ExpectedUdpReplies,
+    out_pkt_buf: &mut [u8],
+    relay_socket: &tokio::net::UdpSocket,
+) -> bool {
+    let Ok((n, peer_addr)) = virtual_res else {
+        tracing::debug!("Virtual UDP socket recv error: {:?}", virtual_res.err());
+        return false;
+    };
+    if let Some(payload) = virtual_buf.get(..n) {
+        forward_virtual_datagram(
+            payload,
+            peer_addr,
+            client_udp_addr,
+            expected,
+            out_pkt_buf,
+            relay_socket,
+        )
+        .await;
+    }
+    true
 }
 
 /// Loops relaying UDP datagrams between client and tunnel until client TCP closes.
@@ -862,15 +1056,30 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
     let mut dns_tasks = tokio::task::JoinSet::new();
     let (dns_tx, mut dns_rx) = tokio::sync::mpsc::channel::<(Vec<SocketAddr>, Bytes)>(64);
     let mut payload_pool = UdpPayloadPool::default();
+    // Destinations the client actually asked for in this session; only
+    // replies matching them are relayed back (audit run-1,
+    // `socks5-udp-relay-unvalidated-tunnel-reply-source`).
+    let mut expected = ExpectedUdpReplies::default();
+    // First datagram must arrive within the grace window (see
+    // `UDP_FIRST_DATAGRAM_GRACE`); after that an unpinned session is
+    // closed instead of waiting the full idle timeout for a hijacker.
+    let first_datagram_deadline = tokio::time::Instant::now() + UDP_FIRST_DATAGRAM_GRACE;
 
     loop {
         while let Some(res) = dns_tasks.try_join_next() {
             let _ = res;
         }
+        let grace =
+            udp_first_datagram_grace_sleep(client_udp_addr.is_some(), first_datagram_deadline);
         tokio::select! {
             () = tokio::time::sleep(idle_timeout) => {
                 tracing::debug!("SOCKS5 UDP ASSOCIATE relay timed out after {:?} of inactivity", idle_timeout);
                 break;
+            }
+            () = tokio::time::sleep(grace) => {
+                if udp_first_datagram_expired(client_udp_addr) {
+                    break;
+                }
             }
             tcp_res = control_stream.read(&mut tcp_byte) => {
                 if !matches!(tcp_res, Ok(1..)) {
@@ -880,42 +1089,38 @@ async fn run_udp_relay_loop<S: AsyncRead + Unpin>(
             }
 
             Some((target_socks, payload)) = dns_rx.recv() => {
-                dispatch_resolved_udp_datagram(virtual_udp.as_ref(), &payload, &target_socks).await;
+                dispatch_resolved_udp_datagram(virtual_udp.as_ref(), &payload, &target_socks, &mut expected).await;
                 payload_pool.release(payload);
             }
 
             relay_res = relay_socket.recv_from(&mut relay_buf) => {
-                let Ok((n, from_addr)) = relay_res else {
-                    tracing::debug!("Tokio UDP relay socket recv error: {:?}", relay_res.err());
-                    break;
+                let mut ctx = UdpRelayCtx {
+                    client_udp_addr: &mut client_udp_addr,
+                    normalized_expected_ip,
+                    virtual_udp: virtual_udp.as_ref(),
+                    target_tunnel: &target_tunnel,
+                    dns_tasks: &mut dns_tasks,
+                    dns_tx: &dns_tx,
+                    payload_pool: &mut payload_pool,
+                    expected: &mut expected,
                 };
-                if let Some(pkt) = relay_buf.get(..n) {
-                    let mut ctx = UdpRelayCtx {
-                        client_udp_addr: &mut client_udp_addr,
-                        normalized_expected_ip,
-                        virtual_udp: virtual_udp.as_ref(),
-                        target_tunnel: &target_tunnel,
-                        dns_tasks: &mut dns_tasks,
-                        dns_tx: &dns_tx,
-                        payload_pool: &mut payload_pool,
-                    };
-                    forward_client_udp_datagram(pkt, from_addr, &mut ctx).await;
+                if !handle_relay_recv(relay_res, &relay_buf, &mut ctx).await {
+                    break;
                 }
             }
 
             virtual_res = virtual_udp.recv_from(&mut virtual_buf) => {
-                let Ok((n, peer_addr)) = virtual_res else {
-                    tracing::debug!("Virtual UDP socket recv error: {:?}", virtual_res.err());
+                if !handle_virtual_recv(
+                    virtual_res,
+                    &virtual_buf,
+                    client_udp_addr,
+                    &mut expected,
+                    &mut out_pkt_buf,
+                    &relay_socket,
+                )
+                .await
+                {
                     break;
-                };
-                if let Some(payload) = virtual_buf.get(..n) {
-                    forward_virtual_to_relay(
-                        payload,
-                        peer_addr,
-                        client_udp_addr,
-                        &mut out_pkt_buf,
-                        &relay_socket,
-                    ).await;
                 }
             }
         }

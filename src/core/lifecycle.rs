@@ -11,18 +11,27 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use gotatun::device::{Device, DeviceBuilder, Peer};
+use gotatun::tun::{IpRecv, IpSend};
+use gotatun::udp::UdpTransportFactory;
+use parking_lot::{Mutex, RwLock};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use x25519_dalek::StaticSecret;
 
-use crate::config::LifecycleMode;
+use crate::config::{LifecycleMode, WgInterfaceConfig, WgPeerConfig};
 use crate::core::CoreError;
 use crate::core::health::TunnelHealthTracker;
-use crate::core::registry::{ActiveTunnel, TunnelEntry, TunnelRegistry, TunnelState, TunnelStats};
+use crate::core::protector::{ProtectedUdpFactory, SocketProtector};
+use crate::core::registry::{
+    ActiveTunnel, TunnelEntry, TunnelRegistry, TunnelState, TunnelStats, WgDevice,
+};
+use crate::netstack::tun::TunEndpoint;
 use crate::netstack::{
     DEFAULT_CHANNEL_CAPACITY, DnsLruCache, StackDnsConfig, VirtualNetworkStack, VirtualTunBridge,
 };
+use crate::proxy::router::is_forbidden_destination_ip;
 use crate::proxy::{DynStream, ProxyTunnelTarget, ProxyUdpSocket};
 
 /// RAII Guard tracking an active connection routed through a specific tunnel.
@@ -369,7 +378,7 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         &'a self,
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<std::net::IpAddr>> + Send + 'a>> {
-        let mode = self.tunnel.netstack.effective_ip_mode();
+        let mode = self.tunnel.effective_ip_mode();
         self.resolve_in_tunnel_with_mode(domain, mode)
     }
 
@@ -377,7 +386,7 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
         &'a self,
         domain: &'a str,
     ) -> crate::proxy::router::ResolveAllFut<'a> {
-        let mode = self.tunnel.netstack.effective_ip_mode();
+        let mode = self.tunnel.effective_ip_mode();
         self.resolve_all_in_tunnel_with_mode(domain, mode)
     }
 
@@ -386,7 +395,7 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
     }
 
     fn connect_timeout(&self) -> Duration {
-        self.tunnel.netstack.connect_timeout()
+        self.tunnel.connect_timeout()
     }
 
     fn note_attempt_aborted(&self) {
@@ -542,6 +551,32 @@ pub struct LifecycleController {
     /// on every connection (each tunnel's own cache would go cold between
     /// its turns).
     shared_dns_cache: Arc<DnsLruCache>,
+    /// VPN mode: when true, `boot_tunnel` builds devices on the shared
+    /// TUN endpoint with a protected UDP factory instead of the smoltcp
+    /// bridge + netstack. Off by default; the daemon proxy path is
+    /// untouched while off.
+    vpn_mode: std::sync::atomic::AtomicBool,
+    /// Installed socket protector (`VpnService.protect`), if any.
+    socket_protector: RwLock<Option<Arc<dyn SocketProtector>>>,
+    /// Shared TUN endpoint for VPN mode, if one was attached.
+    tun_endpoint: RwLock<Option<Arc<TunEndpoint>>>,
+}
+
+/// Union of all peers' `AllowedIPs` for one tunnel entry.
+fn allowed_ips_of(entry: &TunnelEntry) -> Vec<ipnetwork::IpNetwork> {
+    entry
+        .config
+        .read()
+        .peers
+        .iter()
+        .flat_map(|peer| peer.allowed_ips.iter().copied())
+        .collect()
+}
+
+/// The tunnel's `Interface` addresses, used by the VPN data plane for
+/// per-tunnel source NAT.
+fn interface_addrs_of(entry: &TunnelEntry) -> Vec<ipnetwork::IpNetwork> {
+    entry.config.read().interface.addresses.clone()
 }
 
 impl LifecycleController {
@@ -572,6 +607,9 @@ impl LifecycleController {
             ip_mode: std::sync::atomic::AtomicU8::new(0),
             eviction_lock: tokio::sync::Mutex::new(()),
             shared_dns_cache: Arc::new(DnsLruCache::new(2048)),
+            vpn_mode: std::sync::atomic::AtomicBool::new(false),
+            socket_protector: RwLock::new(None),
+            tun_endpoint: RwLock::new(None),
         })
     }
 
@@ -658,6 +696,131 @@ impl LifecycleController {
         crate::config::IpMode::from_u8(self.ip_mode.load(Ordering::Relaxed))
     }
 
+    /// Enable or disable VPN mode. When enabled, newly booted tunnels
+    /// use the shared TUN endpoint and a protected UDP factory.
+    /// `set_vpn_mode` itself does not migrate tunnels that are
+    /// already active; [`Engine::attach_tun`] migrates those via
+    /// [`Self::migrate_proxy_tunnels_to_vpn`] after installing the
+    /// endpoint.
+    pub fn set_vpn_mode(&self, enabled: bool) {
+        self.vpn_mode.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Return whether VPN mode is active.
+    pub fn vpn_mode(&self) -> bool {
+        self.vpn_mode.load(Ordering::Relaxed)
+    }
+
+    /// Install the socket protector used for WireGuard UDP sockets
+    /// booted in VPN mode.
+    pub fn set_socket_protector(&self, protector: Arc<dyn SocketProtector>) {
+        *self.socket_protector.write() = Some(protector);
+    }
+
+    /// Return the installed socket protector, if any.
+    pub fn socket_protector(&self) -> Option<Arc<dyn SocketProtector>> {
+        self.socket_protector.read().clone()
+    }
+
+    /// Attach (or clear with `None`) the shared TUN endpoint used by
+    /// VPN-mode tunnels.
+    pub fn set_tun_endpoint(&self, endpoint: Option<Arc<TunEndpoint>>) {
+        *self.tun_endpoint.write() = endpoint;
+    }
+
+    /// Return the attached TUN endpoint, if any.
+    pub fn tun_endpoint(&self) -> Option<Arc<TunEndpoint>> {
+        self.tun_endpoint.read().clone()
+    }
+
+    /// Drop one tunnel's route from the TUN endpoint (suspend path);
+    /// no-op when no endpoint is attached.
+    fn detach_vpn_route(&self, id: &str) {
+        if let Some(endpoint) = self.tun_endpoint() {
+            endpoint.suspend_tunnel(id);
+        }
+    }
+
+    /// Re-add one tunnel's route to the TUN endpoint (resume path);
+    /// no-op when VPN mode is off or no endpoint is attached.
+    fn attach_vpn_route(&self, entry: &TunnelEntry) {
+        if !self.vpn_mode() {
+            return;
+        }
+        let Some(endpoint) = self.tun_endpoint() else {
+            return;
+        };
+        endpoint.resume_tunnel(&entry.id, allowed_ips_of(entry), interface_addrs_of(entry));
+    }
+
+    /// IDs of tunnels currently booted in proxy mode (Active or
+    /// Suspended with a `WgDevice::Proxy` device). These are the
+    /// tunnels `attach_tun` must migrate to VPN mode.
+    pub fn proxy_booted_tunnel_ids(&self) -> Vec<String> {
+        self.registry
+            .all_entries()
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    *entry.state.read(),
+                    TunnelState::Active | TunnelState::Suspended
+                ) && entry
+                    .active
+                    .read()
+                    .as_ref()
+                    .is_some_and(|active| matches!(active.device, WgDevice::Proxy(_)))
+            })
+            .map(|entry| entry.id.clone())
+            .collect()
+    }
+
+    /// Re-boot every proxy-booted tunnel in VPN mode, returning the
+    /// migrated IDs. Called by `attach_tun` after the TUN endpoint is
+    /// installed and VPN mode is on: a proxy-booted device can only
+    /// change mode by being closed and re-booted, because
+    /// `activate_tunnel` returns the existing handle for an Active
+    /// tunnel and the suspend/resume path re-adds the route only for
+    /// tunnels that already have a TUN channel. A migration failure
+    /// closes the tunnels already migrated, so no VPN-mode device is
+    /// left on an endpoint the caller is about to tear down; the
+    /// failed tunnel itself is left Dormant. Live proxy sessions on
+    /// a migrated tunnel are dropped by the close.
+    pub async fn migrate_proxy_tunnels_to_vpn(&self) -> Result<Vec<String>, CoreError> {
+        let ids = self.proxy_booted_tunnel_ids();
+        let mut migrated: Vec<String> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Err(e) = self.close_tunnel(&id).await {
+                self.unwind_migrated(&migrated).await;
+                return Err(e);
+            }
+            match self.activate_tunnel(&id).await {
+                Ok(_) => migrated.push(id),
+                Err(e) => {
+                    self.unwind_migrated(&migrated).await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(migrated)
+    }
+
+    /// Best-effort close of tunnels already migrated by
+    /// [`Self::migrate_proxy_tunnels_to_vpn`], used when a later
+    /// migration fails.
+    async fn unwind_migrated(&self, migrated: &[String]) {
+        for id in migrated {
+            let _ = self.close_tunnel(id).await;
+        }
+    }
+
+    /// Detach one tunnel from the TUN endpoint entirely (close path);
+    /// no-op when no endpoint is attached.
+    fn detach_vpn_tunnel(&self, id: &str) {
+        if let Some(endpoint) = self.tun_endpoint() {
+            endpoint.detach_tunnel(id);
+        }
+    }
+
     /// Access the underlying [`TunnelRegistry`].
     pub const fn registry(&self) -> &Arc<TunnelRegistry> {
         &self.registry
@@ -699,11 +862,19 @@ impl LifecycleController {
 
     /// Stop the background idle teardown task without closing tunnels yet.
     pub async fn stop_background_tasks(&self) {
-        let _ = self.shutdown_tx.send(true);
-        let handle = self.teardown_handle.lock().take();
-        if let Some(h) = handle {
-            let _ = h.await;
+        if let Some(handle) = self.stop_background_tasks_sync() {
+            let _ = handle.await;
         }
+    }
+
+    /// Synchronously signal the idle-teardown task to stop and detach
+    /// it without waiting. The caller may abort the returned handle
+    /// when waiting is impossible (e.g. `Drop` paths); the signal
+    /// alone stops the loop at its next tick (audit run-1,
+    /// `uniffi:engine-destroy-without-stop-detached-vpn`).
+    pub fn stop_background_tasks_sync(&self) -> Option<JoinHandle<()>> {
+        let _ = self.shutdown_tx.send(true);
+        self.teardown_handle.lock().take()
     }
 
     /// Cleanly close all active and suspended tunnels in the registry and await reactor teardown.
@@ -732,8 +903,9 @@ impl LifecycleController {
         if let Some(active) = maybe_active {
             tracing::debug!("Closing and shutting down netstack for tunnel '{}'", id);
             let () = active.device.suspend().await;
-            active.netstack.close().await;
+            active.close_netstack().await;
         }
+        self.detach_vpn_tunnel(id);
         *entry.state.write() = TunnelState::Dormant;
         Ok(())
     }
@@ -812,7 +984,8 @@ impl LifecycleController {
             tracing::debug!("Evicting idle lazy tunnel '{}'", id);
             *entry.state.write() = TunnelState::Suspended;
             active.device.suspend().await;
-            active.netstack.notify().notify_one();
+            active.notify_netstack();
+            self.detach_vpn_route(id);
         }
     }
 
@@ -883,6 +1056,7 @@ impl LifecycleController {
 
                 *entry.state.write() = TunnelState::Active;
                 activating_guard.defuse();
+                self.attach_vpn_route(&entry);
                 let guard = TunnelConnGuard::new(id, Arc::clone(&entry.stats));
                 Ok((active, guard))
             }
@@ -893,14 +1067,15 @@ impl LifecycleController {
                     self.dns_strategy(),
                     Arc::clone(&self.shared_dns_cache),
                 );
-                match Self::boot_tunnel(
-                    &entry,
-                    self.ip_mode(),
-                    self.prefer_ipv6.load(Ordering::Relaxed),
-                    self.handshake_timeout(),
-                    &dns,
-                )
-                .await
+                match self
+                    .boot_tunnel(
+                        &entry,
+                        self.ip_mode(),
+                        self.prefer_ipv6.load(Ordering::Relaxed),
+                        self.handshake_timeout(),
+                        &dns,
+                    )
+                    .await
                 {
                     Ok(active) => {
                         *entry.active.write() = Some(Arc::clone(&active));
@@ -990,6 +1165,7 @@ impl LifecycleController {
 
                 *entry.state.write() = TunnelState::Active;
                 activating_guard.defuse();
+                self.attach_vpn_route(&entry);
                 Ok(active)
             }
             TunnelState::Dormant | TunnelState::Activating => {
@@ -999,14 +1175,15 @@ impl LifecycleController {
                     self.dns_strategy(),
                     Arc::clone(&self.shared_dns_cache),
                 );
-                match Self::boot_tunnel(
-                    &entry,
-                    self.ip_mode(),
-                    self.prefer_ipv6.load(Ordering::Relaxed),
-                    self.handshake_timeout(),
-                    &dns,
-                )
-                .await
+                match self
+                    .boot_tunnel(
+                        &entry,
+                        self.ip_mode(),
+                        self.prefer_ipv6.load(Ordering::Relaxed),
+                        self.handshake_timeout(),
+                        &dns,
+                    )
+                    .await
                 {
                     Ok(active) => {
                         *entry.active.write() = Some(Arc::clone(&active));
@@ -1051,14 +1228,21 @@ impl LifecycleController {
             tracing::debug!("Suspending active tunnel '{}'", id);
             *entry.state.write() = TunnelState::Suspended;
             active.device.suspend().await;
-            active.netstack.notify().notify_one();
+            active.notify_netstack();
+            self.detach_vpn_route(id);
         }
 
         Ok(())
     }
 
     /// Build a new [`ActiveTunnel`] from a dormant [`TunnelEntry`].
+    ///
+    /// In proxy mode (default) the device is built on a
+    /// [`VirtualTunBridge`] + [`VirtualNetworkStack`]. In VPN mode the
+    /// device is built on the shared [`TunEndpoint`] pair with a
+    /// [`ProtectedUdpFactory`], and no smoltcp stack is created.
     async fn boot_tunnel(
+        &self,
         entry: &TunnelEntry,
         ip_mode: crate::config::IpMode,
         prefer_ipv6: bool,
@@ -1069,72 +1253,25 @@ impl LifecycleController {
             let cfg = entry.config.read();
             (cfg.interface.clone(), cfg.peers.clone())
         };
+        let peers = Self::build_peers(&config_peers, handshake_timeout, &entry.id).await?;
+        if self.vpn_mode() {
+            return self.boot_tunnel_vpn(entry, &config_interface, peers).await;
+        }
+
         let mtu = config_interface.mtu;
         let (bridge, bridge_tx, bridge_rx) = VirtualTunBridge::new(mtu, DEFAULT_CHANNEL_CAPACITY);
-
-        // Prepare peers
-        let mut peers = Vec::with_capacity(config_peers.len());
-        for p_cfg in &config_peers {
-            let mut peer = gotatun::device::Peer::new(p_cfg.public_key);
-            if let Ok(addr) = p_cfg.endpoint.parse::<SocketAddr>() {
-                peer.endpoint = Some(addr);
-            } else {
-                match tokio::time::timeout(
-                    handshake_timeout,
-                    tokio::net::lookup_host(&p_cfg.endpoint),
-                )
-                .await
-                {
-                    Ok(Ok(mut addrs)) => {
-                        let Some(addr) = addrs.next() else {
-                            return Err(CoreError::ActivationFailed(
-                                entry.id.clone(),
-                                format!(
-                                    "endpoint DNS lookup returned no addresses for '{}'",
-                                    p_cfg.endpoint
-                                ),
-                            ));
-                        };
-                        peer.endpoint = Some(addr);
-                    }
-                    Ok(Err(e)) => {
-                        return Err(CoreError::ActivationFailed(
-                            entry.id.clone(),
-                            format!("endpoint DNS lookup failed for '{}': {e}", p_cfg.endpoint),
-                        ));
-                    }
-                    Err(_) => {
-                        return Err(CoreError::ActivationFailed(
-                            entry.id.clone(),
-                            format!("endpoint DNS lookup timed out for '{}'", p_cfg.endpoint),
-                        ));
-                    }
-                }
-            }
-            peer.allowed_ips = p_cfg.allowed_ips.clone();
-            peer.preshared_key = p_cfg.preshared_key;
-            peer.keepalive = p_cfg.persistent_keepalive;
-            peers.push(peer);
-        }
-
-        // Build gotatun Device
-        let mut builder = gotatun::device::DeviceBuilder::new()
+        let builder = DeviceBuilder::new()
             .with_default_udp()
-            .with_ip_pair(bridge_tx, bridge_rx)
-            .with_private_key(config_interface.private_key.clone())
-            .with_peers(peers)
-            .suspended(false);
-
-        if let Some(port) = config_interface.listen_port {
-            builder = builder.with_listen_port(port);
-        }
-
-        let device = builder.build().await.map_err(|e| {
-            CoreError::ActivationFailed(
-                entry.id.clone(),
-                format!("failed to build gotatun device: {e:?}"),
-            )
-        })?;
+            .with_ip_pair(bridge_tx, bridge_rx);
+        let device = Self::finish_device_build(
+            builder,
+            config_interface.private_key.clone(),
+            peers,
+            config_interface.listen_port,
+            &entry.id,
+        )
+        .await
+        .map(WgDevice::Proxy)?;
 
         // Build smoltcp VirtualNetworkStack (shares the daemon-wide DNS cache)
         let netstack = match VirtualNetworkStack::new_with_options(
@@ -1155,20 +1292,187 @@ impl LifecycleController {
             }
         };
 
+        Ok(Self::new_active_tunnel(
+            entry,
+            device,
+            Some(Arc::new(netstack)),
+        ))
+    }
+
+    /// Build a new [`ActiveTunnel`] in VPN mode: device on the shared
+    /// TUN endpoint with a protected UDP factory, no smoltcp stack.
+    /// The tunnel is registered with the endpoint's router before the
+    /// device is built; a failed build unregisters it again.
+    async fn boot_tunnel_vpn(
+        &self,
+        entry: &TunnelEntry,
+        interface: &WgInterfaceConfig,
+        peers: Vec<Peer>,
+    ) -> Result<Arc<ActiveTunnel>, CoreError> {
+        let endpoint = self.tun_endpoint().ok_or_else(|| {
+            CoreError::ActivationFailed(
+                entry.id.clone(),
+                "vpn mode active but no TUN endpoint attached (call attach_tun first)".into(),
+            )
+        })?;
+        // Fail closed before registering any route: without a
+        // protector the tunnel's own handshake packets would be
+        // routed into the TUN interface and wedge the tunnel (audit
+        // run-1, `uniffi:vpn-mode-unprotected-udp-fallback`). There
+        // is no unprotected fallback here; install a protector with
+        // `set_socket_protector` first.
+        let Some(factory) = self.socket_protector().map(ProtectedUdpFactory::new) else {
+            return Err(CoreError::ActivationFailed(
+                entry.id.clone(),
+                "vpn mode requires a socket protector (call set_socket_protector before attach_tun); refusing to boot with unprotected sockets".into(),
+            ));
+        };
+        let (ip_send, ip_recv) =
+            endpoint.attach_tunnel(&entry.id, allowed_ips_of(entry), interface_addrs_of(entry));
+        let builder = DeviceBuilder::new()
+            .with_udp(factory)
+            .with_ip_pair(ip_send, ip_recv);
+        let device = match Self::finish_device_build(
+            builder,
+            interface.private_key.clone(),
+            peers,
+            interface.listen_port,
+            &entry.id,
+        )
+        .await
+        {
+            Ok(device) => WgDevice::Vpn(device),
+            Err(e) => {
+                endpoint.detach_tunnel(&entry.id);
+                return Err(e);
+            }
+        };
+        Ok(Self::new_active_tunnel(entry, device, None))
+    }
+
+    /// Record activation time and wrap a fresh device in an [`ActiveTunnel`].
+    fn new_active_tunnel(
+        entry: &TunnelEntry,
+        device: WgDevice,
+        netstack: Option<Arc<VirtualNetworkStack>>,
+    ) -> Arc<ActiveTunnel> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         entry.stats.last_active_at.store(now, Ordering::Relaxed);
-
-        let active = Arc::new(ActiveTunnel::new(
+        Arc::new(ActiveTunnel::new(
             entry.id.clone(),
             device,
-            Arc::new(netstack),
+            netstack,
             Arc::clone(&entry.stats),
-        ));
+        ))
+    }
 
-        Ok(active)
+    /// Build gotatun peers from the tunnel config, resolving
+    /// non-literal endpoints through DNS under `handshake_timeout`.
+    async fn build_peers(
+        config_peers: &[WgPeerConfig],
+        handshake_timeout: Duration,
+        tunnel_id: &str,
+    ) -> Result<Vec<Peer>, CoreError> {
+        let mut peers = Vec::with_capacity(config_peers.len());
+        for p_cfg in config_peers {
+            let mut peer = Peer::new(p_cfg.public_key);
+            if let Ok(addr) = p_cfg.endpoint.parse::<SocketAddr>() {
+                peer.endpoint = Some(addr);
+            } else {
+                match tokio::time::timeout(
+                    handshake_timeout,
+                    tokio::net::lookup_host(&p_cfg.endpoint),
+                )
+                .await
+                {
+                    Ok(Ok(addrs)) => {
+                        // The host resolver's answer is third-party
+                        // data, not operator config: never handshake
+                        // an endpoint that resolves to a forbidden
+                        // address (loopback/private/link-local/...).
+                        // Take the first allowed answer; when every
+                        // answer is forbidden, fail the tunnel instead
+                        // of silently using a dangerous one (audit
+                        // run-1,
+                        // `lifecycle:build-peers-unchecked-dns-endpoint`).
+                        let addrs: Vec<SocketAddr> = addrs.collect();
+                        if addrs.is_empty() {
+                            return Err(CoreError::ActivationFailed(
+                                tunnel_id.to_string(),
+                                format!(
+                                    "endpoint DNS lookup returned no addresses for '{}'",
+                                    p_cfg.endpoint
+                                ),
+                            ));
+                        }
+                        let Some(addr) = addrs
+                            .iter()
+                            .copied()
+                            .find(|addr| !is_forbidden_destination_ip(addr.ip()))
+                        else {
+                            return Err(CoreError::ActivationFailed(
+                                tunnel_id.to_string(),
+                                format!(
+                                    "endpoint DNS lookup for '{}' resolved only to forbidden addresses",
+                                    p_cfg.endpoint
+                                ),
+                            ));
+                        };
+                        peer.endpoint = Some(addr);
+                    }
+                    Ok(Err(e)) => {
+                        return Err(CoreError::ActivationFailed(
+                            tunnel_id.to_string(),
+                            format!("endpoint DNS lookup failed for '{}': {e}", p_cfg.endpoint),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(CoreError::ActivationFailed(
+                            tunnel_id.to_string(),
+                            format!("endpoint DNS lookup timed out for '{}'", p_cfg.endpoint),
+                        ));
+                    }
+                }
+            }
+            peer.allowed_ips = p_cfg.allowed_ips.clone();
+            peer.preshared_key = p_cfg.preshared_key;
+            peer.keepalive = p_cfg.persistent_keepalive;
+            peers.push(peer);
+        }
+        Ok(peers)
+    }
+
+    /// Finish a gotatun device build: keys, peers, listen port, then
+    /// `build()`. Shared by the proxy and VPN boot paths so the two
+    /// builders cannot drift apart.
+    async fn finish_device_build<Udp, Tx, Rx>(
+        builder: DeviceBuilder<Udp, Tx, Rx>,
+        private_key: StaticSecret,
+        peers: Vec<Peer>,
+        listen_port: Option<u16>,
+        tunnel_id: &str,
+    ) -> Result<Device<(Udp, Tx, Rx)>, CoreError>
+    where
+        Udp: UdpTransportFactory,
+        Tx: IpSend,
+        Rx: IpRecv,
+    {
+        let mut builder = builder
+            .with_private_key(private_key)
+            .with_peers(peers)
+            .suspended(false);
+        if let Some(port) = listen_port {
+            builder = builder.with_listen_port(port);
+        }
+        builder.build().await.map_err(|e| {
+            CoreError::ActivationFailed(
+                tunnel_id.to_string(),
+                format!("failed to build gotatun device: {e:?}"),
+            )
+        })
     }
 
     /// Periodically inspects all tunnels and suspends idle lazy tunnels.
@@ -1228,5 +1532,53 @@ impl LifecycleController {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use x25519_dalek::PublicKey;
+
+    fn test_peer(endpoint: &str) -> WgPeerConfig {
+        WgPeerConfig {
+            public_key: PublicKey::from([99u8; 32]),
+            endpoint: endpoint.to_string(),
+            allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            preshared_key: None,
+            persistent_keepalive: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_peers_rejects_endpoint_resolving_to_forbidden_ip() {
+        // `localhost` resolves to ::1 and 127.0.0.1, both forbidden:
+        // the tunnel must fail instead of handshaking loopback (audit
+        // run-1, `lifecycle:build-peers-unchecked-dns-endpoint`).
+        let err = LifecycleController::build_peers(
+            &[test_peer("localhost:51820")],
+            Duration::from_secs(5),
+            "tunnel-test",
+        )
+        .await
+        .expect_err("localhost endpoint must be rejected");
+        assert!(
+            err.to_string().contains("forbidden"),
+            "error must name the forbidden-address rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_peers_keeps_literal_endpoint() {
+        // An operator-authored IP literal is not a DNS answer and is
+        // left untouched by the forbidden-address check.
+        let peers = LifecycleController::build_peers(
+            &[test_peer("127.0.0.1:51820")],
+            Duration::from_secs(5),
+            "tunnel-test",
+        )
+        .await
+        .expect("literal endpoint must build");
+        assert_eq!(peers[0].endpoint, Some("127.0.0.1:51820".parse().unwrap()));
     }
 }

@@ -50,3 +50,41 @@ jobs:
 
       - name: Coverage
         run: cargo llvm-cov nextest --locked --lib --bins --tests --no-fail-fast --summary-only
+
+  # Kotlin binding freshness gate (audit run-1,
+  # `uniffi:generated-kotlin-binding-stale-vs-lib-rs`): regenerate
+  # the Kotlin binding from the current `lib.rs` with the in-repo
+  # `uniffi-bindgen` and fail when the checked-in generated file
+  # differs. The cdylib is built with the `release-android` profile
+  # (strip=false) so bindgen can read the UniFFI metadata; the
+  # generated binding is architecture-independent, so the host build
+  # is sufficient for the diff.
+  uniffi-bindings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: 1.100.0
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "ci-linux"
+          cache-on-failure: true
+          cache-all-crates: true
+
+      - name: Build UniFFI cdylib and bindgen
+        run: |
+          cargo build -p wpmulti-uniffi --profile release-android --locked --lib
+          cargo build -p wpmulti-uniffi --bin uniffi-bindgen --locked
+
+      - name: Regenerate Kotlin binding and diff
+        run: |
+          rm -rf /tmp/uniffi-kotlin
+          ./target/debug/uniffi-bindgen generate \
+            --library target/release-android/libwpmulti_uniffi.so \
+            --language kotlin \
+            --out-dir /tmp/uniffi-kotlin \
+            --config crates/wpmulti-uniffi/uniffi.toml
+          diff -u crates/wpmulti-uniffi/generated/kotlin/id/onlasdan/wpmulti/wpmulti_uniffi.kt /tmp/uniffi-kotlin/id/onlasdan/wpmulti/wpmulti_uniffi.kt

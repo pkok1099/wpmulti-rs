@@ -61,7 +61,10 @@ pub enum Commands {
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
 
-        /// Bearer authentication token for protected Admin API
+        /// Deprecated: bearer authentication token for protected Admin API.
+        /// The value stays visible in the process argument list
+        /// (`/proc/<pid>/cmdline`, `ps`) for the whole session;
+        /// prefer the `WPMULTI_ADMIN_TOKEN` environment variable.
         #[clap(long)]
         auth_token: Option<String>,
     },
@@ -85,7 +88,10 @@ pub enum Commands {
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
 
-        /// Bearer authentication token for protected Admin API
+        /// Deprecated: bearer authentication token for protected Admin API.
+        /// The value stays visible in the process argument list
+        /// (`/proc/<pid>/cmdline`, `ps`) for the whole session;
+        /// prefer the `WPMULTI_ADMIN_TOKEN` environment variable.
         #[clap(long)]
         auth_token: Option<String>,
     },
@@ -125,7 +131,10 @@ pub enum Commands {
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
 
-        /// Bearer authentication token for protected Admin API
+        /// Deprecated: bearer authentication token for protected Admin API.
+        /// The value stays visible in the process argument list
+        /// (`/proc/<pid>/cmdline`, `ps`) for the whole session;
+        /// prefer the `WPMULTI_ADMIN_TOKEN` environment variable.
         #[clap(long)]
         auth_token: Option<String>,
     },
@@ -143,7 +152,10 @@ pub enum Commands {
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
 
-        /// Bearer authentication token for protected Admin API
+        /// Deprecated: bearer authentication token for protected Admin API.
+        /// The value stays visible in the process argument list
+        /// (`/proc/<pid>/cmdline`, `ps`) for the whole session;
+        /// prefer the `WPMULTI_ADMIN_TOKEN` environment variable.
         #[clap(long)]
         auth_token: Option<String>,
     },
@@ -174,6 +186,19 @@ where
         .finish()
 }
 
+/// Warn that `--auth-token` is deprecated: the flag value stays visible
+/// in the process argument list (`/proc/<pid>/cmdline`, `ps`) to other
+/// local users for the whole session, while the token grants full Admin
+/// API control. Prefer the `WPMULTI_ADMIN_TOKEN` environment variable
+/// (audit run-1, `tui-cli/admin-token-cli-flag-argv`).
+fn warn_auth_token_flag_deprecated() {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "warning: --auth-token is deprecated: the token is visible in the process argument list; use the WPMULTI_ADMIN_TOKEN environment variable instead"
+    );
+}
+
 /// Parse arguments and execute the selected subcommand.
 pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -201,7 +226,12 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Top {
             admin_url,
             auth_token,
-        } => cmd_top(admin_url, auth_token.or(env_token)).await,
+        } => {
+            if auth_token.is_some() {
+                warn_auth_token_flag_deprecated();
+            }
+            cmd_top(admin_url, auth_token.or(env_token)).await
+        }
         Commands::Validate { config, dir } => {
             cmd_validate(config, dir)?;
             Ok(())
@@ -210,6 +240,9 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             admin_url,
             auth_token,
         } => {
+            if auth_token.is_some() {
+                warn_auth_token_flag_deprecated();
+            }
             cmd_status(admin_url, auth_token.or(env_token)).await?;
             Ok(())
         }
@@ -231,11 +264,21 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             target,
             admin_url,
             auth_token,
-        } => cmd_toggle_tunnels(target, true, admin_url, auth_token.or(env_token)).await,
+        } => {
+            if auth_token.is_some() {
+                warn_auth_token_flag_deprecated();
+            }
+            cmd_toggle_tunnels(target, true, admin_url, auth_token.or(env_token)).await
+        }
         Commands::Enable {
             target,
             admin_url,
             auth_token,
-        } => cmd_toggle_tunnels(target, false, admin_url, auth_token.or(env_token)).await,
+        } => {
+            if auth_token.is_some() {
+                warn_auth_token_flag_deprecated();
+            }
+            cmd_toggle_tunnels(target, false, admin_url, auth_token.or(env_token)).await
+        }
     }
 }

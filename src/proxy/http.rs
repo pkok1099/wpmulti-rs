@@ -19,6 +19,66 @@ use crate::proxy::router::{
 
 const MAX_HEADER_SIZE: usize = 16384;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle bound for each read step while forwarding a proxied HTTP
+/// request/response: no byte may stall longer than this (audit run-1,
+/// `src/proxy/http.rs:forward_upstream_response-unbounded-copy-no-timeout`).
+/// 30 s matches the header-read timeout.
+const FORWARD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Total-size bound for one forwarded upstream response and for one
+/// forwarded request body (audit run-1,
+/// `src/proxy/http.rs:forward_upstream_response-unbounded-copy-no-timeout`):
+/// generous enough for large legitimate downloads/uploads, but a
+/// never-ending stream can no longer hold a listener permit forever.
+const MAX_FORWARD_BODY_BYTES: u64 = 1 << 30;
+
+/// Copy from `reader` to `writer` until EOF or `limit` bytes, aborting
+/// when no byte arrives within `idle_timeout`. Each read is capped at
+/// the remaining limit, so a reader offering more than the limit (e.g.
+/// body bytes already buffered past a declared Content-Length) stops
+/// the copy at exactly `limit` instead of failing. Returns the bytes
+/// copied.
+pub(crate) async fn copy_limited_idle<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    limit: u64,
+    idle_timeout: Duration,
+) -> io::Result<u64> {
+    // Heap buffer: an 8 KiB stack buffer would push this future (and
+    // every caller awaiting it) toward the large-future threshold.
+    let mut buf = Box::new([0u8; 8192]);
+    let mut copied: u64 = 0;
+    loop {
+        if copied >= limit {
+            break;
+        }
+        let read_len = (limit - copied).min(buf.len() as u64) as usize;
+        let Some(read_buf) = buf.get_mut(..read_len) else {
+            break;
+        };
+        let n = match tokio::time::timeout(idle_timeout, reader.read(read_buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "forward copy idle timed out",
+                ));
+            }
+        };
+        let n_u64 = n as u64;
+        let Some(chunk) = buf.get(..n) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forward copy read overran its buffer",
+            ));
+        };
+        writer.write_all(chunk).await?;
+        copied += n_u64;
+    }
+    writer.flush().await?;
+    Ok(copied)
+}
 
 /// Parses authority-form string `host:port` or `[ipv6]:port`.
 pub fn parse_authority(authority: &str) -> Option<(String, u16)> {
@@ -414,8 +474,15 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
         tunnel_stream.flush().await?;
     }
 
-    // Bidirectional byte streaming
-    tokio::io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
+    // Bidirectional byte streaming, ending when either side closes or
+    // the session idles past CONNECT_IDLE_TIMEOUT (audit run-1,
+    // `wpmulti/proxy:established-connect-no-idle-timeout`).
+    crate::proxy::copy_bidirectional_with_idle_timeout(
+        &mut stream,
+        &mut tunnel_stream,
+        crate::proxy::CONNECT_IDLE_TIMEOUT,
+    )
+    .await?;
 
     Ok(())
 }
@@ -597,16 +664,32 @@ async fn read_crlf_line<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
+/// Read one CRLF-terminated line with an idle deadline: a stalled
+/// chunked sender cannot hold the forwarding task (audit run-1,
+/// `src/proxy/http.rs:forward_upstream_response-unbounded-copy-no-timeout`).
+async fn read_crlf_line_timeout<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+) -> io::Result<Vec<u8>> {
+    tokio::time::timeout(FORWARD_IDLE_TIMEOUT, read_crlf_line(reader, max_len))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "chunked body read idle timed out"))?
+}
+
 async fn forward_chunked_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: R,
     writer: &mut W,
     leftover: &[u8],
+    limit: u64,
 ) -> io::Result<()> {
     let chained = io::Cursor::new(leftover).chain(reader);
     let mut buf_reader = tokio::io::BufReader::new(chained);
+    // Aggregate body bound: a chunked sender declaring endless chunks
+    // cannot grow the forwarded body without bound.
+    let mut total: u64 = 0;
 
     loop {
-        let size_line = read_crlf_line(&mut buf_reader, 4096).await?;
+        let size_line = read_crlf_line_timeout(&mut buf_reader, 4096).await?;
         let line_str = std::str::from_utf8(
             size_line
                 .get(..size_line.len().saturating_sub(2))
@@ -621,7 +704,7 @@ async fn forward_chunked_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
         if chunk_size == 0 {
             loop {
-                let trailer = read_crlf_line(&mut buf_reader, 8192).await?;
+                let trailer = read_crlf_line_timeout(&mut buf_reader, 8192).await?;
                 writer.write_all(&trailer).await?;
                 if trailer == b"\r\n" {
                     break;
@@ -631,7 +714,20 @@ async fn forward_chunked_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             return Ok(());
         }
 
-        let copied = tokio::io::copy(&mut (&mut buf_reader).take(chunk_size), writer).await?;
+        total = total.saturating_add(chunk_size);
+        if total > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forward chunked body size limit exceeded",
+            ));
+        }
+        let copied = copy_limited_idle(
+            &mut (&mut buf_reader).take(chunk_size),
+            writer,
+            chunk_size,
+            FORWARD_IDLE_TIMEOUT,
+        )
+        .await?;
         if copied != chunk_size {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -639,7 +735,17 @@ async fn forward_chunked_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             ));
         }
         let mut crlf = [0u8; 2];
-        buf_reader.read_exact(&mut crlf).await?;
+        match tokio::time::timeout(FORWARD_IDLE_TIMEOUT, buf_reader.read_exact(&mut crlf)).await {
+            Ok(res) => {
+                res?;
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "chunked body read idle timed out",
+                ));
+            }
+        }
         if crlf != *b"\r\n" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -658,10 +764,22 @@ async fn forward_request_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     is_chunked: bool,
 ) -> io::Result<()> {
     if is_chunked {
-        forward_chunked_body(client_read, upstream_write, leftover).await?;
+        forward_chunked_body(
+            client_read,
+            upstream_write,
+            leftover,
+            MAX_FORWARD_BODY_BYTES,
+        )
+        .await?;
     } else if let Some(cl) = content_length
         && cl > 0
     {
+        if cl > MAX_FORWARD_BODY_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request body exceeds size limit",
+            ));
+        }
         let from_leftover = (leftover.len() as u64).min(cl) as usize;
         if let Some(slice) = leftover.get(..from_leftover)
             && !slice.is_empty()
@@ -670,8 +788,13 @@ async fn forward_request_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         let remaining = cl - from_leftover as u64;
         if remaining > 0 {
-            let copied =
-                tokio::io::copy(&mut (&mut client_read).take(remaining), upstream_write).await?;
+            let copied = copy_limited_idle(
+                &mut (&mut client_read).take(remaining),
+                upstream_write,
+                remaining,
+                FORWARD_IDLE_TIMEOUT,
+            )
+            .await?;
             if copied != remaining {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -821,42 +944,287 @@ async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
     }
 }
 
+/// How an upstream response body is framed (audit run-1,
+/// `src/proxy/http.rs:forward_upstream_response-verbatim-no-framing-validation`).
+pub(crate) enum ResponseBodyFraming {
+    /// Exactly `n` body bytes follow the head.
+    ContentLength(u64),
+    /// Chunked transfer coding; ends at the terminal chunk.
+    Chunked,
+    /// No framing: the body runs until the upstream closes.
+    UntilClose,
+}
+
+/// Parse an upstream response head (status line + headers, up to and
+/// including the trailing blank line) into its status code and body
+/// framing. Rejects a malformed status line, duplicate/conflicting
+/// Content-Length, Content-Length combined with Transfer-Encoding, and
+/// any Transfer-Encoding other than `chunked`.
+/// Parse an upstream response status line (`HTTP/1.1 200 OK`) into its
+/// status code, rejecting an unsupported version or a malformed code.
+fn parse_response_status_line(status_line: &str) -> io::Result<u16> {
+    let mut parts = status_line.splitn(3, ' ');
+    let version = parts.next().unwrap_or("");
+    let Some(code_str) = parts.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed upstream status line",
+        ));
+    };
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported upstream HTTP version",
+        ));
+    }
+    if code_str.len() != 3 || !code_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed upstream status code",
+        ));
+    }
+    code_str
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed upstream status code"))
+}
+
+pub(crate) fn parse_response_head(head: &[u8]) -> io::Result<(u16, ResponseBodyFraming)> {
+    let head_str = std::str::from_utf8(head).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-UTF-8 upstream response head",
+        )
+    })?;
+    let mut lines = head_str.split("\r\n");
+    let status_line = lines.next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing upstream status line")
+    })?;
+    let status = parse_response_status_line(status_line)?;
+
+    let mut content_length: Option<u64> = None;
+    let mut chunked = false;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((k, v)) = line.split_once(':') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed upstream header line",
+            ));
+        };
+        if k.is_empty() || k.chars().any(char::is_whitespace) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid upstream header field name",
+            ));
+        }
+        if k.eq_ignore_ascii_case("content-length") {
+            let val = v.trim();
+            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid upstream Content-Length",
+                ));
+            }
+            let parsed: u64 = val.parse().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upstream Content-Length overflow",
+                )
+            })?;
+            if let Some(prev) = content_length
+                && prev != parsed
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conflicting upstream Content-Length headers",
+                ));
+            }
+            content_length = Some(parsed);
+        } else if k.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked || !v.trim().eq_ignore_ascii_case("chunked") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported upstream Transfer-Encoding",
+                ));
+            }
+            chunked = true;
+        } else {
+            // Other headers are not framing headers.
+        }
+    }
+    if content_length.is_some() && chunked {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "upstream Content-Length and Transfer-Encoding both present",
+        ));
+    }
+
+    // 204/304 never have a body; 1xx heads are interim (the caller
+    // forwards them and reads the final head).
+    let framing = if status == 204 || status == 304 || (100..200).contains(&status) {
+        ResponseBodyFraming::ContentLength(0)
+    } else if let Some(len) = content_length {
+        ResponseBodyFraming::ContentLength(len)
+    } else if chunked {
+        ResponseBodyFraming::Chunked
+    } else {
+        ResponseBodyFraming::UntilClose
+    };
+    Ok((status, framing))
+}
+
+/// Read one upstream response head (up to `MAX_HEADER_SIZE` bytes),
+/// returning the head bytes (including the trailing blank line) and any
+/// body bytes already read past it. Each read is bounded by
+/// `FORWARD_IDLE_TIMEOUT`.
+async fn read_response_head<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut buf = Vec::with_capacity(4096);
+    // Heap chunk: a 4 KiB stack buffer would push this future (and
+    // every caller awaiting it) toward the large-future threshold.
+    let mut chunk = Box::new([0u8; 4096]);
+    loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = buf.get(..pos + 4).unwrap_or_default().to_vec();
+            let leftover = buf.get(pos + 4..).unwrap_or_default().to_vec();
+            return Ok((head, leftover));
+        }
+        if buf.len() >= MAX_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upstream response head too large",
+            ));
+        }
+        let n = match tokio::time::timeout(FORWARD_IDLE_TIMEOUT, reader.read(&mut chunk[..])).await
+        {
+            Ok(Ok(0)) => {
+                if buf.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "upstream closed without sending response",
+                    ));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated upstream response head",
+                ));
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "upstream response head read timed out",
+                ));
+            }
+        };
+        if let Some(slice) = chunk.get(..n) {
+            buf.extend_from_slice(slice);
+        }
+        if buf.len() > MAX_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upstream response head too large",
+            ));
+        }
+    }
+}
+
 async fn forward_upstream_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut upstream_read: R,
     mut client_write: W,
 ) -> io::Result<()> {
-    let mut first_buf = [0u8; 4096];
-    let first_n = match upstream_read.read(&mut first_buf).await {
-        Ok(0) => {
-            let _ = send_response(
-                &mut client_write,
-                "502 Bad Gateway",
-                "text/plain",
-                b"Empty Upstream Response",
-            )
-            .await;
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "upstream closed without sending response",
-            ));
+    // Validate the response head before copying any body: the status
+    // line and Content-Length / Transfer-Encoding framing are parsed,
+    // and the copy stops at the end of the first declared response, so
+    // bytes past its framing are never forwarded to the client (audit
+    // run-1, `...-verbatim-no-framing-validation`). The connection is
+    // closed when this returns, so no pipelined second response can
+    // ride on the same connection either.
+    let mut interim_heads = 0;
+    loop {
+        let (head, leftover) = match read_response_head(&mut upstream_read).await {
+            Ok(res) => res,
+            Err(e) => {
+                let body = if e.kind() == io::ErrorKind::UnexpectedEof {
+                    b"Empty Upstream Response".as_slice()
+                } else {
+                    b"Upstream Read Failed".as_slice()
+                };
+                let _ =
+                    send_response(&mut client_write, "502 Bad Gateway", "text/plain", body).await;
+                return Err(e);
+            }
+        };
+        let (status, framing) = match parse_response_head(&head) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let _ = send_response(
+                    &mut client_write,
+                    "502 Bad Gateway",
+                    "text/plain",
+                    b"Upstream Read Failed",
+                )
+                .await;
+                return Err(e);
+            }
+        };
+        client_write.write_all(&head).await?;
+        if (100..200).contains(&status) {
+            // Interim head: forward it and read the final head. Bytes
+            // after an interim head cannot be a body, so any are a
+            // framing violation.
+            if !leftover.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bytes after upstream interim response head",
+                ));
+            }
+            interim_heads += 1;
+            if interim_heads > 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "too many upstream interim responses",
+                ));
+            }
+            continue;
         }
-        Ok(n) => n,
-        Err(e) => {
-            let _ = send_response(
-                &mut client_write,
-                "502 Bad Gateway",
-                "text/plain",
-                b"Upstream Read Failed",
-            )
-            .await;
-            return Err(e);
+        // Body budget: the head already counts toward the total bound.
+        let budget = MAX_FORWARD_BODY_BYTES.saturating_sub(head.len() as u64);
+        match framing {
+            ResponseBodyFraming::ContentLength(len) => {
+                let mut body_reader = io::Cursor::new(leftover).chain(upstream_read);
+                // EOF before `len` ends the response: the upstream
+                // closed the connection, and the client detects the
+                // short body from the declared length.
+                copy_limited_idle(
+                    &mut body_reader,
+                    &mut client_write,
+                    len.min(budget),
+                    FORWARD_IDLE_TIMEOUT,
+                )
+                .await?;
+            }
+            ResponseBodyFraming::Chunked => {
+                forward_chunked_body(upstream_read, &mut client_write, &leftover, budget).await?;
+            }
+            ResponseBodyFraming::UntilClose => {
+                let mut body_reader = io::Cursor::new(leftover).chain(upstream_read);
+                copy_limited_idle(
+                    &mut body_reader,
+                    &mut client_write,
+                    budget,
+                    FORWARD_IDLE_TIMEOUT,
+                )
+                .await?;
+            }
         }
-    };
-    if let Some(slice) = first_buf.get(..first_n) {
-        client_write.write_all(slice).await?;
+        client_write.flush().await?;
+        return Ok(());
     }
-    tokio::io::copy(&mut upstream_read, &mut client_write).await?;
-    client_write.flush().await
 }
 
 /// Executes RFC 9110 Forward Proxy request forwarding for absolute URIs.

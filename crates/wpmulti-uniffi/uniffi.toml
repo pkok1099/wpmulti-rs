@@ -1,0 +1,4 @@
+[bindings.kotlin]
+package_name = "id.onlasdan.wpmulti"
+android = true
+generate_immutable_records = true

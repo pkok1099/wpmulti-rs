@@ -13,6 +13,20 @@ use crate::cli::commands::{
 use crate::cli::{Cli, Commands};
 
 #[test]
+#[cfg(unix)]
+fn test_config_file_owner_trusted() {
+    use crate::cli::commands::config_file_owner_trusted;
+    // A working-directory `wpmulti.toml` is trusted only when owned by
+    // the process UID or by root (audit run-1,
+    // `config/cwd-wpmulti-toml-discovery-precedence`).
+    assert!(config_file_owner_trusted(1000, 1000));
+    assert!(config_file_owner_trusted(0, 1000));
+    assert!(config_file_owner_trusted(0, 0));
+    assert!(!config_file_owner_trusted(1001, 1000));
+    assert!(!config_file_owner_trusted(1000, 0));
+}
+
+#[test]
 fn test_cli_parse_run_defaults() {
     let args = vec!["wpmulti", "run"];
     let cli = Cli::try_parse_from(args).expect("parse run");

@@ -50,6 +50,12 @@ pub struct ListenerSupervisor {
     handles: Mutex<Vec<ListenerHandle>>,
     started: AtomicBool,
     drain_timeout_ms: Arc<AtomicU64>,
+    /// Daemon-wide connection semaphore shared by every listener loop
+    /// (audit run-1, `listener-per-listener-conn-cap-no-global-cap`):
+    /// the per-listener semaphore alone lets the aggregate grow with
+    /// the listener count, so each accepted connection also holds one
+    /// permit here for its whole lifetime.
+    global_conn_sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for ListenerSupervisor {
@@ -77,6 +83,7 @@ impl ListenerSupervisor {
             handles: Mutex::new(Vec::new()),
             started: AtomicBool::new(false),
             drain_timeout_ms: Arc::new(AtomicU64::new(500)),
+            global_conn_sem: Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_LISTENER_CONNS)),
         }
     }
 
@@ -289,6 +296,7 @@ impl ListenerSupervisor {
             listener_type,
             shutdown_rx,
             Arc::clone(&self.drain_timeout_ms),
+            Arc::clone(&self.global_conn_sem),
         ));
 
         self.handles.lock().push(ListenerHandle {
@@ -580,6 +588,7 @@ impl ListenerSupervisor {
             settings.listener_type,
             shutdown_rx,
             Arc::clone(&self.drain_timeout_ms),
+            Arc::clone(&self.global_conn_sem),
         ));
 
         self.handles.lock().push(ListenerHandle {
@@ -594,6 +603,41 @@ impl ListenerSupervisor {
     pub fn list_listeners(&self) -> Vec<ActiveListenerInfo> {
         let handles = self.handles.lock();
         handles.iter().map(|h| h.info.clone()).collect()
+    }
+
+    /// Stop and remove all dedicated (non-shared) listeners, clearing
+    /// each tunnel's assigned port (audit run-1,
+    /// `core/apply-runtime-config:per-tunnel-enabled-no-listener-reconcile`).
+    /// Used when `per_tunnel.enabled` is flipped off — or when the
+    /// dedicated listener identity (credentials, ports) changes — at
+    /// runtime. Shared listeners are untouched.
+    pub async fn stop_all_dedicated(&self, registry: &Arc<TunnelRegistry>) {
+        let removed: Vec<ListenerHandle> = {
+            let mut guard = self.handles.lock();
+            let mut kept = Vec::with_capacity(guard.len());
+            let mut to_stop = Vec::new();
+            for h in guard.drain(..) {
+                if h.info.is_shared {
+                    kept.push(h);
+                } else {
+                    to_stop.push(h);
+                }
+            }
+            *guard = kept;
+            to_stop
+        };
+
+        for handle in &removed {
+            if let Some(tid) = &handle.info.tunnel_id
+                && let Some(entry) = registry.get(tid)
+            {
+                *entry.assigned_port.write() = None;
+            }
+        }
+        for handle in removed {
+            handle.task.abort();
+            let _ = handle.task.await;
+        }
     }
 
     /// Stop and remove dedicated listeners belonging to `tunnel_id` (used during hot-reload).
@@ -660,6 +704,7 @@ impl ListenerSupervisor {
             listener_type,
             self.shutdown_tx.subscribe(),
             Arc::clone(&self.drain_timeout_ms),
+            Arc::clone(&self.global_conn_sem),
         ));
         self.handles.lock().push(ListenerHandle {
             info: info.clone(),
@@ -800,7 +845,17 @@ impl ListenerSupervisor {
 /// Maximum concurrent client connections accepted per proxy listener.
 const MAX_LISTENER_CONNS: usize = 4096;
 
-async fn acquire_listener_permit(
+/// Maximum concurrent client connections daemon-wide, across all proxy
+/// listeners (audit run-1, `listener-per-listener-conn-cap-no-global-cap`).
+/// Equal to the per-listener cap, so the daemon as a whole never holds
+/// more live proxy connections than one listener could on its own. The
+/// per-listener cap stays as a sub-limit; a single busy listener may
+/// still consume the whole global budget, but the daemon-wide total
+/// (file descriptors, tasks, tunnel resources) is now bounded no matter
+/// how many dedicated listeners exist.
+const MAX_GLOBAL_LISTENER_CONNS: usize = MAX_LISTENER_CONNS;
+
+async fn acquire_one_permit(
     conn_sem: &Arc<tokio::sync::Semaphore>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
@@ -814,6 +869,22 @@ async fn acquire_listener_permit(
         }
         res = Arc::clone(conn_sem).acquire_owned() => res.ok(),
     }
+}
+
+/// Acquire the daemon-wide permit first, then the per-listener permit;
+/// both are held for the life of the accepted connection. The fixed
+/// order (global, then local) avoids any circular wait between loops.
+async fn acquire_listener_permits(
+    global_sem: &Arc<tokio::sync::Semaphore>,
+    conn_sem: &Arc<tokio::sync::Semaphore>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<(
+    tokio::sync::OwnedSemaphorePermit,
+    tokio::sync::OwnedSemaphorePermit,
+)> {
+    let global = acquire_one_permit(global_sem, shutdown_rx).await?;
+    let local = acquire_one_permit(conn_sem, shutdown_rx).await?;
+    Some((global, local))
 }
 
 async fn drain_client_tasks(client_tasks: &mut tokio::task::JoinSet<()>, drain_dur: Duration) {
@@ -842,6 +913,7 @@ async fn run_listener_loop(
     listener_type: ListenerType,
     mut shutdown_rx: watch::Receiver<bool>,
     drain_timeout_ms: Arc<AtomicU64>,
+    global_sem: Arc<tokio::sync::Semaphore>,
 ) {
     let mut client_tasks = tokio::task::JoinSet::new();
     let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_LISTENER_CONNS));
@@ -851,7 +923,9 @@ async fn run_listener_loop(
             let _ = res;
         }
 
-        let Some(permit) = acquire_listener_permit(&conn_sem, &mut shutdown_rx).await else {
+        let Some((global_permit, permit)) =
+            acquire_listener_permits(&global_sem, &conn_sem, &mut shutdown_rx).await
+        else {
             break;
         };
 
@@ -870,6 +944,7 @@ async fn run_listener_loop(
                         let peer_ip = Some(peer_addr.ip());
                         client_tasks.spawn(async move {
                             let _permit = permit;
+                            let _global_permit = global_permit;
                             let result = match listener_type {
                                 ListenerType::Socks5 => {
                                     handle_socks5_with_addrs(stream, r, local_ip, peer_ip).await

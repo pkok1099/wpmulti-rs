@@ -15,18 +15,34 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::config::{AuthMode, PoolStrategy};
 use crate::proxy::http::{
-    extract_basic_auth, handle_http, parse_authority, read_http_request_headers_buffered,
+    ResponseBodyFraming, copy_limited_idle, extract_basic_auth, handle_http, parse_authority,
+    parse_response_head, read_http_request_headers_buffered,
 };
 use crate::proxy::router::{
     DirectTunnelTarget, DynStream, PoolKeyword, PoolRouter, ProxyTunnelTarget, ProxyUdpSocket,
     SingleTunnelRouter, TargetAddr, TunnelRouter, TunnelSelector,
 };
+use crate::proxy::socks5::ExpectedUdpReplies;
 use crate::proxy::socks5::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, CMD_CONNECT, CMD_UDP_ASSOCIATE, METHOD_NO_ACCEPTABLE,
-    METHOD_NO_AUTH, METHOD_USER_PASS, REP_CONN_REFUSED, REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE,
-    REP_NETWORK_UNREACHABLE, REP_SUCCESS, RFC1929_VERSION, SOCKS5_VERSION, UdpPayloadPool,
-    build_socks5_udp_packet, handle_socks5, parse_socks5_udp_packet, send_socks5_reply,
+    METHOD_NO_AUTH, METHOD_USER_PASS, REP_CONN_NOT_ALLOWED, REP_GENERAL_FAILURE,
+    REP_HOST_UNREACHABLE, REP_NETWORK_UNREACHABLE, REP_SUCCESS, RFC1929_VERSION, SOCKS5_VERSION,
+    UdpPayloadPool, build_socks5_udp_packet, handle_socks5, parse_socks5_udp_packet,
+    send_socks5_reply,
 };
+
+/// TEST-NET-1 address named as the proxy-visible destination in tests
+/// that need a live echo server. The destination guard forbids loopback
+/// (and RFC1918) targets, so the client names this address and the mock
+/// tunnel target redirects the actual dial/send to the loopback echo
+/// listener — the proxy path under test still sees a public destination.
+/// Never a real egress: the mock only ever dials the local echo server.
+const TEST_ECHO_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+
+/// Proxy-visible destination for `echo_addr`: same port, TEST-NET-1 IP.
+fn test_echo_target(echo_addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(TEST_ECHO_IP, echo_addr.port())
+}
 
 /// Mock tunnel target with configurable DNS resolution table and connection interception.
 struct MockTunnelTarget {
@@ -36,6 +52,12 @@ struct MockTunnelTarget {
     fail_tcp_with: Option<io::ErrorKind>,
     hang_tcp: bool,
     aborted: Arc<AtomicBool>,
+    /// When set, TCP dials go to this address instead of the requested
+    /// destination (see [`TEST_ECHO_IP`]).
+    dial_redirect: Option<SocketAddr>,
+    /// When set, UDP sends go to this address instead of the requested
+    /// destination (see [`TEST_ECHO_IP`]).
+    udp_redirect: Option<SocketAddr>,
 }
 
 impl MockTunnelTarget {
@@ -47,6 +69,26 @@ impl MockTunnelTarget {
             fail_tcp_with: None,
             hang_tcp: false,
             aborted: Arc::new(AtomicBool::new(false)),
+            dial_redirect: None,
+            udp_redirect: None,
+        }
+    }
+
+    /// Redirect actual TCP dials to `addr` while the proxy still sees
+    /// the requested (public) destination.
+    fn with_dial_redirect(self, addr: SocketAddr) -> Self {
+        Self {
+            dial_redirect: Some(addr),
+            ..self
+        }
+    }
+
+    /// Redirect actual UDP sends to `addr` while the proxy still sees
+    /// the requested (public) destination.
+    fn with_udp_redirect(self, addr: SocketAddr) -> Self {
+        Self {
+            udp_redirect: Some(addr),
+            ..self
         }
     }
 
@@ -74,6 +116,53 @@ impl MockTunnelTarget {
     }
 }
 
+/// Test-only UDP socket that sends every datagram to a fixed echo
+/// address instead of the requested destination (see [`TEST_ECHO_IP`]).
+/// A reply is reported as coming from the destination the send was
+/// addressed to, modeling a real tunnel socket where a reply's sender
+/// is the contacted destination (the relay's expected-source check
+/// relies on that invariant).
+struct RedirectUdpSocket {
+    inner: UdpSocket,
+    redirect: SocketAddr,
+    last_target: Mutex<Option<SocketAddr>>,
+}
+
+impl ProxyUdpSocket for RedirectUdpSocket {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        let redirect = self.redirect;
+        *self.last_target.lock().unwrap() = Some(target);
+        Box::pin(async move { self.inner.send_to(buf, redirect).await })
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
+        let redirect = self.redirect;
+        Box::pin(async move {
+            let (n, from) = self.inner.recv_from(buf).await?;
+            // The echo server really sent this, but the proxy asked for
+            // `last_target`: report that as the sender, as a real
+            // tunnel socket would.
+            let peer = if from == redirect {
+                self.last_target.lock().unwrap().unwrap_or(from)
+            } else {
+                from
+            };
+            Ok((n, peer))
+        })
+    }
+
+    fn local_port(&self) -> u16 {
+        self.inner.local_addr().map_or(0, |a| a.port())
+    }
+}
+
 impl ProxyTunnelTarget for MockTunnelTarget {
     fn tcp_connect<'a>(
         &'a self,
@@ -88,7 +177,7 @@ impl ProxyTunnelTarget for MockTunnelTarget {
             return Box::pin(async move { Err(io::Error::new(kind, "mock tcp connect failed")) });
         }
         Box::pin(async move {
-            let stream = TcpStream::connect(dst).await?;
+            let stream = TcpStream::connect(self.dial_redirect.unwrap_or(dst)).await?;
             Ok(Box::new(stream) as DynStream)
         })
     }
@@ -97,9 +186,17 @@ impl ProxyTunnelTarget for MockTunnelTarget {
         &'a self,
         local_port: u16,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
+        let udp_redirect = self.udp_redirect;
         Box::pin(async move {
             let bind_addr = SocketAddr::from(([127, 0, 0, 1], local_port));
             let socket = UdpSocket::bind(bind_addr).await?;
+            if let Some(redirect) = udp_redirect {
+                return Ok(Box::new(RedirectUdpSocket {
+                    inner: socket,
+                    redirect,
+                    last_target: Mutex::new(None),
+                }) as Box<dyn ProxyUdpSocket>);
+            }
             Ok(Box::new(socket) as Box<dyn ProxyUdpSocket>)
         })
     }
@@ -373,11 +470,15 @@ async fn test_socks5_rfc1929_auth_success_and_failure() {
 #[tokio::test]
 async fn test_socks5_connect_ipv4() {
     let echo_addr = spawn_echo_tcp_server().await;
-    let SocketAddr::V4(echo_v4) = echo_addr else {
+    let target_addr = test_echo_target(echo_addr);
+    let SocketAddr::V4(target_v4) = target_addr else {
         unreachable!();
     };
 
-    let target = Arc::new(DirectTunnelTarget);
+    // The destination guard forbids loopback targets, so the client
+    // names the TEST-NET-1 stand-in and the mock dials the loopback
+    // echo server (see `TEST_ECHO_IP`).
+    let target = Arc::new(MockTunnelTarget::new("test-tunnel").with_dial_redirect(echo_addr));
     let router: Arc<dyn TunnelRouter> =
         Arc::new(SingleTunnelRouter::new("test-tunnel", target, None));
 
@@ -397,8 +498,8 @@ async fn test_socks5_connect_ipv4() {
 
     // 2. CONNECT IPv4
     let mut cmd = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00, ATYP_IPV4];
-    cmd.extend_from_slice(&echo_v4.ip().octets());
-    cmd.extend_from_slice(&echo_v4.port().to_be_bytes());
+    cmd.extend_from_slice(&target_v4.ip().octets());
+    cmd.extend_from_slice(&target_v4.port().to_be_bytes());
     client.write_all(&cmd).await.unwrap();
 
     let mut reply_hdr = [0u8; 4];
@@ -499,11 +600,13 @@ async fn test_socks5_connect_ipv6() {
 #[tokio::test]
 async fn test_socks5_connect_domain_with_tunnel_resolution() {
     let echo_addr = spawn_echo_tcp_server().await;
-    let echo_ip = echo_addr.ip();
     let echo_port = echo_addr.port();
 
-    let mock_target =
-        Arc::new(MockTunnelTarget::new("tunnel-01").with_dns("echo.tunnel.local", echo_ip));
+    let mock_target = Arc::new(
+        MockTunnelTarget::new("tunnel-01")
+            .with_dns("echo.tunnel.local", TEST_ECHO_IP)
+            .with_dial_redirect(echo_addr),
+    );
     assert_eq!(mock_target.id(), "tunnel-01");
     let router: Arc<dyn TunnelRouter> =
         Arc::new(SingleTunnelRouter::new("tunnel-01", mock_target, None));
@@ -561,7 +664,10 @@ async fn test_socks5_connect_unreachable_target_returns_error() {
     let mut g_resp = [0u8; 2];
     client.read_exact(&mut g_resp).await.unwrap();
 
-    // CONNECT to 127.0.0.1 on a closed port (e.g. 1)
+    // CONNECT to 127.0.0.1 on a closed port (e.g. 1). The destination
+    // guard rejects loopback targets before dialing, so this now
+    // reports connection-not-allowed instead of refused/unreachable
+    // (audit run-1, `proxy.destination.ipv4-loopback-rfc1918-not-forbidden`).
     let mut cmd = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00, ATYP_IPV4];
     cmd.extend_from_slice(&[127, 0, 0, 1]);
     cmd.extend_from_slice(&1u16.to_be_bytes());
@@ -570,9 +676,9 @@ async fn test_socks5_connect_unreachable_target_returns_error() {
     let mut reply_hdr = [0u8; 4];
     client.read_exact(&mut reply_hdr).await.unwrap();
     assert_eq!(reply_hdr[0], SOCKS5_VERSION);
-    assert!(
-        reply_hdr[1] == REP_CONN_REFUSED || reply_hdr[1] == REP_HOST_UNREACHABLE,
-        "Expected connection refused or host unreachable, got 0x{:02X}",
+    assert_eq!(
+        reply_hdr[1], REP_CONN_NOT_ALLOWED,
+        "Expected connection not allowed for a loopback target, got 0x{:02X}",
         reply_hdr[1]
     );
 }
@@ -615,8 +721,11 @@ async fn test_socks5_connect_unknown_tunnel_reports_general_failure() {
     assert_eq!(a_resp, [RFC1929_VERSION, 0x00]);
 
     // CONNECT to any target; selection must fail before connecting.
+    // The target is a public TEST-NET-2 address: a loopback target
+    // would be rejected by the destination guard before selection
+    // runs, hiding the general-failure reply under test.
     let mut cmd = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00, ATYP_IPV4];
-    cmd.extend_from_slice(&[127, 0, 0, 1]);
+    cmd.extend_from_slice(&[198, 51, 100, 1]);
     cmd.extend_from_slice(&80u16.to_be_bytes());
     client.write_all(&cmd).await.unwrap();
 
@@ -966,7 +1075,10 @@ fn test_udp_payload_pool_grows_for_larger_payload() {
 async fn test_socks5_udp_associate_relay() {
     let echo_udp_addr = spawn_echo_udp_server().await;
 
-    let target = Arc::new(DirectTunnelTarget);
+    // The destination guard forbids loopback targets, so packets name
+    // the TEST-NET-1 stand-in and the mock UDP socket redirects the
+    // send to the loopback echo server (see `TEST_ECHO_IP`).
+    let target = Arc::new(MockTunnelTarget::new("udp-tunnel").with_udp_redirect(echo_udp_addr));
     let router: Arc<dyn TunnelRouter> =
         Arc::new(SingleTunnelRouter::new("udp-tunnel", target, None));
 
@@ -1030,9 +1142,9 @@ async fn test_socks5_udp_associate_relay() {
 
     // 3. Client binds UDP socket and sends datagram to relay address targeting echo server
     let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let target_dest = TargetAddr::Ip(echo_udp_addr);
+    let packet_dest = TargetAddr::Ip(test_echo_target(echo_udp_addr));
     let payload = b"hello_socks5_udp_relay!";
-    let encap_pkt = build_socks5_udp_packet(&target_dest, payload);
+    let encap_pkt = build_socks5_udp_packet(&packet_dest, payload);
 
     client_udp.send_to(&encap_pkt, relay_addr).await.unwrap();
 
@@ -1047,20 +1159,25 @@ async fn test_socks5_udp_associate_relay() {
     assert_eq!(from_relay, relay_addr);
     let (from_target, echoed_payload) =
         parse_socks5_udp_packet(&resp_buf[..n]).expect("Failed to parse echoed packet");
-    assert_eq!(from_target, target_dest);
+    // The relay stamps the expected (requested) destination, not an
+    // arbitrary tunnel sender.
+    assert_eq!(from_target, packet_dest);
     assert_eq!(echoed_payload, payload);
 }
 
 #[tokio::test]
 async fn test_socks5_udp_associate_relay_domain() {
     let echo_udp_addr = spawn_echo_udp_server().await;
-    let echo_ip = echo_udp_addr.ip();
     let echo_port = echo_udp_addr.port();
 
-    // Mock tunnel resolves the domain to the echo server, so the domain branch
-    // (pooled payload + spawned DNS task) is exercised end to end.
-    let target =
-        Arc::new(MockTunnelTarget::new("udp-tunnel").with_dns("echo.tunnel.local", echo_ip));
+    // Mock tunnel resolves the domain to the TEST-NET-1 stand-in (the
+    // destination guard forbids loopback), and redirects UDP sends to
+    // the loopback echo server (see `TEST_ECHO_IP`).
+    let target = Arc::new(
+        MockTunnelTarget::new("udp-tunnel")
+            .with_dns("echo.tunnel.local", TEST_ECHO_IP)
+            .with_udp_redirect(echo_udp_addr),
+    );
     let router: Arc<dyn TunnelRouter> =
         Arc::new(SingleTunnelRouter::new("udp-tunnel", target, None));
 
@@ -1145,7 +1262,9 @@ async fn test_socks5_udp_associate_relay_domain() {
         assert_eq!(from_relay, relay_addr);
         let (from_target, echoed_payload) =
             parse_socks5_udp_packet(&resp_buf[..n]).expect("Failed to parse echoed packet");
-        assert_eq!(from_target, TargetAddr::Ip(echo_udp_addr));
+        // The domain resolved to the TEST-NET-1 stand-in, so the relay
+        // stamps that requested destination.
+        assert_eq!(from_target, TargetAddr::Ip(test_echo_target(echo_udp_addr)));
         assert_eq!(echoed_payload, payload);
     }
 }
@@ -1216,7 +1335,8 @@ async fn test_read_http_request_headers_unit() {
 #[tokio::test]
 async fn test_http_connect_no_auth() {
     let echo_addr = spawn_echo_tcp_server().await;
-    let target = Arc::new(DirectTunnelTarget);
+    let target_addr = test_echo_target(echo_addr);
+    let target = Arc::new(MockTunnelTarget::new("http-tunnel").with_dial_redirect(echo_addr));
     let router: Arc<dyn TunnelRouter> =
         Arc::new(SingleTunnelRouter::new("http-tunnel", target, None));
 
@@ -1225,10 +1345,7 @@ async fn test_http_connect_no_auth() {
         let _ = handle_http(server, router).await;
     });
 
-    let connect_req = format!(
-        "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
-        echo_addr, echo_addr
-    );
+    let connect_req = format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n",);
     client.write_all(connect_req.as_bytes()).await.unwrap();
 
     // Read 200 Connection Established response
@@ -1246,7 +1363,8 @@ async fn test_http_connect_no_auth() {
 #[tokio::test]
 async fn test_http_basic_auth_challenge_and_success() {
     let echo_addr = spawn_echo_tcp_server().await;
-    let target = Arc::new(DirectTunnelTarget);
+    let target_addr = test_echo_target(echo_addr);
+    let target = Arc::new(MockTunnelTarget::new("auth-http").with_dial_redirect(echo_addr));
     let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
         "auth-http",
         target,
@@ -1261,10 +1379,7 @@ async fn test_http_basic_auth_challenge_and_success() {
             let _ = handle_http(server, r).await;
         });
 
-        let req = format!(
-            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
-            echo_addr, echo_addr
-        );
+        let req = format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n",);
         client.write_all(req.as_bytes()).await.unwrap();
 
         let (status, _, headers, _) = read_http_headers_helper(&mut client).await.unwrap();
@@ -1282,8 +1397,7 @@ async fn test_http_basic_auth_challenge_and_success() {
 
         let auth_hdr = format_basic_auth("proxyuser", "wrongpassword");
         let req = format!(
-            "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Authorization: {}\r\n\r\n",
-            echo_addr, echo_addr, auth_hdr
+            "CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\nProxy-Authorization: {auth_hdr}\r\n\r\n",
         );
         client.write_all(req.as_bytes()).await.unwrap();
 
@@ -1301,8 +1415,7 @@ async fn test_http_basic_auth_challenge_and_success() {
 
         let auth_hdr = format_basic_auth("proxyuser", "proxypass123");
         let req = format!(
-            "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Authorization: {}\r\n\r\n",
-            echo_addr, echo_addr, auth_hdr
+            "CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\nProxy-Authorization: {auth_hdr}\r\n\r\n",
         );
         client.write_all(req.as_bytes()).await.unwrap();
 
@@ -1322,7 +1435,8 @@ async fn test_http_basic_auth_challenge_and_success() {
 #[tokio::test]
 async fn test_http_forward_proxy() {
     let mock_server_addr = spawn_mock_http_server("forward_proxy_payload_ok").await;
-    let target = Arc::new(DirectTunnelTarget);
+    let target_addr = test_echo_target(mock_server_addr);
+    let target = Arc::new(MockTunnelTarget::new("fwd-tunnel").with_dial_redirect(mock_server_addr));
     let router: Arc<dyn TunnelRouter> =
         Arc::new(SingleTunnelRouter::new("fwd-tunnel", target, None));
 
@@ -1332,8 +1446,7 @@ async fn test_http_forward_proxy() {
     });
 
     let req = format!(
-        "GET http://{}/test/api HTTP/1.1\r\nHost: {}\r\nUser-Agent: test\r\n\r\n",
-        mock_server_addr, mock_server_addr
+        "GET http://{target_addr}/test/api HTTP/1.1\r\nHost: {target_addr}\r\nUser-Agent: test\r\n\r\n",
     );
     client.write_all(req.as_bytes()).await.unwrap();
 
@@ -1354,7 +1467,9 @@ async fn test_http_forward_proxy_ipv6_bracket() {
         assert_eq!(port, v6_addr.port());
     }
 
-    let target = Arc::new(DirectTunnelTarget);
+    let target_addr = test_echo_target(mock_server_addr);
+    let target =
+        Arc::new(MockTunnelTarget::new("fwd-tunnel-v6").with_dial_redirect(mock_server_addr));
     let router: Arc<dyn TunnelRouter> =
         Arc::new(SingleTunnelRouter::new("fwd-tunnel-v6", target, None));
     let (mut client, server) = tokio::io::duplex(4096);
@@ -1363,8 +1478,7 @@ async fn test_http_forward_proxy_ipv6_bracket() {
     });
 
     let req = format!(
-        "GET http://{}/test/api HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
-        mock_server_addr, mock_server_addr
+        "GET http://{target_addr}/test/api HTTP/1.1\r\nHost: {target_addr}\r\nConnection: keep-alive\r\n\r\n",
     );
     client.write_all(req.as_bytes()).await.unwrap();
 
@@ -1623,6 +1737,12 @@ fn test_is_forbidden_destination_ip_parity_and_ipv6_ranges() {
 
     let forbidden = [
         "0.0.0.0",
+        "127.0.0.1",
+        "127.0.0.2",
+        "10.0.0.1",
+        "172.16.0.1",
+        "172.31.255.255",
+        "192.168.1.1",
         "169.254.169.254",
         "224.0.0.1",
         "255.255.255.255",
@@ -1632,9 +1752,14 @@ fn test_is_forbidden_destination_ip_parity_and_ipv6_ranges() {
         "fc00::1",
         "fd12:3456:789a::1",
         "ff02::1",
+        "::ffff:127.0.0.1",
+        "::ffff:10.0.0.1",
+        "::ffff:192.168.0.1",
         "::ffff:169.254.169.254",
         "::ffff:0.0.0.0",
         "::ffff:255.255.255.255",
+        "64:ff9b::127.0.0.1",
+        "64:ff9b::10.0.0.1",
         "64:ff9b::169.254.169.254",
         "64:ff9b::0.0.0.0",
     ];
@@ -1900,6 +2025,9 @@ struct FallbackMockTarget {
     dns_calls: AtomicUsize,
     dialed_addrs: parking_lot::Mutex<Vec<SocketAddr>>,
     ips: Vec<IpAddr>,
+    /// When set, dials of any IP other than `ips[0]` go here instead
+    /// (see [`TEST_ECHO_IP`]).
+    dial_redirect: Option<SocketAddr>,
 }
 
 impl FallbackMockTarget {
@@ -1908,6 +2036,14 @@ impl FallbackMockTarget {
             dns_calls: AtomicUsize::new(0),
             dialed_addrs: parking_lot::Mutex::new(Vec::new()),
             ips,
+            dial_redirect: None,
+        }
+    }
+
+    fn with_dial_redirect(self, addr: SocketAddr) -> Self {
+        Self {
+            dial_redirect: Some(addr),
+            ..self
         }
     }
 }
@@ -1919,6 +2055,7 @@ impl ProxyTunnelTarget for FallbackMockTarget {
     ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
         self.dialed_addrs.lock().push(dst);
         let first_ip = self.ips[0];
+        let dial_redirect = self.dial_redirect;
         Box::pin(async move {
             if dst.ip() == first_ip {
                 return Err(io::Error::new(
@@ -1926,7 +2063,7 @@ impl ProxyTunnelTarget for FallbackMockTarget {
                     "first IP unreachable",
                 ));
             }
-            let stream = TcpStream::connect(dst).await?;
+            let stream = TcpStream::connect(dial_redirect.unwrap_or(dst)).await?;
             Ok(Box::new(stream) as DynStream)
         })
     }
@@ -2014,9 +2151,13 @@ async fn assert_http_connect_fallback(router: Arc<dyn TunnelRouter>, port: u16) 
 async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
     let echo_addr = spawn_echo_tcp_server().await;
     let first_ip: IpAddr = "198.51.100.10".parse().unwrap();
-    let second_ip = echo_addr.ip();
+    // The second candidate is the TEST-NET-1 stand-in (loopback
+    // candidates are rejected by the destination guard); the mock dials
+    // the loopback echo server for it (see `TEST_ECHO_IP`).
+    let second_ip = TEST_ECHO_IP;
 
-    let mock = Arc::new(FallbackMockTarget::new(vec![first_ip, second_ip]));
+    let mock =
+        Arc::new(FallbackMockTarget::new(vec![first_ip, second_ip]).with_dial_redirect(echo_addr));
     let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
         "fallback-tun",
         Arc::clone(&mock) as Arc<dyn ProxyTunnelTarget>,
@@ -2054,7 +2195,9 @@ async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
     // 3. HTTP forward proxy: single DNS lookup, fails first_ip, falls back to second_ip
     let http_srv = spawn_mock_http_server("multi_ip_http_ok").await;
     let first_http_ip: IpAddr = "198.51.100.11".parse().unwrap();
-    let mock_fwd = Arc::new(FallbackMockTarget::new(vec![first_http_ip, http_srv.ip()]));
+    let mock_fwd = Arc::new(
+        FallbackMockTarget::new(vec![first_http_ip, TEST_ECHO_IP]).with_dial_redirect(http_srv),
+    );
     let r_fwd: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
         "fallback-fwd",
         Arc::clone(&mock_fwd) as Arc<dyn ProxyTunnelTarget>,
@@ -2077,7 +2220,7 @@ async fn test_zero_toctou_single_dns_and_multi_ip_fallback_socks5_and_http() {
         *mock_fwd.dialed_addrs.lock(),
         vec![
             SocketAddr::new(first_http_ip, http_srv.port()),
-            SocketAddr::new(http_srv.ip(), http_srv.port()),
+            SocketAddr::new(TEST_ECHO_IP, http_srv.port()),
         ]
     );
 }
@@ -2086,6 +2229,9 @@ struct BlackholeCapMockTarget {
     blackhole_ips: std::collections::HashSet<IpAddr>,
     refused_ips: std::collections::HashSet<IpAddr>,
     dialed_addrs: parking_lot::Mutex<Vec<SocketAddr>>,
+    /// When set, dials of any non-blackhole, non-refused IP go here
+    /// instead (see [`TEST_ECHO_IP`]).
+    dial_redirect: Option<SocketAddr>,
 }
 
 impl BlackholeCapMockTarget {
@@ -2094,6 +2240,14 @@ impl BlackholeCapMockTarget {
             blackhole_ips: blackhole_ips.into_iter().collect(),
             refused_ips: refused_ips.into_iter().collect(),
             dialed_addrs: parking_lot::Mutex::new(Vec::new()),
+            dial_redirect: None,
+        }
+    }
+
+    fn with_dial_redirect(self, addr: SocketAddr) -> Self {
+        Self {
+            dial_redirect: Some(addr),
+            ..self
         }
     }
 }
@@ -2106,6 +2260,7 @@ impl ProxyTunnelTarget for BlackholeCapMockTarget {
         self.dialed_addrs.lock().push(dst);
         let is_blackhole = self.blackhole_ips.contains(&dst.ip());
         let is_refused = self.refused_ips.contains(&dst.ip());
+        let dial_redirect = self.dial_redirect;
         Box::pin(async move {
             if is_blackhole {
                 std::future::pending::<io::Result<DynStream>>().await
@@ -2115,7 +2270,7 @@ impl ProxyTunnelTarget for BlackholeCapMockTarget {
                     "mock refused",
                 ))
             } else {
-                let stream = TcpStream::connect(dst).await?;
+                let stream = TcpStream::connect(dial_redirect.unwrap_or(dst)).await?;
                 Ok(Box::new(stream) as DynStream)
             }
         })
@@ -2341,12 +2496,17 @@ async fn test_connect_validated_addrs_falls_back_after_blackhole_within_budget()
 
     let echo_addr = spawn_echo_tcp_server().await;
     let blackhole_ip: IpAddr = "198.51.100.1".parse().unwrap();
-    let mock = BlackholeCapMockTarget::new(vec![blackhole_ip], Vec::new());
+    // The second candidate is the TEST-NET-1 stand-in (loopback
+    // candidates are filtered by the destination guard); the mock
+    // dials the loopback echo server for it (see `TEST_ECHO_IP`).
+    let valid_target = test_echo_target(echo_addr);
+    let mock =
+        BlackholeCapMockTarget::new(vec![blackhole_ip], Vec::new()).with_dial_redirect(echo_addr);
 
     let start = tokio::time::Instant::now();
     let mut stream = connect_validated_addrs_with_timeout(
         &mock,
-        &[blackhole_ip, echo_addr.ip()],
+        &[blackhole_ip, valid_target.ip()],
         echo_addr.port(),
         Duration::from_millis(900),
     )
@@ -2361,7 +2521,10 @@ async fn test_connect_validated_addrs_falls_back_after_blackhole_within_budget()
     assert_eq!(&buf, b"pong");
     assert_eq!(
         *mock.dialed_addrs.lock(),
-        vec![SocketAddr::new(blackhole_ip, echo_addr.port()), echo_addr,]
+        vec![
+            SocketAddr::new(blackhole_ip, echo_addr.port()),
+            valid_target,
+        ]
     );
 }
 
@@ -2499,8 +2662,9 @@ async fn test_socks5_prefers_user_pass_over_no_auth_when_anonymous_allowed() {
     });
 
     // 1. AuthMode::None + allow_anonymous=true: client offering [0x00, 0x02] gets 0x02 and routes to tenant.
-    let t1 = Arc::new(MockTunnelTarget::new("wgcf-001"));
-    let t2 = Arc::new(MockTunnelTarget::new("wgcf-002"));
+    let target_addr = test_echo_target(echo_addr);
+    let t1 = Arc::new(MockTunnelTarget::new("wgcf-001").with_dial_redirect(echo_addr));
+    let t2 = Arc::new(MockTunnelTarget::new("wgcf-002").with_dial_redirect(echo_addr));
     let pool_none = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
     pool_none.add_tunnel("wgcf-001", Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>);
     pool_none.add_tunnel("wgcf-002", Arc::clone(&t2) as Arc<dyn ProxyTunnelTarget>);
@@ -2509,7 +2673,7 @@ async fn test_socks5_prefers_user_pass_over_no_auth_when_anonymous_allowed() {
         Arc::clone(&pool_none),
         &[METHOD_NO_AUTH, METHOD_USER_PASS],
         Some(("wgcf-002", "any")),
-        echo_addr,
+        target_addr,
     )
     .await;
     assert_eq!(chosen, METHOD_USER_PASS);
@@ -2519,14 +2683,14 @@ async fn test_socks5_prefers_user_pass_over_no_auth_when_anonymous_allowed() {
 
     // 2. Client offering only [0x00] still falls back to anonymous NO_AUTH (0x00).
     let (anon_chosen, anon_status) =
-        perform_socks5_greeting_and_auth(pool_none, &[METHOD_NO_AUTH], None, echo_addr).await;
+        perform_socks5_greeting_and_auth(pool_none, &[METHOD_NO_AUTH], None, target_addr).await;
     assert_eq!(anon_chosen, METHOD_NO_AUTH);
     assert_eq!(anon_status, None);
     assert_eq!(t1.tcp_conns.load(Ordering::SeqCst), 1);
 
     // 3. AuthMode::Global + allow_anonymous=true: offering [0x00, 0x02] picks 0x02 and validates password.
-    let g1 = Arc::new(MockTunnelTarget::new("wgcf-001"));
-    let g2 = Arc::new(MockTunnelTarget::new("wgcf-002"));
+    let g1 = Arc::new(MockTunnelTarget::new("wgcf-001").with_dial_redirect(echo_addr));
+    let g2 = Arc::new(MockTunnelTarget::new("wgcf-002").with_dial_redirect(echo_addr));
     let pool_global = Arc::new(
         PoolRouter::new(PoolStrategy::RoundRobin, true)
             .with_auth(AuthMode::Global, Some("secret".to_string())),
@@ -2538,7 +2702,7 @@ async fn test_socks5_prefers_user_pass_over_no_auth_when_anonymous_allowed() {
         Arc::clone(&pool_global),
         &[METHOD_NO_AUTH, METHOD_USER_PASS],
         Some(("wgcf-002", "wrong")),
-        echo_addr,
+        target_addr,
     )
     .await;
     assert_eq!(bad_chosen, METHOD_USER_PASS);
@@ -2549,7 +2713,7 @@ async fn test_socks5_prefers_user_pass_over_no_auth_when_anonymous_allowed() {
         pool_global,
         &[METHOD_NO_AUTH, METHOD_USER_PASS],
         Some(("wgcf-002", "secret")),
-        echo_addr,
+        target_addr,
     )
     .await;
     assert_eq!(ok_chosen, METHOD_USER_PASS);
@@ -2567,18 +2731,17 @@ async fn test_http_forward_empty_upstream_returns_502() {
         }
     });
 
+    let target_addr = test_echo_target(upstream_addr);
     let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
         "direct",
-        Arc::new(DirectTunnelTarget) as Arc<dyn ProxyTunnelTarget>,
+        Arc::new(MockTunnelTarget::new("direct").with_dial_redirect(upstream_addr))
+            as Arc<dyn ProxyTunnelTarget>,
         None,
     ));
     let (mut client, server) = tokio::io::duplex(4096);
     let server_task = tokio::spawn(async move { handle_http(server, router).await });
 
-    let req = format!(
-        "GET http://{}/ HTTP/1.1\r\nHost: {}\r\n\r\n",
-        upstream_addr, upstream_addr
-    );
+    let req = format!("GET http://{target_addr}/ HTTP/1.1\r\nHost: {target_addr}\r\n\r\n",);
     client.write_all(req.as_bytes()).await.unwrap();
 
     let mut resp = Vec::new();
@@ -2642,7 +2805,7 @@ async fn test_pool_round_robin_failover_on_dead_tunnel() {
 
     let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
     pool.add_tunnel("wgcf-dead", Arc::new(DeadTunnelTarget));
-    let ok_target = Arc::new(MockTunnelTarget::new("wgcf-ok"));
+    let ok_target = Arc::new(MockTunnelTarget::new("wgcf-ok").with_dial_redirect(echo_addr));
     pool.add_tunnel(
         "wgcf-ok",
         Arc::clone(&ok_target) as Arc<dyn ProxyTunnelTarget>,
@@ -2657,13 +2820,17 @@ async fn test_pool_round_robin_failover_on_dead_tunnel() {
     client.read_exact(&mut method_resp).await.unwrap();
     assert_eq!(method_resp, [0x05, 0x00]);
 
-    let ip_octets = match echo_addr.ip() {
+    // The client names the TEST-NET-1 stand-in (loopback targets are
+    // rejected by the destination guard); the mock dials the loopback
+    // echo server (see `TEST_ECHO_IP`).
+    let target_addr = test_echo_target(echo_addr);
+    let ip_octets = match target_addr.ip() {
         IpAddr::V4(v4) => v4.octets(),
         IpAddr::V6(_) => unreachable!(),
     };
     let mut req = vec![0x05, 0x01, 0x00, 0x01];
     req.extend_from_slice(&ip_octets);
-    req.extend_from_slice(&echo_addr.port().to_be_bytes());
+    req.extend_from_slice(&target_addr.port().to_be_bytes());
     client.write_all(&req).await.unwrap();
 
     let mut rep = [0u8; 10];
@@ -2691,7 +2858,7 @@ async fn test_socks5_selector_username_with_empty_password_allowed_when_anonymou
     });
 
     for mode in [AuthMode::None, AuthMode::PerTunnel] {
-        let t1 = Arc::new(MockTunnelTarget::new("wgcf-001"));
+        let t1 = Arc::new(MockTunnelTarget::new("wgcf-001").with_dial_redirect(echo_addr));
         let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true).with_auth(mode, None));
         pool.add_tunnel("wgcf-001", Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>);
 
@@ -2699,7 +2866,7 @@ async fn test_socks5_selector_username_with_empty_password_allowed_when_anonymou
             pool,
             &[METHOD_NO_AUTH, METHOD_USER_PASS],
             Some(("round-robin", "")),
-            echo_addr,
+            test_echo_target(echo_addr),
         )
         .await;
         assert_eq!(chosen, METHOD_USER_PASS);
@@ -2712,4 +2879,285 @@ async fn test_socks5_selector_username_with_empty_password_allowed_when_anonymou
     }
 
     accept_task.abort();
+}
+
+/// Upstream that replies to one proxied request with the given raw bytes.
+/// When `close_after` is set it closes the connection after replying;
+/// otherwise it holds the connection open forever, so a proxy that
+/// copies to EOF would hang instead of finishing the response.
+async fn spawn_raw_upstream_server(response: Vec<u8>, close_after: bool) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut header_buf = Vec::new();
+            let mut b = [0u8; 1];
+            while header_buf.len() < 8192 {
+                if stream.read_exact(&mut b).await.is_err() {
+                    return;
+                }
+                header_buf.push(b[0]);
+                if header_buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = stream.write_all(&response).await;
+            let _ = stream.flush().await;
+            if close_after {
+                drop(stream);
+            } else {
+                std::future::pending::<()>().await;
+            }
+        }
+    });
+    addr
+}
+
+fn http_forward_router(upstream_addr: SocketAddr) -> Arc<dyn TunnelRouter> {
+    Arc::new(SingleTunnelRouter::new(
+        "fwd",
+        Arc::new(MockTunnelTarget::new("fwd").with_dial_redirect(upstream_addr))
+            as Arc<dyn ProxyTunnelTarget>,
+        None,
+    ))
+}
+
+async fn http_forward_get(
+    upstream_addr: SocketAddr,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<io::Result<()>>,
+) {
+    let router = http_forward_router(upstream_addr);
+    let (mut client, server) = tokio::io::duplex(65536);
+    let task = tokio::spawn(async move { handle_http(server, router).await });
+    let target_addr = test_echo_target(upstream_addr);
+    let req = format!("GET http://{target_addr}/ HTTP/1.1\r\nHost: {target_addr}\r\n\r\n");
+    client.write_all(req.as_bytes()).await.unwrap();
+    (client, task)
+}
+
+#[tokio::test]
+async fn test_http_forward_enforces_content_length_and_closes() {
+    // Upstream declares 5 body bytes but sends more, then holds the
+    // connection open: the client must receive exactly the 5 declared
+    // bytes and then EOF — never the trailing bytes (audit run-1,
+    // `src/proxy/http.rs:forward_upstream_response-verbatim-no-framing-validation`).
+    let upstream = spawn_raw_upstream_server(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nHELLOEXTRA-PIPELINED-BYTES"
+            .to_vec(),
+        false,
+    )
+    .await;
+    let (mut client, task) = http_forward_get(upstream).await;
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+        .await
+        .expect("proxy must finish the first response without waiting for upstream close")
+        .unwrap();
+    assert_eq!(
+        resp,
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nHELLO"
+    );
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn test_http_forward_chunked_stops_at_terminal_chunk() {
+    // Chunked upstream followed by trailing bytes: only the framed
+    // chunks reach the client, then the connection closes.
+    let upstream = spawn_raw_upstream_server(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n0\r\n\r\nTRAILING"
+            .to_vec(),
+        false,
+    )
+    .await;
+    let (mut client, task) = http_forward_get(upstream).await;
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+        .await
+        .expect("proxy must finish the chunked response")
+        .unwrap();
+    assert_eq!(
+        resp,
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n0\r\n\r\n"
+    );
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn test_http_forward_close_delimited_body_until_close() {
+    // No framing at all: the body runs until the upstream closes.
+    let upstream = spawn_raw_upstream_server(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nBODY-NO-LENGTH".to_vec(),
+        true,
+    )
+    .await;
+    let (mut client, task) = http_forward_get(upstream).await;
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+        .await
+        .expect("proxy must finish the close-delimited response")
+        .unwrap();
+    assert_eq!(
+        resp,
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nBODY-NO-LENGTH"
+    );
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn test_http_forward_invalid_response_framing_returns_502() {
+    let upstream = spawn_raw_upstream_server(b"GARBAGE\r\n\r\n".to_vec(), true).await;
+    let (mut client, task) = http_forward_get(upstream).await;
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+        .await
+        .expect("proxy must answer a malformed upstream response")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 502 Bad Gateway"),
+        "malformed upstream framing must return 502, got: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    let _ = task.await;
+}
+
+#[test]
+fn test_parse_response_head_framing() {
+    let (status, framing) =
+        parse_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n").unwrap();
+    assert_eq!(status, 200);
+    assert!(matches!(framing, ResponseBodyFraming::ContentLength(5)));
+
+    let (status, framing) =
+        parse_response_head(b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+    assert_eq!(status, 200);
+    assert!(matches!(framing, ResponseBodyFraming::Chunked));
+
+    let (status, framing) =
+        parse_response_head(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n").unwrap();
+    assert_eq!(status, 200);
+    assert!(matches!(framing, ResponseBodyFraming::UntilClose));
+
+    let (_, framing) =
+        parse_response_head(b"HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\n").unwrap();
+    assert!(matches!(framing, ResponseBodyFraming::ContentLength(0)));
+
+    assert!(parse_response_head(b"GARBAGE\r\n\r\n").is_err());
+    assert!(
+        parse_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n")
+            .is_err()
+    );
+    assert!(
+        parse_response_head(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .is_err()
+    );
+    assert!(parse_response_head(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n").is_err());
+}
+
+#[tokio::test]
+async fn test_copy_limited_idle_enforces_size_and_idle() {
+    // Size bound: the copy stops at exactly the limit even when the
+    // reader offers more, so a never-ending stream cannot hold the
+    // session past the bound.
+    let (mut w, mut r) = tokio::io::duplex(64);
+    w.write_all(b"0123456789").await.unwrap();
+    drop(w);
+    let mut out = Vec::new();
+    let n = copy_limited_idle(&mut r, &mut out, 5, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!((n, out), (5, b"01234".to_vec()));
+
+    // Idle timeout: a stalled reader fails after the deadline.
+    let (_w, mut r) = tokio::io::duplex(64);
+    let mut out = Vec::new();
+    let err = copy_limited_idle(&mut r, &mut out, 1024, Duration::from_millis(50))
+        .await
+        .expect_err("idle copy must time out");
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+    // Happy path: all bytes copied until EOF.
+    let (mut w, mut r) = tokio::io::duplex(64);
+    w.write_all(b"abc").await.unwrap();
+    drop(w);
+    let mut out = Vec::new();
+    let n = copy_limited_idle(&mut r, &mut out, 1024, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!((n, out), (3, b"abc".to_vec()));
+}
+
+#[test]
+fn test_expected_udp_replies_rejects_unexpected_source() {
+    // Only replies to destinations this session asked for are
+    // expected; anything else (e.g. a spoofed source) is dropped
+    // (audit run-1, `socks5-udp-relay-unvalidated-tunnel-reply-source`).
+    let mut expected = ExpectedUdpReplies::default();
+    let server: SocketAddr = "192.0.2.1:1234".parse().unwrap();
+    let stranger: SocketAddr = "192.0.2.99:1234".parse().unwrap();
+    assert!(!expected.is_expected(server, b"hello"));
+    expected.note_sent(server, b"hello");
+    assert!(expected.is_expected(server, b"reply"));
+    assert!(!expected.is_expected(stranger, b"reply"));
+
+    // DNS: a reply from the queried server must carry an outstanding
+    // TXID, which is then consumed; a wrong TXID or a replay is dropped.
+    let dns_server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let mut query = [0u8; 12];
+    query[..2].copy_from_slice(&0x1234u16.to_be_bytes());
+    expected.note_sent(dns_server, &query);
+    let mut answer = [0u8; 12];
+    answer[..2].copy_from_slice(&0x1234u16.to_be_bytes());
+    assert!(expected.is_expected(dns_server, &answer));
+    assert!(!expected.is_expected(dns_server, &answer));
+    let mut wrong_txid = [0u8; 12];
+    wrong_txid[..2].copy_from_slice(&0x5678u16.to_be_bytes());
+    expected.note_sent(dns_server, &query);
+    assert!(!expected.is_expected(dns_server, &wrong_txid));
+}
+
+#[test]
+fn test_udp_first_datagram_grace_sleep() {
+    use crate::proxy::socks5::udp_first_datagram_grace_sleep;
+    // Pinned sessions never take the grace branch.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    assert_eq!(
+        udp_first_datagram_grace_sleep(true, deadline),
+        Duration::from_secs(3600)
+    );
+    // Unpinned: the remaining time until the deadline.
+    let remaining = udp_first_datagram_grace_sleep(false, deadline);
+    assert!(remaining > Duration::ZERO && remaining <= Duration::from_secs(30));
+    // Unpinned past the deadline: fire immediately.
+    let past = tokio::time::Instant::now() - Duration::from_secs(1);
+    assert_eq!(udp_first_datagram_grace_sleep(false, past), Duration::ZERO);
+}
+
+#[tokio::test]
+async fn test_copy_bidirectional_idle_timeout() {
+    use crate::proxy::copy_bidirectional_with_idle_timeout;
+    let (mut c1, mut s1) = tokio::io::duplex(1024);
+    let (mut c2, mut s2) = tokio::io::duplex(1024);
+    let relay = tokio::spawn(async move {
+        copy_bidirectional_with_idle_timeout(&mut s1, &mut s2, Duration::from_millis(100)).await
+    });
+    // Traffic flows both ways through the relay.
+    c1.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    c2.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+    c2.write_all(b"pong").await.unwrap();
+    c1.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"pong");
+    // Then an idle session ends on its own instead of hanging forever
+    // (audit run-1, `wpmulti/proxy:established-connect-no-idle-timeout`).
+    tokio::time::timeout(Duration::from_secs(2), relay)
+        .await
+        .expect("idle relay must finish")
+        .expect("relay task panicked")
+        .expect("idle relay must end cleanly");
 }

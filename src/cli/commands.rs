@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::api::AdminServer;
 use crate::config::{
     IpMode, MainConfig, TunnelConfig, load_tunnel_config_from_file, load_tunnel_configs_from_dir,
-    parse_duration_str,
+    load_tunnel_configs_from_dir_partial, parse_duration_str,
 };
 use crate::core::TunnelManager;
 use crate::netstack::{DEFAULT_CHANNEL_CAPACITY, VirtualNetworkStack, VirtualTunBridge};
+use crate::proxy::router::is_forbidden_destination_ip;
 use crate::tui::{TuiApp, TuiDataSource, run_terminal_tui};
 
 fn init_logging(log_level: crate::config::LogLevel, log_buffer: &crate::tui::TuiLogBuffer) {
@@ -132,6 +133,32 @@ pub async fn graceful_shutdown(
     manager.lifecycle().close_all_tunnels().await;
 }
 
+/// A `wpmulti.toml` found in the working directory is only trusted when
+/// it is owned by the process UID or by root (audit run-1,
+/// `config/cwd-wpmulti-toml-discovery-precedence`): without the check a
+/// planted file in a shared, extracted, or cloned directory would be
+/// loaded as the operator's config and redirect tunnel loading. A
+/// root-owned file is trusted because the operator's own install (e.g.
+/// `/etc` copies, `sudo` runs) is root-owned; any other owner is not.
+#[cfg(unix)]
+pub(crate) const fn config_file_owner_trusted(file_uid: u32, process_uid: u32) -> bool {
+    file_uid == process_uid || file_uid == 0
+}
+
+/// Real UID of this process, read from `/proc/self/status` (Linux and
+/// Android; `unsafe_code = "forbid"` rules out `libc::getuid()`).
+/// `None` when the UID cannot be determined.
+#[cfg(unix)]
+fn process_uid() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
 /// Find a `wpmulti.toml` in `dir` for `run` when it was started without
 /// `-c` or `-d`. `run` without arguments used to ignore a `wpmulti.toml`
 /// sitting in the working directory and start with the compiled-in
@@ -139,14 +166,59 @@ pub async fn graceful_shutdown(
 /// so a user standing in a folder that already had a config got "No
 /// WireGuard tunnel configurations found" for a config that was right
 /// there.
+///
+/// Only a file owned by the process UID (or root) is trusted here: a
+/// `wpmulti.toml` planted in a shared, extracted, or cloned directory
+/// by another local user must not silently override the per-user
+/// config. An untrusted file is ignored with a warning; pass `-c
+/// <file>` to use such a file explicitly.
 pub(crate) fn discover_local_config_in(dir: &Path) -> Option<PathBuf> {
     let path = dir.join("wpmulti.toml");
-    path.exists().then_some(path)
+    if !path.exists() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let file_uid = match fs::metadata(&path) {
+            Ok(meta) => meta.uid(),
+            Err(e) => {
+                tracing::warn!(
+                    "Ignoring wpmulti.toml in working directory '{}': cannot stat it: {e}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        match process_uid() {
+            Some(uid) if config_file_owner_trusted(file_uid, uid) => {}
+            Some(uid) => {
+                tracing::warn!(
+                    "Ignoring wpmulti.toml in working directory '{}': owned by uid {} (process uid {}); pass -c <file> to use it explicitly",
+                    path.display(),
+                    file_uid,
+                    uid
+                );
+                return None;
+            }
+            None => {
+                tracing::warn!(
+                    "Ignoring wpmulti.toml in working directory '{}': cannot determine process uid; pass -c <file> to use it explicitly",
+                    path.display()
+                );
+                return None;
+            }
+        }
+    }
+    Some(path)
 }
 
 /// Resolve the config file to use when no explicit `-c` was given, in
 /// priority order:
-/// 1. `wpmulti.toml` in the working directory (the historical behaviour).
+/// 1. `wpmulti.toml` in the working directory (the historical behaviour),
+///    but only when it is owned by the process UID or root — an
+///    untrusted local file is ignored (see
+///    [`discover_local_config_in`]).
 /// 2. The per-user `wpmulti.toml` under the XDG config directory
 ///    (`$XDG_CONFIG_HOME/wpmulti/wpmulti.toml`, or
 ///    `~/.config/wpmulti/wpmulti.toml` when `XDG_CONFIG_HOME` is unset) —
@@ -196,6 +268,49 @@ fn user_config_file(
     Some(home.join(".config").join("wpmulti").join("wpmulti.toml"))
 }
 
+/// Report one quarantined `.conf` file on stderr. `tracing` is not
+/// usable here yet: `run`/`probe` print before logging is initialized,
+/// and `eprintln!` is banned by the repo lint config — the locked
+/// `stderr` write below is the same pattern `cmd_validate` uses for
+/// stdout.
+fn warn_skipped_tunnel_config(failure: &crate::config::TunnelLoadFailure) {
+    let mut err_out = std::io::stderr().lock();
+    let _ = writeln!(
+        err_out,
+        "warning: skipping broken tunnel config '{}': {}",
+        failure.path.display(),
+        failure.error
+    );
+}
+
+/// Load tunnels for `run`, degraded (audit run-1,
+/// `config/load-dir-single-bad-conf-fails-all`): one broken `.conf`
+/// must not block the whole daemon. Returns the valid set, warns about
+/// each quarantined file, and only refuses to start when nothing valid
+/// remains. `validate` keeps the strict loader.
+fn load_tunnels_for_run(config_dir: &Path) -> Result<Vec<TunnelConfig>, String> {
+    if !config_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let partial = load_tunnel_configs_from_dir_partial(config_dir)
+        .map_err(|e| format!("Failed to load tunnels: {e}"))?;
+    for failure in &partial.failures {
+        warn_skipped_tunnel_config(failure);
+    }
+    if partial.configs.is_empty() && !partial.failures.is_empty() {
+        return Err(format!(
+            "Failed to load tunnels: {}",
+            partial
+                .failures
+                .iter()
+                .map(|f| f.error.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    Ok(partial.configs)
+}
+
 /// Execute the `wpmulti run` command: starts the multi-tunnel daemon.
 /// Monitoring a running daemon is done with `wpmulti top`, which reads
 /// it through the Admin API; `run` itself stays a plain daemon.
@@ -227,12 +342,7 @@ pub async fn cmd_run(
         config.global.config_dir = dir;
     }
 
-    let tunnels = if config.global.config_dir.exists() {
-        load_tunnel_configs_from_dir(&config.global.config_dir)
-            .map_err(|e| format!("Failed to load tunnels: {e}"))?
-    } else {
-        Vec::new()
-    };
+    let tunnels = load_tunnels_for_run(&config.global.config_dir)?;
 
     if tunnels.is_empty() {
         return Err(format!(
@@ -512,7 +622,12 @@ pub struct ProbeResult {
     pub healthy: bool,
     /// Round-trip time in milliseconds, if handshake succeeded.
     pub rtt_ms: Option<f64>,
-    /// In-tunnel exit IP address, if available.
+    /// In-tunnel exit IP address, if measured. The probe verifies
+    /// egress with an in-tunnel DNS query, which proves the data
+    /// plane carries traffic but does not reveal the egress address,
+    /// so this is currently always `None`: an unmeasured address
+    /// (e.g. the locally configured interface address) is never
+    /// reported as the exit IP.
     pub exit_ip: Option<String>,
     /// Error message, if probe failed.
     pub error: Option<String>,
@@ -544,7 +659,13 @@ async fn build_probe_peers(config: &TunnelConfig, timeout: Duration) -> Vec<gota
         } else if let Ok(Ok(mut addrs)) =
             tokio::time::timeout(timeout, tokio::net::lookup_host(&p_cfg.endpoint)).await
         {
-            peer.endpoint = addrs.next();
+            // Same rule as `LifecycleController::build_peers`: never
+            // handshake an endpoint the host resolver points at a
+            // forbidden address (audit run-1,
+            // `lifecycle:build-peers-unchecked-dns-endpoint`). Take
+            // the first allowed answer; leave the endpoint unset when
+            // every answer is forbidden.
+            peer.endpoint = addrs.find(|addr| !is_forbidden_destination_ip(addr.ip()));
         } else {
             // Endpoint unresolvable; leave peer.endpoint as None.
         }
@@ -624,10 +745,28 @@ pub async fn run_probe_single(
     let t0 = Instant::now();
     let handshake_res = tokio::time::timeout(timeout, device.force_handshake(&peer_pubkey)).await;
 
+    // A handshake alone proves only that the peer answers: the tunnel
+    // is healthy only when the data plane also carries traffic, so a
+    // successful handshake is followed by an uncached in-tunnel DNS
+    // egress probe through the netstack that was built for this probe
+    // (audit run-1,
+    // `cli/probe/handshake-only-healthy-unmeasured-exit-ip`). The
+    // egress probe gets the time left from the probe timeout, so one
+    // probe costs at most `timeout` in total.
     let (healthy, rtt_ms, error) = match handshake_res {
         Ok(Ok(())) => {
-            let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
-            (true, Some(elapsed), None)
+            let remaining = timeout.checked_sub(t0.elapsed()).unwrap_or(Duration::ZERO);
+            match netstack.probe_egress(remaining).await {
+                Ok(()) => {
+                    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+                    (true, Some(elapsed), None)
+                }
+                Err(e) => (
+                    false,
+                    None,
+                    Some(format!("handshake ok but egress probe failed: {e}")),
+                ),
+            }
         }
         Ok(Err(e)) => (false, None, Some(format!("handshake failed: {e}"))),
         Err(_) => (
@@ -637,15 +776,10 @@ pub async fn run_probe_single(
         ),
     };
 
-    let exit_ip = if healthy {
-        config
-            .interface
-            .addresses
-            .first()
-            .map(|net| net.ip().to_string())
-    } else {
-        None
-    };
+    // No in-tunnel egress address is ever measured by this probe, so
+    // none is reported: the configured interface address is the local
+    // tunnel address, not the observed exit IP.
+    let exit_ip = None;
 
     let () = device.suspend().await;
     netstack.close().await;
@@ -690,9 +824,25 @@ pub async fn cmd_probe(
             vec![(t, file.display().to_string())]
         }
         (None, Some(dir)) => {
-            let tunnels = load_tunnel_configs_from_dir(&dir)
+            // Degraded probe (audit run-1,
+            // `config/load-dir-single-bad-conf-fails-all`): probe the
+            // healthy tunnels and report the broken files instead of
+            // refusing the whole directory.
+            let partial = load_tunnel_configs_from_dir_partial(&dir)
                 .map_err(|e| format!("Failed to load configs from '{}': {}", dir.display(), e))?;
-            tunnels
+            for failure in &partial.failures {
+                warn_skipped_tunnel_config(failure);
+            }
+            if partial.configs.is_empty() && !partial.failures.is_empty() {
+                return Err(format!(
+                    "Failed to load configs from '{}': all {} tunnel config(s) failed to load",
+                    dir.display(),
+                    partial.failures.len()
+                )
+                .into());
+            }
+            partial
+                .configs
                 .into_iter()
                 .map(|t| {
                     let filename = format!("{}/{}.conf", dir.display(), t.id);

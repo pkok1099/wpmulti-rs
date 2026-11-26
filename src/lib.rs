@@ -37,25 +37,28 @@ pub use cli::{
 pub use config::{
     AdminSettings, AuthMode, ConfigError, DnsPreference, DnsStrategy, GlobalSettings,
     HealthCheckSettings, IpMode, LifecycleMode, LifecycleSettings, ListenerType, LogLevel,
-    MainConfig, PerTunnelSettings, PoolStrategy, SharedListenerSettings, TuiSettings, TuiSortField,
-    TunnelConfig, TunnelPoolSelection, TunnelPortOverride, WgConfError, WgConfig,
-    WgInterfaceConfig, WgPeerConfig, load_tunnel_config_from_file, load_tunnel_config_from_str,
-    load_tunnel_configs_from_dir, parse_duration_str, parse_wg_conf, parse_wg_conf_file,
+    MainConfig, PartialTunnelLoad, PerTunnelSettings, PoolStrategy, SharedListenerSettings,
+    TuiSettings, TuiSortField, TunnelConfig, TunnelLoadFailure, TunnelPoolSelection,
+    TunnelPortOverride, WgConfError, WgConfig, WgInterfaceConfig, WgPeerConfig,
+    load_tunnel_config_from_file, load_tunnel_config_from_str, load_tunnel_configs_from_dir,
+    load_tunnel_configs_from_dir_partial, parse_duration_str, parse_wg_conf, parse_wg_conf_file,
     strip_comment,
 };
 pub use core::{
     ActiveListenerInfo, ActiveProber, ActiveTunnel, CoreError, DedicatedTunnelRouter,
     GuardedStream, GuardedTunnelTarget, HealthStatus, LifecycleController, ListenerSupervisor,
-    MeteredStream, MeteredUdpSocket, MultiTenantRouter, ReloadReport, TunnelConnGuard, TunnelEntry,
-    TunnelHealthTracker, TunnelManager, TunnelRegistry, TunnelState, TunnelStats, TunnelSummary,
-    WgDevice,
+    MeteredStream, MeteredUdpSocket, MultiTenantRouter, ProtectedUdpFactory, ReloadReport,
+    SocketProtector, TunnelConnGuard, TunnelEntry, TunnelHealthTracker, TunnelManager,
+    TunnelRegistry, TunnelState, TunnelStats, TunnelSummary, WgDevice,
 };
 pub use netstack::{
     BridgeIpRecv, BridgeIpSend, DEFAULT_CHANNEL_CAPACITY, DEFAULT_CONNECT_TIMEOUT, DEFAULT_MTU,
-    DnsError, DnsLruCache, InTunnelDnsResolver, MAX_DRAIN_BATCH_SIZE, QueryType, StackInner,
-    TCP_RX_BUF_SIZE, TCP_TX_BUF_SIZE, UDP_PACKET_QUEUE_CAPACITY, UDP_PAYLOAD_BUF_SIZE,
-    VirtualNetworkStack, VirtualTcpStream, VirtualTunBridge, VirtualUdpSocket, build_query,
-    parse_response, to_smoltcp_endpoint, to_std_socket_addr,
+    DnsError, DnsLruCache, FLOW_IDLE_TIMEOUT, FlowKey, FlowRoute, FlowTable, InTunnelDnsResolver,
+    MAX_DRAIN_BATCH_SIZE, QueryType, StackInner, TCP_RX_BUF_SIZE, TCP_TX_BUF_SIZE, TunEndpoint,
+    TunIpRecv, TunIpSend, TunRoute, TunnelUsable, UDP_PACKET_QUEUE_CAPACITY, UDP_PAYLOAD_BUF_SIZE,
+    VirtualNetworkStack, VirtualTcpStream, VirtualTunBridge, VirtualUdpSocket, VpnRouteStrategy,
+    build_query, longest_prefix_route, parse_flow_key, parse_response, to_smoltcp_endpoint,
+    to_std_socket_addr,
 };
 pub use proxy::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AsyncReadWrite, CMD_BIND, CMD_CONNECT, CMD_UDP_ASSOCIATE,

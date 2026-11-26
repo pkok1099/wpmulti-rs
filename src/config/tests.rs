@@ -856,6 +856,97 @@ fn test_load_tunnel_configs_from_dir_reports_every_broken_file() {
 // 11. IpMode Parsing, Helpers & Validation
 // =========================================================================
 #[test]
+fn test_load_tunnel_configs_from_dir_partial_returns_valid_and_reports_broken() {
+    // Degraded load (audit run-1, `config/load-dir-single-bad-conf-fails-all`):
+    // the valid set is returned together with one failure per broken
+    // file, instead of discarding everything. The strict loader above
+    // still fails on the same directory.
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let dir_path = temp_dir.path();
+
+    let valid = format!(
+        "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\nAllowedIPs = 0.0.0.0/0\n"
+    );
+    let broken_a = valid.replace(VALID_PRIVATE_KEY, "!!!bad!!!");
+    let broken_b = valid.replace(VALID_PRIVATE_KEY, "AAAA!AAA");
+    std::fs::write(dir_path.join("a-broken.conf"), &broken_a).unwrap();
+    std::fs::write(dir_path.join("b-broken.conf"), &broken_b).unwrap();
+    std::fs::write(dir_path.join("c-good.conf"), &valid).unwrap();
+
+    let partial = load_tunnel_configs_from_dir_partial(dir_path).expect("partial load succeeds");
+    assert_eq!(partial.configs.len(), 1, "valid file must be returned");
+    assert_eq!(partial.configs[0].id, "c-good");
+    assert_eq!(
+        partial.failures.len(),
+        2,
+        "both broken files must be reported"
+    );
+    assert!(
+        partial
+            .failures
+            .iter()
+            .any(|f| f.id.as_deref() == Some("a-broken")),
+        "a-broken failure must carry its tunnel id: {:?}",
+        partial.failures
+    );
+    assert!(
+        partial
+            .failures
+            .iter()
+            .any(|f| f.id.as_deref() == Some("b-broken")),
+        "b-broken failure must carry its tunnel id: {:?}",
+        partial.failures
+    );
+    assert!(
+        partial.failures.iter().all(|f| f.error.contains(".conf")),
+        "each failure must name its file: {:?}",
+        partial.failures
+    );
+
+    // The strict loader still fails on the same directory (validate
+    // behaviour is unchanged).
+    assert!(load_tunnel_configs_from_dir(dir_path).is_err());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_load_tunnel_configs_from_dir_partial_rejects_symlink() {
+    // A symlink inside the config directory must never be followed to
+    // a target outside it (audit run-1,
+    // `config/wg-conf-dir-loader-symlink-toctou`), even when the link
+    // itself was swapped in after enumeration: the read opens with
+    // O_NOFOLLOW, so the link is quarantined as a failure instead of
+    // loading the outside file's tunnel.
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let dir_path = temp_dir.path();
+
+    let valid = format!(
+        "[Interface]\nPrivateKey = {VALID_PRIVATE_KEY}\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = {VALID_PUBLIC_KEY}\nEndpoint = 1.1.1.1:51820\nAllowedIPs = 0.0.0.0/0\n"
+    );
+    let outside_dir = tempfile::tempdir().expect("create outside temp dir");
+    let outside = outside_dir.path().join("outside.conf");
+    std::fs::write(&outside, &valid).unwrap();
+    std::os::unix::fs::symlink(&outside, dir_path.join("link.conf")).unwrap();
+    std::fs::write(dir_path.join("good.conf"), &valid).unwrap();
+
+    let partial = load_tunnel_configs_from_dir_partial(dir_path).expect("partial load succeeds");
+    assert_eq!(partial.configs.len(), 1, "only the regular file loads");
+    assert_eq!(partial.configs[0].id, "good");
+    // A symlink present at enumeration is skipped there (its
+    // `file_type` is not a regular file); the O_NOFOLLOW open below is
+    // what closes the swap-in window between enumeration and read.
+    assert!(partial.failures.is_empty());
+
+    // The single-file loader refuses the symlink the same way: the
+    // O_NOFOLLOW open fails instead of following it to the outside
+    // file's tunnel.
+    assert!(load_tunnel_config_from_file(dir_path.join("link.conf")).is_err());
+    assert!(WgConfig::from_file(dir_path.join("link.conf")).is_err());
+    // ...while the target itself still loads directly.
+    assert!(load_tunnel_config_from_file(&outside).is_ok());
+}
+
+#[test]
 fn test_ip_mode_helpers_and_parsing() {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

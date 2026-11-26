@@ -24,8 +24,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{
-    AdminTestClient, HttpProxyTestClient, SharedListenerFixture, Socks5Target, Socks5TestClient,
-    TestEnvironment, WgConfBuilder, WgPeerFixture, WpMultiTomlBuilder, allocate_ephemeral_port,
+    AdminTestClient, EchoRedirectTarget, HttpProxyTestClient, SharedListenerFixture, Socks5Target,
+    Socks5TestClient, TestEnvironment, WgConfBuilder, WgPeerFixture, WpMultiTomlBuilder,
+    allocate_ephemeral_port, test_echo_target,
 };
 use etherparse::PacketBuilder;
 use gotatun::tun::{IpRecv, IpSend};
@@ -638,14 +639,9 @@ fn test_f5_dns_response_decoding_success() {
 // Feature 6: SOCKS5 TCP CONNECT (F6)
 // =============================================================================
 
-async fn spawn_real_socks5_server(expected_pass: Option<&str>) -> SocketAddr {
+async fn spawn_socks5_server_with_router(router: Arc<dyn TunnelRouter>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
-        "e2e-socks5",
-        Arc::new(DirectTunnelTarget),
-        expected_pass.map(|s| ("admin".to_string(), s.to_string())),
-    ));
     tokio::spawn(async move {
         if let Ok((stream, peer_addr)) = listener.accept().await {
             let local_ip = stream.local_addr().ok().map(|a| a.ip());
@@ -655,20 +651,49 @@ async fn spawn_real_socks5_server(expected_pass: Option<&str>) -> SocketAddr {
     addr
 }
 
-async fn spawn_real_http_server(expected_pass: Option<&str>) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn spawn_real_socks5_server(expected_pass: Option<&str>) -> SocketAddr {
     let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
-        "e2e-http",
+        "e2e-socks5",
         Arc::new(DirectTunnelTarget),
         expected_pass.map(|s| ("admin".to_string(), s.to_string())),
     ));
+    spawn_socks5_server_with_router(router).await
+}
+
+/// SOCKS5 server whose tunnel dials a fixed loopback echo listener
+/// regardless of the destination the client named (see
+/// [`EchoRedirectTarget`]): the destination guard forbids loopback
+/// targets, so tests name the TEST-NET-1 stand-in instead.
+async fn spawn_real_socks5_server_with_echo(echo_addr: SocketAddr) -> SocketAddr {
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "e2e-socks5",
+        Arc::new(EchoRedirectTarget::new(echo_addr)),
+        None,
+    ));
+    spawn_socks5_server_with_router(router).await
+}
+
+async fn spawn_http_server_with_router(router: Arc<dyn TunnelRouter>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         if let Ok((stream, _)) = listener.accept().await {
             let _ = handle_http(stream, router).await;
         }
     });
     addr
+}
+
+/// HTTP server whose tunnel dials a fixed loopback echo listener
+/// regardless of the destination the client named (see
+/// [`EchoRedirectTarget`]).
+async fn spawn_real_http_server_with_echo(echo_addr: SocketAddr) -> SocketAddr {
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "e2e-http",
+        Arc::new(EchoRedirectTarget::new(echo_addr)),
+        None,
+    ));
+    spawn_http_server_with_router(router).await
 }
 
 #[tokio::test]
@@ -713,14 +738,18 @@ async fn test_f6_socks5_connect_ipv4_success() {
         let (_s, _) = echo_listener.accept().await.unwrap();
     });
 
-    let addr = spawn_real_socks5_server(None).await;
+    let addr = spawn_real_socks5_server_with_echo(echo_addr).await;
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
     client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
-    let ip = match echo_addr.ip() {
+    // The client names the TEST-NET-1 stand-in (loopback targets are
+    // rejected by the destination guard); the server dials the
+    // loopback echo listener.
+    let target = test_echo_target(echo_addr);
+    let ip = match target.ip() {
         IpAddr::V4(v4) => v4,
         _ => unreachable!(),
     };
-    let _stream = client.cmd_connect_ipv4(ip, echo_addr.port()).await.unwrap();
+    let _stream = client.cmd_connect_ipv4(ip, target.port()).await.unwrap();
 }
 
 #[tokio::test]
@@ -734,14 +763,18 @@ async fn test_f6_socks5_connect_streaming_echo() {
         s.write_all(&buf).await.unwrap();
     });
 
-    let addr = spawn_real_socks5_server(None).await;
+    let addr = spawn_real_socks5_server_with_echo(echo_addr).await;
     let mut client = Socks5TestClient::connect(addr).await.unwrap();
     client.greeting(&[METHOD_NO_AUTH]).await.unwrap();
-    let ip = match echo_addr.ip() {
+    // The client names the TEST-NET-1 stand-in (loopback targets are
+    // rejected by the destination guard); the server dials the
+    // loopback echo listener.
+    let target = test_echo_target(echo_addr);
+    let ip = match target.ip() {
         IpAddr::V4(v4) => v4,
         _ => unreachable!(),
     };
-    let mut stream = client.cmd_connect_ipv4(ip, echo_addr.port()).await.unwrap();
+    let mut stream = client.cmd_connect_ipv4(ip, target.port()).await.unwrap();
 
     stream.write_all(b"socks5_echo").await.unwrap();
     let mut resp = [0u8; 11];
@@ -848,10 +881,14 @@ async fn test_f8_http_connect_handshake_200_ok() {
         let (_s, _) = target_listener.accept().await.unwrap();
     });
 
-    let addr = spawn_real_http_server(None).await;
-    let _stream = HttpProxyTestClient::connect_tunnel(addr, &target_addr.to_string(), None)
-        .await
-        .unwrap();
+    let addr = spawn_real_http_server_with_echo(target_addr).await;
+    // The client names the TEST-NET-1 stand-in (loopback targets are
+    // rejected by the destination guard); the server dials the
+    // loopback target listener.
+    let _stream =
+        HttpProxyTestClient::connect_tunnel(addr, &test_echo_target(target_addr).to_string(), None)
+            .await
+            .unwrap();
 }
 
 #[test]
@@ -881,8 +918,11 @@ async fn test_f8_http_forward_proxy_request_parsing() {
         s.write_all(resp.as_bytes()).await.unwrap();
     });
 
-    let addr = spawn_real_http_server(None).await;
-    let url = format!("http://{}/get", origin_addr);
+    let addr = spawn_real_http_server_with_echo(origin_addr).await;
+    // The client names the TEST-NET-1 stand-in (loopback targets are
+    // rejected by the destination guard); the server dials the
+    // loopback origin listener.
+    let url = format!("http://{}/get", test_echo_target(origin_addr));
     let resp = HttpProxyTestClient::forward_request(addr, "GET", &url, None)
         .await
         .unwrap();
@@ -901,10 +941,14 @@ async fn test_f8_http_connect_tunnel_data_streaming() {
         s.write_all(&echo_buf).await.unwrap();
     });
 
-    let addr = spawn_real_http_server(None).await;
-    let mut stream = HttpProxyTestClient::connect_tunnel(addr, &target_addr.to_string(), None)
-        .await
-        .unwrap();
+    let addr = spawn_real_http_server_with_echo(target_addr).await;
+    // The client names the TEST-NET-1 stand-in (loopback targets are
+    // rejected by the destination guard); the server dials the
+    // loopback target listener.
+    let mut stream =
+        HttpProxyTestClient::connect_tunnel(addr, &test_echo_target(target_addr).to_string(), None)
+            .await
+            .unwrap();
 
     stream.write_all(b"stream_bytes").await.unwrap();
     let mut echo = [0u8; 12];

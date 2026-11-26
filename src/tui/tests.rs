@@ -838,17 +838,21 @@ fn assert_live_runtime_propagation(
     use crate::config::toml_config::DnsStrategy;
     use std::time::Duration;
 
+    let netstack = active
+        .netstack
+        .as_ref()
+        .expect("proxy-mode tunnel must have a netstack");
     assert_eq!(
-        active.netstack.dns_resolver().dns_strategy(),
+        netstack.dns_resolver().dns_strategy(),
         DnsStrategy::TunnelFirst
     );
-    assert!(active.netstack.dns_resolver().prefer_ipv6());
+    assert!(netstack.dns_resolver().prefer_ipv6());
     assert_eq!(
-        active.netstack.dns_resolver().dns_servers()[0],
+        netstack.dns_resolver().dns_servers()[0],
         "9.9.9.9:53".parse().expect("dns")
     );
-    assert_eq!(active.netstack.effective_ip_mode(), IpMode::Ipv4Only);
-    assert_eq!(active.netstack.connect_timeout(), Duration::from_secs(7));
+    assert_eq!(netstack.effective_ip_mode(), IpMode::Ipv4Only);
+    assert_eq!(netstack.connect_timeout(), Duration::from_secs(7));
     assert_eq!(mgr.lifecycle().health_check(), (6, Duration::from_secs(45)));
     assert_eq!(
         mgr.prober().settings_snapshot().probe_interval,
@@ -1382,6 +1386,86 @@ async fn test_tui_remote_http_config_preserves_redacted_secrets_and_auth() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn test_tui_failed_save_leaves_no_redacted_placeholder_on_disk() {
+    // A failed POST /config must not leave the literal '[REDACTED]'
+    // placeholder as the persisted credential (audit run-1,
+    // `tui-save-write:redacted-placeholder-persisted-on-failed-post-config`):
+    // the save applies to the daemon first and only writes the local
+    // file on success.
+    use crate::api::AdminServer;
+    use crate::config::load_tunnel_configs_from_dir;
+    use crate::tui::TuiTab;
+
+    let temp = tempfile::TempDir::new().expect("temp");
+    let conf_dir = temp.path().join("conf.d");
+    std::fs::create_dir_all(&conf_dir).expect("mkdir");
+    write_test_wg_conf(&conf_dir, "t1", "172.16.0.2/32", "127.0.0.1:51820");
+    let tunnels = load_tunnel_configs_from_dir(&conf_dir).expect("load");
+    let toml_path = temp.path().join("wpmulti.toml");
+
+    let cfg = build_remote_tui_test_config(&conf_dir);
+    std::fs::write(&toml_path, toml::to_string_pretty(&cfg).expect("toml")).expect("write");
+
+    let mgr = Arc::new(TunnelManager::new(cfg, tunnels).expect("mgr"));
+    mgr.set_config_path(toml_path.clone());
+    let server = AdminServer::new(
+        "127.0.0.1:0".parse().expect("addr"),
+        Arc::clone(&mgr),
+        Some("remote-tok-123".to_string()),
+    );
+    let addr = server.start().await.expect("start admin");
+
+    let mut app = TuiApp::new(
+        TuiDataSource {
+            admin_url: format!("http://{addr}"),
+            auth_token: Some("remote-tok-123".to_string()),
+        },
+        TuiSortField::Id,
+    )
+    .with_config_path(toml_path.clone());
+    app.set_tab(TuiTab::Config);
+    app.refresh().await.expect("fetch redacted config");
+
+    // A stale tunnel id passes the TUI-local validate() but the server
+    // rejects it, so the POST fails.
+    let mut snapshot = app.config_snapshot.clone().expect("snapshot loaded");
+    snapshot.disabled_tunnels.push("stale-tunnel".to_string());
+    app.config_snapshot = Some(snapshot);
+
+    let err = app
+        .save_config_and_reload_with_report()
+        .await
+        .expect_err("save with a stale tunnel id must fail");
+    assert!(
+        err.contains("HTTP 400"),
+        "expected a 400 from POST /config, got: {err}"
+    );
+
+    let on_disk = std::fs::read_to_string(&toml_path).expect("read toml");
+    assert!(
+        !on_disk.contains("[REDACTED]"),
+        "failed save must not persist the placeholder: {on_disk}"
+    );
+    let persisted = MainConfig::from_file(&toml_path).expect("reload persisted toml");
+    assert_eq!(
+        persisted.admin.auth_token.as_deref(),
+        Some("remote-tok-123")
+    );
+    assert_eq!(
+        persisted.shared_listeners[0].global_password.as_deref(),
+        Some("remote-s5-pass")
+    );
+    assert_eq!(
+        persisted.per_tunnel.overrides["t1"].password.as_deref(),
+        Some("remote-ov-pass")
+    );
+    // The daemon never applied the stale id either.
+    assert!(mgr.config_snapshot().disabled_tunnels.is_empty());
+
+    server.stop().await;
+}
+
 #[test]
 fn test_tui_format_ago() {
     use crate::tui::ui::format_ago;
@@ -1688,4 +1772,41 @@ fn test_tui_top_five_narrow_screen_shows_all_bars() {
         overview.contains("1.52MB"),
         "Top 5 bar value 1.52MB missing on a 110-column screen:\n{output}"
     );
+}
+
+#[test]
+fn test_parse_admin_http_url_rejects_non_loopback_hosts() {
+    use crate::tui::app::parse_admin_http_url;
+
+    // Loopback forms keep working (the default client target included).
+    assert_eq!(
+        parse_admin_http_url("http://127.0.0.1:9090").unwrap(),
+        "127.0.0.1:9090"
+    );
+    assert_eq!(
+        parse_admin_http_url("http://localhost:9090").unwrap(),
+        "localhost:9090"
+    );
+    assert_eq!(
+        parse_admin_http_url("http://[::1]:9090").unwrap(),
+        "[::1]:9090"
+    );
+    assert_eq!(
+        parse_admin_http_url("http://127.0.0.2:9090").unwrap(),
+        "127.0.0.2:9090"
+    );
+
+    // Anything else must be rejected: the Bearer <redacted> travels over
+    // plain HTTP with no TLS endpoint, so a non-loopback host would
+    // expose it to the network on every request (audit run-1,
+    // `tui-cli/admin-bearer-plaintext-http`).
+    for url in [
+        "http://192.168.1.10:9090",
+        "http://10.0.0.5:9090",
+        "http://203.0.113.7:9090",
+        "http://daemon.example.com:9090",
+        "http://[2001:db8::1]:9090",
+    ] {
+        assert!(parse_admin_http_url(url).is_err(), "{url} must be rejected");
+    }
 }

@@ -17,9 +17,7 @@ use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint};
 use tokio::sync::Notify;
 
-use crate::netstack::stack::{
-    StackInner, WakerSlot, register_shutdown_waker, reject_loopback_dst,
-};
+use crate::netstack::stack::{StackInner, WakerSlot, register_shutdown_waker, reject_loopback_dst};
 
 impl std::fmt::Debug for VirtualTcpStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

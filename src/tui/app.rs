@@ -156,7 +156,14 @@ fn validate_http_request_path(path: &str) -> Result<(), String> {
 }
 
 /// Parse an Admin API URL (`http://host[:port]`) into `host:port`.
-fn parse_admin_http_url(admin_url: &str) -> Result<String, String> {
+///
+/// Only loopback hosts are accepted: the Admin Bearer <redacted> travels
+/// over plain HTTP with no TLS endpoint anywhere in the daemon, so
+/// sending it to a non-loopback host would expose the token to the
+/// network in cleartext on every request (audit run-1,
+/// `tui-cli/admin-bearer-plaintext-http`). Reach a remote daemon through
+/// a loopback SSH tunnel (`ssh -L 9090:127.0.0.1:9090`) instead.
+pub(crate) fn parse_admin_http_url(admin_url: &str) -> Result<String, String> {
     let url = admin_url.trim().trim_end_matches('/');
     if url.starts_with("https://") {
         return Err("HTTPS is not supported for Admin API; use http://".to_string());
@@ -168,6 +175,11 @@ fn parse_admin_http_url(admin_url: &str) -> Result<String, String> {
     {
         return Err(format!("Invalid Admin API URL '{admin_url}'"));
     }
+    if !is_loopback_admin_host(authority) {
+        return Err(format!(
+            "Admin API URL '{admin_url}' is not a loopback host: the admin token is sent over plain HTTP, so use http://127.0.0.1:<port> (or an SSH tunnel to 127.0.0.1)"
+        ));
+    }
     let has_port = authority
         .strip_prefix('[')
         .map_or_else(|| authority.contains(':'), |rest| rest.contains("]:"));
@@ -176,6 +188,19 @@ fn parse_admin_http_url(admin_url: &str) -> Result<String, String> {
     } else {
         Ok(format!("{authority}:80"))
     }
+}
+
+/// True when `authority` (`host[:port]`, `[v6]:port`) names a loopback
+/// host: `localhost`, `127.0.0.0/8`, or `::1`.
+fn is_loopback_admin_host(authority: &str) -> bool {
+    let host = authority.strip_prefix('[').map_or_else(
+        || authority.split_once(':').map_or(authority, |(h, _)| h),
+        |rest| rest.split_once(']').map_or(authority, |(h, _)| h),
+    );
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Execute an HTTP/1.1 request against the Admin API, validating HTTP status and returning body bytes.
@@ -220,7 +245,11 @@ pub(crate) async fn admin_http_request_with_body(
             ),
         );
     } else if method == "POST" {
-        req.push_str("Content-Length: 0\r\n");
+        // A bodiless POST still declares `application/json`: the Admin
+        // API requires that content type on every state-changing POST
+        // (CSRF guard — a cross-origin simple request cannot carry it),
+        // so a POST without a body must not arrive header-less.
+        req.push_str("Content-Type: application/json\r\nContent-Length: 0\r\n");
     } else {
         // No body and not POST: no Content-Length header.
     }
@@ -512,6 +541,75 @@ pub struct TuiApp {
     pub overlay: TuiOverlay,
 }
 
+/// Replace one redacted secret slot with the real value from the
+/// on-disk config when the slot still holds a redaction sentinel
+/// (`[REDACTED]`, `[KEEP]`, …). A slot holding a real value (a rotation
+/// the operator just typed) or `None` (no secret set) is untouched.
+fn restore_secret(slot: &mut Option<String>, disk: Option<&String>) {
+    if slot
+        .as_deref()
+        .is_some_and(crate::config::is_redacted_secret_placeholder)
+        && let Some(real) = disk
+    {
+        *slot = Some(real.clone());
+    }
+}
+
+/// Replace every redacted secret in `cfg` with the real value from
+/// `on_disk` — the file the daemon just rewrote on a successful POST,
+/// or the previous local copy. Mirrors the secret fields
+/// `redact_config_secrets` (Admin API) replaces with placeholders.
+fn restore_redacted_secrets(cfg: &mut MainConfig, on_disk: &MainConfig) {
+    restore_secret(&mut cfg.admin.auth_token, on_disk.admin.auth_token.as_ref());
+    for (listener, disk_listener) in cfg
+        .shared_listeners
+        .iter_mut()
+        .zip(on_disk.shared_listeners.iter())
+    {
+        restore_secret(
+            &mut listener.global_password,
+            disk_listener.global_password.as_ref(),
+        );
+    }
+    for (id, ovr) in &mut cfg.per_tunnel.overrides {
+        let disk_password = on_disk
+            .per_tunnel
+            .overrides
+            .get(id)
+            .and_then(|prev| prev.password.as_ref());
+        restore_secret(&mut ovr.password, disk_password);
+    }
+}
+
+/// Name the first secret field that still holds a redaction sentinel
+/// after [`restore_redacted_secrets`], if any — such a value must never
+/// be written to disk as a credential.
+fn first_unrecovered_placeholder(cfg: &MainConfig) -> Option<&'static str> {
+    if cfg
+        .admin
+        .auth_token
+        .as_deref()
+        .is_some_and(crate::config::is_redacted_secret_placeholder)
+    {
+        return Some("admin.auth_token");
+    }
+    if cfg.shared_listeners.iter().any(|l| {
+        l.global_password
+            .as_deref()
+            .is_some_and(crate::config::is_redacted_secret_placeholder)
+    }) {
+        return Some("shared_listener.global_password");
+    }
+    if cfg.per_tunnel.overrides.values().any(|o| {
+        o.password
+            .as_deref()
+            .is_some_and(crate::config::is_redacted_secret_placeholder)
+    }) {
+        return Some("per_tunnel.overrides password");
+    }
+    None
+}
+
 impl TuiApp {
     /// Construct a new [`TuiApp`] with the given data source and initial sort field.
     pub fn new(data_source: TuiDataSource, sort_field: TuiSortField) -> Self {
@@ -796,8 +894,21 @@ impl TuiApp {
         self.sync_tui_settings(cfg);
     }
 
-    /// Validate, persist `config_snapshot` to `config_path`, apply runtime settings,
-    /// reload `.conf` tunnels, and return a structured [`ConfigSaveReport`].
+    /// Validate, apply runtime settings to the daemon, persist
+    /// `config_snapshot` to `config_path`, reload `.conf` tunnels, and
+    /// return a structured [`ConfigSaveReport`].
+    ///
+    /// The daemon is applied to FIRST, before any disk write (audit
+    /// run-1, `tui-save-write:redacted-placeholder-persisted-on-failed-post-config`):
+    /// the snapshot came from `GET /config`, so every set secret in it
+    /// is the literal `[REDACTED]` placeholder. Writing it to disk
+    /// before the POST left the publicly-known placeholder as the
+    /// persisted credential whenever the POST failed; the server restores
+    /// the real secrets and rewrites the file only on success, so on a
+    /// failed POST the disk is now untouched. The local write below
+    /// likewise never stores a placeholder: redacted secrets are
+    /// restored from the on-disk file first, and the write is refused
+    /// when no real value can be recovered.
     pub async fn save_config_and_reload_with_report(&mut self) -> Result<ConfigSaveReport, String> {
         let Some(cfg) = self.config_snapshot.clone() else {
             return Err("Config snapshot not loaded".to_string());
@@ -806,25 +917,6 @@ impl TuiApp {
             cfg.validate()
                 .map_err(|e| format!("Config validation failed: {e}"))?;
         }
-
-        let saved_to_disk = if let Some(path) = &self.config_path {
-            let fresh = toml::to_string_pretty(&cfg)
-                .map_err(|e| format!("Failed to serialize TOML: {e}"))?;
-            // Preserve the user's comments in the existing file where
-            // possible; fall back to the plain dump if the file cannot
-            // be merged safely.
-            let existing = tokio::fs::read_to_string(path).await.ok();
-            let serialized = existing
-                .as_deref()
-                .and_then(|text| crate::config::merge_config_preserving_comments(text, &fresh))
-                .unwrap_or(fresh);
-            crate::core::write_config_atomically(path, &serialized)
-                .await
-                .map_err(|e| format!("Failed to write '{}': {e}", path.display()))?;
-            true
-        } else {
-            false
-        };
 
         self.data_source.apply_config(&cfg).await?;
         // A rotated `admin.auth_token` is a `[RESTART]` edit, so it is
@@ -838,6 +930,42 @@ impl TuiApp {
         {
             self.data_source.set_remote_auth_token(Some(tok.clone()));
         }
+
+        let saved_to_disk = if let Some(path) = &self.config_path {
+            let existing_text = tokio::fs::read_to_string(path).await.ok();
+            // The daemon just persisted the secret-restored config (or
+            // the previous local copy still holds the real secrets):
+            // recover them so the local write never stores a
+            // `[REDACTED]` placeholder as a credential.
+            let mut persist_cfg = cfg.clone();
+            if let Some(text) = &existing_text
+                && let Ok(on_disk) = MainConfig::from_toml_str(text)
+            {
+                restore_redacted_secrets(&mut persist_cfg, &on_disk);
+            }
+            if let Some(field) = first_unrecovered_placeholder(&persist_cfg) {
+                return Err(format!(
+                    "Refusing to write '{}': secret '{field}' is redacted and no real value could be recovered from the on-disk config; the daemon already applied the change, but the local file was left untouched",
+                    path.display()
+                ));
+            }
+            let fresh = toml::to_string_pretty(&persist_cfg)
+                .map_err(|e| format!("Failed to serialize TOML: {e}"))?;
+            // Preserve the user's comments in the existing file where
+            // possible; fall back to the plain dump if the file cannot
+            // be merged safely.
+            let serialized = existing_text
+                .as_deref()
+                .and_then(|text| crate::config::merge_config_preserving_comments(text, &fresh))
+                .unwrap_or(fresh);
+            crate::core::write_config_atomically(path, &serialized)
+                .await
+                .map_err(|e| format!("Failed to write '{}': {e}", path.display()))?;
+            true
+        } else {
+            false
+        };
+
         self.sync_tui_settings(&cfg);
         let reload_report = self.data_source.reload().await?;
 

@@ -8,6 +8,7 @@
 )]
 
 pub mod admin_client;
+pub mod echo_target;
 pub mod fixtures;
 pub mod http_client;
 pub mod mock_peer;
@@ -15,6 +16,7 @@ pub mod socks5_client;
 
 // Convenient re-exports for integration tests
 pub use admin_client::AdminTestClient;
+pub use echo_target::{EchoRedirectTarget, TEST_ECHO_IP, test_echo_target};
 pub use fixtures::{
     SharedListenerFixture, TestEnvironment, WgConfBuilder, WgPeerFixture, WgcfFixtureSet,
     WpMultiTomlBuilder, allocate_ephemeral_port, allocate_ephemeral_port_range,
