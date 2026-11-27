@@ -1406,18 +1406,47 @@ impl SingleTunnelRouter {
     }
 }
 
-/// Constant-time byte comparison to prevent timing side-channel attacks on proxy credentials.
+/// Maximum input length compared by [`constant_time_eq_str`]: the
+/// comparison always iterates exactly this many bytes, so its running
+/// time cannot reveal either input's length (audit run-3 #8). Inputs
+/// longer than this fail closed — they can never compare equal — which
+/// is safe for the short secrets this guards (admin tokens, proxy
+/// passwords): it can only reject absurdly long credentials, never
+/// accept a wrong one.
+const MAX_COMPARED_SECRET_LEN: usize = 256;
+
+/// Constant-time string comparison independent of both inputs' lengths.
+///
+/// It always iterates exactly [`MAX_COMPARED_SECRET_LEN`] bytes,
+/// treating missing bytes as 0, so no length knee is observable (audit
+/// run-3 #8: the old loop ran `max(len)` iterations, costing ~+0.8
+/// ns/byte past the secret length, with the knee exactly at the secret
+/// length). Length (in)equality is folded into the accumulator, never
+/// branched on early. Inputs longer than the cap compare unequal.
 pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
-    let max_len = a.len().max(b.len());
     let mut diff = usize::from(a.len() != b.len());
-    for i in 0..max_len {
+    diff |= usize::from(a.len() > MAX_COMPARED_SECRET_LEN);
+    diff |= usize::from(b.len() > MAX_COMPARED_SECRET_LEN);
+    for i in 0..MAX_COMPARED_SECRET_LEN {
         let x = a.get(i).copied().unwrap_or(0);
         let y = b.get(i).copied().unwrap_or(0);
         diff |= usize::from(x ^ y);
     }
     diff == 0
+}
+
+/// Compare both halves of a credential pair, always running both.
+///
+/// Combining them with `&&` would skip the password check when the
+/// username mismatches, leaking which half failed through timing (audit
+/// run-3 #8: ~+13 ns for right-user/wrong-pass vs wrong-user). The `&`
+/// below only combines already-computed results.
+pub fn credentials_match(presented: (&str, &str), expected: (&str, &str)) -> bool {
+    let user_matches = constant_time_eq_str(presented.0, expected.0);
+    let pass_matches = constant_time_eq_str(presented.1, expected.1);
+    user_matches & pass_matches
 }
 
 /// Shared credential check for routers that resolve a [`TunnelSelector`]
@@ -1519,8 +1548,10 @@ impl TunnelRouter for SingleTunnelRouter {
         if let Some((expected_user, expected_pass)) = &self.auth {
             match credentials {
                 Some((u, p))
-                    if constant_time_eq_str(u, expected_user)
-                        && constant_time_eq_str(p, expected_pass) =>
+                    if credentials_match(
+                        (u, p),
+                        (expected_user.as_str(), expected_pass.as_str()),
+                    ) =>
                 {
                     Ok(TunnelSelector::ById(self.tunnel_id.clone()))
                 }

@@ -21,7 +21,7 @@ use crate::core::health::HealthStatus;
 use crate::core::lifecycle::{GuardedTunnelTarget, LifecycleController, handshake_is_fresh};
 use crate::core::registry::{TunnelEntry, TunnelRegistry};
 use crate::core::selection::{WarmList, dormant_jitter_ms, score_entry};
-use crate::proxy::router::{AuthChecker, constant_time_eq_str};
+use crate::proxy::router::{AuthChecker, constant_time_eq_str, credentials_match};
 use crate::proxy::{
     DynStream, PoolKeyword, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket, TunnelRouter,
     TunnelSelector,
@@ -1038,8 +1038,10 @@ impl TunnelRouter for DedicatedTunnelRouter {
         if let Some((expected_user, expected_pass)) = &self.auth {
             match credentials {
                 Some((u, p))
-                    if constant_time_eq_str(u, expected_user)
-                        && constant_time_eq_str(p, expected_pass) =>
+                    if credentials_match(
+                        (u, p),
+                        (expected_user.as_str(), expected_pass.as_str()),
+                    ) =>
                 {
                     Ok(TunnelSelector::ById(self.tunnel_id.clone()))
                 }

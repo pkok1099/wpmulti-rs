@@ -18,7 +18,9 @@ use crate::core::health::{HealthStatus, TunnelHealthTracker};
 use crate::core::lifecycle::{LifecycleController, TunnelConnGuard};
 use crate::core::listener::ListenerSupervisor;
 use crate::core::registry::{TunnelEntry, TunnelRegistry, TunnelState, TunnelStats};
-use crate::core::router::{MAX_LIVE_TUNNEL_CONNS, MultiTenantRouter, preferred_entries};
+use crate::core::router::{
+    DedicatedTunnelRouter, MAX_LIVE_TUNNEL_CONNS, MultiTenantRouter, preferred_entries,
+};
 use crate::core::selection::{
     WarmList, dormant_surcharge_ms, score_entry, slow_start_weight, tunnel_score,
 };
@@ -4286,4 +4288,40 @@ async fn test_p2c_loser_from_warm_list_releases_halfopen_slot() {
         "loser t1 (warm list) must be routable again: its HalfOpen trial slot must be released by select_p2c"
     );
     lifecycle.stop().await;
+}
+
+/// Regression (audit run-3 #8): both halves of a dedicated router's
+/// credential pair must be checked — a wrong username and a wrong
+/// password are both plain rejections, with no short-circuit between
+/// the two comparisons.
+#[test]
+fn test_dedicated_router_authenticate_checks_both_halves() {
+    let registry = Arc::new(TunnelRegistry::new());
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = DedicatedTunnelRouter::new(
+        "wgcf-dedicated-01",
+        lifecycle,
+        Some(("admin".to_string(), "secret123".to_string())),
+    );
+    assert_eq!(
+        router.authenticate(Some(("admin", "secret123"))),
+        Ok(TunnelSelector::ById("wgcf-dedicated-01".to_string()))
+    );
+    assert_eq!(
+        router.authenticate(Some(("wrong-user", "secret123"))),
+        Err(ProxyAuthError::InvalidCredentials)
+    );
+    assert_eq!(
+        router.authenticate(Some(("admin", "wrong-pass"))),
+        Err(ProxyAuthError::InvalidCredentials)
+    );
+    assert_eq!(
+        router.authenticate(Some(("wrong-user", "wrong-pass"))),
+        Err(ProxyAuthError::InvalidCredentials)
+    );
+    assert_eq!(router.authenticate(None), Err(ProxyAuthError::AuthRequired));
 }

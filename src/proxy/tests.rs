@@ -3251,6 +3251,65 @@ async fn test_socks5_and_http_reject_cgnat_and_reserved_ranges() {
     );
 }
 
+/// Regression (audit run-3 #8, `proxy/router.rs:constant-time-eq-str-max-length-timing-leaks-secret-length`):
+/// the comparator must stay correct while its running time no longer
+/// depends on either input's length (fixed iteration count).
+#[test]
+fn test_constant_time_eq_str_correctness() {
+    use crate::proxy::router::constant_time_eq_str;
+
+    assert!(constant_time_eq_str("secret-token-123", "secret-token-123"));
+    assert!(!constant_time_eq_str(
+        "secret-token-123",
+        "secret-token-124"
+    ));
+    assert!(!constant_time_eq_str("secret-token-123", "secret-token"));
+    assert!(!constant_time_eq_str("secret-token", "secret-token-123"));
+    assert!(!constant_time_eq_str("", "secret-token-123"));
+    assert!(!constant_time_eq_str("secret-token-123", ""));
+    assert!(constant_time_eq_str("", ""));
+    // The fixed-iteration cap: inputs longer than the cap never compare
+    // equal, even when identical — fail closed, never open.
+    let at_cap = "a".repeat(256);
+    assert!(constant_time_eq_str(&at_cap, &at_cap));
+    let over_cap = "a".repeat(257);
+    assert!(!constant_time_eq_str(&over_cap, &over_cap));
+    assert!(!constant_time_eq_str(&over_cap, &at_cap));
+    // A long guess sharing the secret's prefix must not match.
+    let long_guess = format!("secret-token-123{}", "x".repeat(300));
+    assert!(!constant_time_eq_str(&long_guess, "secret-token-123"));
+}
+
+/// Regression (audit run-3 #8): both halves of a credential pair must
+/// be checked — a wrong username and a wrong password are both plain
+/// rejections, with no short-circuit between the two comparisons.
+#[test]
+fn test_single_tunnel_router_authenticate_checks_both_halves() {
+    let target = Arc::new(DirectTunnelTarget);
+    let router = SingleTunnelRouter::new(
+        "auth-tunnel",
+        target,
+        Some(("admin".to_string(), "secret123".to_string())),
+    );
+    assert_eq!(
+        router.authenticate(Some(("admin", "secret123"))),
+        Ok(TunnelSelector::ById("auth-tunnel".to_string()))
+    );
+    assert_eq!(
+        router.authenticate(Some(("wrong-user", "secret123"))),
+        Err(ProxyAuthError::InvalidCredentials)
+    );
+    assert_eq!(
+        router.authenticate(Some(("admin", "wrong-pass"))),
+        Err(ProxyAuthError::InvalidCredentials)
+    );
+    assert_eq!(
+        router.authenticate(Some(("wrong-user", "wrong-pass"))),
+        Err(ProxyAuthError::InvalidCredentials)
+    );
+    assert_eq!(router.authenticate(None), Err(ProxyAuthError::AuthRequired));
+}
+
 #[tokio::test]
 async fn test_race_hedges_dormant_slow_leg_with_second_tunnel() {
     use crate::proxy::router::connect_via_router;
