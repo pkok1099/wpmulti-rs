@@ -662,6 +662,15 @@ fn interface_addrs_of(entry: &TunnelEntry) -> Vec<ipnetwork::IpNetwork> {
 /// them while it is fresh.
 const ENDPOINT_DNS_CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// How long a stale endpoint address may keep being served after a
+/// lookup timeout. A timeout means the resolver cannot currently
+/// confirm the edge, so the stale address may point at a dead edge:
+/// it must not be served for the remainder of the 300 s TTL. Capping
+/// it to this window bounds the damage while still bridging a
+/// transient DNS outage; after it, the next activation re-resolves
+/// (and may land on a different, live edge).
+const ENDPOINT_DNS_STALE_SERVE_WINDOW: Duration = Duration::from_secs(30);
+
 /// One cached WireGuard endpoint DNS answer.
 #[derive(Debug)]
 struct EndpointDnsCacheEntry {
@@ -704,11 +713,32 @@ impl EndpointDnsCache {
             .map(|entry| entry.addr)
     }
 
-    /// The cached address regardless of freshness: the last-known-good
-    /// answer, served only when a fresh lookup times out.
-    fn get_stale(&self, endpoint: &str) -> Option<SocketAddr> {
-        let entries = self.entries.read();
-        entries.get(endpoint).map(|entry| entry.addr)
+    /// The cached address regardless of freshness, served only when a
+    /// fresh lookup times out — with its remaining lifetime capped to
+    /// `window`: a lookup timeout means the resolver cannot currently
+    /// confirm the edge, so the stale address may point at a dead edge
+    /// and must not be served for the remainder of the TTL. The cap is
+    /// applied atomically with the read, so a fresh entry inserted
+    /// concurrently is never shortened by mistake.
+    fn serve_stale_capped(&self, endpoint: &str, window: Duration) -> Option<SocketAddr> {
+        let mut entries = self.entries.write();
+        let entry = entries.get_mut(endpoint)?;
+        let capped = Instant::now() + window;
+        if entry.expires_at > capped {
+            entry.expires_at = capped;
+        }
+        let addr = entry.addr;
+        drop(entries);
+        Some(addr)
+    }
+
+    /// Drop the cached address for an endpoint, forcing the next
+    /// activation to re-resolve it. Used when a tunnel that never
+    /// handshaked fails its probe: the cached edge IP may be dead,
+    /// and serving it for the rest of the TTL would keep every
+    /// activation dialing the same dead edge.
+    fn invalidate(&self, endpoint: &str) {
+        self.entries.write().remove(endpoint);
     }
 
     fn insert(&self, endpoint: &str, addr: SocketAddr) {
@@ -741,6 +771,16 @@ impl EndpointDnsCache {
 
 /// Daemon-wide endpoint DNS cache shared by every tunnel activation.
 static ENDPOINT_DNS_CACHE: LazyLock<EndpointDnsCache> = LazyLock::new(EndpointDnsCache::new);
+
+/// Drop the cached endpoint address for `endpoint`, forcing the next
+/// activation to re-resolve it. The cache key is the endpoint string
+/// as written in config, so callers pass exactly that string. A
+/// missing key is a no-op (literal-IP endpoints never enter the
+/// cache). Called when a tunnel that never handshaked fails its
+/// probe: the cached edge IP may be dead.
+pub(crate) fn invalidate_endpoint_dns_cache(endpoint: &str) {
+    ENDPOINT_DNS_CACHE.invalidate(endpoint);
+}
 
 impl LifecycleController {
     /// Construct a new lifecycle controller.
@@ -1541,7 +1581,10 @@ impl LifecycleController {
     ///
     /// A lookup timeout is transient (slow or unreachable DNS), so the
     /// last-known-good cached address is served instead and a warning
-    /// is logged: a wrong endpoint only fails the handshake. A hard
+    /// is logged: a wrong endpoint only fails the handshake. The stale
+    /// address is served for at most
+    /// [`ENDPOINT_DNS_STALE_SERVE_WINDOW`] more — a dead edge must not
+    /// be pinned for the rest of the TTL. A hard
     /// resolution error, an empty answer, or an answer of only
     /// forbidden addresses keeps the existing strict failure: those
     /// mean the name is gone or hijacked, and masking them would hide
@@ -1599,14 +1642,17 @@ impl LifecycleController {
                 format!("endpoint DNS lookup failed for '{endpoint}': {e}"),
             )),
             Err(_) => {
-                let Some(addr) = cache.get_stale(endpoint) else {
+                let Some(addr) =
+                    cache.serve_stale_capped(endpoint, ENDPOINT_DNS_STALE_SERVE_WINDOW)
+                else {
                     return Err(CoreError::ActivationFailed(
                         tunnel_id.to_string(),
                         format!("endpoint DNS lookup timed out for '{endpoint}'"),
                     ));
                 };
                 tracing::warn!(
-                    "Endpoint DNS lookup timed out for '{endpoint}'; using stale cached address {addr}"
+                    "Endpoint DNS lookup timed out for '{endpoint}'; using stale cached address {addr} (served at most {}s more)",
+                    ENDPOINT_DNS_STALE_SERVE_WINDOW.as_secs()
                 );
                 Ok(addr)
             }
@@ -1902,5 +1948,40 @@ mod tests {
         .await
         .expect("timed-out lookup must serve the stale entry");
         assert_eq!(resolved, stale);
+    }
+
+    #[test]
+    fn test_endpoint_dns_cache_invalidate_removes_entry() {
+        let cache = EndpointDnsCache::new();
+        let endpoint = "endpoint-cache-invalidate.invalid:51820";
+        let cached: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        cache.insert(endpoint, cached);
+        assert_eq!(cache.get(endpoint), Some(cached));
+        cache.invalidate(endpoint);
+        assert_eq!(cache.get(endpoint), None);
+        // Invalidating a missing key is a no-op, not a panic.
+        cache.invalidate(endpoint);
+        cache.invalidate("never-inserted.invalid:51820");
+    }
+
+    #[tokio::test]
+    async fn test_endpoint_dns_cache_stale_serve_caps_remaining_ttl() {
+        // A stale address served after a lookup timeout must not live
+        // for the rest of the 300 s TTL: serving it caps its remaining
+        // life to the short stale-serve window, after which the next
+        // activation re-resolves.
+        let cache = EndpointDnsCache::new();
+        let endpoint = "endpoint-cache-stale-cap.invalid:51820";
+        let stale: SocketAddr = "192.0.2.3:51820".parse().unwrap();
+        cache.insert(endpoint, stale);
+        assert_eq!(cache.get(endpoint), Some(stale));
+        let served = cache.serve_stale_capped(endpoint, Duration::from_millis(50));
+        assert_eq!(served, Some(stale));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            cache.get(endpoint),
+            None,
+            "stale entry must expire once the capped window passes"
+        );
     }
 }

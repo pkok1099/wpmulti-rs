@@ -493,7 +493,7 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
         "HTTP",
         leftover,
     );
-    let copy_result = crate::proxy::copy_bidirectional_with_zero_response_retry(
+    let outcome = crate::proxy::copy_bidirectional_with_zero_response_retry(
         &mut stream,
         tunnel_stream,
         crate::proxy::CONNECT_IDLE_TIMEOUT,
@@ -506,9 +506,22 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
         selector,
         &target,
         tunnel_id.as_deref(),
-        &copy_result,
+        &outcome,
     );
-    copy_result?;
+    // A blackhole session (request sent, zero response bytes) is a
+    // failure of the serving tunnel, not of the target: charge it
+    // to the tunnel so the breaker, the EWMA score, and the warm
+    // list all learn from it. The retry already recorded the first
+    // tunnel when it rescued the session, and `tunnel_id` now names
+    // the tunnel that ultimately served it, so each blackhole is
+    // recorded exactly once.
+    if let Ok((client_bytes, 0)) = &outcome.result
+        && *client_bytes > 0
+        && let Some(id) = tunnel_id.as_deref()
+    {
+        router.record_tunnel_blackhole(id);
+    }
+    outcome.result?;
 
     Ok(())
 }
@@ -948,6 +961,15 @@ async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
             Err(e)
         }
         Err(RouterConnectError::ForbiddenDestination(e)) => {
+            // Same as the SOCKS5 path: a policy rejection is not a
+            // proxy failure, but it is a failed connection from the
+            // client's view, and without this line a fast failure
+            // leaves no daemon-side trace at all.
+            tracing::info!(
+                selector = ?selector,
+                target = %target,
+                "HTTP CONNECT rejected: forbidden destination: {e}"
+            );
             send_response(
                 stream,
                 "403 Forbidden",
@@ -1253,6 +1275,32 @@ async fn forward_upstream_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
+/// Log a fabricated forward-path session outcome through the
+/// session-end taxonomy and hand the result back. The forward path
+/// tracks no exact byte counts, so a success is logged as
+/// `Completed` (the response head arrived) and a failure as
+/// `Failed`.
+fn log_forward_session_end(
+    selector: &TunnelSelector,
+    target: &TargetAddr,
+    tunnel_id: Option<&str>,
+    result: io::Result<(u64, u64)>,
+    started_at: std::time::Instant,
+) -> io::Result<()> {
+    let kind = if result.is_ok() {
+        crate::proxy::CopyEndKind::Completed
+    } else {
+        crate::proxy::CopyEndKind::Failed
+    };
+    let outcome = crate::proxy::ConnectSessionOutcome {
+        result,
+        kind,
+        duration: started_at.elapsed(),
+    };
+    crate::proxy::log_connect_session_end("HTTP", selector, target, tunnel_id, &outcome);
+    outcome.result.map(|_| ())
+}
+
 /// Executes RFC 9110 Forward Proxy request forwarding for absolute URIs.
 async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
@@ -1293,6 +1341,7 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
     let (mut tunnel_stream, tunnel_id, target) =
         resolve_and_connect_http_target(&mut stream, &router, selector, &host, port, credentials)
             .await?;
+    let session_start = std::time::Instant::now();
 
     let content_length = req
         .headers
@@ -1306,7 +1355,11 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
 
     let req_buf = build_forward_request_head(&req, &path, synthesized_host.as_deref());
 
-    // Forward request line and headers to destination server
+    // Forward request line and headers to destination server. A write
+    // failure here means the tunnel broke right after the connect
+    // succeeded; log it through the session-end taxonomy instead of
+    // returning silently — otherwise the client's 502 leaves no
+    // daemon-side trace (the listener only warns on timeouts).
     if let Err(e) = tunnel_stream.write_all(req_buf.as_bytes()).await {
         let _ = send_response(
             &mut stream,
@@ -1315,7 +1368,13 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
             b"Upstream Write Failed",
         )
         .await;
-        return Err(e);
+        return log_forward_session_end(
+            selector,
+            &target,
+            tunnel_id.as_deref(),
+            Err(io::Error::new(e.kind(), e.to_string())),
+            session_start,
+        );
     }
     if let Err(e) = tunnel_stream.flush().await {
         let _ = send_response(
@@ -1325,7 +1384,13 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
             b"Upstream Flush Failed",
         )
         .await;
-        return Err(e);
+        return log_forward_session_end(
+            selector,
+            &target,
+            tunnel_id.as_deref(),
+            Err(io::Error::new(e.kind(), e.to_string())),
+            session_start,
+        );
     }
 
     let (client_read, client_write) = tokio::io::split(stream);
@@ -1346,14 +1411,13 @@ async fn handle_http_forward<S: AsyncRead + AsyncWrite + Unpin>(
     // counts are not tracked on the forward path, so the session-end
     // log gets that lower bound and only warns on failure.
     let session_result: io::Result<(u64, u64)> = join_result.map(|_| (1, 1));
-    crate::proxy::log_connect_session_end(
-        "HTTP",
+    log_forward_session_end(
         selector,
         &target,
         tunnel_id.as_deref(),
-        &session_result,
-    );
-    session_result?;
+        session_result,
+        session_start,
+    )?;
 
     Ok(())
 }

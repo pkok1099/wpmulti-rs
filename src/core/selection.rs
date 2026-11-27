@@ -165,6 +165,13 @@ impl WarmList {
         drop(inner);
     }
 
+    /// Drop `id` from the list: it blackholed a session, so the
+    /// fast path must stop sampling it until a later success
+    /// re-admits it. A no-op when `id` is not a member.
+    pub(crate) fn note_failure(&self, id: &str) {
+        self.inner.write().retain(|existing| existing != id);
+    }
+
     /// Pick a random member in O(1), or `None` when empty. Callers
     /// validate the pick (routable, not ejected) before using it.
     pub(crate) fn pick(&self) -> Option<String> {

@@ -5,10 +5,11 @@
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
@@ -304,6 +305,36 @@ struct DnsCacheEntry {
 /// (singleflight). `io::Error` is not `Clone`, so both arms are `Arc`d.
 type SharedDnsResult = Result<Arc<Vec<IpAddr>>, Arc<io::Error>>;
 
+/// Age past which a waiter stops queueing behind a singleflight cell
+/// and starts its own upstream query instead. Matches the pool-race
+/// stagger (`RACE_STAGGER`, 250 ms): the hedge leg of a race arrives
+/// right around this age, so it races the leader's query instead of
+/// joining a cell that is already stuck on a cold tunnel.
+const SINGLEFLIGHT_HEDGE_AGE: Duration = Duration::from_millis(250);
+
+/// One in-flight singleflight cell: the shared result, the instant
+/// the first waiter created it, and whether a hedge query already
+/// started for it. The creation time lets a late waiter tell a fresh
+/// cell (join it) from a slow one (hedge it); the flag bounds the
+/// hedge to one independent query per cell, so a slow upstream cannot
+/// turn into a stampede.
+#[derive(Debug)]
+struct InflightCell {
+    cell: Arc<OnceCell<SharedDnsResult>>,
+    created_at: Instant,
+    hedge_started: AtomicBool,
+}
+
+impl InflightCell {
+    fn new() -> Self {
+        Self {
+            cell: Arc::new(OnceCell::new()),
+            created_at: Instant::now(),
+            hedge_started: AtomicBool::new(false),
+        }
+    }
+}
+
 /// Thread-safe TTL-aware LRU cache for resolved DNS domain names.
 #[derive(Debug)]
 pub struct DnsLruCache {
@@ -317,7 +348,7 @@ pub struct DnsLruCache {
     /// its own slow in-tunnel query. The key carries the resolver's
     /// upstream scope (see [`InTunnelDnsResolver::cache_key`]), so the
     /// cell only coalesces lookups that would hit the same servers.
-    inflight: AsyncMutex<HashMap<String, Arc<OnceCell<SharedDnsResult>>>>,
+    inflight: AsyncMutex<HashMap<String, Arc<InflightCell>>>,
 }
 
 impl DnsLruCache {
@@ -335,21 +366,24 @@ impl DnsLruCache {
         }
     }
 
-    /// Get or create the singleflight cell for a cache key.
-    async fn inflight_cell(&self, key: &str) -> Arc<OnceCell<SharedDnsResult>> {
-        {
-            let mut inflight = self.inflight.lock().await;
-            Arc::clone(
-                inflight
-                    .entry(key.to_string())
-                    .or_insert_with(|| Arc::new(OnceCell::new())),
-            )
+    /// Get or create the singleflight cell for a cache key, reporting
+    /// whether this caller created it: only the creator runs the
+    /// leader query, while a waiter that finds an old cell may hedge
+    /// instead (see [`InTunnelDnsResolver::resolve_singleflight`]).
+    async fn inflight_entry(&self, key: &str) -> (Arc<InflightCell>, bool) {
+        let mut inflight = self.inflight.lock().await;
+        match inflight.entry(key.to_string()) {
+            Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
+            Entry::Vacant(entry) => (
+                Arc::clone(entry.insert(Arc::new(InflightCell::new()))),
+                true,
+            ),
         }
     }
 
     /// Remove the singleflight cell for a key, but only if it is still the
     /// same cell (a newer lookup for the same key may have replaced it).
-    async fn remove_inflight(&self, key: &str, cell: &Arc<OnceCell<SharedDnsResult>>) {
+    async fn remove_inflight(&self, key: &str, cell: &Arc<InflightCell>) {
         let mut inflight = self.inflight.lock().await;
         if let Some(existing) = inflight.get(key)
             && Arc::ptr_eq(existing, cell)
@@ -468,7 +502,7 @@ pub struct InTunnelDnsResolver {
     cache: Arc<DnsLruCache>,
     timeout: Duration,
     max_retries: usize,
-    prefer_ipv6: std::sync::atomic::AtomicBool,
+    prefer_ipv6: AtomicBool,
     ip_mode: std::sync::atomic::AtomicU8,
     dns_strategy: std::sync::atomic::AtomicU8,
 }
@@ -509,7 +543,7 @@ impl InTunnelDnsResolver {
             cache,
             timeout: Duration::from_secs(2),
             max_retries: 2,
-            prefer_ipv6: std::sync::atomic::AtomicBool::new(false),
+            prefer_ipv6: AtomicBool::new(false),
             ip_mode: std::sync::atomic::AtomicU8::new(0),
             dns_strategy: std::sync::atomic::AtomicU8::new(0),
         }
@@ -665,12 +699,66 @@ impl InTunnelDnsResolver {
 
         // Singleflight: concurrent lookups for the same domain share one
         // upstream query instead of each doing its own slow in-tunnel query
-        // (a stampede when the cache entry expires under load).
-        let cell = self.cache.inflight_cell(&cache_key).await;
-        let shared = cell
+        // (a stampede when the cache entry expires under load). A waiter
+        // that arrives after the leader's query already went slow may
+        // hedge with its own query instead (see `resolve_singleflight`).
+        let shared = self
+            .resolve_singleflight(stack, trimmed, mode, prefer_v6, &cache_key)
+            .await;
+
+        match shared {
+            Ok(ips) => Ok((*ips).clone()),
+            // Rebuild the error with the same kind and message; the
+            // original's source chain is not shareable across tasks.
+            Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
+        }
+    }
+
+    /// Resolve through the singleflight cell for `cache_key`.
+    ///
+    /// The first caller for a key becomes the leader and runs the
+    /// upstream query; concurrent waiters share its result. A waiter
+    /// that arrives while the leader's query is already older than
+    /// [`SINGLEFLIGHT_HEDGE_AGE`] starts one independent upstream
+    /// query on its own stack instead of queueing behind a query that
+    /// may be stuck on a cold tunnel (the measured failure: one
+    /// cold-tunnel query fanning out to 31 waiters). At most one hedge
+    /// runs per cell, so a slow upstream cannot turn into a stampede;
+    /// a hedge that fails falls back to joining the cell below, which
+    /// may still succeed.
+    ///
+    /// There is deliberately no in-cell retry of a timed-out leader
+    /// query: one retry would stretch the resolve from the 1 s DNS
+    /// deadline to ~2 s, past the race leg's 1.25 s
+    /// [`FIRST_ATTEMPT_TIMEOUT`](crate::proxy::router::FIRST_ATTEMPT_TIMEOUT),
+    /// so the race would abort the leg before the error could be
+    /// attributed to the tunnel's circuit breaker (a dead tunnel
+    /// would keep being selected instead of tripping `Unhealthy`).
+    /// A failed shared query is retried across tunnels instead, by
+    /// the pool failover's attempt 2.
+    async fn resolve_singleflight(
+        &self,
+        stack: &VirtualNetworkStack,
+        domain: &str,
+        mode: crate::config::IpMode,
+        prefer_v6: bool,
+        cache_key: &str,
+    ) -> SharedDnsResult {
+        let (entry, created) = self.cache.inflight_entry(cache_key).await;
+        if !created
+            && entry.created_at.elapsed() > SINGLEFLIGHT_HEDGE_AGE
+            && !entry.hedge_started.swap(true, Ordering::Relaxed)
+            && let Ok(ips) = self
+                .resolve_uncached(stack, domain, mode, prefer_v6, cache_key)
+                .await
+        {
+            return Ok(Arc::new(ips));
+        }
+        let shared = entry
+            .cell
             .get_or_init(|| async {
                 match self
-                    .resolve_uncached(stack, trimmed, mode, prefer_v6, &cache_key)
+                    .resolve_uncached(stack, domain, mode, prefer_v6, cache_key)
                     .await
                 {
                     Ok(ips) => Ok(Arc::new(ips)),
@@ -679,14 +767,8 @@ impl InTunnelDnsResolver {
             })
             .await
             .clone();
-        self.cache.remove_inflight(&cache_key, &cell).await;
-
-        match shared {
-            Ok(ips) => Ok((*ips).clone()),
-            // Rebuild the error with the same kind and message; the
-            // original's source chain is not shareable across tasks.
-            Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
-        }
+        self.cache.remove_inflight(cache_key, &entry).await;
+        shared
     }
 
     /// Perform the actual upstream lookup (host or in-tunnel) and populate

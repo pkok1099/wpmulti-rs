@@ -328,6 +328,148 @@ async fn test_shared_port_router_auth_and_strategies() {
 }
 
 // =============================================================================
+// 4b. Live-resolve target for the DNS pre-resolve (fix8)
+// =============================================================================
+
+fn make_live_resolve_router() -> (Arc<TunnelRegistry>, Arc<MultiTenantRouter>) {
+    let registry = Arc::new(TunnelRegistry::new());
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true, // anonymous access allowed: the pre-resolve needs no auth
+    );
+    (registry, router)
+}
+
+#[tokio::test]
+async fn test_live_resolve_target_returns_none_when_warm_list_empty() {
+    let (_registry, router) = make_live_resolve_router();
+    let target = router
+        .live_resolve_target(&TunnelSelector::DefaultPool, None)
+        .await;
+    assert!(
+        target.is_none(),
+        "an empty warm list must offer no pre-resolve target"
+    );
+}
+
+#[tokio::test]
+async fn test_live_resolve_target_returns_none_when_warm_tunnel_not_live() {
+    let (registry, router) = make_live_resolve_router();
+    let id = "wgcf-warm-dormant-01".to_string();
+    registry
+        .register(TunnelEntry::new(
+            id.clone(),
+            make_test_tunnel_config(&id),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    // Seeded in the warm list, but still Dormant with no handshake:
+    // not Live, so it must not serve the pre-resolve.
+    router.note_warm_success(&id);
+    let target = router
+        .live_resolve_target(&TunnelSelector::DefaultPool, None)
+        .await;
+    assert!(
+        target.is_none(),
+        "a dormant warm-list tunnel is not live and must not serve the pre-resolve"
+    );
+}
+
+#[tokio::test]
+async fn test_live_resolve_target_returns_live_warm_tunnel() {
+    let (registry, router) = make_live_resolve_router();
+    let id = "wgcf-warm-live-01".to_string();
+    registry
+        .register(TunnelEntry::new(
+            id.clone(),
+            make_test_tunnel_config(&id),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    // Activate the tunnel (boots a device + stack with the test config,
+    // as the existing router tests do).
+    let _target = router
+        .select_tunnel(&TunnelSelector::ById(id.clone()), None)
+        .await
+        .expect("activation must succeed");
+    assert!(registry.get(&id).unwrap().is_active());
+    // Make it Live: a fresh handshake plus a healthy verdict.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let entry = registry.get(&id).unwrap();
+    entry.stats.record_handshake(now);
+    entry.health.record_success();
+    router.note_warm_success(&id);
+
+    let live = router
+        .live_resolve_target(&TunnelSelector::DefaultPool, None)
+        .await
+        .expect("a live warm-list tunnel must serve the pre-resolve");
+    assert_eq!(
+        live.tunnel_id().map(str::to_string).as_deref(),
+        Some(id.as_str()),
+        "pre-resolve target must be the live warm-list tunnel"
+    );
+}
+
+#[tokio::test]
+async fn test_record_tunnel_blackhole_penalizes_tunnel() {
+    let (registry, router) = make_live_resolve_router();
+    let id = "wgcf-blackhole-01".to_string();
+    registry
+        .register(TunnelEntry::new(
+            id.clone(),
+            make_test_tunnel_config(&id),
+            LifecycleMode::Lazy,
+        ))
+        .unwrap();
+    let entry = registry.get(&id).unwrap();
+    // A healthy tunnel with a known RTT baseline: the state a
+    // blackhole report must change.
+    entry.stats.record_rtt_sample(50);
+    entry.health.record_success();
+    router.note_warm_success(&id);
+
+    router.record_tunnel_blackhole(&id);
+    assert_eq!(
+        entry.health.consecutive_failures(),
+        1,
+        "one blackhole is one breaker failure"
+    );
+    assert_eq!(
+        entry.health.current_status(),
+        HealthStatus::Healthy,
+        "one blackhole must not eject a healthy tunnel"
+    );
+    // The EWMA penalty: the 10s failure sample joins the 50ms
+    // baseline at alpha 0.2 — (10000 + 4*50) / 5 = 2040ms.
+    assert_eq!(
+        entry.stats.rtt_ewma_ms.load(Ordering::Relaxed),
+        2040,
+        "a blackhole must penalize the tunnel's EWMA score"
+    );
+
+    // Two more blackholes trip the breaker at the default threshold.
+    router.record_tunnel_blackhole(&id);
+    router.record_tunnel_blackhole(&id);
+    assert_eq!(entry.health.consecutive_failures(), 3);
+    assert_eq!(
+        entry.health.current_status(),
+        HealthStatus::Unhealthy,
+        "three consecutive blackholes must eject the tunnel"
+    );
+}
+
+// =============================================================================
 // 5. Dedicated Per-Tunnel Listener Supervisor & Loopback Binding
 // =============================================================================
 
@@ -3820,6 +3962,22 @@ fn test_warm_list_bounded_most_recent_first_and_o1_pick() {
         let picked = warm.pick().expect("non-empty warm list must pick");
         assert!(warm.snapshot().contains(&picked));
     }
+}
+
+#[test]
+fn test_warm_list_note_failure_drops_member() {
+    let warm = WarmList::new();
+    warm.note_success("wgcf-001");
+    warm.note_success("wgcf-002");
+    warm.note_success("wgcf-003");
+    warm.note_failure("wgcf-002");
+    let snapshot = warm.snapshot();
+    assert_eq!(snapshot.len(), 2);
+    assert_eq!(snapshot[0], "wgcf-003");
+    assert_eq!(snapshot[1], "wgcf-001");
+    // Dropping a non-member is a no-op.
+    warm.note_failure("wgcf-999");
+    assert_eq!(warm.len(), 2);
 }
 
 #[test]

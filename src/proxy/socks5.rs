@@ -556,6 +556,17 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
             return Err(e);
         }
         Err(RouterConnectError::ForbiddenDestination(e)) => {
+            // A forbidden destination is a deterministic policy
+            // rejection, not a proxy failure — but it is still a
+            // failed connection from the client's view, and without
+            // this line a fast failure leaves no daemon-side trace at
+            // all (the listener only warns on timeouts, and no other
+            // layer logs this arm).
+            tracing::info!(
+                selector = ?selector,
+                target = %target,
+                "SOCKS5 CONNECT rejected: forbidden destination: {e}"
+            );
             let _ = send_socks5_reply(&mut stream, REP_CONN_NOT_ALLOWED, dummy_addr).await;
             return Err(e);
         }
@@ -605,7 +616,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         "SOCKS5",
         Vec::new(),
     );
-    let copy_result = crate::proxy::copy_bidirectional_with_zero_response_retry(
+    let outcome = crate::proxy::copy_bidirectional_with_zero_response_retry(
         &mut stream,
         tunnel_stream,
         crate::proxy::CONNECT_IDLE_TIMEOUT,
@@ -618,9 +629,22 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         selector,
         &target,
         tunnel_id.as_deref(),
-        &copy_result,
+        &outcome,
     );
-    copy_result?;
+    // A blackhole session (request sent, zero response bytes) is a
+    // failure of the serving tunnel, not of the target: charge it
+    // to the tunnel so the breaker, the EWMA score, and the warm
+    // list all learn from it. The retry already recorded the first
+    // tunnel when it rescued the session, and `tunnel_id` now names
+    // the tunnel that ultimately served it, so each blackhole is
+    // recorded exactly once.
+    if let Ok((client_bytes, 0)) = &outcome.result
+        && *client_bytes > 0
+        && let Some(id) = tunnel_id.as_deref()
+    {
+        router.record_tunnel_blackhole(id);
+    }
+    outcome.result?;
 
     Ok(())
 }

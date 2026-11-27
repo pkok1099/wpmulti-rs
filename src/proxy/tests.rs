@@ -340,6 +340,40 @@ async fn spawn_one_byte_tcp_server() -> SocketAddr {
     addr
 }
 
+/// Accept connections and close immediately without reading — the
+/// peer sends RST (Linux resets a socket closed with unread data in
+/// its receive buffer), so the proxy sees a tunnel-side reset with
+/// zero response bytes instead of the clean EOF the blackhole gives.
+async fn spawn_reset_tcp_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+    addr
+}
+
+/// Accept connections, read exactly one byte, write back exactly one
+/// byte, then close with the rest of the request unread — the proxy
+/// sees one response byte followed by a reset, so it must NOT retry.
+async fn spawn_reset_after_response_tcp_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1];
+                if stream.read_exact(&mut buf).await.is_ok() {
+                    let _ = stream.write_all(b"X").await;
+                }
+            });
+        }
+    });
+    addr
+}
+
 async fn spawn_echo_tcp_server_ipv6() -> Option<SocketAddr> {
     let listener = TcpListener::bind("[::1]:0").await.ok()?;
     let addr = listener.local_addr().ok()?;
@@ -1066,6 +1100,67 @@ async fn test_http_connect_empty_pool_logs_selection_failure() {
     assert!(
         rendered.contains("no tunnels registered in pool"),
         "expected the selection error in the daemon log, got: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_forbidden_destination_logs_info_on_socks5_and_http() {
+    // A forbidden destination is a policy rejection, not a proxy
+    // failure — but it is a failed connection from the client's view,
+    // and before this fix neither path left any daemon-side trace of
+    // it (the listener only warns on timeouts). Both paths must now
+    // emit one INFO line naming the target.
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mock = Arc::new(
+        MockTunnelTarget::new("forbidden-1")
+            .with_dns("forbidden.example.com", "127.0.0.1".parse().unwrap()),
+    );
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("forbidden-1", mock, None));
+
+    // SOCKS5 CONNECT to a domain that resolves to loopback.
+    run_socks5_connect_expect_rep(
+        Arc::clone(&router),
+        ATYP_DOMAIN,
+        b"forbidden.example.com",
+        80,
+        Some(REP_CONN_NOT_ALLOWED),
+    )
+    .await;
+
+    // HTTP CONNECT to the same domain.
+    let (mut client, server) = tokio::io::duplex(4096);
+    let r_connect = Arc::clone(&router);
+    let server_task = tokio::spawn(async move { handle_http(server, r_connect).await });
+    client
+        .write_all(
+            b"CONNECT forbidden.example.com:443 HTTP/1.1\r\nHost: forbidden.example.com:443\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
+    assert_eq!(status, 403);
+    let _ = server_task.await;
+
+    let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(
+        rendered.contains("SOCKS5 CONNECT rejected: forbidden destination:"),
+        "expected the SOCKS5 forbidden-destination INFO in the daemon log, got: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("HTTP CONNECT rejected: forbidden destination:"),
+        "expected the HTTP forbidden-destination INFO in the daemon log, got: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("forbidden.example.com:80")
+            && rendered.contains("forbidden.example.com:443"),
+        "expected both targets in the daemon log, got: {rendered:?}"
     );
 }
 
@@ -2929,14 +3024,29 @@ async fn test_connect_via_router_fast_tcp_failure_warns_with_tunnel_and_target()
 
 #[test]
 fn test_log_connect_session_end_warns_on_empty_reply() {
-    use crate::proxy::log_connect_session_end;
+    use crate::proxy::{ConnectSessionOutcome, CopyEndKind, log_connect_session_end};
+
+    fn outcome(
+        result: io::Result<(u64, u64)>,
+        kind: CopyEndKind,
+        ms: u64,
+    ) -> ConnectSessionOutcome {
+        ConnectSessionOutcome {
+            result,
+            kind,
+            duration: Duration::from_millis(ms),
+        }
+    }
 
     // The measured "empty reply" failure: the client sent a request
     // and the target sent nothing back, yet the copy returned `Ok` —
     // the session must leave one WARN naming the tunnel and target.
+    // Plain output: with ANSI colors the `duration_ms=15000` field
+    // is split by escape codes and never matches as one string.
     let captured = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
         .with_writer(VecMakeWriter(Arc::clone(&captured)))
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
@@ -2947,7 +3057,7 @@ fn test_log_connect_session_end_warns_on_empty_reply() {
         &TunnelSelector::DefaultPool,
         &target,
         Some("live-1"),
-        &Ok((128, 0)),
+        &outcome(Ok((128, 0)), CopyEndKind::ClientAborted, 15_000),
     );
     let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     assert!(
@@ -2962,6 +3072,14 @@ fn test_log_connect_session_end_warns_on_empty_reply() {
         rendered.contains("203.0.113.1:80"),
         "expected the target in the WARN, got: {rendered:?}"
     );
+    assert!(
+        rendered.contains("ClientAborted"),
+        "expected the session ending in the WARN, got: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("duration_ms=15000"),
+        "expected the session duration in the WARN, got: {rendered:?}"
+    );
 
     // A session that exchanged bytes both ways is healthy: no WARN.
     captured.lock().unwrap().clear();
@@ -2970,7 +3088,7 @@ fn test_log_connect_session_end_warns_on_empty_reply() {
         &TunnelSelector::DefaultPool,
         &target,
         Some("live-1"),
-        &Ok((128, 512)),
+        &outcome(Ok((128, 512)), CopyEndKind::TunnelClosed, 1_200),
     );
     assert!(
         captured.lock().unwrap().is_empty(),
@@ -2984,25 +3102,48 @@ fn test_log_connect_session_end_warns_on_empty_reply() {
         &TunnelSelector::DefaultPool,
         &target,
         Some("live-1"),
-        &Ok((0, 0)),
+        &outcome(Ok((0, 0)), CopyEndKind::IdleTimeout, 300_000),
     );
     assert!(
         captured.lock().unwrap().is_empty(),
         "client that sent nothing must not warn"
     );
+}
+
+#[test]
+fn test_log_connect_session_end_warns_on_errors_except_timeouts() {
+    use crate::proxy::{ConnectSessionOutcome, CopyEndKind, log_connect_session_end};
+
+    fn outcome(
+        result: io::Result<(u64, u64)>,
+        kind: CopyEndKind,
+        ms: u64,
+    ) -> ConnectSessionOutcome {
+        ConnectSessionOutcome {
+            result,
+            kind,
+            duration: Duration::from_millis(ms),
+        }
+    }
 
     // A copy error after the grant is a failed session: one WARN with
     // the error. Timeouts are excluded — the listener already warns
     // on those, so logging them here would double-report one session.
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let target = TargetAddr::Ip("203.0.113.1:80".parse().unwrap());
+    let reset = io::Error::new(io::ErrorKind::ConnectionReset, "connection reset by peer");
     log_connect_session_end(
         "SOCKS5",
         &TunnelSelector::DefaultPool,
         &target,
         Some("live-1"),
-        &Err(io::Error::new(
-            io::ErrorKind::ConnectionReset,
-            "connection reset by peer",
-        )),
+        &outcome(Err(reset), CopyEndKind::Failed, 2_500),
     );
     let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     assert!(
@@ -3010,12 +3151,13 @@ fn test_log_connect_session_end_warns_on_empty_reply() {
         "expected the post-grant failure WARN, got: {rendered:?}"
     );
     captured.lock().unwrap().clear();
+    let timed_out = io::Error::new(io::ErrorKind::TimedOut, "timed out");
     log_connect_session_end(
         "SOCKS5",
         &TunnelSelector::DefaultPool,
         &target,
         Some("live-1"),
-        &Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")),
+        &outcome(Err(timed_out), CopyEndKind::IdleTimeout, 300_000),
     );
     assert!(
         captured.lock().unwrap().is_empty(),
@@ -3676,7 +3818,7 @@ fn test_udp_first_datagram_grace_sleep() {
 
 #[tokio::test]
 async fn test_retry_copy_idle_timeout() {
-    use crate::proxy::copy_bidirectional_with_zero_response_retry;
+    use crate::proxy::{CopyEndKind, copy_bidirectional_with_zero_response_retry};
     let (mut c1, mut s1) = tokio::io::duplex(1024);
     let (mut c2, s2) = tokio::io::duplex(1024);
     let s2: DynStream = Box::new(s2);
@@ -3701,18 +3843,70 @@ async fn test_retry_copy_idle_timeout() {
     assert_eq!(&buf, b"pong");
     // Then an idle session ends on its own instead of hanging forever
     // (audit run-1, `wpmulti/proxy:established-connect-no-idle-timeout`).
-    let (client_bytes, tunnel_bytes) = tokio::time::timeout(Duration::from_secs(2), relay)
+    let outcome = tokio::time::timeout(Duration::from_secs(2), relay)
         .await
         .expect("idle relay must finish")
-        .expect("relay task panicked")
-        .expect("idle relay must end cleanly");
+        .expect("relay task panicked");
+    assert_eq!(outcome.kind, CopyEndKind::IdleTimeout);
+    let (client_bytes, tunnel_bytes) = outcome.result.expect("idle relay must end cleanly");
     assert_eq!((client_bytes, tunnel_bytes), (4, 4));
+}
+
+#[tokio::test]
+async fn test_blackhole_session_ends_promptly_when_client_gives_up() {
+    use crate::proxy::{
+        CLIENT_ABORT_SILENCE_THRESHOLD, CopyEndKind, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // A tunnel that reads the request and then stays silent forever
+    // (never a byte back, never an EOF): the fix8 blackhole shape.
+    // `usize::MAX` keeps the server reading past the request instead
+    // of closing after it.
+    let blackhole_addr = spawn_blackhole_tcp_server(usize::MAX).await;
+    let tunnel: DynStream = Box::new(TcpStream::connect(blackhole_addr).await.unwrap());
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    // The idle timeout is far above the silence threshold, so only
+    // the prompt end can finish this session in time.
+    let idle_timeout = Duration::from_secs(30);
+    let mut tunnel_id = None;
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            copy_bidirectional_with_zero_response_retry(
+                &mut server,
+                tunnel,
+                idle_timeout,
+                None,
+                &mut tunnel_id,
+            ),
+            async move {
+                client.write_all(b"hello").await.unwrap();
+                // Wait past the silence threshold, then give up:
+                // the client half-closes when it drops here, as
+                // curl does at its 15s timeout.
+                tokio::time::sleep(CLIENT_ABORT_SILENCE_THRESHOLD + Duration::from_millis(500))
+                    .await;
+            },
+        )
+    })
+    .await
+    .expect("blackhole session must end promptly, not at the idle timeout");
+    assert_eq!(outcome.kind, CopyEndKind::ClientAborted);
+    let (client_bytes, tunnel_bytes) = outcome.result.expect("session must end cleanly");
+    assert_eq!((client_bytes, tunnel_bytes), (5, 0));
+    assert!(
+        outcome.duration >= CLIENT_ABORT_SILENCE_THRESHOLD,
+        "session must have run past the silence threshold, got {:?}",
+        outcome.duration
+    );
 }
 
 #[tokio::test]
 async fn test_zero_response_retry_retries_through_different_tunnel() {
     use crate::proxy::router::connect_via_router;
-    use crate::proxy::{ZeroResponseRetry, copy_bidirectional_with_zero_response_retry};
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
 
     let msg = b"retry me";
     let blackhole_addr = spawn_blackhole_tcp_server(msg.len()).await;
@@ -3768,7 +3962,8 @@ async fn test_zero_response_retry_retries_through_different_tunnel() {
     assert_eq!(&echo_buf, msg);
 
     let (result, tunnel_id) = relay_out;
-    let (client_bytes, tunnel_bytes) = result.expect("relay must end cleanly");
+    let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
+    assert_eq!(result.kind, CopyEndKind::IdleTimeout);
     assert_eq!(tunnel_id.as_deref(), Some("alive-1"));
     // The replayed prefix is counted once, when the client first sent it.
     assert_eq!(
@@ -3781,7 +3976,7 @@ async fn test_zero_response_retry_retries_through_different_tunnel() {
 async fn test_zero_response_retry_skips_when_prefix_overflows_cap() {
     use crate::proxy::router::connect_via_router;
     use crate::proxy::{
-        ZERO_RESPONSE_RETRY_PREFIX_CAP, ZeroResponseRetry,
+        CopyEndKind, ZERO_RESPONSE_RETRY_PREFIX_CAP, ZeroResponseRetry,
         copy_bidirectional_with_zero_response_retry,
     };
 
@@ -3842,7 +4037,8 @@ async fn test_zero_response_retry_skips_when_prefix_overflows_cap() {
     .await
     .expect("test must finish within 10s");
     let (result, tunnel_id) = relay_out;
-    let (client_bytes, tunnel_bytes) = result.expect("relay must end cleanly");
+    let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
+    assert_eq!(result.kind, CopyEndKind::TunnelClosed);
     assert_eq!(tunnel_id.as_deref(), Some("dead-1"));
     assert_eq!(client_bytes, payload_len as u64);
     assert_eq!(tunnel_bytes, 0);
@@ -3851,7 +4047,9 @@ async fn test_zero_response_retry_skips_when_prefix_overflows_cap() {
 #[tokio::test]
 async fn test_zero_response_retry_no_retry_when_response_received() {
     use crate::proxy::router::connect_via_router;
-    use crate::proxy::{ZeroResponseRetry, copy_bidirectional_with_zero_response_retry};
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
 
     let msg = b"hello";
     let one_byte_addr = spawn_one_byte_tcp_server().await;
@@ -3905,9 +4103,219 @@ async fn test_zero_response_retry_no_retry_when_response_received() {
     .expect("test must finish within 5s");
     assert_eq!(first_byte, b'X');
     let (result, tunnel_id) = relay_out;
-    let (client_bytes, tunnel_bytes) = result.expect("relay must end cleanly");
+    let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
+    assert_eq!(result.kind, CopyEndKind::TunnelClosed);
     assert_eq!(tunnel_id.as_deref(), Some("one-byte-1"));
     assert_eq!((client_bytes, tunnel_bytes), (msg.len() as u64, 1));
+}
+
+#[tokio::test]
+async fn test_zero_response_retry_retries_after_reset() {
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    let msg = b"retry me";
+    let reset_addr = spawn_reset_tcp_server().await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "reset-1",
+        Arc::new(MockTunnelTarget::new("reset-1").with_dial_redirect(reset_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    // First dial lands on the reset server (RoundRobin starts at index 0).
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("reset-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, echo_buf) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_millis(500),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                // The request hit a reset with zero response bytes,
+                // was retried through the echo tunnel, and comes back.
+                let mut echo_buf = vec![0u8; msg.len()];
+                client.read_exact(&mut echo_buf).await.unwrap();
+                echo_buf
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 5s");
+    assert_eq!(&echo_buf, msg);
+
+    let (result, tunnel_id) = relay_out;
+    let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
+    assert_eq!(result.kind, CopyEndKind::IdleTimeout);
+    assert_eq!(tunnel_id.as_deref(), Some("alive-1"));
+    assert_eq!(
+        (client_bytes, tunnel_bytes),
+        (msg.len() as u64, msg.len() as u64)
+    );
+}
+
+#[tokio::test]
+async fn test_zero_response_retry_retries_after_reset_large_prefix() {
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // 32 KiB fits the 64 KiB replay cap but is written in 8 KiB
+    // chunks, so the reset strikes mid-write: this exercises the
+    // tunnel-write-failure arm (`BrokenPipe`), not just the
+    // tunnel-read reset arm.
+    let payload_len = 32 * 1024;
+    let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+    let reset_addr = spawn_reset_tcp_server().await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "reset-1",
+        Arc::new(MockTunnelTarget::new("reset-1").with_dial_redirect(reset_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("reset-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, echo_buf) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_millis(500),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(&payload).await.unwrap();
+                let mut echo_buf = vec![0u8; payload_len];
+                client.read_exact(&mut echo_buf).await.unwrap();
+                echo_buf
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 10s");
+    assert_eq!(echo_buf, payload);
+
+    let (result, tunnel_id) = relay_out;
+    let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
+    assert_eq!(result.kind, CopyEndKind::IdleTimeout);
+    assert_eq!(tunnel_id.as_deref(), Some("alive-1"));
+    assert_eq!(
+        (client_bytes, tunnel_bytes),
+        (payload_len as u64, payload_len as u64)
+    );
+}
+
+#[tokio::test]
+async fn test_zero_response_retry_no_retry_after_reset_with_response() {
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    let msg = b"hello";
+    let reset_addr = spawn_reset_after_response_tcp_server().await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "reset-1",
+        Arc::new(MockTunnelTarget::new("reset-1").with_dial_redirect(reset_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("reset-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, first_byte) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_millis(500),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                // Exactly one response byte, then a reset — the
+                // session must NOT be retried (a response was received).
+                let mut buf = [0u8; 1];
+                client.read_exact(&mut buf).await.unwrap();
+                buf[0]
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 5s");
+    assert_eq!(first_byte, b'X');
+    let (result, tunnel_id) = relay_out;
+    assert_eq!(tunnel_id.as_deref(), Some("reset-1"));
+    let err = result
+        .result
+        .expect_err("relay must end with the reset error, not a retry");
+    assert_eq!(result.kind, CopyEndKind::Failed);
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
 }
 
 #[tokio::test]

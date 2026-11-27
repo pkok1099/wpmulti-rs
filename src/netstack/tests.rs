@@ -3,13 +3,14 @@
 use etherparse::PacketBuilder;
 use gotatun::tun::IpSend;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use x25519_dalek::StaticSecret;
 
 use crate::config::WgInterfaceConfig;
 use crate::netstack::bridge::{
-    BridgeIpRecv, DEFAULT_CHANNEL_CAPACITY, DEFAULT_MTU, VirtualTunBridge,
+    BridgeIpRecv, BridgeIpSend, DEFAULT_CHANNEL_CAPACITY, DEFAULT_MTU, VirtualTunBridge,
 };
 use crate::netstack::dns::{
     DnsError, DnsLruCache, QueryType, build_query, build_response, parse_response,
@@ -1020,6 +1021,196 @@ async fn test_dns_singleflight_coalesces_concurrent_lookups() {
     );
 
     stack.close().await;
+}
+
+/// Mock DNS responder over a bridge that answers every query with
+/// `answer`, except the first packet, which it either delays by
+/// `first_delay` or drops entirely (`drop_first`). Counts every
+/// query packet received. The delay is applied synchronously before
+/// replying, so a test that needs the first query to stay slow while
+/// later queries are answered must route the later queries through a
+/// different stack (see the singleflight hedge test).
+fn spawn_flaky_dns_responder(
+    mut ip_send: BridgeIpSend,
+    mut ip_recv: BridgeIpRecv,
+    answer: Ipv4Addr,
+    first_delay: Duration,
+    drop_first: bool,
+    query_count: Arc<std::sync::atomic::AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use gotatun::tun::{IpRecv, IpSend};
+        use zerocopy::IntoBytes;
+
+        let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+        let mut first = true;
+        loop {
+            // Long idle window, and a timeout only re-arms the wait:
+            // a hedge or a leader retry can arrive seconds after the
+            // first query (the first packet may be delayed 800 ms or
+            // dropped outright), so exiting on a short idle gap would
+            // lose the very packets the test is about. Only a real
+            // receive error ends the responder; the test aborts it.
+            let recv = tokio::time::timeout(Duration::from_secs(10), ip_recv.recv(&mut pool)).await;
+            let mut packets = match recv {
+                Ok(Ok(packets)) => packets,
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            };
+            let mut queries = Vec::new();
+            for pkt in packets.by_ref() {
+                query_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                queries.push((*pkt).as_bytes().to_vec());
+            }
+            drop(packets);
+
+            for raw in queries {
+                let is_first = first;
+                first = false;
+                if drop_first && is_first {
+                    continue;
+                }
+                if is_first && !first_delay.is_zero() {
+                    tokio::time::sleep(first_delay).await;
+                }
+                let parsed = etherparse::SlicedPacket::from_ip(&raw).unwrap();
+                let udp_hdr = match &parsed.transport {
+                    Some(etherparse::TransportSlice::Udp(u)) => u,
+                    _ => panic!("expected udp"),
+                };
+                let dns_query = udp_hdr.payload();
+                let tx_id = u16::from_be_bytes([dns_query[0], dns_query[1]]);
+
+                let mut dns_resp = Vec::new();
+                dns_resp.extend_from_slice(&tx_id.to_be_bytes());
+                dns_resp.extend_from_slice(&[0x81, 0x80]);
+                dns_resp.extend_from_slice(&[0x00, 0x01]);
+                dns_resp.extend_from_slice(&[0x00, 0x01]);
+                dns_resp.extend_from_slice(&[0x00, 0x00]);
+                dns_resp.extend_from_slice(&[0x00, 0x00]);
+                dns_resp.extend_from_slice(&dns_query[12..]);
+                dns_resp.extend_from_slice(&[0xC0, 0x0C]);
+                dns_resp.extend_from_slice(&[0x00, 0x01]);
+                dns_resp.extend_from_slice(&[0x00, 0x01]);
+                dns_resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]);
+                dns_resp.extend_from_slice(&[0x00, 0x04]);
+                dns_resp.extend_from_slice(&answer.octets());
+
+                let (src_ip, dst_ip) = match parsed.net.unwrap() {
+                    etherparse::NetSlice::Ipv4(v4) => {
+                        (v4.header().source(), v4.header().destination())
+                    }
+                    _ => panic!("expected ipv4"),
+                };
+                let udp_ports = (udp_hdr.source_port(), udp_hdr.destination_port());
+
+                let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64).udp(udp_ports.1, udp_ports.0);
+                let mut reply_raw = Vec::new();
+                builder.write(&mut reply_raw, &dns_resp).unwrap();
+
+                let mut reply_pkt = pool.get();
+                reply_pkt.truncate(reply_raw.len());
+                reply_pkt.copy_from_slice(&reply_raw);
+                let ip_reply = reply_pkt.try_into_ip().unwrap();
+
+                ip_send.send(ip_reply).await.unwrap();
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_dns_singleflight_hedge_bypasses_slow_cell() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // One shared cache, two stacks: A answers its first query slowly
+    // (800 ms — inside the 1 s DNS deadline, so the leader's query
+    // still succeeds), B answers immediately. The leader resolves
+    // through A; a second resolve through B starts 300 ms later, when
+    // the cell is already past the 250 ms hedge age.
+    let shared_cache = Arc::new(DnsLruCache::new(2048));
+    let dns_cfg = StackDnsConfig::with_shared_cache(
+        "1.1.1.1:53".parse().unwrap(),
+        crate::config::toml_config::DnsStrategy::TunnelOnly,
+        Arc::clone(&shared_cache),
+    );
+    let answer = Ipv4Addr::new(93, 184, 216, 34);
+
+    let config_a = make_test_config("10.2.0.2/32", None);
+    let (bridge_a, ip_send_a, ip_recv_a) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack_a = Arc::new(
+        VirtualNetworkStack::new_with_options(
+            &config_a,
+            bridge_a,
+            crate::config::IpMode::DualStack,
+            false,
+            &dns_cfg,
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    );
+    let config_b = make_test_config("10.3.0.2/32", None);
+    let (bridge_b, ip_send_b, ip_recv_b) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack_b = Arc::new(
+        VirtualNetworkStack::new_with_options(
+            &config_b,
+            bridge_b,
+            crate::config::IpMode::DualStack,
+            false,
+            &dns_cfg,
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    );
+
+    let count_a = Arc::new(AtomicUsize::new(0));
+    let count_b = Arc::new(AtomicUsize::new(0));
+    let responder_a = spawn_flaky_dns_responder(
+        ip_send_a,
+        ip_recv_a,
+        answer,
+        Duration::from_millis(800),
+        false,
+        Arc::clone(&count_a),
+    );
+    let responder_b = spawn_flaky_dns_responder(
+        ip_send_b,
+        ip_recv_b,
+        answer,
+        Duration::ZERO,
+        false,
+        Arc::clone(&count_b),
+    );
+
+    let stack_a2 = Arc::clone(&stack_a);
+    let leader = tokio::spawn(async move { stack_a2.resolve_in_tunnel("example.com").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    let hedged = stack_b.resolve_in_tunnel("example.com").await;
+    let hedged_elapsed = started.elapsed();
+    assert_eq!(hedged.unwrap(), IpAddr::V4(answer));
+    assert!(
+        hedged_elapsed < Duration::from_millis(400),
+        "hedge must return well before the leader's 800 ms answer (joining the cell would take ~500 ms), took {hedged_elapsed:?}"
+    );
+    assert_eq!(
+        count_b.load(Ordering::Relaxed),
+        1,
+        "hedge must send its own query instead of queueing behind the cell (one A query: the v4-only interface narrows DualStack to Ipv4Only)"
+    );
+    let leader_ip = leader.await.unwrap().unwrap();
+    assert_eq!(leader_ip, IpAddr::V4(answer));
+    assert_eq!(
+        count_a.load(Ordering::Relaxed),
+        1,
+        "leader must send its own query (one A query: the v4-only interface narrows DualStack to Ipv4Only)"
+    );
+
+    responder_a.abort();
+    responder_b.abort();
+    stack_a.close().await;
+    stack_b.close().await;
 }
 
 // =========================================================================

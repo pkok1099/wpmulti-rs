@@ -568,6 +568,11 @@ impl ActiveProber {
         // and no failure is recorded for this pass (audit run-1,
         // `core/probe_egress:vpn-mode-noop-success`).
         let mut unverified = false;
+        // Set when the handshake itself failed or timed out (not when
+        // the handshake succeeded but the egress check failed): the
+        // peer was never reached, so the cached edge IP it dials may
+        // be dead (see the invalidation below).
+        let mut handshake_failed = false;
         for attempt in 0..attempts {
             let probe_res =
                 tokio::time::timeout(timeout, active_clone.device.force_handshake(&peer_pubkey))
@@ -605,6 +610,7 @@ impl ActiveProber {
                     }
                 }
                 Ok(Err(e)) => {
+                    handshake_failed = true;
                     tracing::debug!(
                         "Active probe handshake failed (attempt {}/{}): {}",
                         attempt + 1,
@@ -613,6 +619,7 @@ impl ActiveProber {
                     );
                 }
                 Err(_) => {
+                    handshake_failed = true;
                     tracing::debug!(
                         "Active probe handshake timed out (attempt {}/{})",
                         attempt + 1,
@@ -631,6 +638,29 @@ impl ActiveProber {
             && *entry_ref.state.read() == crate::core::registry::TunnelState::Active
         {
             entry_ref.health.record_failure(threshold, cooldown);
+        }
+        // A tunnel that never completed a handshake and whose probe
+        // could not force one may be dialing a dead edge IP: the
+        // endpoint cache would otherwise serve that IP to every
+        // activation for the rest of its TTL. Invalidate this tunnel's
+        // peer endpoints so the next activation re-resolves (and may
+        // land on a different, live edge). The signal is deliberately
+        // narrow — a tunnel that handshaked before has a proven-good
+        // edge, so its probe failure must not flush the shared cache —
+        // and a spurious flush only costs one fresh DNS lookup, since
+        // the resolver usually returns the same address.
+        if !succeeded
+            && handshake_failed
+            && entry_ref.stats.last_handshake.load(Ordering::Relaxed) == 0
+        {
+            for peer in &entry_ref.config.read().peers {
+                tracing::debug!(
+                    "Active probe handshake failed for tunnel '{}' that never handshaked; invalidating cached endpoint '{}'",
+                    entry_ref.id,
+                    peer.endpoint
+                );
+                crate::core::lifecycle::invalidate_endpoint_dns_cache(&peer.endpoint);
+            }
         }
     }
 
