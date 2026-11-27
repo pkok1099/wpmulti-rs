@@ -1430,6 +1430,147 @@ async fn test_tcp_stream_handshake_and_exchange() {
     stack.close().await;
 }
 
+/// Spawn a mock TCP peer that completes the handshake, ACKs the
+/// first data segment the way a real origin would, and then stays
+/// silent forever (never data, never FIN). The returned task never
+/// finishes on its own; abort it when the test ends.
+fn spawn_silent_tcp_peer(
+    mut ip_send: BridgeIpSend,
+    mut ip_recv: BridgeIpRecv,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+        let syn_pkt = recv_ipv4_tcp(&mut ip_recv, &mut pool).await;
+        assert!(syn_pkt.syn);
+        let server_isn = 50000u32;
+        send_ipv4_tcp_ack(
+            &mut ip_send,
+            &mut pool,
+            TcpReplySpec {
+                src_ip: syn_pkt.dst_ip,
+                dst_ip: syn_pkt.src_ip,
+                src_port: syn_pkt.dst_port,
+                dst_port: syn_pkt.src_port,
+                seq: server_isn,
+                ack: syn_pkt.seq + 1,
+                syn: true,
+                fin: false,
+                payload: &[],
+            },
+        )
+        .await;
+        // ACK completing the handshake.
+        let ack_pkt = recv_ipv4_tcp(&mut ip_recv, &mut pool).await;
+        assert!(ack_pkt.ack);
+        // Swallow the request bytes, ACK them the way a real origin
+        // would (TCP-level ACK, still no HTTP response), then stay
+        // silent forever.
+        let data_pkt = recv_ipv4_tcp(&mut ip_recv, &mut pool).await;
+        assert!(!data_pkt.payload.is_empty());
+        let data_len = data_pkt.payload.len() as u32;
+        send_ipv4_tcp_ack(
+            &mut ip_send,
+            &mut pool,
+            TcpReplySpec {
+                src_ip: data_pkt.dst_ip,
+                dst_ip: data_pkt.src_ip,
+                src_port: data_pkt.dst_port,
+                dst_port: data_pkt.src_port,
+                seq: server_isn + 1,
+                ack: data_pkt.seq + data_len,
+                syn: false,
+                fin: false,
+                payload: &[],
+            },
+        )
+        .await;
+        loop {
+            let _pkt = recv_ipv4_tcp(&mut ip_recv, &mut pool).await;
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_blackhole_tunnel_session_ends_promptly_when_client_gives_up() {
+    use crate::proxy::router::DynStream;
+    use crate::proxy::{
+        CLIENT_ABORT_SILENCE_THRESHOLD, CopyEndKind, copy_bidirectional_with_zero_response_retry,
+    };
+    use tokio::net::{TcpListener, TcpStream};
+
+    // Production shape: the tunnel is a real VirtualTcpStream over a
+    // stack; the peer completes the TCP handshake, swallows the
+    // request, and then stays silent forever (never data, never FIN,
+    // never an ACK for the request). The client is a real TCP socket
+    // that gives up after 3s. The copy must end promptly as
+    // ClientAborted, not at the idle timeout. (fix10: the one
+    // production element not yet reproduced — the earlier tests used
+    // a plain TCP tunnel stream.)
+    let config = make_test_config("10.2.0.2/32", None);
+    let (bridge, ip_send, ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack = VirtualNetworkStack::new(&config, bridge).unwrap();
+
+    let dst = SocketAddr::from(([93, 184, 216, 34], 80));
+    let peer_task = spawn_silent_tcp_peer(ip_send, ip_recv);
+
+    let tunnel: DynStream = Box::new(
+        stack
+            .tcp_connect(dst)
+            .await
+            .expect("tcp_connect must succeed"),
+    );
+
+    // Real TCP client pair (proxy <-> curl).
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let client_task = tokio::spawn(async move {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        // Wait past the silence threshold, then give up: dropping
+        // the client half-closes, as curl does at its 15s timeout.
+        tokio::time::sleep(CLIENT_ABORT_SILENCE_THRESHOLD + Duration::from_millis(500)).await;
+    });
+    let (mut proxy_client, _) = listener.accept().await.unwrap();
+
+    // The idle timeout is far above the silence threshold, so only
+    // the prompt end can finish this session in time.
+    let idle_timeout = Duration::from_secs(30);
+    let mut tunnel_id = None;
+    let (outcome, client_result) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            copy_bidirectional_with_zero_response_retry(
+                &mut proxy_client,
+                tunnel,
+                idle_timeout,
+                None,
+                &mut tunnel_id,
+            ),
+            client_task,
+        )
+    })
+    .await
+    .expect("blackhole session must end promptly, not at the idle timeout");
+    client_result.expect("client task must not panic");
+    let (client_bytes, tunnel_bytes) = outcome.result.expect("session must end cleanly");
+    assert_eq!(
+        outcome.kind,
+        CopyEndKind::ClientAborted,
+        "client_bytes={client_bytes} tunnel_bytes={tunnel_bytes} duration={:?}",
+        outcome.duration
+    );
+    assert_eq!((client_bytes, tunnel_bytes), (37, 0));
+    assert!(
+        outcome.duration >= CLIENT_ABORT_SILENCE_THRESHOLD,
+        "session must have run past the silence threshold, got {:?}",
+        outcome.duration
+    );
+    peer_task.abort();
+    stack.close().await;
+}
+
 // =========================================================================
 // 8. IpMode Isolation Tests (ipv4_only & ipv6_only)
 // =========================================================================

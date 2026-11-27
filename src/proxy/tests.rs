@@ -3902,6 +3902,139 @@ async fn test_blackhole_session_ends_promptly_when_client_gives_up() {
 }
 
 #[tokio::test]
+async fn test_blackhole_session_ends_promptly_with_real_tcp_client() {
+    use crate::proxy::{
+        CLIENT_ABORT_SILENCE_THRESHOLD, CopyEndKind, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // Same blackhole shape as the duplex test, but the client side is
+    // a real loopback TCP pair: production curl closes a real socket,
+    // and the copy must observe that close the same way it observes
+    // a dropped duplex half. (fix10 repro: the duplex test passes
+    // while production sessions linger to the idle timeout.)
+    let blackhole_addr = spawn_blackhole_tcp_server(usize::MAX).await;
+    let tunnel: DynStream = Box::new(TcpStream::connect(blackhole_addr).await.unwrap());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = listener.local_addr().unwrap();
+    let connect = tokio::spawn(async move { TcpStream::connect(client_addr).await.unwrap() });
+    let (mut server, _) = listener.accept().await.unwrap();
+    let mut client = connect.await.unwrap();
+
+    // The idle timeout is far above the silence threshold, so only
+    // the prompt end can finish this session in time.
+    let idle_timeout = Duration::from_secs(30);
+    let mut tunnel_id = None;
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            copy_bidirectional_with_zero_response_retry(
+                &mut server,
+                tunnel,
+                idle_timeout,
+                None,
+                &mut tunnel_id,
+            ),
+            async move {
+                client.write_all(b"hello").await.unwrap();
+                // Wait past the silence threshold, then give up:
+                // drop the client socket the way curl does at its
+                // 15s timeout.
+                tokio::time::sleep(CLIENT_ABORT_SILENCE_THRESHOLD + Duration::from_millis(500))
+                    .await;
+                drop(client);
+            },
+        )
+    })
+    .await
+    .expect("blackhole session must end promptly, not at the idle timeout");
+    assert_eq!(outcome.kind, CopyEndKind::ClientAborted);
+    let (client_bytes, tunnel_bytes) = outcome.result.expect("session must end cleanly");
+    assert_eq!((client_bytes, tunnel_bytes), (5, 0));
+    assert!(
+        outcome.duration >= CLIENT_ABORT_SILENCE_THRESHOLD,
+        "session must have run past the silence threshold, got {:?}",
+        outcome.duration
+    );
+}
+
+#[tokio::test]
+async fn test_blackhole_session_ends_promptly_via_socks_handler() {
+    use crate::proxy::CLIENT_ABORT_SILENCE_THRESHOLD;
+
+    // Full production path: real TCP client -> SOCKS5 handshake ->
+    // mock tunnel dials a real blackhole TCP server -> copy with
+    // retry enabled (as production does). The client closes after
+    // 3s of silence; the handler task must finish promptly, not at
+    // the idle timeout. (fix10: isolates the handler path + retry
+    // from the copy loop, which already passes with a real TCP
+    // client.)
+    let blackhole_addr = spawn_blackhole_tcp_server(usize::MAX).await;
+    let t1 = Arc::new(MockTunnelTarget::new("bh-1").with_dial_redirect(blackhole_addr));
+    let pool = Arc::new(
+        PoolRouter::new(PoolStrategy::RoundRobin, true).with_auth(AuthMode::PerTunnel, None),
+    );
+    pool.add_tunnel("bh-1", Arc::clone(&t1) as Arc<dyn ProxyTunnelTarget>);
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let handler = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        handle_socks5(stream, router).await
+    });
+
+    // Raw SOCKS5 client (what curl does at the socket level).
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_USER_PASS])
+        .await
+        .unwrap();
+    let mut g_resp = [0u8; 2];
+    client.read_exact(&mut g_resp).await.unwrap();
+    assert_eq!(g_resp, [SOCKS5_VERSION, METHOD_USER_PASS]);
+
+    let mut auth_req = vec![RFC1929_VERSION, 4];
+    auth_req.extend_from_slice(b"bh-1");
+    auth_req.push(0);
+    client.write_all(&auth_req).await.unwrap();
+    let mut a_resp = [0u8; 2];
+    client.read_exact(&mut a_resp).await.unwrap();
+    assert_eq!(a_resp, [RFC1929_VERSION, 0x00]);
+
+    // CONNECT 192.0.2.1:80 (TEST-NET-1, passes the destination guard).
+    let mut cmd = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00, ATYP_IPV4];
+    cmd.extend_from_slice(&[192, 0, 2, 1]);
+    cmd.extend_from_slice(&80u16.to_be_bytes());
+    client.write_all(&cmd).await.unwrap();
+    let mut reply = [0u8; 10];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], SOCKS5_VERSION);
+    assert_eq!(
+        reply[1], REP_SUCCESS,
+        "grant must succeed, got 0x{:02X}",
+        reply[1]
+    );
+
+    // Send the request, wait past the silence threshold, then give
+    // up the way curl does at its 15s timeout.
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(CLIENT_ABORT_SILENCE_THRESHOLD + Duration::from_millis(500)).await;
+    drop(client);
+
+    // The handler must finish promptly (client gave up), not at the
+    // 300s idle timeout. 10s bound keeps the test fast while leaving
+    // ample margin over the 3s silence.
+    let joined = tokio::time::timeout(Duration::from_secs(10), handler)
+        .await
+        .expect("handler must end promptly after the client gives up");
+    let result = joined.expect("handler task must not panic");
+    assert!(result.is_ok(), "handler must end cleanly, got {result:?}");
+}
+
+#[tokio::test]
 async fn test_zero_response_retry_retries_through_different_tunnel() {
     use crate::proxy::router::connect_via_router;
     use crate::proxy::{

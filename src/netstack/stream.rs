@@ -325,7 +325,7 @@ impl AsyncWrite for VirtualTcpStream {
         poll
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.write_closed {
             return Poll::Ready(Ok(()));
         }
@@ -344,38 +344,27 @@ impl AsyncWrite for VirtualTcpStream {
                 "tcp socket handle not found in socket set",
             )));
         }
-        let StackInner {
-            sockets,
-            shutdown_wakers,
-            ..
-        } = &mut *inner;
+        let StackInner { sockets, .. } = &mut *inner;
         let socket = sockets.get_mut::<tcp::Socket<'_>>(self.handle);
 
-        match socket.state() {
-            State::Established | State::CloseWait => {
-                socket.close();
-                socket.register_send_waker(cx.waker());
-                register_shutdown_waker(shutdown_wakers, self.handle, WakerSlot::Send, cx.waker());
-                drop(inner);
-                self.notify.notify_one();
-                Poll::Pending
-            }
-            State::FinWait1 | State::Closing | State::LastAck => {
-                socket.register_send_waker(cx.waker());
-                register_shutdown_waker(shutdown_wakers, self.handle, WakerSlot::Send, cx.waker());
-                Poll::Pending
-            }
-            State::FinWait2
-            | State::Closed
-            | State::Listen
-            | State::SynSent
-            | State::SynReceived
-            | State::TimeWait => {
-                drop(inner);
-                self.get_mut().write_closed = true;
-                Poll::Ready(Ok(()))
-            }
+        // Queue the FIN if the socket is still open, then report
+        // the write side closed at once: `poll_shutdown` only
+        // initiates the close (like `TcpStream::shutdown`) — it
+        // must not wait for the peer to ACK the FIN. A silent peer
+        // would park the caller here until the idle timeout: the
+        // proxy copy loop shuts the tunnel down when the client
+        // gives up, and a blackhole tunnel never ACKs, so the
+        // session never ended as `ClientAborted` (fix10).
+        let queued_fin = matches!(socket.state(), State::Established | State::CloseWait);
+        if queued_fin {
+            socket.close();
         }
+        drop(inner);
+        self.as_mut().get_mut().write_closed = true;
+        if queued_fin {
+            self.notify.notify_one();
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
