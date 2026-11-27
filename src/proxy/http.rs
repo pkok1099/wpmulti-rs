@@ -12,6 +12,7 @@ use std::time::Duration;
 use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::proxy::replay::{BlackholeEjectionReason, replay_metrics};
 use crate::proxy::router::{
     DynStream, RouterConnectError, TargetAddr, TunnelRouter, TunnelSelector, connect_via_router,
     is_forbidden_destination_ip, is_valid_target_domain, parse_domain_ip_literal,
@@ -520,6 +521,7 @@ async fn handle_http_connect<S: AsyncRead + AsyncWrite + Unpin>(
         && let Some(id) = tunnel_id.as_deref()
     {
         router.record_tunnel_blackhole(id);
+        replay_metrics().inc_blackhole_ejection(BlackholeEjectionReason::SessionEnd);
     }
     outcome.result?;
 

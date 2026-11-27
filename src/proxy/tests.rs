@@ -19,8 +19,8 @@ use crate::proxy::http::{
     parse_response_head, read_http_request_headers_buffered,
 };
 use crate::proxy::router::{
-    DirectTunnelTarget, DynStream, PoolKeyword, PoolRouter, ProxyTunnelTarget, ProxyUdpSocket,
-    SingleTunnelRouter, TargetAddr, TunnelRouter, TunnelSelector,
+    DirectTunnelTarget, DynStream, PoolKeyword, PoolRouter, ProxyAuthError, ProxyTunnelTarget,
+    ProxyUdpSocket, SelectTunnelFut, SingleTunnelRouter, TargetAddr, TunnelRouter, TunnelSelector,
 };
 use crate::proxy::socks5::ExpectedUdpReplies;
 use crate::proxy::socks5::{
@@ -355,7 +355,7 @@ async fn spawn_reset_tcp_server() -> SocketAddr {
     addr
 }
 
-/// Accept connections, read exactly one byte, write back exactly one
+/// Accept connections, read the request, write back exactly one
 /// byte, then close with the rest of the request unread — the proxy
 /// sees one response byte followed by a reset, so it must NOT retry.
 async fn spawn_reset_after_response_tcp_server() -> SocketAddr {
@@ -372,6 +372,145 @@ async fn spawn_reset_after_response_tcp_server() -> SocketAddr {
         }
     });
     addr
+}
+
+/// Accept connections, read the whole GET head, wait `delay`, then
+/// echo it back — a slow primary that answers late (fix12: the
+/// secondary wins the race, but the primary was only slow, not
+/// dead, so it must take no breaker penalty).
+async fn spawn_delayed_echo_tcp_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let mut read = 0usize;
+                while read < buf.len() {
+                    match stream.read(&mut buf[read..]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            read += n;
+                            if read >= 4 && buf[..read].ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                tokio::time::sleep(delay).await;
+                let _ = stream.write_all(&buf[..read]).await;
+            });
+        }
+    });
+    addr
+}
+
+/// Accept connections, read the request, wait `delay`, then close
+/// without replying — a primary whose connection dies after a delay
+/// (fix12: EOF before any response byte is a transport failure,
+/// not a blackhole).
+async fn spawn_delayed_close_tcp_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                tokio::time::sleep(delay).await;
+                // Dropping the stream closes the connection: the
+                // observer sees EOF.
+            });
+        }
+    });
+    addr
+}
+
+/// A `PoolRouter` wrapper that records every attribution call
+/// (blackhole / transport failure / RTT sample) per tunnel id, so
+/// fix12 tests can prove what penalty the losing primary earned.
+/// The pool router itself uses the trait's no-op defaults, so
+/// penalties are invisible through it.
+struct RecordingRouter {
+    inner: Arc<PoolRouter>,
+    blackholes: Mutex<Vec<String>>,
+    transport_failures: Mutex<Vec<String>>,
+    rtt_samples: Mutex<Vec<(String, u64)>>,
+}
+
+impl RecordingRouter {
+    fn new(inner: Arc<PoolRouter>) -> Self {
+        Self {
+            inner,
+            blackholes: Mutex::new(Vec::new()),
+            transport_failures: Mutex::new(Vec::new()),
+            rtt_samples: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn blackhole_count(&self, tunnel_id: &str) -> usize {
+        self.blackholes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| id.as_str() == tunnel_id)
+            .count()
+    }
+
+    fn transport_failure_count(&self, tunnel_id: &str) -> usize {
+        self.transport_failures
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| id.as_str() == tunnel_id)
+            .count()
+    }
+
+    fn rtt_samples_for(&self, tunnel_id: &str) -> Vec<u64> {
+        self.rtt_samples
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id.as_str() == tunnel_id)
+            .map(|(_, ms)| *ms)
+            .collect()
+    }
+}
+
+impl TunnelRouter for RecordingRouter {
+    fn authenticate(
+        &self,
+        credentials: Option<(&str, &str)>,
+    ) -> Result<TunnelSelector, ProxyAuthError> {
+        self.inner.authenticate(credentials)
+    }
+
+    fn select_tunnel<'a>(
+        &'a self,
+        selector: &'a TunnelSelector,
+        credentials: Option<(&'a str, &'a str)>,
+    ) -> SelectTunnelFut<'a> {
+        self.inner.select_tunnel(selector, credentials)
+    }
+
+    fn record_tunnel_blackhole(&self, tunnel_id: &str) {
+        self.blackholes.lock().unwrap().push(tunnel_id.to_string());
+    }
+
+    fn record_tunnel_transport_failure(&self, tunnel_id: &str) {
+        self.transport_failures
+            .lock()
+            .unwrap()
+            .push(tunnel_id.to_string());
+    }
+
+    fn record_tunnel_rtt(&self, tunnel_id: &str, sample_ms: u64) {
+        self.rtt_samples
+            .lock()
+            .unwrap()
+            .push((tunnel_id.to_string(), sample_ms));
+    }
 }
 
 async fn spawn_echo_tcp_server_ipv6() -> Option<SocketAddr> {
@@ -4611,7 +4750,10 @@ async fn test_socks5_connect_zero_response_retry() {
 
 #[tokio::test]
 async fn test_safe_http_silence_replay_rescues_blackhole() {
-    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
+    use crate::proxy::replay::{
+        REPLAY_TEST_LOCK, replay_budget_concurrent_for_tests, replay_metrics,
+        reset_replay_state_for_tests,
+    };
     use crate::proxy::router::connect_via_router;
     use crate::proxy::{
         CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
@@ -4620,8 +4762,9 @@ async fn test_safe_http_silence_replay_rescues_blackhole() {
     // fix11: a plaintext GET to a blackhole primary is rescued by
     // the silence replay — at 2.5 s a second tunnel is dialled, the
     // buffered GET is sent on it, and the echo comes back through
-    // the secondary. The primary takes the blackhole penalty and
-    // the session continues on the secondary.
+    // the secondary. fix12: the primary is NOT penalised at the
+    // win — it is observed until its 15 s deadline, and only a
+    // deadline miss earns the blackhole penalty.
     let _replay_guard = REPLAY_TEST_LOCK.lock().await;
     reset_replay_state_for_tests();
 
@@ -4695,8 +4838,11 @@ async fn test_safe_http_silence_replay_rescues_blackhole() {
         (msg.len() as u64, msg.len() as u64)
     );
     // The silence replay claimed the shared token (fix5 did not),
-    // fired once, sent the GET on the secondary, and rescued the
-    // session: the secondary won the race.
+    // fired once, sent the GET on the secondary, and the secondary
+    // won the race. fix12: the blackhole primary is NOT penalised
+    // here — it is under observation until its 15 s deadline, so
+    // at this point no verdict exists yet and the replay slot is
+    // still held by the observer.
     let metrics = replay_metrics();
     assert_eq!(metrics.eligible.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 1);
@@ -4704,9 +4850,13 @@ async fn test_safe_http_silence_replay_rescues_blackhole() {
     assert_eq!(metrics.dial_failed.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.request_sent.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.winner_secondary.load(Ordering::Relaxed), 1);
-    assert_eq!(metrics.rescued.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.secondary_wins.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.unobserved_loser.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.late_response.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.deadline_miss.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.claimed_silence.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.claimed_fix5.load(Ordering::Relaxed), 0);
+    assert_eq!(replay_budget_concurrent_for_tests(), 1);
 }
 
 #[tokio::test]
@@ -4793,7 +4943,7 @@ async fn test_safe_http_silence_replay_ignores_opaque_tls() {
     assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.dial_started.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.request_sent.load(Ordering::Relaxed), 0);
-    assert_eq!(metrics.rescued.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.secondary_wins.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.claimed_silence.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.claimed_fix5.load(Ordering::Relaxed), 0);
 }
@@ -4880,6 +5030,344 @@ async fn test_zero_response_retry_blocks_opaque_after_bytes_written() {
     assert_eq!(metrics.suppressed_ineligible.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.claimed_fix5.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.claimed_silence.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn test_hedge_loser_classify_late_response_eof_rst_and_silence() {
+    use crate::proxy::replay::{HedgeLoserOutcome, classify_hedge_loser};
+    use std::time::Instant;
+
+    // Late response: one byte after 200 ms, well before the deadline.
+    let (observed, mut peer) = tokio::io::duplex(64);
+    let mut observed: DynStream = Box::new(observed);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = peer.write_all(b"X").await;
+    });
+    let start = Instant::now();
+    let outcome = classify_hedge_loser(&mut observed, start + Duration::from_secs(5)).await;
+    match outcome {
+        HedgeLoserOutcome::LateResponse { first_byte_at } => {
+            let ms = first_byte_at.duration_since(start).as_millis();
+            assert!(
+                ms >= 150,
+                "late byte must arrive after the 200 ms delay, got {ms} ms"
+            );
+            assert!(
+                ms < 2000,
+                "late byte must not wait out the deadline, got {ms} ms"
+            );
+        }
+        _ => panic!("a byte before the deadline must classify as LateResponse"),
+    }
+
+    // EOF: the peer drops at once.
+    let (observed, peer) = tokio::io::duplex(64);
+    let mut observed: DynStream = Box::new(observed);
+    drop(peer);
+    let outcome =
+        classify_hedge_loser(&mut observed, Instant::now() + Duration::from_secs(5)).await;
+    assert!(
+        matches!(outcome, HedgeLoserOutcome::TransportFailure),
+        "an immediate EOF must classify as TransportFailure"
+    );
+
+    // RST: a real TCP pair; the peer reads one byte of the request
+    // and then closes with the rest unread, so Linux resets the
+    // socket instead of sending FIN.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1];
+        let _ = stream.read_exact(&mut buf).await;
+        drop(stream);
+    });
+    let mut observed: DynStream = Box::new(TcpStream::connect(server_addr).await.unwrap());
+    observed
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let outcome =
+        classify_hedge_loser(&mut observed, Instant::now() + Duration::from_secs(5)).await;
+    assert!(
+        matches!(outcome, HedgeLoserOutcome::TransportFailure),
+        "a reset before any response byte must classify as TransportFailure"
+    );
+    accept.await.unwrap();
+
+    // Silence: the peer stays open but never answers, and the short
+    // deadline passes.
+    let (observed, _peer) = tokio::io::duplex(64);
+    let mut observed: DynStream = Box::new(observed);
+    let start = Instant::now();
+    let outcome = classify_hedge_loser(&mut observed, start + Duration::from_millis(200)).await;
+    assert!(
+        matches!(outcome, HedgeLoserOutcome::DeadlineMiss),
+        "silence until the deadline must classify as DeadlineMiss"
+    );
+    assert!(
+        start.elapsed().as_millis() >= 150,
+        "the classifier must wait out the deadline, not return at once"
+    );
+}
+
+#[tokio::test]
+async fn test_hedge_loser_apply_outcome_charges_only_deadline_miss() {
+    use crate::proxy::replay::{
+        HedgeLoserCtx, HedgeLoserOutcome, REPLAY_TEST_LOCK, apply_hedge_loser_outcome,
+        replay_metrics, reset_replay_state_for_tests,
+    };
+    use std::time::Instant;
+
+    // One outcome of each kind through the same context: only the
+    // deadline miss may charge the blackhole penalty.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    let recording = Arc::new(RecordingRouter::new(pool));
+    let router_inner: Arc<RecordingRouter> = Arc::clone(&recording);
+    let router: Arc<dyn TunnelRouter> = router_inner;
+    let forwarded_at = Instant::now();
+    let ctx = HedgeLoserCtx {
+        router,
+        primary_tunnel_id: "slow-1".to_string(),
+        primary_request_forwarded_at: forwarded_at,
+        secondary_request_forwarded_at: Some(forwarded_at),
+        secondary_first_response_at: forwarded_at,
+    };
+
+    apply_hedge_loser_outcome(
+        &ctx,
+        &HedgeLoserOutcome::LateResponse {
+            first_byte_at: forwarded_at + Duration::from_millis(3200),
+        },
+    );
+    apply_hedge_loser_outcome(&ctx, &HedgeLoserOutcome::TransportFailure);
+    apply_hedge_loser_outcome(&ctx, &HedgeLoserOutcome::DeadlineMiss);
+
+    let metrics = replay_metrics();
+    assert_eq!(metrics.late_response.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.transport_failure.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.deadline_miss.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.true_rescues.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.both_legs_responded.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        metrics
+            .primary_response_latency_ms_sum
+            .load(Ordering::Relaxed),
+        3200
+    );
+    assert_eq!(
+        metrics
+            .blackhole_ejections_deadline_miss
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(recording.blackhole_count("slow-1"), 1);
+    assert_eq!(recording.transport_failure_count("slow-1"), 1);
+    assert_eq!(recording.rtt_samples_for("slow-1"), vec![3200]);
+}
+
+#[tokio::test]
+async fn test_hedge_loser_late_response_no_penalty() {
+    use crate::proxy::replay::{
+        REPLAY_TEST_LOCK, replay_budget_concurrent_for_tests, replay_metrics,
+        reset_replay_state_for_tests,
+    };
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // fix12: the primary answers 3 s after the request — after the
+    // secondary won the race at 2.5 s, but before the 15 s deadline.
+    // It must take NO breaker penalty, and its observed latency must
+    // feed the EWMA instead. The replay slot stays held while the
+    // loser is observed and is released once the verdict lands.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let slow_addr = spawn_delayed_echo_tcp_server(Duration::from_secs(3)).await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "slow-1",
+        Arc::new(MockTunnelTarget::new("slow-1").with_dial_redirect(slow_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let recording = Arc::new(RecordingRouter::new(pool));
+    let router_inner: Arc<RecordingRouter> = Arc::clone(&recording);
+    let router: Arc<dyn TunnelRouter> = router_inner;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("slow-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, echo_buf) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_secs(3),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                let mut echo_buf = vec![0u8; msg.len()];
+                client.read_exact(&mut echo_buf).await.unwrap();
+                echo_buf
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 15s");
+    assert_eq!(&echo_buf, msg);
+
+    let (result, tunnel_id) = relay_out;
+    let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
+    assert_eq!(result.kind, CopyEndKind::IdleTimeout);
+    assert_eq!(tunnel_id.as_deref(), Some("alive-1"));
+    assert_eq!(
+        (client_bytes, tunnel_bytes),
+        (msg.len() as u64, msg.len() as u64)
+    );
+
+    // The secondary won, the slow primary answered at ~3 s, and the
+    // observer resolved before the session ended.
+    let metrics = replay_metrics();
+    assert_eq!(metrics.secondary_wins.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.late_response.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.transport_failure.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.deadline_miss.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.true_rescues.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.both_legs_responded.load(Ordering::Relaxed), 1);
+    assert_eq!(recording.blackhole_count("slow-1"), 0);
+    assert_eq!(recording.transport_failure_count("slow-1"), 0);
+    let samples = recording.rtt_samples_for("slow-1");
+    assert_eq!(samples.len(), 1);
+    assert!(
+        samples[0] >= 2500,
+        "observed latency must cover the 3 s delay, got {} ms",
+        samples[0]
+    );
+    assert!(
+        samples[0] < 6000,
+        "observed latency must not wait out the deadline, got {} ms",
+        samples[0]
+    );
+    assert_eq!(replay_budget_concurrent_for_tests(), 0);
+}
+
+#[tokio::test]
+async fn test_hedge_loser_transport_failure_no_blackhole() {
+    use crate::proxy::replay::{
+        REPLAY_TEST_LOCK, replay_budget_concurrent_for_tests, replay_metrics,
+        reset_replay_state_for_tests,
+    };
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // fix12: the primary's connection dies 2.8 s after the request —
+    // after the secondary won the race at 2.5 s, before answering.
+    // That is a transport failure, not a blackhole: no blackhole
+    // penalty, and the slot is released once the verdict lands.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let dying_addr = spawn_delayed_close_tcp_server(Duration::from_millis(2800)).await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "dying-1",
+        Arc::new(MockTunnelTarget::new("dying-1").with_dial_redirect(dying_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let recording = Arc::new(RecordingRouter::new(pool));
+    let router_inner: Arc<RecordingRouter> = Arc::clone(&recording);
+    let router: Arc<dyn TunnelRouter> = router_inner;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("dying-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, echo_buf) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_secs(3),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                let mut echo_buf = vec![0u8; msg.len()];
+                client.read_exact(&mut echo_buf).await.unwrap();
+                echo_buf
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 15s");
+    assert_eq!(&echo_buf, msg);
+
+    let (result, tunnel_id) = relay_out;
+    let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
+    assert_eq!(result.kind, CopyEndKind::IdleTimeout);
+    assert_eq!(tunnel_id.as_deref(), Some("alive-1"));
+    assert_eq!(
+        (client_bytes, tunnel_bytes),
+        (msg.len() as u64, msg.len() as u64)
+    );
+
+    // The secondary won, the dying primary closed at ~2.8 s, and
+    // the observer resolved before the session ended.
+    let metrics = replay_metrics();
+    assert_eq!(metrics.secondary_wins.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.late_response.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.transport_failure.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.deadline_miss.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.true_rescues.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.both_legs_responded.load(Ordering::Relaxed), 0);
+    assert_eq!(recording.blackhole_count("dying-1"), 0);
+    assert_eq!(recording.transport_failure_count("dying-1"), 1);
+    assert!(recording.rtt_samples_for("dying-1").is_empty());
+    assert_eq!(replay_budget_concurrent_for_tests(), 0);
 }
 
 #[test]

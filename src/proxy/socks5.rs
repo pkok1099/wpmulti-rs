@@ -11,6 +11,7 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::proxy::replay::{BlackholeEjectionReason, replay_metrics};
 use crate::proxy::router::{
     DynStream, ProxyTunnelTarget, ProxyUdpSocket, RouterConnectError, TargetAddr, TunnelRouter,
     TunnelSelector, bound_candidate_addrs, connect_via_router, is_forbidden_destination_ip,
@@ -643,6 +644,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         && let Some(id) = tunnel_id.as_deref()
     {
         router.record_tunnel_blackhole(id);
+        replay_metrics().inc_blackhole_ejection(BlackholeEjectionReason::SessionEnd);
     }
     outcome.result?;
 

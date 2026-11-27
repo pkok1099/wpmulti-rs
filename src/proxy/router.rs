@@ -1295,6 +1295,21 @@ pub trait TunnelRouter: Send + Sync {
     /// first byte. The default is a no-op (pool routers do not
     /// track per-tunnel health).
     fn record_tunnel_blackhole(&self, _tunnel_id: &str) {}
+
+    /// Record one first-byte latency sample (milliseconds) for
+    /// `tunnel_id` into the Peak-EWMA. For the hedge-loser
+    /// observer: a primary that answered late proved itself slow,
+    /// not dead, so its observed latency — not a maximal failure
+    /// sample — feeds the score. The default is a no-op.
+    fn record_tunnel_rtt(&self, _tunnel_id: &str, _sample_ms: u64) {}
+
+    /// Record a transport failure on `tunnel_id`: the tunnel's
+    /// connection died (EOF / reset) before answering. The router
+    /// charges the failure to the tunnel's health, but — unlike a
+    /// blackhole — does not drop it from the warm list: a dead
+    /// connection is not evidence the tunnel is silently
+    /// blackholing. The default is a no-op.
+    fn record_tunnel_transport_failure(&self, _tunnel_id: &str) {}
 }
 
 impl<T: TunnelRouter + ?Sized> TunnelRouter for Arc<T> {
@@ -1323,6 +1338,14 @@ impl<T: TunnelRouter + ?Sized> TunnelRouter for Arc<T> {
 
     fn record_tunnel_blackhole(&self, tunnel_id: &str) {
         (**self).record_tunnel_blackhole(tunnel_id);
+    }
+
+    fn record_tunnel_rtt(&self, tunnel_id: &str, sample_ms: u64) {
+        (**self).record_tunnel_rtt(tunnel_id, sample_ms);
+    }
+
+    fn record_tunnel_transport_failure(&self, tunnel_id: &str) {
+        (**self).record_tunnel_transport_failure(tunnel_id);
     }
 }
 

@@ -1000,6 +1000,33 @@ impl TunnelRouter for MultiTenantRouter {
         entry.stats.record_rtt_failure();
         self.warm_list.note_failure(tunnel_id);
     }
+
+    fn record_tunnel_rtt(&self, tunnel_id: &str, sample_ms: u64) {
+        // A real first-byte latency sample: feed it to the
+        // Peak-EWMA as-is (clamped to 1 ms–tau inside). The
+        // hedge-loser observer calls this for a primary that
+        // answered late — slow, not dead — so the selector learns
+        // the tunnel is slow instead of treating it as dead.
+        let Some(entry) = self.registry.get(tunnel_id) else {
+            return;
+        };
+        entry.stats.record_rtt_sample(sample_ms);
+    }
+
+    fn record_tunnel_transport_failure(&self, tunnel_id: &str) {
+        // The tunnel's connection died (EOF / reset) before
+        // answering: the same failure charge the dial path applies
+        // to a tunnel-side failure (breaker + maximally slow EWMA
+        // sample), but without the warm-list removal — a dead
+        // connection is not evidence the tunnel is silently
+        // blackholing, so the fast path keeps sampling it.
+        let Some(entry) = self.registry.get(tunnel_id) else {
+            return;
+        };
+        let (threshold, cooldown) = self.effective_health();
+        entry.health.record_failure(threshold, cooldown);
+        entry.stats.record_rtt_failure();
+    }
 }
 
 /// Dedicated router for per-tunnel ports forwarding all connections directly to a single tunnel.

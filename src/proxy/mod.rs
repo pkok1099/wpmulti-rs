@@ -16,11 +16,12 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use replay::{
-    PostSendReplayToken, RACE_PRIMARY, RACE_SECONDARY_FAILED, RaceReaderArgs, RaceReaderDone,
-    ReplayDialCtx, ReplayDialOutcome, ReplaySource, SafeGetParse, SecondaryLeg, SilencePhase,
-    SilenceReplay, SuppressReason, UpstreamRaceReader, dial_secondary_leg,
-    parse_safe_http_get_header, replay_budget_finish, replay_budget_note_primary_request,
-    replay_budget_try_start, replay_metrics,
+    BlackholeEjectionReason, HEDGE_LOSER_OBSERVE_DEADLINE, HedgeLoserCtx, PostSendReplayToken,
+    RACE_PRIMARY, RACE_SECONDARY_FAILED, RaceReaderArgs, RaceReaderDone, ReplayDialCtx,
+    ReplayDialOutcome, ReplaySource, SafeGetParse, SecondaryLeg, SilencePhase, SilenceReplay,
+    SuppressReason, UpstreamRaceReader, dial_secondary_leg, parse_safe_http_get_header,
+    replay_budget_finish, replay_budget_note_primary_request, replay_budget_try_start,
+    replay_metrics, spawn_hedge_loser_observer,
 };
 
 pub use http::{
@@ -330,8 +331,9 @@ struct RetryCopy {
 }
 
 /// Milliseconds from `from` to `to` (0 when either is missing, or
-/// when the order is reversed): the replay latency metrics.
-fn latency_ms(from: Option<Instant>, to: Option<Instant>) -> u128 {
+/// when the order is reversed): the replay latency metrics. Shared
+/// with the hedge-loser observer, which logs the same offsets.
+pub(crate) fn latency_ms(from: Option<Instant>, to: Option<Instant>) -> u128 {
     match (from, to) {
         (Some(from), Some(to)) => to.saturating_duration_since(from).as_millis(),
         _ => 0,
@@ -384,6 +386,62 @@ impl RetryCopy {
             self.silence.budget_held = false;
             replay_budget_finish();
         }
+    }
+
+    /// Transfer the held replay budget slot to the hedge-loser
+    /// observer: the session stops owning it (so the epoch-end
+    /// backstop cannot release it twice) and the observer releases
+    /// it when its verdict lands. Returns false when no slot was
+    /// held.
+    const fn take_replay_budget(&mut self) -> bool {
+        if self.silence.budget_held {
+            self.silence.budget_held = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Start observing the losing primary after a secondary win:
+    /// move the primary stream into a spawned observer task that
+    /// holds the replay budget slot until the primary answers,
+    /// dies, or the client's original deadline passes. Returns
+    /// false when no observer could start (no dial context or no
+    /// primary tunnel id): the loser is then unobserved and takes
+    /// no penalty.
+    fn start_hedge_loser_observation(
+        &mut self,
+        primary_stream: DynStream,
+        primary_tunnel_id: Option<String>,
+        header_written_at: Option<Instant>,
+        secondary_request_sent_at: Option<Instant>,
+        secondary_first_response_at: Instant,
+    ) -> bool {
+        let Some(router) = self.dial_ctx.as_ref().map(|ctx| Arc::clone(&ctx.router)) else {
+            return false;
+        };
+        let Some(tunnel_id) = primary_tunnel_id else {
+            return false;
+        };
+        if !self.take_replay_budget() {
+            return false;
+        }
+        let forwarded_at = header_written_at.unwrap_or(self.started_at);
+        let deadline = forwarded_at
+            .checked_add(HEDGE_LOSER_OBSERVE_DEADLINE)
+            .unwrap_or_else(|| Instant::now() + HEDGE_LOSER_OBSERVE_DEADLINE);
+        spawn_hedge_loser_observer(
+            HedgeLoserCtx {
+                router,
+                primary_tunnel_id: tunnel_id,
+                primary_request_forwarded_at: forwarded_at,
+                secondary_request_forwarded_at: secondary_request_sent_at,
+                secondary_first_response_at,
+            },
+            primary_stream,
+            deadline,
+        );
+        true
     }
 
     /// App bytes actually written upstream so far: the seed prefix
@@ -977,6 +1035,7 @@ impl RetryCopy {
         // records it once at the session end instead — never both.)
         if let Some(failed) = tunnel_id.as_deref() {
             ctx.router.record_tunnel_blackhole(failed);
+            replay_metrics().inc_blackhole_ejection(BlackholeEjectionReason::ZeroResponseRetry);
         }
         *tunnel_id = new_id;
         Some(stream)
@@ -1075,14 +1134,18 @@ where
     let mut retry = retry;
     loop {
         let outcome = state.run_epoch(&mut *a, &mut b, tunnel_id.as_deref()).await;
-        // Backstop: free the replay slot when the epoch ends. The
-        // prompt path is the race resolution mid-epoch, through the
-        // reader; this only covers a session that ends while a
-        // replay is still in flight.
-        state.finish_replay_budget();
         match outcome {
-            EpochOutcome::Done((kind, result)) => return state.outcome(kind, result),
+            EpochOutcome::Done((kind, result)) => {
+                // Backstop: free the replay slot when the session
+                // ends while a replay is still in flight. The prompt
+                // path is the race resolution mid-epoch, through the
+                // reader — except a secondary win, whose slot the
+                // hedge-loser observer now owns.
+                state.finish_replay_budget();
+                return state.outcome(kind, result);
+            }
             EpochOutcome::ZeroResponse => {
+                state.finish_replay_budget();
                 let Some(ctx) = retry.take() else {
                     // run_epoch only reports a zero response while a
                     // retry is available; unreachable in practice.
@@ -1094,25 +1157,29 @@ where
                 b = new_stream;
             }
             EpochOutcome::SilenceReplayWon { leg, first_byte_at } => {
-                // The secondary answered first: the primary was
-                // slow/unhealthy, so it takes the blackhole penalty
-                // (breaker, EWMA, warm-list removal), exactly as a
-                // blackhole session does. A primary win after the
+                // The secondary answered first: it wins the race,
+                // but a win is not proof the primary blackholed —
+                // the primary may only have been slow. No penalty
+                // is charged here. The primary stream moves to the
+                // hedge-loser observer, which watches it until the
+                // client's original deadline and only then decides
+                // whether it blackholed. A primary win after the
                 // secondary dial started is not evidence the
                 // secondary is bad, so the secondary is never
                 // penalised for losing the race.
-                if let Some(primary) = tunnel_id.as_deref()
-                    && let Some(ctx) = state.dial_ctx.as_ref()
-                {
-                    ctx.router.record_tunnel_blackhole(primary);
-                }
                 let header_written_at = state.silence.header_written_at;
-                let (secondary_dial_ms, secondary_first_byte_ms, primary_first_byte_ms) = {
+                let (
+                    secondary_dial_ms,
+                    secondary_first_byte_ms,
+                    primary_first_byte_ms,
+                    secondary_sent_at,
+                ) = {
                     let timings = state.silence.shared.timings.lock();
                     (
                         latency_ms(timings.dial_started_at, timings.dial_connected_at),
                         latency_ms(timings.dial_connected_at, Some(first_byte_at)),
                         latency_ms(header_written_at, timings.primary_first_byte_at),
+                        timings.secondary_request_sent_at,
                     )
                 };
                 tracing::info!(
@@ -1125,13 +1192,25 @@ where
                     secondary_dial_ms = secondary_dial_ms,
                     secondary_first_byte_ms = secondary_first_byte_ms,
                     total_ms = latency_ms(header_written_at, Some(first_byte_at)),
-                    "CONNECT session rescued by safe HTTP silence replay"
+                    "safe HTTP silence replay: secondary won the race; primary under observation"
                 );
                 replay_metrics().inc_winner_secondary();
-                replay_metrics().inc_rescued();
+                replay_metrics().inc_secondary_win();
+                let primary_stream = std::mem::replace(&mut b, leg.stream);
+                let primary_id = tunnel_id.clone();
+                if !state.start_hedge_loser_observation(
+                    primary_stream,
+                    primary_id,
+                    header_written_at,
+                    secondary_sent_at,
+                    first_byte_at,
+                ) {
+                    // No observer could start: the loser is
+                    // unobserved and takes no penalty.
+                    replay_metrics().inc_unobserved_loser();
+                }
                 *tunnel_id = leg.tunnel_id;
                 state.silence.phase = SilencePhase::Done;
-                b = leg.stream;
             }
         }
     }

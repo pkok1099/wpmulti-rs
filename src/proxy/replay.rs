@@ -40,6 +40,14 @@ use super::router::{
 /// requests while the failure it rescues is 0.02-0.05%.
 pub(crate) const SILENCE_REPLAY_DELAY: Duration = Duration::from_millis(2500);
 
+/// How long a losing primary is observed after the secondary wins:
+/// until the client's own 15 s deadline, measured from when the
+/// request was forwarded to the primary. The observer only watches
+/// for the primary's first response byte, its close, or its silence
+/// until this deadline — it never forwards anything from the primary
+/// to the client.
+pub(crate) const HEDGE_LOSER_OBSERVE_DEADLINE: Duration = Duration::from_secs(15);
+
 /// Largest request header a silence replay will consider: a GET head
 /// past this is not a small idempotent request, and the replay bytes
 /// must be known exactly without re-reading the client stream.
@@ -117,6 +125,31 @@ impl SuppressReason {
             Self::NoTunnel => "no_tunnel",
             Self::ClientGone => "client_gone",
             Self::ClientSentMore => "client_sent_more",
+        }
+    }
+}
+
+/// Why a tunnel was ejected by the blackhole penalty, the `reason`
+/// label of `tunnel_blackhole_ejections_total`. The label set is
+/// closed (an enum, never free text) so the metric stays bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlackholeEjectionReason {
+    /// The hedge-loser observer watched the primary miss its
+    /// deadline after losing the race.
+    DeadlineMiss,
+    /// The fix5 zero-response retry rescued the session and charged
+    /// the failed tunnel.
+    ZeroResponseRetry,
+    /// A session ended with bytes sent and zero response bytes.
+    SessionEnd,
+}
+
+impl BlackholeEjectionReason {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::DeadlineMiss => "deadline_miss",
+            Self::ZeroResponseRetry => "zero_response_retry",
+            Self::SessionEnd => "session_end",
         }
     }
 }
@@ -222,10 +255,32 @@ pub(crate) struct ReplayMetrics {
     pub(crate) request_sent: AtomicU64,
     pub(crate) winner_primary: AtomicU64,
     pub(crate) winner_secondary: AtomicU64,
-    pub(crate) rescued: AtomicU64,
+    /// Secondary legs that produced the first response byte: a win,
+    /// not yet proven a rescue — the primary may only have been
+    /// slow (fix12 renames the fix11 `rescued` counter, which
+    /// claimed a rescue the observation never proved).
+    pub(crate) secondary_wins: AtomicU64,
     pub(crate) both_legs_responded: AtomicU64,
     pub(crate) claimed_fix5: AtomicU64,
     pub(crate) claimed_silence: AtomicU64,
+    /// Hedge-loser observation outcomes (fix12): what the losing
+    /// primary did after the secondary won the race.
+    pub(crate) late_response: AtomicU64,
+    pub(crate) transport_failure: AtomicU64,
+    pub(crate) deadline_miss: AtomicU64,
+    /// Secondary wins where the primary missed its deadline: the
+    /// only ones that are proven rescues.
+    pub(crate) true_rescues: AtomicU64,
+    /// Secondary wins whose loser could not be observed at all
+    /// (no observer could start): no penalty is ever charged.
+    pub(crate) unobserved_loser: AtomicU64,
+    /// Sum of observed late-response latencies, in milliseconds:
+    /// the mean late latency is this divided by `late_response`.
+    pub(crate) primary_response_latency_ms_sum: AtomicU64,
+    /// Blackhole ejections, by the path that charged them.
+    pub(crate) blackhole_ejections_deadline_miss: AtomicU64,
+    pub(crate) blackhole_ejections_zero_response_retry: AtomicU64,
+    pub(crate) blackhole_ejections_session_end: AtomicU64,
 }
 
 impl ReplayMetrics {
@@ -245,10 +300,19 @@ impl ReplayMetrics {
             request_sent: AtomicU64::new(0),
             winner_primary: AtomicU64::new(0),
             winner_secondary: AtomicU64::new(0),
-            rescued: AtomicU64::new(0),
+            secondary_wins: AtomicU64::new(0),
             both_legs_responded: AtomicU64::new(0),
             claimed_fix5: AtomicU64::new(0),
             claimed_silence: AtomicU64::new(0),
+            late_response: AtomicU64::new(0),
+            transport_failure: AtomicU64::new(0),
+            deadline_miss: AtomicU64::new(0),
+            true_rescues: AtomicU64::new(0),
+            unobserved_loser: AtomicU64::new(0),
+            primary_response_latency_ms_sum: AtomicU64::new(0),
+            blackhole_ejections_deadline_miss: AtomicU64::new(0),
+            blackhole_ejections_zero_response_retry: AtomicU64::new(0),
+            blackhole_ejections_session_end: AtomicU64::new(0),
         }
     }
 
@@ -293,12 +357,48 @@ impl ReplayMetrics {
         self.winner_secondary.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn inc_rescued(&self) {
-        self.rescued.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn inc_secondary_win(&self) {
+        self.secondary_wins.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn inc_both_legs_responded(&self) {
         self.both_legs_responded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_late_response(&self) {
+        self.late_response.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_transport_failure(&self) {
+        self.transport_failure.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_deadline_miss(&self) {
+        self.deadline_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_true_rescue(&self) {
+        self.true_rescues.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_unobserved_loser(&self) {
+        self.unobserved_loser.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_primary_response_latency_ms(&self, ms: u64) {
+        self.primary_response_latency_ms_sum
+            .fetch_add(ms, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_blackhole_ejection(&self, reason: BlackholeEjectionReason) {
+        let counter = match reason {
+            BlackholeEjectionReason::DeadlineMiss => &self.blackhole_ejections_deadline_miss,
+            BlackholeEjectionReason::ZeroResponseRetry => {
+                &self.blackhole_ejections_zero_response_retry
+            }
+            BlackholeEjectionReason::SessionEnd => &self.blackhole_ejections_session_end,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn inc_claimed(&self, source: ReplaySource) {
@@ -315,6 +415,7 @@ impl ReplayMetrics {
         self.render_eligibility(out);
         self.render_race(out);
         self.render_claimed(out);
+        self.render_hedge(out);
     }
 
     /// Eligibility and suppression counters.
@@ -427,15 +528,89 @@ impl ReplayMetrics {
         );
         write_counter(
             out,
-            "safe_http_replay_rescued_total",
-            "Sessions rescued because the secondary leg answered first",
-            self.rescued.load(Ordering::Relaxed),
+            "hedge_secondary_wins_total",
+            "Secondary legs that produced the first response byte: a race win, not yet proven a rescue",
+            self.secondary_wins.load(Ordering::Relaxed),
         );
         write_counter(
             out,
             "safe_http_replay_both_legs_responded_total",
             "Races where both legs produced a response byte",
             self.both_legs_responded.load(Ordering::Relaxed),
+        );
+    }
+
+    /// Hedge-loser observation outcomes (fix12): what the losing
+    /// primary did after the secondary won, and the proven-rescue
+    /// rate behind them. `true_rescue_rate =
+    /// hedge_primary_deadline_miss_total /
+    /// safe_http_replay_request_sent_total`;
+    /// `latency-only_win_rate = hedge_primary_late_response_total /
+    /// safe_http_replay_request_sent_total`. The latency sum divided
+    /// by `hedge_primary_late_response_total` is the mean late
+    /// latency of the primaries that answered.
+    fn render_hedge(&self, out: &mut String) {
+        write_counter(
+            out,
+            "hedge_primary_late_response_total",
+            "Losing primaries that answered before their deadline: slow, not dead, no penalty",
+            self.late_response.load(Ordering::Relaxed),
+        );
+        write_counter(
+            out,
+            "hedge_primary_transport_failure_total",
+            "Losing primaries that closed or reset before answering",
+            self.transport_failure.load(Ordering::Relaxed),
+        );
+        write_counter(
+            out,
+            "hedge_primary_deadline_miss_total",
+            "Losing primaries that stayed silent until their deadline: proven blackholes",
+            self.deadline_miss.load(Ordering::Relaxed),
+        );
+        write_counter(
+            out,
+            "hedge_true_rescues_total",
+            "Secondary wins where the primary missed its deadline: the only proven rescues",
+            self.true_rescues.load(Ordering::Relaxed),
+        );
+        write_counter(
+            out,
+            "hedge_unobserved_loser_total",
+            "Secondary wins whose loser could not be observed at all: no penalty charged",
+            self.unobserved_loser.load(Ordering::Relaxed),
+        );
+        write_counter(
+            out,
+            "hedge_primary_response_latency_ms_total",
+            "Sum of observed late-response latencies in milliseconds (mean = this / hedge_primary_late_response_total)",
+            self.primary_response_latency_ms_sum.load(Ordering::Relaxed),
+        );
+        write_counter_labeled(
+            out,
+            "tunnel_blackhole_ejections_total",
+            "Tunnels ejected by the blackhole penalty, by the path that charged them",
+            "reason",
+            BlackholeEjectionReason::DeadlineMiss.label(),
+            self.blackhole_ejections_deadline_miss
+                .load(Ordering::Relaxed),
+        );
+        write_counter_labeled(
+            out,
+            "tunnel_blackhole_ejections_total",
+            "Tunnels ejected by the blackhole penalty, by the path that charged them",
+            "reason",
+            BlackholeEjectionReason::ZeroResponseRetry.label(),
+            self.blackhole_ejections_zero_response_retry
+                .load(Ordering::Relaxed),
+        );
+        write_counter_labeled(
+            out,
+            "tunnel_blackhole_ejections_total",
+            "Tunnels ejected by the blackhole penalty, by the path that charged them",
+            "reason",
+            BlackholeEjectionReason::SessionEnd.label(),
+            self.blackhole_ejections_session_end.load(Ordering::Relaxed),
         );
     }
 
@@ -533,9 +708,26 @@ pub(crate) fn reset_replay_state_for_tests() {
     REPLAY_METRICS.request_sent.store(0, Ordering::Relaxed);
     REPLAY_METRICS.winner_primary.store(0, Ordering::Relaxed);
     REPLAY_METRICS.winner_secondary.store(0, Ordering::Relaxed);
-    REPLAY_METRICS.rescued.store(0, Ordering::Relaxed);
+    REPLAY_METRICS.secondary_wins.store(0, Ordering::Relaxed);
     REPLAY_METRICS
         .both_legs_responded
+        .store(0, Ordering::Relaxed);
+    REPLAY_METRICS.late_response.store(0, Ordering::Relaxed);
+    REPLAY_METRICS.transport_failure.store(0, Ordering::Relaxed);
+    REPLAY_METRICS.deadline_miss.store(0, Ordering::Relaxed);
+    REPLAY_METRICS.true_rescues.store(0, Ordering::Relaxed);
+    REPLAY_METRICS.unobserved_loser.store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .primary_response_latency_ms_sum
+        .store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .blackhole_ejections_deadline_miss
+        .store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .blackhole_ejections_zero_response_retry
+        .store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .blackhole_ejections_session_end
         .store(0, Ordering::Relaxed);
     REPLAY_METRICS.claimed_fix5.store(0, Ordering::Relaxed);
     REPLAY_METRICS.claimed_silence.store(0, Ordering::Relaxed);
@@ -543,6 +735,14 @@ pub(crate) fn reset_replay_state_for_tests() {
     budget.tokens = REPLAY_BUCKET_CAPACITY;
     budget.requests_since_refill = 0;
     budget.concurrent = 0;
+}
+
+/// How many replay concurrency slots are held right now. Tests
+/// only: proves the slot stays held while a hedge loser is being
+/// observed, and is released when the observation ends.
+#[cfg(test)]
+pub(crate) fn replay_budget_concurrent_for_tests() -> u32 {
+    REPLAY_BUDGET.lock().concurrent
 }
 
 /// The result of positively parsing the buffered client prefix as a
@@ -776,6 +976,11 @@ pub(crate) const RACE_SECONDARY_FAILED: u8 = 3;
 pub(crate) struct ReplayTimings {
     pub(crate) dial_started_at: Option<Instant>,
     pub(crate) dial_connected_at: Option<Instant>,
+    /// When the GET header was written to the secondary leg: the
+    /// second of the four hedge timestamps (the other three are the
+    /// primary header-written time, the secondary first byte, and
+    /// the primary first byte the observer records).
+    pub(crate) secondary_request_sent_at: Option<Instant>,
     pub(crate) primary_first_byte_at: Option<Instant>,
     pub(crate) secondary_first_byte_at: Option<Instant>,
     pub(crate) secondary_tunnel_id: Option<String>,
@@ -800,6 +1005,7 @@ impl RaceShared {
             timings: Mutex::new(ReplayTimings {
                 dial_started_at: None,
                 dial_connected_at: None,
+                secondary_request_sent_at: None,
                 primary_first_byte_at: None,
                 secondary_first_byte_at: None,
                 secondary_tunnel_id: None,
@@ -883,12 +1089,17 @@ pub(crate) async fn dial_secondary_leg(
         stream.flush().await
     };
     match send.await {
-        Ok(()) => ReplayDialOutcome::Ready(SecondaryLeg {
-            stream,
-            tunnel_id,
-            dial_started_at: started,
-            dial_connected_at: connected,
-        }),
+        Ok(()) => {
+            // The GET is on the secondary: record when, for the
+            // hedge timestamps (the observer logs all four).
+            shared.timings.lock().secondary_request_sent_at = Some(Instant::now());
+            ReplayDialOutcome::Ready(SecondaryLeg {
+                stream,
+                tunnel_id,
+                dial_started_at: started,
+                dial_connected_at: connected,
+            })
+        }
         Err(e) => ReplayDialOutcome::Failed(RouterConnectError::TcpConnect(e)),
     }
 }
@@ -1177,4 +1388,143 @@ where
         self.shared.winner.store(RACE_PRIMARY, Ordering::Relaxed);
         self.secondary = None;
     }
+}
+
+/// What the hedge-loser observation found about the primary that
+/// lost the first-response-byte race. Only `DeadlineMiss` charges
+/// the blackhole penalty: a late answer proves the tunnel was slow,
+/// and a close/reset proves its connection died — neither proves it
+/// was silently blackholing.
+pub(crate) enum HedgeLoserOutcome {
+    /// The primary answered before the deadline: slow, not dead.
+    /// Carries when its first response byte arrived, so the
+    /// observed latency can feed the EWMA.
+    LateResponse { first_byte_at: Instant },
+    /// The primary closed (EOF) or reset before answering.
+    TransportFailure,
+    /// The primary stayed silent until the deadline: a proven
+    /// blackhole.
+    DeadlineMiss,
+}
+
+/// Everything the hedge-loser observer needs, bundled so the spawn
+/// call stays under the argument limit. The primary stream itself
+/// travels separately (it is moved into the spawned task).
+pub(crate) struct HedgeLoserCtx {
+    pub(crate) router: Arc<dyn TunnelRouter>,
+    pub(crate) primary_tunnel_id: String,
+    /// When the request was forwarded to the primary: the anchor
+    /// for the deadline and for all four hedge timestamps.
+    pub(crate) primary_request_forwarded_at: Instant,
+    pub(crate) secondary_request_forwarded_at: Option<Instant>,
+    pub(crate) secondary_first_response_at: Instant,
+}
+
+/// Observe the losing primary until it answers, dies, or the
+/// deadline passes. Only a 1-byte read: the response bytes are
+/// never forwarded or parsed, they only prove the tunnel was alive.
+/// Awaiting one byte in Tokio is cheap — no polling loop — and the
+/// read is bounded by the deadline, so the observation always ends.
+pub(crate) async fn classify_hedge_loser(
+    primary: &mut DynStream,
+    deadline: Instant,
+) -> HedgeLoserOutcome {
+    let mut probe = [0u8; 1];
+    match tokio::time::timeout_at(deadline.into(), primary.read(&mut probe)).await {
+        Ok(Ok(n)) if n > 0 => HedgeLoserOutcome::LateResponse {
+            first_byte_at: Instant::now(),
+        },
+        Ok(Ok(_) | Err(_)) => HedgeLoserOutcome::TransportFailure,
+        Err(_) => HedgeLoserOutcome::DeadlineMiss,
+    }
+}
+
+/// Apply one observation: the penalty (or none) the losing primary
+/// earned, the hedge counters, and one structured log line carrying
+/// all four hedge timestamps as millisecond offsets from when the
+/// request was forwarded to the primary (bounded numbers, never
+/// unbounded labels).
+pub(crate) fn apply_hedge_loser_outcome(ctx: &HedgeLoserCtx, outcome: &HedgeLoserOutcome) {
+    let metrics = replay_metrics();
+    let primary_first_ms = match outcome {
+        HedgeLoserOutcome::LateResponse { first_byte_at } => {
+            // Slow, not dead: no breaker charge. The observed
+            // first-byte latency feeds the Peak-EWMA, so the
+            // selector learns the tunnel is slow instead of
+            // treating it as dead.
+            let latency = first_byte_at.saturating_duration_since(ctx.primary_request_forwarded_at);
+            let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+            ctx.router
+                .record_tunnel_rtt(&ctx.primary_tunnel_id, latency_ms);
+            metrics.inc_late_response();
+            metrics.add_primary_response_latency_ms(latency_ms);
+            metrics.inc_both_legs_responded();
+            latency.as_millis()
+        }
+        HedgeLoserOutcome::TransportFailure => {
+            // The connection died loudly: charge the transport
+            // failure (breaker + RTT failure), not the blackhole
+            // penalty — a dead connection is not a silent tunnel,
+            // and it stays on the warm list.
+            ctx.router
+                .record_tunnel_transport_failure(&ctx.primary_tunnel_id);
+            metrics.inc_transport_failure();
+            0
+        }
+        HedgeLoserOutcome::DeadlineMiss => {
+            // Silent until the deadline: the blackhole penalty, as
+            // a proven blackhole — breaker, EWMA, warm-list removal.
+            ctx.router.record_tunnel_blackhole(&ctx.primary_tunnel_id);
+            metrics.inc_deadline_miss();
+            metrics.inc_true_rescue();
+            metrics.inc_blackhole_ejection(BlackholeEjectionReason::DeadlineMiss);
+            0
+        }
+    };
+    let outcome_label = match outcome {
+        HedgeLoserOutcome::LateResponse { .. } => "late_response",
+        HedgeLoserOutcome::TransportFailure => "transport_failure",
+        HedgeLoserOutcome::DeadlineMiss => "deadline_miss",
+    };
+    tracing::info!(
+        outcome = outcome_label,
+        primary_tunnel = ctx.primary_tunnel_id.as_str(),
+        primary_first_byte_ms = primary_first_ms,
+        secondary_request_sent_ms = super::latency_ms(
+            Some(ctx.primary_request_forwarded_at),
+            ctx.secondary_request_forwarded_at
+        ),
+        secondary_first_response_ms = super::latency_ms(
+            Some(ctx.primary_request_forwarded_at),
+            Some(ctx.secondary_first_response_at)
+        ),
+        "hedge loser observed"
+    );
+}
+
+/// Run one hedge-loser observation to its verdict, then release the
+/// replay concurrency slot the win transferred to this task.
+/// Exactly once: the slot is released here and nowhere else once
+/// the session handed it over, and the observation always ends
+/// (answer, close, or deadline), so the slot cannot leak.
+async fn observe_hedge_loser(ctx: HedgeLoserCtx, primary: DynStream, deadline: Instant) {
+    let mut primary = primary;
+    let outcome = classify_hedge_loser(&mut primary, deadline).await;
+    // The verdict is in: close the loser now, whatever it did.
+    drop(primary);
+    apply_hedge_loser_outcome(&ctx, &outcome);
+    replay_budget_finish();
+}
+
+/// Spawn the hedge-loser observer for a primary that lost the race.
+/// The task owns the primary stream, the router, and the replay
+/// budget slot until the observation ends.
+pub(crate) fn spawn_hedge_loser_observer(
+    ctx: HedgeLoserCtx,
+    primary: DynStream,
+    deadline: Instant,
+) {
+    tokio::spawn(async move {
+        observe_hedge_loser(ctx, primary, deadline).await;
+    });
 }
