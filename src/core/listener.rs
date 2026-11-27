@@ -3,6 +3,7 @@
 //! Handles automatic port assignment, socket binding, protocol dispatch (SOCKS5 and HTTP),
 //! and coordinated graceful shutdown.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -56,6 +57,11 @@ pub struct ListenerSupervisor {
     /// the listener count, so each accepted connection also holds one
     /// permit here for its whole lifetime.
     global_conn_sem: Arc<tokio::sync::Semaphore>,
+    /// Daemon-wide per-source-IP connection accounting (audit run-3,
+    /// #5), shared by every listener loop like `global_conn_sem`: a
+    /// per-listener tracker would let one IP hold a full share on each
+    /// of many listeners and still exhaust the global budget.
+    ip_tracker: Arc<PerIpConnTracker>,
 }
 
 impl Default for ListenerSupervisor {
@@ -84,12 +90,22 @@ impl ListenerSupervisor {
             started: AtomicBool::new(false),
             drain_timeout_ms: Arc::new(AtomicU64::new(500)),
             global_conn_sem: Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_LISTENER_CONNS)),
+            ip_tracker: Arc::new(PerIpConnTracker::default()),
         }
     }
 
     /// Return whether `start_all` has been invoked on this supervisor.
     pub fn is_started(&self) -> bool {
         self.started.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot the connection-budget state shared by every listener
+    /// accept loop (global semaphore plus per-source-IP accounting).
+    fn conn_limits(&self) -> ConnLimits {
+        ConnLimits {
+            global_sem: Arc::clone(&self.global_conn_sem),
+            ip_tracker: Arc::clone(&self.ip_tracker),
+        }
     }
 
     /// Start all listeners configured in [`MainConfig`].
@@ -117,7 +133,7 @@ impl ListenerSupervisor {
         }
 
         // 2. Start configured shared listeners
-        let per_tunnel_passwords: std::collections::HashMap<String, String> = config
+        let per_tunnel_passwords: HashMap<String, String> = config
             .per_tunnel
             .overrides
             .iter()
@@ -296,7 +312,7 @@ impl ListenerSupervisor {
             listener_type,
             shutdown_rx,
             Arc::clone(&self.drain_timeout_ms),
-            Arc::clone(&self.global_conn_sem),
+            self.conn_limits(),
         ));
 
         self.handles.lock().push(ListenerHandle {
@@ -492,14 +508,8 @@ impl ListenerSupervisor {
         registry: &Arc<TunnelRegistry>,
         lifecycle: &Arc<LifecycleController>,
     ) -> Result<ActiveListenerInfo, CoreError> {
-        self.start_shared_listener_inner(
-            settings,
-            registry,
-            lifecycle,
-            None,
-            std::collections::HashMap::new(),
-        )
-        .await
+        self.start_shared_listener_inner(settings, registry, lifecycle, None, HashMap::new())
+            .await
     }
 
     /// Start a single shared listener with explicit static health check parameters.
@@ -516,7 +526,7 @@ impl ListenerSupervisor {
             registry,
             lifecycle,
             (failure_threshold, cooldown_duration),
-            std::collections::HashMap::new(),
+            HashMap::new(),
         )
         .await
     }
@@ -528,7 +538,7 @@ impl ListenerSupervisor {
         registry: &Arc<TunnelRegistry>,
         lifecycle: &Arc<LifecycleController>,
         health: (usize, Duration),
-        per_tunnel_passwords: std::collections::HashMap<String, String>,
+        per_tunnel_passwords: HashMap<String, String>,
     ) -> Result<ActiveListenerInfo, CoreError> {
         self.start_shared_listener_inner(
             settings,
@@ -546,7 +556,7 @@ impl ListenerSupervisor {
         registry: &Arc<TunnelRegistry>,
         lifecycle: &Arc<LifecycleController>,
         health_override: Option<(usize, Duration)>,
-        per_tunnel_passwords: std::collections::HashMap<String, String>,
+        per_tunnel_passwords: HashMap<String, String>,
     ) -> Result<ActiveListenerInfo, CoreError> {
         let bind_addr = settings.bind;
         let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
@@ -588,7 +598,7 @@ impl ListenerSupervisor {
             settings.listener_type,
             shutdown_rx,
             Arc::clone(&self.drain_timeout_ms),
-            Arc::clone(&self.global_conn_sem),
+            self.conn_limits(),
         ));
 
         self.handles.lock().push(ListenerHandle {
@@ -704,7 +714,7 @@ impl ListenerSupervisor {
             listener_type,
             self.shutdown_tx.subscribe(),
             Arc::clone(&self.drain_timeout_ms),
-            Arc::clone(&self.global_conn_sem),
+            self.conn_limits(),
         ));
         self.handles.lock().push(ListenerHandle {
             info: info.clone(),
@@ -855,6 +865,85 @@ const MAX_LISTENER_CONNS: usize = 4096;
 /// how many dedicated listeners exist.
 const MAX_GLOBAL_LISTENER_CONNS: usize = MAX_LISTENER_CONNS;
 
+/// Maximum concurrent proxy connections from a single source IP
+/// (audit run-3, #5: no per-source-IP fairness).
+///
+/// The daemon-wide semaphore caps total connections at 4096 but has no
+/// per-IP dimension, so one greedy source IP could hold the whole budget
+/// and starve every other IP until its sessions idle-timed out. Each
+/// source IP is therefore also bounded to 256 concurrent connections:
+/// a single IP can consume at most 1/16 of the daemon-wide budget,
+/// leaving 3840 permits for other IPs, and at least 16 distinct IPs can
+/// each run at their full per-IP share at once. 256 is far above the
+/// concurrent-connection count of any legitimate single client of this
+/// personal proxy (a browser opens a handful per host; even a busy NAT
+/// household stays in the tens), yet far below the global cap, so the
+/// bound only bites on greedy or abusive patterns. In-memory only, no
+/// persistence and no config knob. Slots are released when the session
+/// ends (see [`PerIpSlot`]), so there is no permanent lockout: a freed
+/// slot is immediately reusable by any IP, including the one that just
+/// released it.
+pub(crate) const MAX_CONNS_PER_SOURCE_IP: usize = 256;
+
+/// In-memory per-source-IP connection accounting (audit run-3, #5).
+/// One instance lives on [`ListenerSupervisor`] and is shared by every
+/// listener loop; see the field docs there for why it must not be
+/// per-listener.
+#[derive(Debug, Default)]
+pub(crate) struct PerIpConnTracker {
+    counts: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl PerIpConnTracker {
+    /// Take one connection slot for `ip`, or `None` when the IP is
+    /// already at [`MAX_CONNS_PER_SOURCE_IP`]. The returned guard
+    /// releases the slot on drop.
+    pub(crate) fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PerIpSlot> {
+        let mut counts = self.counts.lock();
+        let current = counts.get(&ip).copied().unwrap_or(0);
+        if current >= MAX_CONNS_PER_SOURCE_IP {
+            return None;
+        }
+        counts.insert(ip, current + 1);
+        drop(counts);
+        Some(PerIpSlot {
+            tracker: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+/// RAII guard for one per-source-IP connection slot: dropping it frees
+/// the slot, so a released connection is immediately reusable and no IP
+/// is ever locked out permanently.
+#[derive(Debug)]
+pub(crate) struct PerIpSlot {
+    tracker: Arc<PerIpConnTracker>,
+    ip: IpAddr,
+}
+
+impl Drop for PerIpSlot {
+    fn drop(&mut self) {
+        let mut counts = self.tracker.counts.lock();
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// The connection-budget state shared by every listener accept loop:
+/// the daemon-wide semaphore plus the per-source-IP accounting (audit
+/// run-3, #5). Grouped so [`run_listener_loop`] stays within the
+/// six-argument limit.
+#[derive(Debug, Clone)]
+struct ConnLimits {
+    global_sem: Arc<tokio::sync::Semaphore>,
+    ip_tracker: Arc<PerIpConnTracker>,
+}
+
 async fn acquire_one_permit(
     conn_sem: &Arc<tokio::sync::Semaphore>,
     shutdown_rx: &mut watch::Receiver<bool>,
@@ -913,7 +1002,7 @@ async fn run_listener_loop(
     listener_type: ListenerType,
     mut shutdown_rx: watch::Receiver<bool>,
     drain_timeout_ms: Arc<AtomicU64>,
-    global_sem: Arc<tokio::sync::Semaphore>,
+    limits: ConnLimits,
 ) {
     let mut client_tasks = tokio::task::JoinSet::new();
     let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_LISTENER_CONNS));
@@ -924,7 +1013,7 @@ async fn run_listener_loop(
         }
 
         let Some((global_permit, permit)) =
-            acquire_listener_permits(&global_sem, &conn_sem, &mut shutdown_rx).await
+            acquire_listener_permits(&limits.global_sem, &conn_sem, &mut shutdown_rx).await
         else {
             break;
         };
@@ -939,10 +1028,19 @@ async fn run_listener_loop(
             res = listener.accept() => {
                 match res {
                     Ok((stream, peer_addr)) => {
+                        // Audit run-3, #5: over-cap source IPs are closed
+                        // without spawning a session, so both permits
+                        // return to the pool here and a greedy IP cannot
+                        // starve other IPs out of the global budget.
+                        let Some(ip_slot) = limits.ip_tracker.try_acquire(peer_addr.ip()) else {
+                            tracing::debug!("per-source-IP cap reached for {peer_addr}");
+                            continue;
+                        };
                         let r = Arc::clone(&router);
                         let local_ip = stream.local_addr().ok().map(|a| a.ip());
                         let peer_ip = Some(peer_addr.ip());
                         client_tasks.spawn(async move {
+                            let _ip_slot = ip_slot;
                             let _permit = permit;
                             let _global_permit = global_permit;
                             let result = match listener_type {

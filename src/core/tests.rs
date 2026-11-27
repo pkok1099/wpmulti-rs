@@ -16,7 +16,7 @@ use crate::config::{
 use crate::core::TunnelManager;
 use crate::core::health::{HealthStatus, TunnelHealthTracker};
 use crate::core::lifecycle::{LifecycleController, TunnelConnGuard};
-use crate::core::listener::ListenerSupervisor;
+use crate::core::listener::{ListenerSupervisor, MAX_CONNS_PER_SOURCE_IP, PerIpConnTracker};
 use crate::core::registry::{TunnelEntry, TunnelRegistry, TunnelState, TunnelStats};
 use crate::core::router::{
     DedicatedTunnelRouter, MAX_LIVE_TUNNEL_CONNS, MultiTenantRouter, preferred_entries,
@@ -4324,4 +4324,146 @@ fn test_dedicated_router_authenticate_checks_both_halves() {
         Err(ProxyAuthError::InvalidCredentials)
     );
     assert_eq!(router.authenticate(None), Err(ProxyAuthError::AuthRequired));
+}
+
+// =============================================================================
+// Per-source-IP fairness (audit run-3, #5)
+// =============================================================================
+
+/// Open a TCP connection to `port` from the given loopback source IP
+/// (`127.0.0.1` vs `127.0.0.2` are distinct peers on Linux loopback),
+/// so the test can act as two different source IPs.
+async fn connect_from(source: std::net::IpAddr, port: u16) -> tokio::net::TcpStream {
+    let socket = tokio::net::TcpSocket::new_v4().expect("loopback tcp socket");
+    socket
+        .bind(std::net::SocketAddr::new(source, 0))
+        .expect("bind loopback source address");
+    socket
+        .connect(std::net::SocketAddr::new(
+            "127.0.0.1".parse().unwrap(),
+            port,
+        ))
+        .await
+        .expect("connect to test listener")
+}
+
+/// Send a SOCKS5 no-auth greeting and expect the `[0x05, 0x00]`
+/// method-selection reply: proof the server accepted the connection
+/// and is holding it as a live session.
+async fn socks5_greet_no_auth(stream: &mut tokio::net::TcpStream) {
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("write socks5 greeting");
+    let mut reply = [0u8; 2];
+    stream
+        .read_exact(&mut reply)
+        .await
+        .expect("read socks5 method reply");
+    assert_eq!(reply, [0x05, 0x00], "server must select no-auth");
+}
+
+#[test]
+fn test_per_ip_tracker_caps_one_ip_and_releases_on_drop() {
+    // Pinning test for the per-IP slot accounting (not the regression
+    // test itself): the cap binds per IP, a released slot is reusable,
+    // and another IP is unaffected while the first is at its cap.
+    let tracker = Arc::new(PerIpConnTracker::default());
+    let greedy: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let other: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+
+    let mut slots = Vec::with_capacity(MAX_CONNS_PER_SOURCE_IP);
+    for _ in 0..MAX_CONNS_PER_SOURCE_IP {
+        let slot = tracker.try_acquire(greedy);
+        assert!(slot.is_some(), "slot below the per-IP cap must succeed");
+        slots.push(slot.unwrap());
+    }
+    assert!(
+        tracker.try_acquire(greedy).is_none(),
+        "one slot past the per-IP cap must be refused"
+    );
+    assert!(
+        tracker.try_acquire(other).is_some(),
+        "another IP must still get a slot while the first is at its cap"
+    );
+
+    // Releasing one slot frees it immediately: no permanent lockout.
+    slots.pop();
+    assert!(
+        tracker.try_acquire(greedy).is_some(),
+        "a released slot must be reusable by the same IP"
+    );
+}
+
+#[tokio::test]
+async fn test_per_source_ip_fairness_greedy_ip_cannot_starve_other_ip() {
+    // Regression test for audit run-3, #5: without per-IP fairness a
+    // single source IP could hold the whole 4096-permit global budget
+    // and starve every other IP. With the fix, the greedy IP is capped
+    // at MAX_CONNS_PER_SOURCE_IP, its next connection is closed
+    // promptly, and another IP is still served.
+    //
+    // On the old code this test fails at the 257th-connection
+    // assertion: the over-cap connection stays open (the server waits
+    // for its SOCKS5 greeting) until the 5 s read timeout fires.
+    let registry = Arc::new(TunnelRegistry::new());
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let supervisor = ListenerSupervisor::new();
+    let settings = SharedListenerSettings {
+        name: "fairness-test".to_string(),
+        listener_type: ListenerType::Socks5,
+        bind: std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), 0),
+        auth_mode: AuthMode::None,
+        global_password: None,
+        default_strategy: PoolStrategy::default(),
+        allow_anonymous: true,
+        pool: TunnelPoolSelection::default(),
+        ip_mode: None,
+    };
+    let info = supervisor
+        .start_shared_listener(&settings, &registry, &lifecycle)
+        .await
+        .expect("shared test listener should start");
+    let port = info.address.port();
+
+    let greedy: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let other: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+
+    // Fill the greedy IP's whole per-IP share with live sessions; each
+    // greeting reply proves the server accepted and holds that session.
+    let mut greedy_sessions = Vec::with_capacity(MAX_CONNS_PER_SOURCE_IP);
+    for _ in 0..MAX_CONNS_PER_SOURCE_IP {
+        let mut stream = connect_from(greedy, port).await;
+        socks5_greet_no_auth(&mut stream).await;
+        greedy_sessions.push(stream);
+    }
+
+    // One more connection from the greedy IP must be closed promptly
+    // instead of being held as a session.
+    let mut over_cap = connect_from(greedy, port).await;
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(5), over_cap.read(&mut byte)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0))),
+        "over-cap connection from the greedy IP must be closed promptly, got {closed:?}"
+    );
+    drop(over_cap);
+
+    // Another IP is still served while the greedy IP is at its cap.
+    let mut other_stream = connect_from(other, port).await;
+    socks5_greet_no_auth(&mut other_stream).await;
+    drop(other_stream);
+
+    // Releasing one greedy session frees its slot: no permanent lockout.
+    greedy_sessions.pop();
+    let mut recovered = connect_from(greedy, port).await;
+    socks5_greet_no_auth(&mut recovered).await;
+
+    drop(recovered);
+    drop(greedy_sessions);
+    supervisor.stop().await;
 }
