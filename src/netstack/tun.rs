@@ -384,14 +384,18 @@ impl FlowTable {
     }
 
     /// Look a flow up, refreshing its idle timer. An expired entry is
-    /// dropped and reported as a miss.
+    /// dropped and reported as a miss; the drop goes through
+    /// [`FlowTable::remove`] so a NATed flow's reverse-NAT index entry
+    /// is dropped with it instead of leaking.
     pub fn lookup(&mut self, key: &FlowKey) -> Option<FlowRoute> {
         let now = Instant::now();
-        let entry = self.entries.get_mut(key)?;
-        if now.duration_since(entry.last_seen) > self.idle_timeout {
-            self.entries.remove(key);
+        if let Some(entry) = self.entries.get(key)
+            && now.duration_since(entry.last_seen) > self.idle_timeout
+        {
+            self.remove(key);
             return None;
         }
+        let entry = self.entries.get_mut(key)?;
         entry.last_seen = now;
         Some(entry.route.clone())
     }
@@ -1925,6 +1929,77 @@ mod tests {
             table.lookup(&newest).is_some(),
             "newest flow must survive eviction of the oldest"
         );
+    }
+
+    #[test]
+    fn test_flow_table_reverse_index_does_not_leak_on_expiry_lookup() {
+        let mut table = FlowTable::new(Duration::from_millis(5));
+        let orig_src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let nat_src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100));
+        let mut prev_reverse_len = 0usize;
+        for cycle in 0..3u32 {
+            // 64 distinct NATed flows per cycle (well under the 1024
+            // live-entry threshold where resolve_route prunes).
+            let keys: Vec<FlowKey> = (0..64u32)
+                .map(|n| FlowKey {
+                    src: orig_src,
+                    dst: IpAddr::V4(Ipv4Addr::new(
+                        93,
+                        184,
+                        ((cycle * 64 + n) >> 8) as u8,
+                        ((cycle * 64 + n) & 0xff) as u8,
+                    )),
+                    src_port: 10000 + (cycle * 64 + n) as u16,
+                    dst_port: 443,
+                    proto: PROTO_TCP,
+                })
+                .collect();
+            for key in &keys {
+                table.insert(
+                    *key,
+                    FlowRoute {
+                        tunnel_id: "tunnel-a".to_string(),
+                        orig_src,
+                        nat_src,
+                    },
+                );
+            }
+            assert_eq!(
+                table.len(),
+                64,
+                "cycle {cycle}: forward table holds one cycle"
+            );
+            assert_eq!(
+                table.reverse.len(),
+                64,
+                "cycle {cycle}: reverse index holds one entry per NATed flow"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+            // One late return packet per expired flow, no re-insert.
+            for key in &keys {
+                let nat_key = FlowKey {
+                    src: nat_src,
+                    ..*key
+                };
+                assert!(
+                    table.lookup_reverse(&nat_key).is_none(),
+                    "cycle {cycle}: expired flow must miss on reverse lookup"
+                );
+            }
+            assert_eq!(
+                table.len(),
+                0,
+                "cycle {cycle}: forward table must be empty after all expiry lookups"
+            );
+            assert_eq!(
+                table.reverse.len(),
+                prev_reverse_len,
+                "cycle {cycle}: reverse index must not grow across cycles (was {}, now {})",
+                prev_reverse_len,
+                table.reverse.len()
+            );
+            prev_reverse_len = table.reverse.len();
+        }
     }
 
     #[test]
