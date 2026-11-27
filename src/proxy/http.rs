@@ -1298,6 +1298,8 @@ fn log_forward_session_end(
         result,
         kind,
         duration: started_at.elapsed(),
+        // The forward path never replays: no session id to join.
+        request_id: 0,
     };
     crate::proxy::log_connect_session_end("HTTP", selector, target, tunnel_id, &outcome);
     outcome.result.map(|_| ())

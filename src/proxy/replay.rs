@@ -200,6 +200,19 @@ static REPLAY_BUDGET: Mutex<ReplayBudget> = Mutex::new(ReplayBudget {
     concurrent: 0,
 });
 
+/// Process-wide monotonic id minted once per CONNECT session, so
+/// every replay decision record of one session — trigger, dial
+/// outcome, race resolution, observer verdict, session end — can be
+/// joined by grepping a single number. Starts at 1 so 0 means "no
+/// session id" (the forward path, which never replays). Never a
+/// Prometheus label: only a structured log field.
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Mint the next per-session correlation id.
+pub(crate) fn next_replay_request_id() -> u64 {
+    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Count one primary CONNECT request towards the bucket refill: one
 /// token per [`REPLAY_BUCKET_REFILL_REQUESTS`] requests.
 pub(crate) fn replay_budget_note_primary_request() {
@@ -931,6 +944,10 @@ pub(crate) struct SilenceReplay {
     /// When the complete GET header was written to the primary
     /// tunnel: the 2.5 s silence timer runs from here.
     pub(crate) header_written_at: Option<Instant>,
+    /// When the 2.5 s silence timer fired: the decision point the
+    /// fix13 diagnostic record is anchored to. Set once, in
+    /// `start_silence_replay`, the only path out of `Armed`.
+    pub(crate) trigger_fired_at: Option<Instant>,
     /// The replay phase.
     pub(crate) phase: SilencePhase,
     /// Whether this session holds a slot in the global replay
@@ -948,6 +965,7 @@ impl SilenceReplay {
             checked: false,
             header: None,
             header_written_at: None,
+            trigger_fired_at: None,
             phase: SilencePhase::Idle,
             budget_held: false,
             shared: Arc::new(RaceShared::new()),
@@ -1413,6 +1431,9 @@ pub(crate) enum HedgeLoserOutcome {
 pub(crate) struct HedgeLoserCtx {
     pub(crate) router: Arc<dyn TunnelRouter>,
     pub(crate) primary_tunnel_id: String,
+    /// The session the loser belongs to, so the observer verdict
+    /// joins the same request's trigger and race records.
+    pub(crate) request_id: u64,
     /// When the request was forwarded to the primary: the anchor
     /// for the deadline and for all four hedge timestamps.
     pub(crate) primary_request_forwarded_at: Instant,
@@ -1487,6 +1508,7 @@ pub(crate) fn apply_hedge_loser_outcome(ctx: &HedgeLoserCtx, outcome: &HedgeLose
         HedgeLoserOutcome::DeadlineMiss => "deadline_miss",
     };
     tracing::info!(
+        request_id = ctx.request_id,
         outcome = outcome_label,
         primary_tunnel = ctx.primary_tunnel_id.as_str(),
         primary_first_byte_ms = primary_first_ms,

@@ -3174,6 +3174,8 @@ fn test_log_connect_session_end_warns_on_empty_reply() {
             result,
             kind,
             duration: Duration::from_millis(ms),
+            // Fabricated outcome, no replay session to join.
+            request_id: 0,
         }
     }
 
@@ -3262,6 +3264,8 @@ fn test_log_connect_session_end_warns_on_errors_except_timeouts() {
             result,
             kind,
             duration: Duration::from_millis(ms),
+            // Fabricated outcome, no replay session to join.
+            request_id: 0,
         }
     }
 
@@ -5133,6 +5137,7 @@ async fn test_hedge_loser_apply_outcome_charges_only_deadline_miss() {
     let ctx = HedgeLoserCtx {
         router,
         primary_tunnel_id: "slow-1".to_string(),
+        request_id: 7,
         primary_request_forwarded_at: forwarded_at,
         secondary_request_forwarded_at: Some(forwarded_at),
         secondary_first_response_at: forwarded_at,
@@ -5476,4 +5481,449 @@ fn test_parse_safe_http_get_header_incomplete() {
         parse_safe_http_get_header(&[0x00, 0x01, 0x02, 0xff, 0xfe]),
         SafeGetParse::Incomplete
     ));
+}
+
+/// Fields every replay decision record must carry (fix13):
+/// the correlation id, the decision, the primary tunnel, the
+/// target, and the decision offsets.
+const REPLAY_DECISION_FIELDS: &[&str] = &[
+    "request_id=",
+    "decision",
+    "started",
+    "dead-1",
+    "target=",
+    "request_forwarded_ms=",
+    "silence_trigger_ms=",
+    "primary_response_bytes=",
+];
+
+/// Pull the `request_id=<digits>` value out of one rendered log
+/// line, so a test can prove two records carry the same session id.
+fn request_id_in_line(line: &str) -> Option<u64> {
+    let rest = line.split("request_id=").nth(1)?;
+    rest.chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// Assert one rendered log line carries every listed field
+/// substring (fix13 decision/suppression records).
+fn assert_line_has_fields(line: &str, fields: &[&str]) {
+    for field in fields {
+        assert!(
+            line.contains(field),
+            "log line must carry {field}, got: {line:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_replay_decision_record_at_trigger_has_required_fields() {
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // fix13: a request that reaches the 2.5 s decision point emits
+    // one structured record carrying the session's correlation id,
+    // the primary tunnel, the target, and the decision offsets —
+    // and the same id appears on the race-resolution line and on
+    // the session outcome, so the whole decision chain joins.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let blackhole_addr = spawn_blackhole_tcp_server(usize::MAX).await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "dead-1",
+        Arc::new(MockTunnelTarget::new("dead-1").with_dial_redirect(blackhole_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("dead-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, echo_buf) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_secs(3),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                let mut echo_buf = vec![0u8; msg.len()];
+                client.read_exact(&mut echo_buf).await.unwrap();
+                echo_buf
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 10s");
+    assert_eq!(&echo_buf, msg);
+
+    let (result, tunnel_id) = relay_out;
+    assert_eq!(result.kind, CopyEndKind::IdleTimeout);
+    assert_eq!(tunnel_id.as_deref(), Some("alive-1"));
+    assert_ne!(
+        result.request_id, 0,
+        "a replay session must mint a correlation id"
+    );
+
+    let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    let decision_line = rendered
+        .lines()
+        .find(|line| line.contains("safe HTTP silence replay decision"))
+        .unwrap_or_else(|| {
+            panic!("expected one decision record at the trigger, got: {rendered:?}")
+        });
+    // Required fields: the correlation id, the decision, the
+    // primary tunnel, the target, and the decision offsets.
+    assert_line_has_fields(decision_line, REPLAY_DECISION_FIELDS);
+    // The same id joins the decision to the race resolution and to
+    // the session outcome.
+    let id = request_id_in_line(decision_line).expect("decision record must carry a numeric id");
+    assert_eq!(result.request_id, id);
+    let won_line = rendered
+        .lines()
+        .find(|line| line.contains("secondary won the race"))
+        .unwrap_or_else(|| panic!("expected the secondary-win line, got: {rendered:?}"));
+    assert!(
+        won_line.contains(&format!("request_id={id}")),
+        "race resolution must carry the same id, got: {won_line:?}"
+    );
+    // Behaviour unchanged: the replay still fired exactly once.
+    let metrics = replay_metrics();
+    assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.request_sent.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.secondary_wins.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn test_replay_suppression_budget_records_reason() {
+    use crate::proxy::replay::{
+        REPLAY_TEST_LOCK, replay_budget_finish, replay_budget_try_start, replay_metrics,
+        reset_replay_state_for_tests,
+    };
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // fix13: when the 2.5 s trigger fires but the global bucket is
+    // empty, the suppression record names the reason
+    // (budget_exhausted) under the session's id — the exact record
+    // the fix12 measurement was missing.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+    // Drain all 10 bucket tokens (releasing each concurrency slot
+    // right away, so the bucket — not the concurrency cap — is what
+    // runs out).
+    for _ in 0..10 {
+        assert!(replay_budget_try_start());
+        replay_budget_finish();
+    }
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let blackhole_addr = spawn_blackhole_tcp_server(usize::MAX).await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "dead-1",
+        Arc::new(MockTunnelTarget::new("dead-1").with_dial_redirect(blackhole_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("dead-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_secs(5),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                // Wait past the silence timer, then give up the way
+                // curl does at its timeout: drop the client half.
+                tokio::time::sleep(Duration::from_millis(3000)).await;
+                drop(client);
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 10s");
+
+    let (result, tunnel_id) = relay_out;
+    assert_eq!(result.kind, CopyEndKind::ClientAborted);
+    assert_eq!(tunnel_id.as_deref(), Some("dead-1"));
+    assert_ne!(result.request_id, 0);
+
+    let metrics = replay_metrics();
+    assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.dial_started.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.suppressed_budget.load(Ordering::Relaxed), 1);
+
+    let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    let suppressed_line = rendered
+        .lines()
+        .find(|line| line.contains("safe HTTP silence replay suppressed"))
+        .unwrap_or_else(|| panic!("expected one suppression record, got: {rendered:?}"));
+    assert_line_has_fields(
+        suppressed_line,
+        &[
+            "request_id=",
+            "budget_exhausted",
+            "dead-1",
+            "request_forwarded_ms=",
+            "silence_trigger_ms=",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn test_replay_dial_not_sent_records_no_tunnel_reason() {
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // fix13: a replay whose dial ends without sending the request
+    // records why — here the pool holds only the primary tunnel, so
+    // there is no alternate to dial through.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let blackhole_addr = spawn_blackhole_tcp_server(usize::MAX).await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "dead-1",
+        Arc::new(MockTunnelTarget::new("dead-1").with_dial_redirect(blackhole_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("dead-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_secs(5),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(3000)).await;
+                drop(client);
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 10s");
+
+    let (result, tunnel_id) = relay_out;
+    assert_eq!(result.kind, CopyEndKind::ClientAborted);
+    assert_eq!(tunnel_id.as_deref(), Some("dead-1"));
+
+    let metrics = replay_metrics();
+    assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.dial_started.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.request_sent.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.dial_failed.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.suppressed_no_tunnel.load(Ordering::Relaxed), 1);
+
+    let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    let suppressed_line = rendered
+        .lines()
+        .find(|line| line.contains("safe HTTP silence replay suppressed"))
+        .unwrap_or_else(|| panic!("expected one suppression record, got: {rendered:?}"));
+    assert_line_has_fields(suppressed_line, &["request_id=", "no_tunnel", "dead-1"]);
+    // The decision record fired first (the dial started), under the
+    // same id as the suppression that followed it.
+    let decision_line = rendered
+        .lines()
+        .find(|line| line.contains("safe HTTP silence replay decision"))
+        .unwrap_or_else(|| panic!("expected the decision record, got: {rendered:?}"));
+    let decision_id = request_id_in_line(decision_line).expect("decision record must carry an id");
+    let suppressed_id =
+        request_id_in_line(suppressed_line).expect("suppression record must carry an id");
+    assert_eq!(decision_id, suppressed_id);
+    assert_eq!(result.request_id, decision_id);
+}
+
+#[tokio::test]
+async fn test_replay_budget_exhaustion_emits_no_warn() {
+    use crate::proxy::replay::{
+        REPLAY_TEST_LOCK, replay_budget_finish, replay_budget_try_start, replay_metrics,
+        reset_replay_state_for_tests,
+    };
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // fix13: a normal budget exhaustion is not an operational
+    // warning — the suppression is recorded at DEBUG, and nothing
+    // at WARN or above is emitted while the trigger fires and the
+    // session ends.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+    for _ in 0..10 {
+        assert!(replay_budget_try_start());
+        replay_budget_finish();
+    }
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let blackhole_addr = spawn_blackhole_tcp_server(usize::MAX).await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "dead-1",
+        Arc::new(MockTunnelTarget::new("dead-1").with_dial_redirect(blackhole_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("dead-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_secs(5),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(3000)).await;
+                drop(client);
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 10s");
+
+    let (result, tunnel_id) = relay_out;
+    assert_eq!(result.kind, CopyEndKind::ClientAborted);
+    assert_eq!(tunnel_id.as_deref(), Some("dead-1"));
+
+    let metrics = replay_metrics();
+    assert_eq!(metrics.suppressed_budget.load(Ordering::Relaxed), 1);
+
+    let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(
+        rendered.is_empty(),
+        "budget exhaustion must emit no WARN, got: {rendered:?}"
+    );
 }

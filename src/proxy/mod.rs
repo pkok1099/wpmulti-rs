@@ -19,9 +19,9 @@ use replay::{
     BlackholeEjectionReason, HEDGE_LOSER_OBSERVE_DEADLINE, HedgeLoserCtx, PostSendReplayToken,
     RACE_PRIMARY, RACE_SECONDARY_FAILED, RaceReaderArgs, RaceReaderDone, ReplayDialCtx,
     ReplayDialOutcome, ReplaySource, SafeGetParse, SecondaryLeg, SilencePhase, SilenceReplay,
-    SuppressReason, UpstreamRaceReader, dial_secondary_leg, parse_safe_http_get_header,
-    replay_budget_finish, replay_budget_note_primary_request, replay_budget_try_start,
-    replay_metrics, spawn_hedge_loser_observer,
+    SuppressReason, UpstreamRaceReader, dial_secondary_leg, next_replay_request_id,
+    parse_safe_http_get_header, replay_budget_finish, replay_budget_note_primary_request,
+    replay_budget_try_start, replay_metrics, spawn_hedge_loser_observer,
 };
 
 pub use http::{
@@ -93,6 +93,10 @@ pub(crate) struct ConnectSessionOutcome {
     pub(crate) result: io::Result<(u64, u64)>,
     pub(crate) kind: CopyEndKind,
     pub(crate) duration: Duration,
+    /// The session's correlation id (0 on the forward path, which
+    /// never replays): joins the session-end WARN to the same
+    /// request's replay decision records.
+    pub(crate) request_id: u64,
 }
 
 /// Log the end of an established CONNECT session at WARN when it
@@ -133,6 +137,7 @@ pub(crate) fn log_connect_session_end(
         Ok((client_bytes, tunnel_bytes)) => {
             if *client_bytes > 0 && *tunnel_bytes == 0 {
                 tracing::warn!(
+                    request_id = outcome.request_id,
                     protocol = protocol,
                     selector = ?selector,
                     target = %target,
@@ -147,6 +152,7 @@ pub(crate) fn log_connect_session_end(
         Err(e) => {
             if e.kind() != io::ErrorKind::TimedOut {
                 tracing::warn!(
+                    request_id = outcome.request_id,
                     protocol = protocol,
                     selector = ?selector,
                     target = %target,
@@ -328,6 +334,11 @@ struct RetryCopy {
     seed_len: usize,
     /// Per-session state of the one delayed silence replay.
     silence: SilenceReplay,
+    /// Correlation id minted once per session: every replay
+    /// decision record of this session carries it, so one grep
+    /// joins trigger, dial outcome, race resolution, observer
+    /// verdict, and session end.
+    request_id: u64,
 }
 
 /// Milliseconds from `from` to `to` (0 when either is missing, or
@@ -355,6 +366,7 @@ impl RetryCopy {
             result,
             kind,
             duration: self.started_at.elapsed(),
+            request_id: self.request_id,
         }
     }
 
@@ -434,6 +446,7 @@ impl RetryCopy {
             HedgeLoserCtx {
                 router,
                 primary_tunnel_id: tunnel_id,
+                request_id: self.request_id,
                 primary_request_forwarded_at: forwarded_at,
                 secondary_request_forwarded_at: secondary_request_sent_at,
                 secondary_first_response_at,
@@ -502,12 +515,42 @@ impl RetryCopy {
         }
     }
 
+    /// Millisecond offsets for the fix13 decision records: when
+    /// the request was forwarded to the primary and when the 2.5 s
+    /// timer fired, both measured from the session start, plus how
+    /// many response bytes the primary had produced at the
+    /// decision. Together with the request id they answer, for a
+    /// failed post-grant session, whether it reached the trigger,
+    /// whether the primary was still silent, and whether the replay
+    /// was suppressed — without putting the request id or the
+    /// target in a Prometheus label.
+    fn replay_decision_offsets(&self) -> (u128, u128, u64) {
+        (
+            latency_ms(Some(self.started_at), self.silence.header_written_at),
+            latency_ms(Some(self.started_at), self.silence.trigger_fired_at),
+            self.tunnel_bytes.load(Ordering::Relaxed),
+        )
+    }
+
     /// The replay is suppressed: record the reason, close the phase,
-    /// and never re-arm the timer for this session.
-    fn suppress_silence_replay(&mut self, reason: SuppressReason) {
+    /// and never re-arm the timer for this session. The record
+    /// carries the session's correlation id and the decision
+    /// offsets, so a suppressed replay can be joined to the same
+    /// request's trigger and session-end records. DEBUG, never
+    /// WARN: a normal budget exhaustion is not an operational
+    /// warning.
+    fn suppress_silence_replay(&mut self, reason: SuppressReason, primary_tunnel: Option<&str>) {
         replay_metrics().inc_suppressed(reason);
+        let (request_forwarded_ms, silence_trigger_ms, primary_response_bytes) =
+            self.replay_decision_offsets();
         tracing::debug!(
+            request_id = self.request_id,
             reason = reason.label(),
+            primary_tunnel = ?primary_tunnel,
+            target = ?self.dial_ctx.as_ref().map(|ctx| &ctx.target),
+            request_forwarded_ms = request_forwarded_ms,
+            silence_trigger_ms = silence_trigger_ms,
+            primary_response_bytes = primary_response_bytes,
             "safe HTTP silence replay suppressed"
         );
         self.silence.phase = SilencePhase::Done;
@@ -530,6 +573,7 @@ impl RetryCopy {
             replay_metrics().inc_winner_primary();
             let timings = self.silence.shared.timings.lock();
             tracing::info!(
+                request_id = self.request_id,
                 protocol = self.dial_ctx.as_ref().map_or("?", |ctx| ctx.protocol),
                 selector = ?self.dial_ctx.as_ref().map(|ctx| &ctx.selector),
                 target = ?self.dial_ctx.as_ref().map(|ctx| &ctx.target),
@@ -549,6 +593,7 @@ impl RetryCopy {
             self.silence.phase = SilencePhase::Done;
             self.finish_replay_budget();
             tracing::info!(
+                request_id = self.request_id,
                 protocol = self.dial_ctx.as_ref().map_or("?", |ctx| ctx.protocol),
                 primary_tunnel = ?primary_tunnel,
                 "safe HTTP silence replay: secondary leg failed; primary continues"
@@ -565,35 +610,57 @@ impl RetryCopy {
     /// polling). The global budget is reserved before the shared
     /// token is claimed, so a budget failure leaves the token free
     /// for a fix5 retry later in the session.
-    fn start_silence_replay(&mut self, client_done: bool) -> bool {
+    fn start_silence_replay(&mut self, client_done: bool, primary_tunnel: Option<&str>) -> bool {
         let Some(header) = self.silence.header.clone() else {
             return false;
         };
+        // The timer fired: anchor the decision record here, so
+        // every later record of this session (suppression, dial
+        // outcome, race resolution) can state when the 2.5 s
+        // decision point was reached.
+        self.silence.trigger_fired_at = Some(Instant::now());
         if self.tunnel_bytes.load(Ordering::Relaxed) > 0 {
-            self.suppress_silence_replay(SuppressReason::ResponseStarted);
+            self.suppress_silence_replay(SuppressReason::ResponseStarted, primary_tunnel);
             return false;
         }
         if client_done {
-            self.suppress_silence_replay(SuppressReason::ClientGone);
+            self.suppress_silence_replay(SuppressReason::ClientGone, primary_tunnel);
             return false;
         }
         if self.client_bytes.load(Ordering::Relaxed) > header.len() as u64 {
-            self.suppress_silence_replay(SuppressReason::ClientSentMore);
+            self.suppress_silence_replay(SuppressReason::ClientSentMore, primary_tunnel);
             return false;
         }
         if !replay_budget_try_start() {
-            self.suppress_silence_replay(SuppressReason::BudgetExhausted);
+            self.suppress_silence_replay(SuppressReason::BudgetExhausted, primary_tunnel);
             return false;
         }
         self.silence.budget_held = true;
         if !self.claim_post_send_replay(ReplaySource::SilenceReplay) {
             self.finish_replay_budget();
-            self.suppress_silence_replay(SuppressReason::TokenClaimed);
+            self.suppress_silence_replay(SuppressReason::TokenClaimed, primary_tunnel);
             return false;
         }
         self.silence.phase = SilencePhase::Dialing;
         replay_metrics().inc_silence_trigger();
         replay_metrics().inc_dial_started();
+        // One record per request that reaches the decision point:
+        // it reached the trigger, the primary was still silent, and
+        // the replay started. Suppressions are recorded by
+        // `suppress_silence_replay` with the same fields, so a
+        // failed session's whole decision chain shares one id.
+        let (request_forwarded_ms, silence_trigger_ms, primary_response_bytes) =
+            self.replay_decision_offsets();
+        tracing::info!(
+            request_id = self.request_id,
+            decision = "started",
+            primary_tunnel = ?primary_tunnel,
+            target = ?self.dial_ctx.as_ref().map(|ctx| &ctx.target),
+            request_forwarded_ms = request_forwarded_ms,
+            silence_trigger_ms = silence_trigger_ms,
+            primary_response_bytes = primary_response_bytes,
+            "safe HTTP silence replay decision"
+        );
         true
     }
 
@@ -634,6 +701,7 @@ impl RetryCopy {
         &mut self,
         outcome: ReplayDialOutcome,
         secondary_tx: &mut Option<tokio::sync::oneshot::Sender<SecondaryLeg>>,
+        primary_tunnel: Option<&str>,
     ) {
         match outcome {
             ReplayDialOutcome::Ready(leg) => {
@@ -642,30 +710,59 @@ impl RetryCopy {
                 let sent = secondary_tx.take().is_some_and(|tx| tx.send(leg).is_ok());
                 if !sent {
                     // The reader is gone (the epoch ended): the leg
-                    // is dropped with the failed send.
+                    // is dropped with the failed send. The dial
+                    // started but the request never raced — record
+                    // why, under the same request id, so it is not
+                    // mistaken for a budget suppression later.
+                    let (request_forwarded_ms, silence_trigger_ms, primary_response_bytes) =
+                        self.replay_decision_offsets();
+                    tracing::debug!(
+                        request_id = self.request_id,
+                        reason = "reader_gone",
+                        primary_tunnel = ?primary_tunnel,
+                        target = ?self.dial_ctx.as_ref().map(|ctx| &ctx.target),
+                        request_forwarded_ms = request_forwarded_ms,
+                        silence_trigger_ms = silence_trigger_ms,
+                        primary_response_bytes = primary_response_bytes,
+                        "safe HTTP silence replay dialled leg dropped: race reader gone"
+                    );
                     self.silence.phase = SilencePhase::Done;
                     self.finish_replay_budget();
                 }
             }
             ReplayDialOutcome::Suppressed(reason) => {
-                self.suppress_silence_replay(reason);
+                self.suppress_silence_replay(reason, primary_tunnel);
                 self.finish_replay_budget();
             }
             ReplayDialOutcome::NoTunnel => {
-                self.suppress_silence_replay(SuppressReason::NoTunnel);
+                self.suppress_silence_replay(SuppressReason::NoTunnel, primary_tunnel);
                 self.finish_replay_budget();
             }
             ReplayDialOutcome::Failed(e) => {
-                self.on_replay_dial_failed(&e);
+                self.on_replay_dial_failed(&e, primary_tunnel);
             }
         }
     }
 
     /// The secondary dial (or the GET send) failed: leave the
     /// primary alive, close the replay, and count it.
-    fn on_replay_dial_failed(&mut self, e: &router::RouterConnectError) {
+    fn on_replay_dial_failed(
+        &mut self,
+        e: &router::RouterConnectError,
+        primary_tunnel: Option<&str>,
+    ) {
         replay_metrics().inc_dial_failed();
-        tracing::debug!("safe HTTP silence replay dial failed: {e:?}");
+        let (request_forwarded_ms, silence_trigger_ms, primary_response_bytes) =
+            self.replay_decision_offsets();
+        tracing::debug!(
+            request_id = self.request_id,
+            primary_tunnel = ?primary_tunnel,
+            target = ?self.dial_ctx.as_ref().map(|ctx| &ctx.target),
+            request_forwarded_ms = request_forwarded_ms,
+            silence_trigger_ms = silence_trigger_ms,
+            primary_response_bytes = primary_response_bytes,
+            "safe HTTP silence replay dial failed: {e:?}"
+        );
         self.silence.phase = SilencePhase::Done;
         self.finish_replay_budget();
     }
@@ -882,12 +979,12 @@ impl RetryCopy {
                     // arm only decides to start the replay; the
                     // spawn happens after the select, so it can
                     // borrow the dial set the loop polls.
-                    spawn_dial = self.start_silence_replay(a_done);
+                    spawn_dial = self.start_silence_replay(a_done, tunnel_id);
                 }
                 res = dial_set.join_next(), if !dial_set.is_empty() => {
                     match res {
                         Some(Ok(outcome)) => {
-                            self.on_dial_outcome(outcome, &mut secondary_tx);
+                            self.on_dial_outcome(outcome, &mut secondary_tx, tunnel_id);
                         }
                         Some(Err(e)) => {
                             // The dial task panicked: treat it as a
@@ -897,6 +994,7 @@ impl RetryCopy {
                                 &router::RouterConnectError::TcpConnect(io::Error::other(
                                     "dial task failed",
                                 )),
+                                tunnel_id,
                             );
                         }
                         None => {}
@@ -907,6 +1005,27 @@ impl RetryCopy {
                 self.spawn_silence_dial(tunnel_id, &mut dial_set);
             }
         }
+    }
+
+    /// One structured DEBUG line for a zero-response retry
+    /// decision that did not re-dial, under the session's
+    /// correlation id. The message is pre-formatted by the caller
+    /// when it interpolates an error; the decision itself is what
+    /// the record must carry.
+    fn retry_decision_log(
+        &self,
+        ctx: &ZeroResponseRetry<'_>,
+        tunnel_id: Option<&str>,
+        message: &str,
+    ) {
+        tracing::debug!(
+            request_id = self.request_id,
+            protocol = ctx.protocol,
+            selector = ?ctx.selector,
+            target = %ctx.target,
+            failed_tunnel = ?tunnel_id,
+            "{message}"
+        );
     }
 
     /// Attempt the one zero-response retry: re-dial through a
@@ -924,12 +1043,10 @@ impl RetryCopy {
         tunnel_id: &mut Option<String>,
     ) -> Option<DynStream> {
         let Some(prefix) = self.prefix.snapshot_if_complete() else {
-            tracing::debug!(
-                protocol = ctx.protocol,
-                selector = ?ctx.selector,
-                target = %ctx.target,
-                failed_tunnel = ?tunnel_id.as_deref(),
-                "zero-response retry skipped: client sent more than the replay cap"
+            self.retry_decision_log(
+                &ctx,
+                tunnel_id.as_deref(),
+                "zero-response retry skipped: client sent more than the replay cap",
             );
             return None;
         };
@@ -940,12 +1057,10 @@ impl RetryCopy {
         // already have processed them, and the EOF does not prove
         // otherwise.
         if !self.post_send_retry_allowed(&prefix) {
-            tracing::debug!(
-                protocol = ctx.protocol,
-                selector = ?ctx.selector,
-                target = %ctx.target,
-                failed_tunnel = ?tunnel_id.as_deref(),
-                "zero-response retry skipped: request is not a replayable safe GET"
+            self.retry_decision_log(
+                &ctx,
+                tunnel_id.as_deref(),
+                "zero-response retry skipped: request is not a replayable safe GET",
             );
             replay_metrics().inc_suppressed(SuppressReason::Ineligible);
             return None;
@@ -954,12 +1069,10 @@ impl RetryCopy {
         // claimed the session's one post-send replay, fix5 cannot
         // also re-dial.
         if !self.claim_post_send_replay(ReplaySource::Fix5) {
-            tracing::debug!(
-                protocol = ctx.protocol,
-                selector = ?ctx.selector,
-                target = %ctx.target,
-                failed_tunnel = ?tunnel_id.as_deref(),
-                "zero-response retry skipped: post-send replay already claimed"
+            self.retry_decision_log(
+                &ctx,
+                tunnel_id.as_deref(),
+                "zero-response retry skipped: post-send replay already claimed",
             );
             replay_metrics().inc_suppressed(SuppressReason::TokenClaimed);
             return None;
@@ -983,12 +1096,10 @@ impl RetryCopy {
                     | router::RouterConnectError::DnsResolution(e)
                     | router::RouterConnectError::TcpConnect(e) => e,
                 };
-                tracing::debug!(
-                    protocol = ctx.protocol,
-                    selector = ?ctx.selector,
-                    target = %ctx.target,
-                    failed_tunnel = ?tunnel_id.as_deref(),
-                    "zero-response retry re-dial failed: {inner}"
+                self.retry_decision_log(
+                    &ctx,
+                    tunnel_id.as_deref(),
+                    &format!("zero-response retry re-dial failed: {inner}"),
                 );
                 return None;
             }
@@ -999,12 +1110,10 @@ impl RetryCopy {
             stream.flush().await
         };
         if let Err(e) = replay.await {
-            tracing::debug!(
-                protocol = ctx.protocol,
-                selector = ?ctx.selector,
-                target = %ctx.target,
-                failed_tunnel = ?tunnel_id.as_deref(),
-                "zero-response retry replay failed: {e}"
+            self.retry_decision_log(
+                &ctx,
+                tunnel_id.as_deref(),
+                &format!("zero-response retry replay failed: {e}"),
             );
             return None;
         }
@@ -1019,6 +1128,7 @@ impl RetryCopy {
                 .fetch_add(uncounted as u64, Ordering::Relaxed);
         }
         tracing::info!(
+            request_id = self.request_id,
             protocol = ctx.protocol,
             selector = ?ctx.selector,
             target = %ctx.target,
@@ -1130,6 +1240,7 @@ where
         dial_ctx,
         seed_len,
         silence: SilenceReplay::new(),
+        request_id: next_replay_request_id(),
     };
     let mut retry = retry;
     loop {
@@ -1183,6 +1294,7 @@ where
                     )
                 };
                 tracing::info!(
+                    request_id = state.request_id,
                     protocol = state.dial_ctx.as_ref().map_or("?", |ctx| ctx.protocol),
                     selector = ?state.dial_ctx.as_ref().map(|ctx| &ctx.selector),
                     target = ?state.dial_ctx.as_ref().map(|ctx| &ctx.target),
