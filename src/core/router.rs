@@ -287,6 +287,15 @@ impl MultiTenantRouter {
             .is_some_and(|entry| !entry.is_disabled() && entry.health.is_routable())
     }
 
+    /// Release a `HalfOpen` trial slot claimed during selection (e.g.
+    /// the P2C loser): a no-op unless the tunnel is `HalfOpen` with a
+    /// slot in flight.
+    fn release_trial(&self, id: &str) {
+        if let Some(entry) = self.registry.get(id) {
+            entry.health.release_trial_slot();
+        }
+    }
+
     fn claim_from_healthy(&self, healthy: &[&String], start_idx: usize) -> io::Result<String> {
         if healthy.is_empty() {
             return Err(io::Error::new(
@@ -485,7 +494,20 @@ impl MultiTenantRouter {
             break;
         }
         match (best, second) {
-            (Some((a_score, a)), Some((b_score, b))) => Ok(if b_score < a_score { b } else { a }),
+            (Some((a_score, a)), Some((b_score, b))) => {
+                // The loser claimed a `HalfOpen` trial slot in
+                // `try_claim_candidate` but will never be used: release
+                // it here, or it stays unroutable — and skipped by the
+                // prober — with no timeout (audit run-3 #3). The winner
+                // keeps its slot for the caller, as before.
+                if b_score < a_score {
+                    self.release_trial(&a);
+                    Ok(b)
+                } else {
+                    self.release_trial(&b);
+                    Ok(a)
+                }
+            }
             (Some((_, a)), None) | (None, Some((_, a))) => Ok(a),
             (None, None) => self.fallback_scan_select(allowed),
         }

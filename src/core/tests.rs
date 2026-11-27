@@ -4181,3 +4181,109 @@ async fn test_p2c_auto_keyword_selects_warm_tunnel() {
 
     lifecycle.stop().await;
 }
+
+// =============================================================================
+// P2C loser HalfOpen trial-slot release (run-3 #3)
+// =============================================================================
+
+async fn p2c_halfopen_setup(
+    t1_fresh: bool,
+    t2_fresh: bool,
+) -> (
+    Arc<TunnelRegistry>,
+    Arc<MultiTenantRouter>,
+    Arc<LifecycleController>,
+) {
+    let registry = Arc::new(TunnelRegistry::new());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_secs();
+    for (id, fresh) in [("t1", t1_fresh), ("t2", t2_fresh)] {
+        let entry = registry
+            .register(TunnelEntry::new(
+                id,
+                make_test_tunnel_config(id),
+                LifecycleMode::Lazy,
+            ))
+            .unwrap();
+        if fresh {
+            entry.stats.record_handshake(now);
+        } else {
+            entry.stats.record_handshake(now - 1000);
+        }
+        entry.stats.record_rtt_sample(50);
+        entry.stats.record_activated(now - 3600);
+        // Force HalfOpen without claiming the trial slot.
+        entry.health.mark_unhealthy(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            entry.health.current_status(),
+            HealthStatus::HalfOpen,
+            "{id} must be HalfOpen before selection"
+        );
+        assert!(
+            entry.health.can_route(),
+            "{id} must be routable before selection (no slot claimed yet)"
+        );
+    }
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let router = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        true,
+    );
+    router.note_warm_success("t1");
+    (registry, router, lifecycle)
+}
+
+/// Loser drawn from the random draw: warm-list t1 is fresh (wins),
+/// random-draw t2 is dormant (loses). After select_p2c the loser
+/// must still be routable — its trial slot must have been released.
+#[tokio::test]
+async fn test_p2c_loser_from_random_draw_releases_halfopen_slot() {
+    let (registry, router, lifecycle) = p2c_halfopen_setup(true, false).await;
+    let picked = router
+        .select_p2c(Some(&["t2".to_string()]))
+        .expect("selection must succeed with two HalfOpen tunnels");
+    assert_eq!(picked, "t1", "fresh warm-list tunnel must win");
+    let t1 = registry.get("t1").unwrap();
+    let t2 = registry.get("t2").unwrap();
+    assert!(
+        !t1.health.can_route(),
+        "winner t1 legitimately holds its trial slot for the caller"
+    );
+    assert!(
+        t2.health.can_route(),
+        "loser t2 (random draw) must be routable again: its HalfOpen trial slot must be released by select_p2c"
+    );
+    lifecycle.stop().await;
+}
+
+/// Loser drawn from the warm list: warm-list t1 is dormant (loses),
+/// random-draw t2 is fresh (wins). After select_p2c the warm-list
+/// loser must still be routable.
+#[tokio::test]
+async fn test_p2c_loser_from_warm_list_releases_halfopen_slot() {
+    let (registry, router, lifecycle) = p2c_halfopen_setup(false, true).await;
+    let picked = router
+        .select_p2c(Some(&["t2".to_string()]))
+        .expect("selection must succeed with two HalfOpen tunnels");
+    assert_eq!(picked, "t2", "fresh random-draw tunnel must win");
+    let t1 = registry.get("t1").unwrap();
+    let t2 = registry.get("t2").unwrap();
+    assert!(
+        !t2.health.can_route(),
+        "winner t2 legitimately holds its trial slot for the caller"
+    );
+    assert!(
+        t1.health.can_route(),
+        "loser t1 (warm list) must be routable again: its HalfOpen trial slot must be released by select_p2c"
+    );
+    lifecycle.stop().await;
+}
