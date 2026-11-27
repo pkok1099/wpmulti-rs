@@ -45,6 +45,16 @@ pub use socks5::{
 
 const MAX_PROXY_CONCURRENT_CONNS: usize = 4096;
 
+/// Single connection budget shared by the public listener helpers
+/// ([`run_socks5_listener`], [`run_http_listener`]): the 4096 cap is
+/// one process-wide budget, not 4096 per listener (audit run-3 #9:
+/// 2x SOCKS5 + 1x HTTP served 12275 aggregate ~= 3x4096 on Colab,
+/// each listener filling its own private 4096 cap). The daemon's own
+/// listeners keep their separate `ListenerSupervisor` budget; this
+/// cap is for embedders driving the helpers directly.
+static SHARED_PROXY_CONN_SEM: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONCURRENT_CONNS)));
+
 /// Idle timeout for an established CONNECT session (audit run-1,
 /// `wpmulti/proxy:established-connect-no-idle-timeout`): 5 minutes
 /// matches the lifecycle tunnel idle timeout and the UDP ASSOCIATE
@@ -1379,11 +1389,14 @@ where
 }
 
 /// Runs an asynchronous SOCKS5 server listening on the provided [`tokio::net::TcpListener`].
+///
+/// Connections share the process-wide [`MAX_PROXY_CONCURRENT_CONNS`]
+/// budget with [`run_http_listener`]: once it is exhausted, new
+/// connections wait for a slot instead of being accepted.
 pub async fn run_socks5_listener(
     listener: tokio::net::TcpListener,
     router: Arc<dyn TunnelRouter>,
 ) -> io::Result<()> {
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONCURRENT_CONNS));
     loop {
         let (stream, peer_addr) = match listener.accept().await {
             Ok(conn) => conn,
@@ -1393,7 +1406,7 @@ pub async fn run_socks5_listener(
                 continue;
             }
         };
-        let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
+        let Ok(permit) = Arc::clone(&SHARED_PROXY_CONN_SEM).acquire_owned().await else {
             break;
         };
         let local_ip = stream.local_addr().ok().map(|a| a.ip());
@@ -1411,11 +1424,14 @@ pub async fn run_socks5_listener(
 }
 
 /// Runs an asynchronous HTTP/HTTPS CONNECT proxy server listening on the provided [`tokio::net::TcpListener`].
+///
+/// Connections share the process-wide [`MAX_PROXY_CONCURRENT_CONNS`]
+/// budget with [`run_socks5_listener`]: once it is exhausted, new
+/// connections wait for a slot instead of being accepted.
 pub async fn run_http_listener(
     listener: tokio::net::TcpListener,
     router: Arc<dyn TunnelRouter>,
 ) -> io::Result<()> {
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONCURRENT_CONNS));
     loop {
         let (stream, peer_addr) = match listener.accept().await {
             Ok(conn) => conn,
@@ -1425,7 +1441,7 @@ pub async fn run_http_listener(
                 continue;
             }
         };
-        let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
+        let Ok(permit) = Arc::clone(&SHARED_PROXY_CONN_SEM).acquire_owned().await else {
             break;
         };
         let router_clone = Arc::clone(&router);

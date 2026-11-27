@@ -6223,6 +6223,99 @@ async fn test_replay_dial_not_sent_records_no_tunnel_reason() {
     assert_eq!(result.request_id, decision_id);
 }
 
+// -----------------------------------------------------------------------------
+// Shared listener connection cap (audit run-3 #9)
+// -----------------------------------------------------------------------------
+
+/// Open a SOCKS5 session (no-auth greeting + CONNECT to `target`) and
+/// return the held client stream; the session stays open against the
+/// echo server, so it keeps holding its listener permit.
+async fn open_socks5_session(listener_addr: SocketAddr, target: SocketAddr) -> TcpStream {
+    let mut client = TcpStream::connect(listener_addr).await.unwrap();
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+        .await
+        .unwrap();
+    let mut resp = [0u8; 2];
+    client.read_exact(&mut resp).await.unwrap();
+    assert_eq!(resp, [SOCKS5_VERSION, METHOD_NO_AUTH]);
+    let SocketAddr::V4(target_v4) = target else {
+        unreachable!();
+    };
+    let mut req = vec![SOCKS5_VERSION, 0x01, 0x00, ATYP_IPV4];
+    req.extend_from_slice(&target_v4.ip().octets());
+    req.extend_from_slice(&target_v4.port().to_be_bytes());
+    client.write_all(&req).await.unwrap();
+    let mut reply = [0u8; 10];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], SOCKS5_VERSION);
+    assert_eq!(reply[1], REP_SUCCESS);
+    client
+}
+
+/// Open an HTTP CONNECT session to `target` and return the held
+/// client stream; the session stays open against the echo server.
+async fn open_http_session(listener_addr: SocketAddr, target: SocketAddr) -> TcpStream {
+    let mut client = TcpStream::connect(listener_addr).await.unwrap();
+    let req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n",);
+    client.write_all(req.as_bytes()).await.unwrap();
+    let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
+    assert_eq!(status, 200);
+    client
+}
+
+#[tokio::test]
+async fn test_shared_proxy_conn_cap_across_listeners() {
+    // Audit run-3 #9: each public listener helper used to make its
+    // own private 4096 semaphore, so 2x SOCKS5 + 1x HTTP served
+    // 12275 aggregate ~= 3x4096 on Colab. With one shared budget,
+    // sessions opened across all three listeners must draw from the
+    // same pool: 9 held sessions consume exactly 9 permits. The
+    // delta (not the absolute count) is asserted, so the test is
+    // robust to other tests in the process holding permits.
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target_addr = test_echo_target(echo_addr);
+    let target = Arc::new(MockTunnelTarget::new("cap-tunnel").with_dial_redirect(echo_addr));
+    let router: Arc<dyn TunnelRouter> =
+        Arc::new(SingleTunnelRouter::new("cap-tunnel", target, None));
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_c = listener_c.local_addr().unwrap();
+    let r = Arc::clone(&router);
+    tokio::spawn(async move {
+        let _ = super::run_socks5_listener(listener_a, r).await;
+    });
+    let r = Arc::clone(&router);
+    tokio::spawn(async move {
+        let _ = super::run_socks5_listener(listener_b, r).await;
+    });
+    let r = Arc::clone(&router);
+    tokio::spawn(async move {
+        let _ = super::run_http_listener(listener_c, r).await;
+    });
+
+    let baseline = super::SHARED_PROXY_CONN_SEM.available_permits();
+    let mut held = Vec::new();
+    for addr in [addr_a, addr_b] {
+        for _ in 0..3 {
+            held.push(open_socks5_session(addr, target_addr).await);
+        }
+    }
+    for _ in 0..3 {
+        held.push(open_http_session(addr_c, target_addr).await);
+    }
+    assert_eq!(
+        baseline - super::SHARED_PROXY_CONN_SEM.available_permits(),
+        9,
+        "9 sessions across 3 listeners must consume 9 permits from one shared budget"
+    );
+    drop(held);
+}
+
 #[tokio::test]
 async fn test_replay_budget_exhaustion_emits_no_warn() {
     use crate::proxy::replay::{
