@@ -3960,6 +3960,15 @@ async fn test_blackhole_session_ends_promptly_with_real_tcp_client() {
 #[tokio::test]
 async fn test_blackhole_session_ends_promptly_via_socks_handler() {
     use crate::proxy::CLIENT_ABORT_SILENCE_THRESHOLD;
+    use crate::proxy::replay::REPLAY_TEST_LOCK;
+
+    // fix11: this test sends an eligible GET through the full
+    // handler and waits past the 2.5 s silence timer, so it fires
+    // a silence replay (which finds no second tunnel and is
+    // suppressed as NoTunnel). It asserts no metrics, but it holds
+    // the replay lock so its counter increments cannot land inside
+    // another test's delta window.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
 
     // Full production path: real TCP client -> SOCKS5 handshake ->
     // mock tunnel dials a real blackhole TCP server -> copy with
@@ -4036,12 +4045,21 @@ async fn test_blackhole_session_ends_promptly_via_socks_handler() {
 
 #[tokio::test]
 async fn test_zero_response_retry_retries_through_different_tunnel() {
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
     use crate::proxy::router::connect_via_router;
     use crate::proxy::{
         CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
     };
 
-    let msg = b"retry me";
+    // fix11: the replayed request must be a positively identified
+    // safe HTTP GET (the old opaque "retry me" is no longer
+    // replayed once bytes were sent). The silence replay must not
+    // also fire: fix5 wins the shared token, and the epoch ends
+    // long before the 2.5 s timer.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
     let blackhole_addr = spawn_blackhole_tcp_server(msg.len()).await;
     let echo_addr = spawn_echo_tcp_server().await;
     let target = TargetAddr::Ip(test_echo_target(echo_addr));
@@ -4103,6 +4121,12 @@ async fn test_zero_response_retry_retries_through_different_tunnel() {
         (client_bytes, tunnel_bytes),
         (msg.len() as u64, msg.len() as u64)
     );
+    // The shared post-send token went to fix5, not to the silence
+    // replay: one replay per chain, and the timer never fired.
+    let metrics = replay_metrics();
+    assert_eq!(metrics.claimed_fix5.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.claimed_silence.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -4244,12 +4268,20 @@ async fn test_zero_response_retry_no_retry_when_response_received() {
 
 #[tokio::test]
 async fn test_zero_response_retry_retries_after_reset() {
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
     use crate::proxy::router::connect_via_router;
     use crate::proxy::{
         CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
     };
 
-    let msg = b"retry me";
+    // fix11: the replayed request must be a positively identified
+    // safe HTTP GET (the old opaque "retry me" is no longer
+    // replayed once bytes were sent). fix5 wins the shared token;
+    // the silence timer never fires.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
     let reset_addr = spawn_reset_tcp_server().await;
     let echo_addr = spawn_echo_tcp_server().await;
     let target = TargetAddr::Ip(test_echo_target(echo_addr));
@@ -4310,29 +4342,46 @@ async fn test_zero_response_retry_retries_after_reset() {
         (client_bytes, tunnel_bytes),
         (msg.len() as u64, msg.len() as u64)
     );
+    // The shared post-send token went to fix5, not to the silence
+    // replay: one replay per chain, and the timer never fired.
+    let metrics = replay_metrics();
+    assert_eq!(metrics.claimed_fix5.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.claimed_silence.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
 async fn test_zero_response_retry_retries_after_reset_large_prefix() {
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
     use crate::proxy::router::connect_via_router;
     use crate::proxy::{
         CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
     };
 
-    // 32 KiB fits the 64 KiB replay cap but is written in 8 KiB
-    // chunks, so the reset strikes mid-write: this exercises the
-    // tunnel-write-failure arm (`BrokenPipe`), not just the
-    // tunnel-read reset arm.
+    // fix11 rework: this used to assert that a 32 KiB opaque payload
+    // is retried after a reset. The tightened fix5 only replays a
+    // request when no app byte was written upstream, or when it is
+    // a positively identified safe HTTP GET — so an opaque payload
+    // whose bytes were all written to the tunnel must NOT be
+    // retried. The blackhole reads the whole payload (every byte is
+    // written upstream, deterministically) and then closes with zero
+    // response bytes, so the session must end as TunnelClosed with
+    // no echo and a suppressed{ineligible} count.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    // 32 KiB fits the 64 KiB replay cap, so the cap is not what
+    // blocks the retry here — the opaque content is.
     let payload_len = 32 * 1024;
     let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
-    let reset_addr = spawn_reset_tcp_server().await;
+    let blackhole_addr = spawn_blackhole_tcp_server(payload_len).await;
     let echo_addr = spawn_echo_tcp_server().await;
     let target = TargetAddr::Ip(test_echo_target(echo_addr));
 
     let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
     pool.add_tunnel(
-        "reset-1",
-        Arc::new(MockTunnelTarget::new("reset-1").with_dial_redirect(reset_addr)),
+        "dead-1",
+        Arc::new(MockTunnelTarget::new("dead-1").with_dial_redirect(blackhole_addr)),
     );
     pool.add_tunnel(
         "alive-1",
@@ -4344,11 +4393,11 @@ async fn test_zero_response_retry_retries_after_reset_large_prefix() {
     let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
-    assert_eq!(first_id.as_deref(), Some("reset-1"));
+    assert_eq!(first_id.as_deref(), Some("dead-1"));
 
     let (mut client, mut server) = tokio::io::duplex(2048);
     let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
-    let (relay_out, echo_buf) = tokio::time::timeout(Duration::from_secs(10), async {
+    let (relay_out, ()) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
             async move {
                 let mut tunnel_id = first_id;
@@ -4363,25 +4412,35 @@ async fn test_zero_response_retry_retries_after_reset_large_prefix() {
                 (result, tunnel_id)
             },
             async {
+                // The blackhole consumes the whole payload, then
+                // closes with no reply. No echo may arrive: the
+                // session must end with no response bytes, not a
+                // retried echo.
                 client.write_all(&payload).await.unwrap();
-                let mut echo_buf = vec![0u8; payload_len];
-                client.read_exact(&mut echo_buf).await.unwrap();
-                echo_buf
+                let mut one = [0u8; 1];
+                let n = client.read(&mut one).await.unwrap();
+                assert_eq!(
+                    n, 0,
+                    "no response bytes must arrive when the retry is blocked"
+                );
             },
         )
     })
     .await
     .expect("test must finish within 10s");
-    assert_eq!(echo_buf, payload);
 
     let (result, tunnel_id) = relay_out;
     let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
-    assert_eq!(result.kind, CopyEndKind::IdleTimeout);
-    assert_eq!(tunnel_id.as_deref(), Some("alive-1"));
-    assert_eq!(
-        (client_bytes, tunnel_bytes),
-        (payload_len as u64, payload_len as u64)
-    );
+    assert_eq!(result.kind, CopyEndKind::TunnelClosed);
+    assert_eq!(tunnel_id.as_deref(), Some("dead-1"));
+    assert_eq!(client_bytes, payload_len as u64);
+    assert_eq!(tunnel_bytes, 0);
+    // The retry was blocked as ineligible, not spent: no token was
+    // claimed by either replay path.
+    let metrics = replay_metrics();
+    assert_eq!(metrics.suppressed_ineligible.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.claimed_fix5.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.claimed_silence.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -4480,7 +4539,16 @@ async fn test_connect_via_router_excludes_tunnel() {
 
 #[tokio::test]
 async fn test_socks5_connect_zero_response_retry() {
-    let msg = b"socks5_retry_test!";
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
+
+    // fix11: the replayed request must be a positively identified
+    // safe HTTP GET (the old opaque "socks5_retry_test!" is no
+    // longer replayed once bytes were sent). fix5 wins the shared
+    // token; the silence timer never fires.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
     let blackhole_addr = spawn_blackhole_tcp_server(msg.len()).await;
     let echo_addr = spawn_echo_tcp_server().await;
     let target_addr = test_echo_target(echo_addr);
@@ -4532,4 +4600,392 @@ async fn test_socks5_connect_zero_response_retry() {
         .expect("echo must arrive after the retry")
         .expect("echo read must succeed");
     assert_eq!(&echo_buf, msg);
+    // The shared post-send token went to fix5: the echo can only
+    // arrive after the retry claimed it, and the silence timer
+    // never fired (the blackhole closed in milliseconds).
+    let metrics = replay_metrics();
+    assert_eq!(metrics.claimed_fix5.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.claimed_silence.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn test_safe_http_silence_replay_rescues_blackhole() {
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // fix11: a plaintext GET to a blackhole primary is rescued by
+    // the silence replay — at 2.5 s a second tunnel is dialled, the
+    // buffered GET is sent on it, and the echo comes back through
+    // the secondary. The primary takes the blackhole penalty and
+    // the session continues on the secondary.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    // The primary reads the GET and then stays silent forever.
+    let blackhole_addr = spawn_blackhole_tcp_server(usize::MAX).await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "dead-1",
+        Arc::new(MockTunnelTarget::new("dead-1").with_dial_redirect(blackhole_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("dead-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    // The idle timeout must exceed the 2.5 s silence timer, or the
+    // session ends idle before the replay can fire.
+    let (relay_out, echo_buf) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_secs(3),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                // The GET went to the blackhole first (no reply for
+                // 2.5 s), was replayed through the echo tunnel, and
+                // comes back.
+                let mut echo_buf = vec![0u8; msg.len()];
+                client.read_exact(&mut echo_buf).await.unwrap();
+                echo_buf
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 10s");
+    assert_eq!(&echo_buf, msg);
+
+    let (result, tunnel_id) = relay_out;
+    let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
+    // After the rescue the session idles out, as in the fix5 retry
+    // tests: the mock echo server does not produce a prompt tunnel
+    // EOF once the client drops. The rescue is proven by the echo
+    // arriving through the secondary, the tunnel switch, and the
+    // counters below — not by the end kind.
+    assert_eq!(result.kind, CopyEndKind::IdleTimeout);
+    assert_eq!(tunnel_id.as_deref(), Some("alive-1"));
+    assert_eq!(
+        (client_bytes, tunnel_bytes),
+        (msg.len() as u64, msg.len() as u64)
+    );
+    // The silence replay claimed the shared token (fix5 did not),
+    // fired once, sent the GET on the secondary, and rescued the
+    // session: the secondary won the race.
+    let metrics = replay_metrics();
+    assert_eq!(metrics.eligible.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.dial_started.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.dial_failed.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.request_sent.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.winner_secondary.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.rescued.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.claimed_silence.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.claimed_fix5.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn test_safe_http_silence_replay_ignores_opaque_tls() {
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // fix11: opaque TLS-like bytes are never replayed. The client
+    // sends a TLS ClientHello prefix to a silent blackhole, waits
+    // past the 2.5 s silence timer, and gives up — the session must
+    // end as ClientAborted on the primary tunnel, with no replay
+    // dialled and no counter moved.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    // First bytes of a TLS 1.2 ClientHello: handshake, TLS 1.0
+    // record version, then a length. Not a GET, not text.
+    let msg: &[u8] = &[
+        0x16, 0x03, 0x01, 0x00, 0x2e, 0x01, 0x00, 0x00, 0x2a, 0x03, 0x03, 0x5a, 0x6b, 0x7c, 0x8d,
+        0x9e, 0xaf, 0x00,
+    ];
+    let blackhole_addr = spawn_blackhole_tcp_server(usize::MAX).await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "dead-1",
+        Arc::new(MockTunnelTarget::new("dead-1").with_dial_redirect(blackhole_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("dead-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_secs(5),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                // Wait past the silence timer, then give up the way
+                // curl does at its timeout: drop the client half.
+                tokio::time::sleep(Duration::from_millis(3000)).await;
+                drop(client);
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 10s");
+
+    let (result, tunnel_id) = relay_out;
+    let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
+    assert_eq!(result.kind, CopyEndKind::ClientAborted);
+    assert_eq!(tunnel_id.as_deref(), Some("dead-1"));
+    assert_eq!(client_bytes, msg.len() as u64);
+    assert_eq!(tunnel_bytes, 0);
+    // No replay of any kind: the request never parsed as a safe
+    // GET, so the timer never armed and the token was never claimed.
+    let metrics = replay_metrics();
+    assert_eq!(metrics.eligible.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.dial_started.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.request_sent.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.rescued.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.claimed_silence.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.claimed_fix5.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn test_zero_response_retry_blocks_opaque_after_bytes_written() {
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // fix11: the tightened fix5. A small opaque request whose bytes
+    // were all written to the tunnel must NOT be replayed when the
+    // tunnel closes with zero response bytes — only a positively
+    // identified safe GET (or zero bytes written) may be. The
+    // blackhole reads the whole message first, so every byte was
+    // written upstream, deterministically.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let msg = b"opaque request, not a GET";
+    let blackhole_addr = spawn_blackhole_tcp_server(msg.len()).await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "dead-1",
+        Arc::new(MockTunnelTarget::new("dead-1").with_dial_redirect(blackhole_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("dead-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_millis(500),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                // No echo may arrive: the session must end with no
+                // response bytes, not a retried echo.
+                let mut one = [0u8; 1];
+                let n = client.read(&mut one).await.unwrap();
+                assert_eq!(
+                    n, 0,
+                    "no response bytes must arrive when the retry is blocked"
+                );
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 10s");
+
+    let (result, tunnel_id) = relay_out;
+    let (client_bytes, tunnel_bytes) = result.result.expect("relay must end cleanly");
+    assert_eq!(result.kind, CopyEndKind::TunnelClosed);
+    assert_eq!(tunnel_id.as_deref(), Some("dead-1"));
+    assert_eq!(client_bytes, msg.len() as u64);
+    assert_eq!(tunnel_bytes, 0);
+    // The retry was blocked as ineligible, not spent.
+    let metrics = replay_metrics();
+    assert_eq!(metrics.suppressed_ineligible.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.claimed_fix5.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.claimed_silence.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn test_parse_safe_http_get_header_eligible() {
+    use crate::proxy::replay::{SafeGetParse, parse_safe_http_get_header};
+
+    // Eligible: HTTP/1.1 and HTTP/1.0, with and without an explicit
+    // zero Content-Length. Only the header is returned, not a
+    // pipelined second request.
+    let get11 = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    assert!(matches!(
+        parse_safe_http_get_header(get11),
+        SafeGetParse::Eligible(_)
+    ));
+    assert!(matches!(
+        parse_safe_http_get_header(b"GET /path?x=1 HTTP/1.0\r\nHost: a\r\n\r\n"),
+        SafeGetParse::Eligible(_)
+    ));
+    assert!(matches!(
+        parse_safe_http_get_header(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n"
+        ),
+        SafeGetParse::Eligible(_)
+    ));
+    if let SafeGetParse::Eligible(header) = parse_safe_http_get_header(
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nGET /second HTTP/1.1\r\nHost: x\r\n\r\n",
+    ) {
+        assert_eq!(&*header, get11);
+    } else {
+        panic!("pipelined GET must parse as eligible with only the first header");
+    }
+}
+
+#[test]
+fn test_parse_safe_http_get_header_ineligible() {
+    use crate::proxy::replay::{SafeGetParse, parse_safe_http_get_header};
+
+    fn ineligible(bytes: &[u8]) -> bool {
+        matches!(parse_safe_http_get_header(bytes), SafeGetParse::Ineligible)
+    }
+
+    // Ineligible: every other method, a body, an upgrade, and
+    // ambiguous length headers.
+    assert!(ineligible(b"POST / HTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(ineligible(b"HEAD / HTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(ineligible(b"OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(ineligible(
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: a\r\n\r\n"
+    ));
+    assert!(ineligible(
+        b"GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+    ));
+    assert!(ineligible(
+        b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n"
+    ));
+    assert!(ineligible(
+        b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n"
+    ));
+    assert!(ineligible(
+        b"GET / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n\r\n"
+    ));
+    assert!(ineligible(
+        b"GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\n\r\n"
+    ));
+    assert!(ineligible(
+        b"GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\n\r\n"
+    ));
+    assert!(ineligible(b"GET * HTTP/1.1\r\nHost: a\r\n\r\n"));
+    // A header past the 16 KiB cap is ineligible even with a
+    // terminator at the end.
+    let mut big = b"GET / HTTP/1.1\r\nHost: a\r\nX-Pad: ".to_vec();
+    big.extend(std::iter::repeat_n(b'a', 17 * 1024));
+    big.extend_from_slice(b"\r\n\r\n");
+    assert!(ineligible(&big));
+    // A binary blob past the 16 KiB cap, with no terminator, is
+    // ineligible (it cannot become a GET).
+    let blob = vec![0x16u8; 17 * 1024];
+    assert!(ineligible(&blob));
+}
+
+#[test]
+fn test_parse_safe_http_get_header_incomplete() {
+    use crate::proxy::replay::{SafeGetParse, parse_safe_http_get_header};
+
+    // Incomplete: no terminator yet, header still under the cap.
+    assert!(matches!(
+        parse_safe_http_get_header(b"GET / HTTP/1.1\r\nHost: example.com\r\n"),
+        SafeGetParse::Incomplete
+    ));
+    assert!(matches!(
+        parse_safe_http_get_header(b"GET / HTTP/1.1\r\n"),
+        SafeGetParse::Incomplete
+    ));
+    assert!(matches!(
+        parse_safe_http_get_header(b""),
+        SafeGetParse::Incomplete
+    ));
+    // A short binary blob (or TLS prefix) with no terminator yet is
+    // incomplete too: the parser cannot rule it out until a
+    // terminator arrives or the cap is passed.
+    assert!(matches!(
+        parse_safe_http_get_header(&[0x16, 0x03, 0x01, 0x00, 0x2e, 0x01]),
+        SafeGetParse::Incomplete
+    ));
+    assert!(matches!(
+        parse_safe_http_get_header(&[0x00, 0x01, 0x02, 0xff, 0xfe]),
+        SafeGetParse::Incomplete
+    ));
 }

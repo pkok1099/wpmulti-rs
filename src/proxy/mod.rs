@@ -1,6 +1,7 @@
 //! Proxy engines for `wpmulti`: SOCKS5 (RFC 1928, RFC 1929) and HTTP CONNECT (RFC 9110, RFC 7617).
 
 pub mod http;
+pub mod replay;
 pub mod router;
 pub mod socks5;
 #[cfg(test)]
@@ -13,6 +14,14 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use replay::{
+    PostSendReplayToken, RACE_PRIMARY, RACE_SECONDARY_FAILED, RaceReaderArgs, RaceReaderDone,
+    ReplayDialCtx, ReplayDialOutcome, ReplaySource, SafeGetParse, SecondaryLeg, SilencePhase,
+    SilenceReplay, SuppressReason, UpstreamRaceReader, dial_secondary_leg,
+    parse_safe_http_get_header, replay_budget_finish, replay_budget_note_primary_request,
+    replay_budget_try_start, replay_metrics,
+};
 
 pub use http::{
     extract_basic_auth, handle_http, parse_authority, read_http_request_headers,
@@ -170,13 +179,15 @@ pub(crate) const ZERO_RESPONSE_RETRY_PREFIX_CAP: usize = 64 * 1024;
 /// reset (`ConnectionReset` on the tunnel read) and a failed tunnel
 /// write (`BrokenPipe` on the tunnel write): both end the session
 /// with zero response bytes on the initial flight, before any
-/// response byte arrived. For opaque TLS traffic the retry is only
-/// safe in that initial flight — the request may have reached the
-/// origin and the reset may have struck on the way back, so the
-/// double-submit risk is consciously accepted, exactly as for the
-/// EOF retry. The retry is therefore limited to the zero-response
-/// cases only (never a timeout or a budget failure), to one attempt,
-/// and to sessions whose whole client-sent prefix fits in
+/// response byte arrived. Since fix11 the retry is only allowed when
+/// no app byte was written upstream, or when the buffered prefix is
+/// a positively identified safe HTTP GET (`parse_safe_http_get_header`
+/// in `replay.rs`): opaque TLS and unclassified traffic are never
+/// replayed after bytes were sent, because the origin may already
+/// have processed them and the EOF does not prove otherwise. The
+/// retry is therefore limited to the zero-response cases only (never
+/// a timeout or a budget failure), to one attempt, and to sessions
+/// whose whole client-sent prefix fits in
 /// [`ZERO_RESPONSE_RETRY_PREFIX_CAP`].
 pub(crate) struct ZeroResponseRetry<'a> {
     router: &'a Arc<dyn TunnelRouter>,
@@ -254,6 +265,16 @@ impl RetryPrefix {
             .load(Ordering::Relaxed)
             .then(|| self.buf.lock().clone())
     }
+
+    /// The buffered prefix parsed as a safe GET header, without
+    /// cloning the whole prefix: the parse only reads the first
+    /// 16 KiB, so it stays cheap while the prefix grows. The lock is
+    /// held only for the short synchronous scan, never across an
+    /// await.
+    fn safe_get_parse(&self) -> SafeGetParse {
+        let buf = self.buf.lock();
+        parse_safe_http_get_header(&buf)
+    }
 }
 
 /// Outcome of one copy epoch: either the session ended (both sides
@@ -264,6 +285,14 @@ impl RetryPrefix {
 enum EpochOutcome {
     Done((CopyEndKind, io::Result<(u64, u64)>)),
     ZeroResponse,
+    /// The secondary leg of a silence replay produced the first
+    /// response byte: the session continues on the secondary stream
+    /// (the outer loop updates the tunnel id and records the
+    /// blackhole on the primary).
+    SilenceReplayWon {
+        leg: SecondaryLeg,
+        first_byte_at: Instant,
+    },
 }
 
 /// Shared state across the epochs of one retrying CONNECT session.
@@ -286,6 +315,27 @@ struct RetryCopy {
     /// line (`"zero-response EOF"`, or the reset / write-failure
     /// reason that triggered it).
     retry_reason: &'static str,
+    /// The session's one post-send replay, shared by fix5 and the
+    /// silence replay: exactly one of them can claim it.
+    replay_token: PostSendReplayToken,
+    /// Owned dial context for a post-send replay (None when the
+    /// session has no retry context: then no replay is possible).
+    dial_ctx: Option<Arc<ReplayDialCtx>>,
+    /// Bytes already written to the first tunnel before the copy
+    /// started (the seed prefix): they count as app bytes written
+    /// upstream for the tightened fix5 rule.
+    seed_len: usize,
+    /// Per-session state of the one delayed silence replay.
+    silence: SilenceReplay,
+}
+
+/// Milliseconds from `from` to `to` (0 when either is missing, or
+/// when the order is reversed): the replay latency metrics.
+fn latency_ms(from: Option<Instant>, to: Option<Instant>) -> u128 {
+    match (from, to) {
+        (Some(from), Some(to)) => to.saturating_duration_since(from).as_millis(),
+        _ => 0,
+    }
 }
 
 impl RetryCopy {
@@ -315,6 +365,253 @@ impl RetryCopy {
             && self.started_at.elapsed() > CLIENT_ABORT_SILENCE_THRESHOLD
     }
 
+    /// Claim the session's one post-send replay for `source`, and
+    /// record it. On success the fix5 trigger sites are gated off
+    /// too (`retried`), so the other mechanism cannot also fire.
+    fn claim_post_send_replay(&mut self, source: ReplaySource) -> bool {
+        if !self.replay_token.claim(source) {
+            return false;
+        }
+        self.retried = true;
+        replay_metrics().inc_claimed(source);
+        true
+    }
+
+    /// Release the global replay budget slot this session holds, if
+    /// any. Idempotent: the slot is released exactly once.
+    fn finish_replay_budget(&mut self) {
+        if self.silence.budget_held {
+            self.silence.budget_held = false;
+            replay_budget_finish();
+        }
+    }
+
+    /// App bytes actually written upstream so far: the seed prefix
+    /// (written by the handler before the copy) plus the bytes the
+    /// client-to-tunnel direction forwarded. A chunk whose write
+    /// failed is not counted — it never reached a target.
+    fn bytes_written_upstream(&self) -> u64 {
+        self.seed_len as u64 + self.client_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Whether a zero-response retry may re-send the buffered
+    /// prefix: always when no app byte was written upstream (nothing
+    /// could have been processed), and otherwise only when the
+    /// prefix is a positively identified safe HTTP GET. Opaque TLS
+    /// and unknown streams are never replayed after bytes were sent.
+    fn post_send_retry_allowed(&self, prefix: &[u8]) -> bool {
+        if self.bytes_written_upstream() == 0 {
+            return true;
+        }
+        matches!(
+            parse_safe_http_get_header(prefix),
+            SafeGetParse::Eligible(_)
+        )
+    }
+
+    /// The buffered prefix may now hold a complete eligible GET
+    /// header: examine it once (and only while a replay is
+    /// possible). When an eligible GET is found, record the header
+    /// and arm the 2.5 s timer from when the header was written to
+    /// the primary.
+    fn note_activity_for_silence(&mut self) {
+        // Only arm from Idle: once the timer is armed, or once a
+        // replay was claimed (fix5) or suppressed, later activity
+        // (for example the echo arriving in the retry epoch) must
+        // not re-arm it.
+        if self.silence.checked
+            || self.silence.phase != SilencePhase::Idle
+            || self.dial_ctx.is_none()
+        {
+            return;
+        }
+        match self.prefix.safe_get_parse() {
+            SafeGetParse::Eligible(header) => {
+                self.silence.checked = true;
+                self.silence.header = Some(Arc::clone(&header));
+                self.silence
+                    .shared
+                    .header_len
+                    .store(header.len(), Ordering::Relaxed);
+                self.silence.header_written_at = Some(Instant::now());
+                self.silence.phase = SilencePhase::Armed;
+                replay_metrics().inc_eligible();
+            }
+            SafeGetParse::Ineligible => {
+                self.silence.checked = true;
+            }
+            SafeGetParse::Incomplete => {}
+        }
+    }
+
+    /// The replay is suppressed: record the reason, close the phase,
+    /// and never re-arm the timer for this session.
+    fn suppress_silence_replay(&mut self, reason: SuppressReason) {
+        replay_metrics().inc_suppressed(reason);
+        tracing::debug!(
+            reason = reason.label(),
+            "safe HTTP silence replay suppressed"
+        );
+        self.silence.phase = SilencePhase::Done;
+    }
+
+    /// Pick up a race resolution the reader recorded: the primary won
+    /// (or the secondary failed). Close the phase, release the
+    /// budget, and record the winner — the reader only sets the
+    /// flag, so this is the one place the resolution is logged and
+    /// counted. A secondary win never reaches here: the reader
+    /// returns instead, and the outer loop logs the rescue.
+    fn check_replay_resolution(&mut self, primary_tunnel: Option<&str>) {
+        if self.silence.phase != SilencePhase::Racing {
+            return;
+        }
+        let winner = self.silence.shared.winner.load(Ordering::Relaxed);
+        if winner == RACE_PRIMARY {
+            self.silence.phase = SilencePhase::Done;
+            self.finish_replay_budget();
+            replay_metrics().inc_winner_primary();
+            let timings = self.silence.shared.timings.lock();
+            tracing::info!(
+                protocol = self.dial_ctx.as_ref().map_or("?", |ctx| ctx.protocol),
+                selector = ?self.dial_ctx.as_ref().map(|ctx| &ctx.selector),
+                target = ?self.dial_ctx.as_ref().map(|ctx| &ctx.target),
+                primary_tunnel = ?primary_tunnel,
+                secondary_tunnel = ?timings.secondary_tunnel_id.as_deref(),
+                primary_first_byte_ms = latency_ms(
+                    self.silence.header_written_at,
+                    timings.primary_first_byte_at
+                ),
+                secondary_dial_ms = latency_ms(
+                    timings.dial_started_at,
+                    timings.dial_connected_at
+                ),
+                "safe HTTP silence replay: primary won the race; secondary closed"
+            );
+        } else if winner == RACE_SECONDARY_FAILED {
+            self.silence.phase = SilencePhase::Done;
+            self.finish_replay_budget();
+            tracing::info!(
+                protocol = self.dial_ctx.as_ref().map_or("?", |ctx| ctx.protocol),
+                primary_tunnel = ?primary_tunnel,
+                "safe HTTP silence replay: secondary leg failed; primary continues"
+            );
+        } else {
+            // No resolution yet: the race is still running.
+        }
+    }
+
+    /// The 2.5 s timer fired on an eligible GET: start the replay if
+    /// every condition still holds, and return whether the dial
+    /// should be spawned (the spawn itself happens outside the
+    /// select loop, so it cannot borrow the dial set the loop is
+    /// polling). The global budget is reserved before the shared
+    /// token is claimed, so a budget failure leaves the token free
+    /// for a fix5 retry later in the session.
+    fn start_silence_replay(&mut self, client_done: bool) -> bool {
+        let Some(header) = self.silence.header.clone() else {
+            return false;
+        };
+        if self.tunnel_bytes.load(Ordering::Relaxed) > 0 {
+            self.suppress_silence_replay(SuppressReason::ResponseStarted);
+            return false;
+        }
+        if client_done {
+            self.suppress_silence_replay(SuppressReason::ClientGone);
+            return false;
+        }
+        if self.client_bytes.load(Ordering::Relaxed) > header.len() as u64 {
+            self.suppress_silence_replay(SuppressReason::ClientSentMore);
+            return false;
+        }
+        if !replay_budget_try_start() {
+            self.suppress_silence_replay(SuppressReason::BudgetExhausted);
+            return false;
+        }
+        self.silence.budget_held = true;
+        if !self.claim_post_send_replay(ReplaySource::SilenceReplay) {
+            self.finish_replay_budget();
+            self.suppress_silence_replay(SuppressReason::TokenClaimed);
+            return false;
+        }
+        self.silence.phase = SilencePhase::Dialing;
+        replay_metrics().inc_silence_trigger();
+        replay_metrics().inc_dial_started();
+        true
+    }
+
+    /// Spawn the secondary dial task into the epoch's dial set. The
+    /// task dials one different tunnel and sends the GET header on
+    /// it; the epoch loop keeps reading the primary while it runs.
+    /// Called outside the select loop (after the timer arm fired),
+    /// so it can borrow the dial set the loop polls.
+    fn spawn_silence_dial(
+        &self,
+        primary_tunnel: Option<&str>,
+        dial_set: &mut tokio::task::JoinSet<ReplayDialOutcome>,
+    ) {
+        let Some(ctx) = self.dial_ctx.clone() else {
+            return;
+        };
+        let Some(header) = self.silence.header.clone() else {
+            return;
+        };
+        let shared = Arc::clone(&self.silence.shared);
+        let tunnel_bytes = Arc::clone(&self.tunnel_bytes);
+        let client_bytes = Arc::clone(&self.client_bytes);
+        let exclude = primary_tunnel.map(str::to_string);
+        dial_set.spawn(dial_secondary_leg(
+            ctx,
+            exclude,
+            header,
+            tunnel_bytes,
+            client_bytes,
+            shared,
+        ));
+    }
+
+    /// Handle what the secondary dial task found: hand a ready leg
+    /// to the race reader, or close the replay (and release the
+    /// budget) when it was moot, impossible, or failed.
+    fn on_dial_outcome(
+        &mut self,
+        outcome: ReplayDialOutcome,
+        secondary_tx: &mut Option<tokio::sync::oneshot::Sender<SecondaryLeg>>,
+    ) {
+        match outcome {
+            ReplayDialOutcome::Ready(leg) => {
+                self.silence.phase = SilencePhase::Racing;
+                replay_metrics().inc_request_sent();
+                let sent = secondary_tx.take().is_some_and(|tx| tx.send(leg).is_ok());
+                if !sent {
+                    // The reader is gone (the epoch ended): the leg
+                    // is dropped with the failed send.
+                    self.silence.phase = SilencePhase::Done;
+                    self.finish_replay_budget();
+                }
+            }
+            ReplayDialOutcome::Suppressed(reason) => {
+                self.suppress_silence_replay(reason);
+                self.finish_replay_budget();
+            }
+            ReplayDialOutcome::NoTunnel => {
+                self.suppress_silence_replay(SuppressReason::NoTunnel);
+                self.finish_replay_budget();
+            }
+            ReplayDialOutcome::Failed(e) => {
+                self.on_replay_dial_failed(&e);
+            }
+        }
+    }
+
+    /// The secondary dial (or the GET send) failed: leave the
+    /// primary alive, close the replay, and count it.
+    fn on_replay_dial_failed(&mut self, e: &router::RouterConnectError) {
+        replay_metrics().inc_dial_failed();
+        tracing::debug!("safe HTTP silence replay dial failed: {e:?}");
+        self.silence.phase = SilencePhase::Done;
+        self.finish_replay_budget();
+    }
+
     /// Decide how the epoch ends when the tunnel side closes
     /// cleanly: a zero-response retry while one is still available,
     /// or the session end.
@@ -335,13 +632,107 @@ impl RetryCopy {
         EpochOutcome::Done((CopyEndKind::TunnelClosed, Ok((client, tunnel))))
     }
 
+    /// Handle the client-to-tunnel direction finishing. Returns
+    /// `Some(outcome)` when the epoch ends, or `None` when the
+    /// client half closed and the epoch continues (the caller sets
+    /// `a_done`).
+    fn on_client_done(&mut self, res: io::Result<()>) -> Option<EpochOutcome> {
+        match res {
+            Ok(()) => {
+                // A client half-close after a long silent wait is
+                // the client giving up on a blackhole tunnel: end
+                // now instead of lingering until the idle timeout.
+                if self.client_aborted_after_silence() {
+                    return Some(EpochOutcome::Done((
+                        CopyEndKind::ClientAborted,
+                        Ok(self.counts()),
+                    )));
+                }
+                None
+            }
+            // A failed write to the tunnel with zero response bytes
+            // is the same retryable shape as a clean EOF: the
+            // request never got an answer, and the whole
+            // client-sent prefix is buffered for replay. Only
+            // `BrokenPipe` counts here — it is the write side
+            // failing because the tunnel reset the connection. A
+            // client-read failure (`ConnectionReset` on this
+            // direction) means the client itself went away, so
+            // there is nobody to retry for. No client-sent check is
+            // needed: the chunk whose write failed was pushed to the
+            // prefix before the write was attempted.
+            Err(e)
+                if e.kind() == io::ErrorKind::BrokenPipe
+                    && self.tunnel_bytes.load(Ordering::Relaxed) == 0
+                    && !self.retried
+                    && self.prefix.complete.load(Ordering::Relaxed) =>
+            {
+                self.retry_reason = "tunnel write failed with zero response bytes";
+                Some(EpochOutcome::ZeroResponse)
+            }
+            Err(e) => Some(EpochOutcome::Done((CopyEndKind::Failed, Err(e)))),
+        }
+    }
+
+    /// Handle the tunnel-to-client direction (the race reader)
+    /// finishing. Always ends the epoch. The reader may have
+    /// resolved the race just before returning (primary won, then
+    /// the tunnel closed): record it before the epoch ends.
+    fn on_upstream_done(
+        &mut self,
+        res: RaceReaderDone,
+        a_done: bool,
+        tunnel_id: Option<&str>,
+    ) -> EpochOutcome {
+        self.check_replay_resolution(tunnel_id);
+        match res {
+            RaceReaderDone::PrimaryClosed => self.on_tunnel_closed(
+                self.client_bytes.load(Ordering::Relaxed),
+                self.tunnel_bytes.load(Ordering::Relaxed),
+                a_done,
+            ),
+            // A tunnel-side reset with zero response bytes is the
+            // same retryable shape as a clean EOF: the target never
+            // answered, and the whole client-sent prefix is buffered
+            // for replay. Only `ConnectionReset` counts here — it is
+            // the read side failing because the tunnel reset the
+            // connection. A client-write failure (`BrokenPipe` on
+            // this direction) means the client itself went away, so
+            // there is nobody to retry for. No client-sent check is
+            // needed: the reset can arrive before the client's first
+            // bytes are read, and the retry replays the (possibly
+            // empty) prefix the same way the clean-EOF arm does.
+            RaceReaderDone::PrimaryReset(_e)
+                if self.tunnel_bytes.load(Ordering::Relaxed) == 0
+                    && !a_done
+                    && !self.retried
+                    && self.prefix.complete.load(Ordering::Relaxed) =>
+            {
+                self.retry_reason = "connection reset with zero response bytes";
+                EpochOutcome::ZeroResponse
+            }
+            RaceReaderDone::PrimaryReset(e) | RaceReaderDone::PrimaryFailed(e) => {
+                EpochOutcome::Done((CopyEndKind::Failed, Err(e)))
+            }
+            RaceReaderDone::SecondaryWon(win) => EpochOutcome::SilenceReplayWon {
+                leg: win.leg,
+                first_byte_at: win.first_byte_at,
+            },
+        }
+    }
+
     /// Run one epoch: relay both directions on the current tunnel
     /// stream until one side ends. The tunnel side does not
     /// half-close the client on EOF — the client must not see EOF
     /// while a retry may still deliver its response — and the epoch
     /// ends as soon as the tunnel side ends (there is no tunnel left
     /// to read from), instead of waiting for the client to close.
-    async fn run_epoch<A, B>(&mut self, a: &mut A, b: &mut B) -> EpochOutcome
+    async fn run_epoch<A, B>(
+        &mut self,
+        a: &mut A,
+        b: &mut B,
+        tunnel_id: Option<&str>,
+    ) -> EpochOutcome
     where
         A: AsyncRead + AsyncWrite + Unpin,
         B: AsyncRead + AsyncWrite + Unpin,
@@ -370,94 +761,48 @@ impl RetryCopy {
             capture,
             true,
         ));
-        let mut b_to_a = Box::pin(copy_direction_retry(
-            b_read,
-            a_write,
-            activity_tx,
-            Arc::clone(&tunnel_bytes),
-            None,
-            false,
-        ));
+        // The tunnel-to-client direction is the race reader: it
+        // forwards the primary's responses, and races a secondary
+        // leg once the silence replay hands it one.
+        let (secondary_tx, secondary_rx) = tokio::sync::oneshot::channel();
+        let mut secondary_tx = Some(secondary_tx);
+        let mut upstream = Box::pin(
+            UpstreamRaceReader::new(RaceReaderArgs {
+                client_write: a_write,
+                primary_read: b_read,
+                secondary_rx,
+                activity: activity_tx,
+                tunnel_bytes: Arc::clone(&tunnel_bytes),
+                client_bytes: Arc::clone(&client_bytes),
+                shared: Arc::clone(&self.silence.shared),
+            })
+            .run(),
+        );
+        // The secondary dial runs as a spawned task, so the epoch
+        // loop keeps reading the primary while the dial is in
+        // flight. Dropping the set aborts a dial still in flight
+        // when the epoch ends.
+        let mut dial_set: tokio::task::JoinSet<ReplayDialOutcome> = tokio::task::JoinSet::new();
         let mut a_done = false;
         loop {
+            // The race reader resolves the replay on its own (primary
+            // win / secondary failure): pick up the resolution —
+            // release the budget, close the phase — before the next
+            // select, so a resolved replay never holds its slot past
+            // the next wakeup.
+            self.check_replay_resolution(tunnel_id);
+            let armed = self.silence.phase == SilencePhase::Armed;
+            let delay = self.silence.delay_until_firing();
+            let mut spawn_dial = false;
             tokio::select! {
                 res = &mut a_to_b, if !a_done => {
-                    match res {
-                        Ok(()) => {
-                            // A client half-close after a long silent
-                            // wait is the client giving up on a
-                            // blackhole tunnel: end now instead of
-                            // lingering until the idle timeout.
-                            if self.client_aborted_after_silence() {
-                                return EpochOutcome::Done((
-                                    CopyEndKind::ClientAborted,
-                                    Ok(self.counts()),
-                                ));
-                            }
-                            a_done = true;
-                        }
-                        // A failed write to the tunnel with zero
-                        // response bytes is the same retryable shape
-                        // as a clean EOF: the request never got an
-                        // answer, and the whole client-sent prefix is
-                        // buffered for replay. Only `BrokenPipe`
-                        // counts here — it is the write side failing
-                        // because the tunnel reset the connection. A
-                        // client-read failure (`ConnectionReset` on
-                        // this direction) means the client itself went
-                        // away, so there is nobody to retry for. No
-                        // client-sent check is needed: the chunk whose
-                        // write failed was pushed to the prefix before
-                        // the write was attempted.
-                        Err(e) if e.kind() == io::ErrorKind::BrokenPipe
-                            && tunnel_bytes.load(Ordering::Relaxed) == 0
-                            && !retried
-                            && prefix.complete.load(Ordering::Relaxed) =>
-                        {
-                            self.retry_reason = "tunnel write failed with zero response bytes";
-                            return EpochOutcome::ZeroResponse;
-                        }
-                        Err(e) => {
-                            return EpochOutcome::Done((CopyEndKind::Failed, Err(e)));
-                        }
+                    if let Some(outcome) = self.on_client_done(res) {
+                        return outcome;
                     }
+                    a_done = true;
                 }
-                res = &mut b_to_a => {
-                    match res {
-                        Ok(()) => {
-                            return self.on_tunnel_closed(
-                                client_bytes.load(Ordering::Relaxed),
-                                tunnel_bytes.load(Ordering::Relaxed),
-                                a_done,
-                            );
-                        }
-                        // A tunnel-side reset with zero response bytes
-                        // is the same retryable shape as a clean EOF:
-                        // the target never answered, and the whole
-                        // client-sent prefix is buffered for replay.
-                        // Only `ConnectionReset` counts here — it is
-                        // the read side failing because the tunnel
-                        // reset the connection. A client-write failure
-                        // (`BrokenPipe` on this direction) means the
-                        // client itself went away, so there is nobody
-                        // to retry for. No client-sent check is needed:
-                        // the reset can arrive before the client's
-                        // first bytes are read, and the retry replays
-                        // the (possibly empty) prefix the same way
-                        // the clean-EOF arm does.
-                        Err(e) if e.kind() == io::ErrorKind::ConnectionReset
-                            && tunnel_bytes.load(Ordering::Relaxed) == 0
-                            && !a_done
-                            && !retried
-                            && prefix.complete.load(Ordering::Relaxed) =>
-                        {
-                            self.retry_reason = "connection reset with zero response bytes";
-                            return EpochOutcome::ZeroResponse;
-                        }
-                        Err(e) => {
-                            return EpochOutcome::Done((CopyEndKind::Failed, Err(e)));
-                        }
-                    }
+                res = &mut upstream => {
+                    return self.on_upstream_done(res, a_done, tunnel_id);
                 }
                 res = tokio::time::timeout(idle_timeout, self.activity_rx.changed()) => {
                     if res.is_err() {
@@ -470,7 +815,38 @@ impl RetryCopy {
                             )),
                         ));
                     }
+                    // A chunk flowed: the buffered prefix may now
+                    // hold a complete eligible GET header.
+                    self.note_activity_for_silence();
                 }
+                () = tokio::time::sleep(delay), if armed => {
+                    // The 2.5 s timer fired on an eligible GET. The
+                    // arm only decides to start the replay; the
+                    // spawn happens after the select, so it can
+                    // borrow the dial set the loop polls.
+                    spawn_dial = self.start_silence_replay(a_done);
+                }
+                res = dial_set.join_next(), if !dial_set.is_empty() => {
+                    match res {
+                        Some(Ok(outcome)) => {
+                            self.on_dial_outcome(outcome, &mut secondary_tx);
+                        }
+                        Some(Err(e)) => {
+                            // The dial task panicked: treat it as a
+                            // failed dial and leave the primary alive.
+                            tracing::debug!("silence replay dial task failed: {e}");
+                            self.on_replay_dial_failed(
+                                &router::RouterConnectError::TcpConnect(io::Error::other(
+                                    "dial task failed",
+                                )),
+                            );
+                        }
+                        None => {}
+                    }
+                }
+            }
+            if spawn_dial {
+                self.spawn_silence_dial(tunnel_id, &mut dial_set);
             }
         }
     }
@@ -499,7 +875,40 @@ impl RetryCopy {
             );
             return None;
         };
-        let (mut stream, new_id) = match router::connect_via_router(
+        // Tightened fix5 (fix11): a request is only replayed when no
+        // app byte was written upstream, or when it is a positively
+        // identified safe HTTP GET. Opaque TLS and unknown streams
+        // are never replayed after bytes were sent — the origin may
+        // already have processed them, and the EOF does not prove
+        // otherwise.
+        if !self.post_send_retry_allowed(&prefix) {
+            tracing::debug!(
+                protocol = ctx.protocol,
+                selector = ?ctx.selector,
+                target = %ctx.target,
+                failed_tunnel = ?tunnel_id.as_deref(),
+                "zero-response retry skipped: request is not a replayable safe GET"
+            );
+            replay_metrics().inc_suppressed(SuppressReason::Ineligible);
+            return None;
+        }
+        // The silence replay shares this token: if it already
+        // claimed the session's one post-send replay, fix5 cannot
+        // also re-dial.
+        if !self.claim_post_send_replay(ReplaySource::Fix5) {
+            tracing::debug!(
+                protocol = ctx.protocol,
+                selector = ?ctx.selector,
+                target = %ctx.target,
+                failed_tunnel = ?tunnel_id.as_deref(),
+                "zero-response retry skipped: post-send replay already claimed"
+            );
+            replay_metrics().inc_suppressed(SuppressReason::TokenClaimed);
+            return None;
+        }
+        // The re-dial is a single direct dial, not the racing
+        // router: a replay must not start its own fix6 race.
+        let (mut stream, new_id) = match router::connect_direct(
             ctx.router,
             ctx.selector,
             ctx.target,
@@ -570,7 +979,6 @@ impl RetryCopy {
             ctx.router.record_tunnel_blackhole(failed);
         }
         *tunnel_id = new_id;
-        self.retried = true;
         Some(stream)
     }
 }
@@ -631,6 +1039,24 @@ where
     let seed = retry
         .as_ref()
         .map_or(Vec::new(), |ctx| ctx.seed_prefix.clone());
+    let seed_len = seed.len();
+    // The silence replay draws from the global bucket: one primary
+    // request per refill token.
+    replay_budget_note_primary_request();
+    // Owned dial context for a post-send replay, cloned from the
+    // handler's borrowed context: the silence replay dials from a
+    // spawned task, where those borrows do not live.
+    let dial_ctx = retry.as_ref().map(|ctx| {
+        Arc::new(ReplayDialCtx {
+            router: Arc::clone(ctx.router),
+            selector: ctx.selector.clone(),
+            target: ctx.target.clone(),
+            credentials: ctx
+                .credentials
+                .map(|(user, pass)| (user.to_string(), pass.to_string())),
+            protocol: ctx.protocol,
+        })
+    });
     let mut state = RetryCopy {
         activity_tx,
         activity_rx,
@@ -641,10 +1067,20 @@ where
         idle_timeout,
         started_at: Instant::now(),
         retry_reason: "zero-response EOF",
+        replay_token: PostSendReplayToken::new(),
+        dial_ctx,
+        seed_len,
+        silence: SilenceReplay::new(),
     };
     let mut retry = retry;
     loop {
-        match state.run_epoch(&mut *a, &mut b).await {
+        let outcome = state.run_epoch(&mut *a, &mut b, tunnel_id.as_deref()).await;
+        // Backstop: free the replay slot when the epoch ends. The
+        // prompt path is the race resolution mid-epoch, through the
+        // reader; this only covers a session that ends while a
+        // replay is still in flight.
+        state.finish_replay_budget();
+        match outcome {
             EpochOutcome::Done((kind, result)) => return state.outcome(kind, result),
             EpochOutcome::ZeroResponse => {
                 let Some(ctx) = retry.take() else {
@@ -656,6 +1092,46 @@ where
                     return state.outcome(CopyEndKind::TunnelClosed, Ok(state.counts()));
                 };
                 b = new_stream;
+            }
+            EpochOutcome::SilenceReplayWon { leg, first_byte_at } => {
+                // The secondary answered first: the primary was
+                // slow/unhealthy, so it takes the blackhole penalty
+                // (breaker, EWMA, warm-list removal), exactly as a
+                // blackhole session does. A primary win after the
+                // secondary dial started is not evidence the
+                // secondary is bad, so the secondary is never
+                // penalised for losing the race.
+                if let Some(primary) = tunnel_id.as_deref()
+                    && let Some(ctx) = state.dial_ctx.as_ref()
+                {
+                    ctx.router.record_tunnel_blackhole(primary);
+                }
+                let header_written_at = state.silence.header_written_at;
+                let (secondary_dial_ms, secondary_first_byte_ms, primary_first_byte_ms) = {
+                    let timings = state.silence.shared.timings.lock();
+                    (
+                        latency_ms(timings.dial_started_at, timings.dial_connected_at),
+                        latency_ms(timings.dial_connected_at, Some(first_byte_at)),
+                        latency_ms(header_written_at, timings.primary_first_byte_at),
+                    )
+                };
+                tracing::info!(
+                    protocol = state.dial_ctx.as_ref().map_or("?", |ctx| ctx.protocol),
+                    selector = ?state.dial_ctx.as_ref().map(|ctx| &ctx.selector),
+                    target = ?state.dial_ctx.as_ref().map(|ctx| &ctx.target),
+                    from_tunnel = ?tunnel_id.as_deref(),
+                    to_tunnel = ?leg.tunnel_id.as_deref(),
+                    primary_first_byte_ms = primary_first_byte_ms,
+                    secondary_dial_ms = secondary_dial_ms,
+                    secondary_first_byte_ms = secondary_first_byte_ms,
+                    total_ms = latency_ms(header_written_at, Some(first_byte_at)),
+                    "CONNECT session rescued by safe HTTP silence replay"
+                );
+                replay_metrics().inc_winner_secondary();
+                replay_metrics().inc_rescued();
+                *tunnel_id = leg.tunnel_id;
+                state.silence.phase = SilencePhase::Done;
+                b = leg.stream;
             }
         }
     }

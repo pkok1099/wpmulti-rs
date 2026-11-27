@@ -546,7 +546,7 @@ pub(crate) async fn connect_via_router(
             };
             race.race(target_tunnel, &mut tried_ids).await
         } else {
-            connect_target(&target_tunnel, target, attempt, max_attempts)
+            connect_target(&target_tunnel, target, attempt, max_attempts, true)
                 .await
                 .map(|stream| (stream, tried_ids.last().cloned()))
         };
@@ -622,7 +622,7 @@ impl LegRace<'_> {
         set.spawn(async move {
             let result = tokio::time::timeout(
                 timeout,
-                connect_target(&tunnel, &target, attempt, max_attempts),
+                connect_target(&tunnel, &target, attempt, max_attempts, true),
             )
             .await
             .unwrap_or_else(|_| {
@@ -821,6 +821,7 @@ async fn connect_target(
     target: &TargetAddr,
     attempt: usize,
     max_attempts: usize,
+    warn_dns: bool,
 ) -> Result<DynStream, RouterConnectError> {
     match target {
         TargetAddr::Ip(dst_addr) => target_tunnel
@@ -836,18 +837,73 @@ async fn connect_target(
                     Err(RouterConnectError::ForbiddenDestination(e))
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to resolve target domain '{}' (attempt {}/{}): {:?}",
-                        domain,
-                        attempt + 1,
-                        max_attempts,
-                        e
-                    );
+                    // A replay dial is best-effort: its failures are
+                    // replay metrics, not WARNs, so the caller
+                    // suppresses the DNS warning for it.
+                    if warn_dns {
+                        tracing::warn!(
+                            "Failed to resolve target domain '{}' (attempt {}/{}): {:?}",
+                            domain,
+                            attempt + 1,
+                            max_attempts,
+                            e
+                        );
+                    }
                     Err(RouterConnectError::DnsResolution(e))
                 }
             }
         }
     }
+}
+
+/// Dial `target` through exactly one tunnel selected by `selector`,
+/// excluding `exclude_tunnel`, without the fix6 dial race and without
+/// the pool failover loop: a post-send replay (fix5 retry or the
+/// `safe_http_silence_replay`) must not start its own race, or one
+/// replay would spend the whole request chain's dial budget on
+/// speculative legs. The single dial is capped at
+/// [`FIRST_ATTEMPT_TIMEOUT`], the same per-leg cap the race uses, so
+/// a slow dormant tunnel fails the replay fast and the primary leg
+/// keeps serving. Returns `NotConnected` when no tunnel other than
+/// the excluded one exists (a `ById` selector, or a one-tunnel pool),
+/// so the caller can tell "no different tunnel" apart from a dial
+/// failure.
+pub(crate) async fn connect_direct(
+    router: &Arc<dyn TunnelRouter>,
+    selector: &TunnelSelector,
+    target: &TargetAddr,
+    credentials: Option<(&str, &str)>,
+    exclude_tunnel: Option<&str>,
+) -> Result<(DynStream, Option<String>), RouterConnectError> {
+    for attempt in 1..=MAX_RACE_SELECT_TRIES {
+        let target_tunnel = router
+            .select_tunnel(selector, credentials)
+            .await
+            .map_err(RouterConnectError::SelectTunnel)?;
+        let id = target_tunnel.tunnel_id().map(str::to_string);
+        if id.as_deref() == exclude_tunnel {
+            continue;
+        }
+        let dial = connect_target(
+            &target_tunnel,
+            target,
+            attempt,
+            MAX_RACE_SELECT_TRIES,
+            false,
+        );
+        return match tokio::time::timeout(FIRST_ATTEMPT_TIMEOUT, dial).await {
+            Ok(Ok(stream)) => Ok((stream, id)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(RouterConnectError::TcpConnect(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "replay dial timed out",
+            ))),
+        };
+    }
+    Err(RouterConnectError::SelectTunnel(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "no tunnel other than the excluded one",
+    )))
 }
 
 /// Dial TCP sequentially over validated candidate `IpAddr`s on `port` without re-resolving DNS,

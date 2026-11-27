@@ -191,6 +191,9 @@ pub fn generate_prometheus_metrics(manager: &TunnelManager) -> String {
         &entries,
         |e| e.health.cooldown_remaining_secs(),
     );
+    // Safe HTTP silence replay (fix11): global counters rendered
+    // from the proxy's replay state, next to the tunnel gauges.
+    crate::proxy::replay::write_replay_metrics(&mut out);
 
     out
 }
