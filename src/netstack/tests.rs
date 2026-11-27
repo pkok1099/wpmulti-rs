@@ -665,23 +665,23 @@ async fn test_in_tunnel_dns_resolution_and_cache() {
     stack.close().await;
 }
 
+/// Per-stack DNS cache scoping (audit run-3 #4): replaces
+/// `test_shared_dns_cache_across_stacks`, which asserted the
+/// daemon-wide sharing this fix removes. Two stacks built the way the
+/// daemon builds tunnel stacks — each with its own private cache
+/// ([`StackDnsConfig::new`]) — must not share entries, even with the
+/// same upstream: a resolution learned via A must not be served to B.
 #[tokio::test]
-async fn test_shared_dns_cache_across_stacks() {
-    use std::sync::Arc;
-
+async fn test_dns_cache_scoped_per_stack() {
     use crate::config::toml_config::DnsStrategy;
 
-    // One daemon-wide cache shared by both stacks.
-    let shared = Arc::new(DnsLruCache::new(2048));
-    let dns_a = StackDnsConfig::with_shared_cache(
+    let dns_a = StackDnsConfig::new(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
         DnsStrategy::TunnelOnly,
-        Arc::clone(&shared),
     );
-    let dns_b = StackDnsConfig::with_shared_cache(
+    let dns_b = StackDnsConfig::new(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
         DnsStrategy::TunnelOnly,
-        Arc::clone(&shared),
     );
 
     let config = make_test_config("10.2.0.2/32", None);
@@ -696,9 +696,9 @@ async fn test_shared_dns_cache_across_stacks() {
     )
     .unwrap();
 
-    // Stack B has no mock DNS responder on its bridge: if the cache were
-    // per-stack, resolving via B would have to query the (absent) upstream
-    // and time out. A shared cache serves it from A's earlier lookup.
+    // Stack B has no mock DNS responder on its bridge: with per-stack
+    // caches, resolving via B has to query its own (absent) upstream
+    // and fail. A shared cache would serve it from A's earlier lookup.
     let (bridge_b, _ip_send_b, _ip_recv_b) = VirtualTunBridge::new(DEFAULT_MTU, 64);
     let stack_b = VirtualNetworkStack::new_with_options(
         &config,
@@ -771,17 +771,25 @@ async fn test_shared_dns_cache_across_stacks() {
 
     responder_task.await.unwrap();
 
-    // Resolution via B: must be served from the shared cache without any
-    // network packet. Bounded so a regression (per-stack cache) fails fast
-    // instead of waiting out the 3s in-tunnel DNS deadline.
+    // Second resolution via A: served from A's own cache (no second
+    // query — the responder is gone, so a miss would fail here).
+    // Sharing inside one tunnel is preserved.
+    let cached_a = stack_a.resolve_in_tunnel("example.com").await.unwrap();
+    assert_eq!(cached_a, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+
+    // Resolution via B: must NOT be served from A's cache entry, so
+    // it fails against its own (absent) upstream. Bounded so the
+    // failure is observed fast.
     let resolved_b = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         stack_b.resolve_in_tunnel("example.com"),
     )
     .await
-    .expect("stack B resolution timed out: shared DNS cache not used")
-    .unwrap();
-    assert_eq!(resolved_b, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+    .expect("stack B resolution must finish within the timeout");
+    assert!(
+        resolved_b.is_err(),
+        "stack B must not be served from stack A's cache entry"
+    );
 
     stack_a.close().await;
     stack_b.close().await;
@@ -3341,4 +3349,171 @@ async fn test_tun_unusable_specific_route_does_not_shadow_usable_covering() {
     );
 
     endpoint.shutdown().await;
+}
+
+/// Answer a single DNS query arriving on a bridge with 93.184.216.34,
+/// then return (mock upstream for DNS tests).
+async fn mock_dns_answer_once(
+    mut ip_recv: crate::netstack::BridgeIpRecv,
+    mut ip_send: crate::netstack::BridgeIpSend,
+) {
+    use gotatun::tun::{IpRecv, IpSend};
+    use zerocopy::IntoBytes;
+
+    let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+    let mut packets = ip_recv.recv(&mut pool).await.unwrap();
+    let pkt = packets.next().unwrap();
+    let raw = (*pkt).as_bytes();
+
+    let parsed = etherparse::SlicedPacket::from_ip(raw).unwrap();
+    let udp_hdr = match &parsed.transport {
+        Some(etherparse::TransportSlice::Udp(u)) => u,
+        _ => panic!("expected udp"),
+    };
+    let dns_query = udp_hdr.payload();
+    let tx_id = u16::from_be_bytes([dns_query[0], dns_query[1]]);
+
+    // Build mock DNS response pointing to 93.184.216.34
+    let mut dns_resp = Vec::new();
+    dns_resp.extend_from_slice(&tx_id.to_be_bytes());
+    dns_resp.extend_from_slice(&[0x81, 0x80]); // Response
+    dns_resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+    dns_resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT=1
+    dns_resp.extend_from_slice(&[0x00, 0x00]);
+    dns_resp.extend_from_slice(&[0x00, 0x00]);
+    // Echo question
+    dns_resp.extend_from_slice(&dns_query[12..]);
+    // Answer: compression pointer to name
+    dns_resp.extend_from_slice(&[0xC0, 0x0C]);
+    dns_resp.extend_from_slice(&[0x00, 0x01]); // Type A
+    dns_resp.extend_from_slice(&[0x00, 0x01]); // Class IN
+    dns_resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL=60s
+    dns_resp.extend_from_slice(&[0x00, 0x04]); // Len=4
+    dns_resp.extend_from_slice(&[93, 184, 216, 34]);
+
+    let (src_ip, dst_ip) = match parsed.net.unwrap() {
+        etherparse::NetSlice::Ipv4(v4) => (v4.header().source(), v4.header().destination()),
+        _ => panic!("expected ipv4"),
+    };
+    let udp_ports = (udp_hdr.source_port(), udp_hdr.destination_port());
+
+    let builder = PacketBuilder::ipv4(dst_ip, src_ip, 64).udp(udp_ports.1, udp_ports.0);
+    let mut reply_raw = Vec::new();
+    builder.write(&mut reply_raw, &dns_resp).unwrap();
+
+    let mut reply_pkt = pool.get();
+    reply_pkt.truncate(reply_raw.len());
+    reply_pkt.copy_from_slice(&reply_raw);
+    let ip_reply = reply_pkt.try_into_ip().unwrap();
+
+    ip_send.send(ip_reply).await.unwrap();
+}
+
+/// Run-3 validation #4: per-stack DNS cache scoping (fingerprint
+/// `netstack/dns:shared-cache-timing-oracle-across-proxy-clients`).
+///
+/// Two stacks, same upstream 1.1.1.1:53. Stack A resolves
+/// example.com via its mock responder; stack B must NOT be served
+/// from A's entry: B has no responder, only an observer that records
+/// whether B sends a fresh upstream query. A cache hit for B would
+/// send no query at all — the timing oracle the finding describes.
+#[tokio::test]
+async fn test_dns_cache_scoped_per_stack_queries_own_upstream() {
+    use crate::config::toml_config::DnsStrategy;
+
+    // Post-fix daemon construction: each stack gets its own private
+    // cache (StackDnsConfig::new), so B can never be served from A's
+    // entry. (With the pre-fix shared cache this test failed: B was
+    // served from A's entry without any upstream query.)
+    let dns_a = StackDnsConfig::new(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+        DnsStrategy::TunnelOnly,
+    );
+    let dns_b = StackDnsConfig::new(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+        DnsStrategy::TunnelOnly,
+    );
+
+    let config = make_test_config("10.2.0.2/32", None);
+    let (bridge_a, ip_send_a, ip_recv_a) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack_a = VirtualNetworkStack::new_with_options(
+        &config,
+        bridge_a,
+        crate::config::IpMode::DualStack,
+        false,
+        &dns_a,
+        Duration::from_secs(15),
+    )
+    .unwrap();
+
+    let (bridge_b, _ip_send_b, mut ip_recv_b) = VirtualTunBridge::new(DEFAULT_MTU, 64);
+    let stack_b = VirtualNetworkStack::new_with_options(
+        &config,
+        bridge_b,
+        crate::config::IpMode::DualStack,
+        false,
+        &dns_b,
+        Duration::from_secs(15),
+    )
+    .unwrap();
+
+    // Mock DNS responder on stack A's bridge only: answers one query
+    // with 93.184.216.34, then exits.
+    let responder_task = tokio::spawn(mock_dns_answer_once(ip_recv_a, ip_send_a));
+
+    // Observer on stack B's bridge: records whether B sends a fresh
+    // upstream DNS query (it never answers, so B's resolve fails).
+    let observer_task = tokio::spawn(async move {
+        use gotatun::tun::IpRecv;
+        use zerocopy::IntoBytes;
+
+        let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+        let mut packets = ip_recv_b.recv(&mut pool).await.unwrap();
+        let pkt = packets.next().unwrap();
+        let raw = (*pkt).as_bytes();
+
+        let parsed = etherparse::SlicedPacket::from_ip(raw).unwrap();
+        match &parsed.transport {
+            Some(etherparse::TransportSlice::Udp(u)) => {
+                assert_eq!(
+                    u.destination_port(),
+                    53,
+                    "stack B must send a DNS query to its upstream"
+                );
+            }
+            _ => panic!("expected udp"),
+        }
+    });
+
+    // First resolution via A: queries the mock DNS, populates the cache.
+    let resolved_a = stack_a.resolve_in_tunnel("example.com").await.unwrap();
+    assert_eq!(resolved_a, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+
+    responder_task.await.unwrap();
+
+    // Second resolution via A: served from A's own cache (no second
+    // query — the responder is gone, so a miss would fail here).
+    let cached_a = stack_a.resolve_in_tunnel("example.com").await.unwrap();
+    assert_eq!(cached_a, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+
+    // Resolution via B: must miss — no answer on its bridge — and
+    // must send a fresh upstream query of its own instead of being
+    // served from A's cache entry.
+    let resolved_b = tokio::time::timeout(
+        Duration::from_secs(5),
+        stack_b.resolve_in_tunnel("example.com"),
+    )
+    .await
+    .expect("stack B resolution must finish within the timeout");
+    assert!(
+        resolved_b.is_err(),
+        "stack B must not be served from stack A's cache entry"
+    );
+    tokio::time::timeout(Duration::from_secs(2), observer_task)
+        .await
+        .expect("stack B must send a fresh upstream query")
+        .unwrap();
+
+    stack_a.close().await;
+    stack_b.close().await;
 }

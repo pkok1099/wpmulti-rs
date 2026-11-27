@@ -485,16 +485,19 @@ fn build_fallback_servers(fallback: SocketAddr) -> Vec<SocketAddr> {
 
 /// In-tunnel DNS resolver guaranteeing zero host DNS leaks.
 ///
-/// The cache is reference-counted so one daemon-wide cache can be shared by
-/// every tunnel's resolver — but entries are keyed by the resolver's
-/// upstream DNS servers (see [`Self::cache_key`]), so a shared cache
-/// never serves one tunnel's DNS answer to a resolver with different
+/// The cache is reference-counted so several resolvers can share one
+/// cache instance — but entries are keyed by the resolver's upstream
+/// DNS servers (see [`Self::cache_key`]), so a shared cache never
+/// serves one tunnel's DNS answer to a resolver with different
 /// upstreams; host-fallback answers live under a separate `host|`
-/// namespace. With per-tunnel caches, round-robin across many tunnels
-/// re-resolves the same domain on nearly every connection (each
-/// tunnel's cache goes cold between its turns), while a scoped shared
-/// cache stays warm as long as any tunnel with the same upstreams
-/// resolved the domain recently.
+/// namespace. The daemon no longer shares a cache across tunnels:
+/// each tunnel's resolver gets its own cache, so a resolution learned
+/// through one tunnel can never be served to — and timed by — another
+/// tunnel's clients (audit run-3 #4, shared-cache timing oracle).
+/// The cost is one upstream query per tunnel for the same domain
+/// instead of one daemon-wide, and round-robin across many tunnels
+/// re-resolves more often (each tunnel's cache goes cold between its
+/// turns).
 #[derive(Debug)]
 pub struct InTunnelDnsResolver {
     has_configured_dns: bool,
@@ -521,7 +524,8 @@ impl InTunnelDnsResolver {
         Self::with_fallback_and_cache(configured_dns, fallback, Arc::new(DnsLruCache::new(2048)))
     }
 
-    /// Construct resolver sharing a daemon-wide DNS cache with other tunnels.
+    /// Construct resolver sharing the given DNS cache with other
+    /// resolvers built from the same instance.
     pub fn with_fallback_and_cache(
         configured_dns: &[IpAddr],
         fallback: SocketAddr,

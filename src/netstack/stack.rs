@@ -87,18 +87,20 @@ impl std::fmt::Debug for StackInner {
 
 /// DNS configuration for a virtual network stack.
 ///
-/// `shared_cache` is the daemon-wide DNS cache: every tunnel built with the
-/// same cache instance shares resolutions, so round-robin across many tunnels
-/// does not re-resolve the same domain on every connection. One-off stacks
-/// (CLI probes, tests) use [`StackDnsConfig::new`], which creates a fresh
-/// private cache.
+/// `shared_cache` is the cache this stack's resolver uses. The daemon
+/// gives each tunnel its own cache ([`StackDnsConfig::new`]), so a
+/// resolution learned through one tunnel is never served to another
+/// tunnel's clients (audit run-3 #4, shared-cache timing oracle);
+/// sharing is kept inside one tunnel only. [`StackDnsConfig::with_shared_cache`]
+/// shares one explicitly supplied cache between stacks, for tests.
 #[derive(Debug)]
 pub struct StackDnsConfig {
     /// Fallback DNS server used when the tunnel `.conf` omits `DNS`.
     pub fallback: SocketAddr,
     /// Resolution strategy (`TunnelOnly`, `TunnelFirst`, `Host`).
     pub strategy: crate::config::toml_config::DnsStrategy,
-    /// DNS cache shared with other stacks (or a fresh private one).
+    /// DNS cache this stack's resolver uses (private per stack, unless
+    /// built with [`StackDnsConfig::with_shared_cache`]).
     pub shared_cache: Arc<DnsLruCache>,
 }
 
@@ -112,7 +114,9 @@ impl StackDnsConfig {
         }
     }
 
-    /// Build DNS config sharing a daemon-wide cache with other stacks.
+    /// Build DNS config sharing one explicitly supplied cache with
+    /// other stacks built from the same instance (tests only; the
+    /// daemon gives each tunnel its own cache — see [`StackDnsConfig`]).
     pub const fn with_shared_cache(
         fallback: SocketAddr,
         strategy: crate::config::toml_config::DnsStrategy,

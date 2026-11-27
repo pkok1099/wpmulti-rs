@@ -31,7 +31,7 @@ use crate::core::registry::{
 use crate::core::selection::WarmList;
 use crate::netstack::tun::TunEndpoint;
 use crate::netstack::{
-    DEFAULT_CHANNEL_CAPACITY, DnsLruCache, StackDnsConfig, VirtualNetworkStack, VirtualTunBridge,
+    DEFAULT_CHANNEL_CAPACITY, StackDnsConfig, VirtualNetworkStack, VirtualTunBridge,
 };
 use crate::proxy::router::is_forbidden_destination_ip;
 use crate::proxy::{DynStream, ProxyTunnelTarget, ProxyUdpSocket};
@@ -623,11 +623,6 @@ pub struct LifecycleController {
     prefer_ipv6: std::sync::atomic::AtomicBool,
     ip_mode: std::sync::atomic::AtomicU8,
     eviction_lock: tokio::sync::Mutex<()>,
-    /// Daemon-wide DNS cache shared by every tunnel's resolver, so
-    /// round-robin across many tunnels does not re-resolve the same domain
-    /// on every connection (each tunnel's own cache would go cold between
-    /// its turns).
-    shared_dns_cache: Arc<DnsLruCache>,
     /// VPN mode: when true, `boot_tunnel` builds devices on the shared
     /// TUN endpoint with a protected UDP factory instead of the smoltcp
     /// bridge + netstack. Off by default; the daemon proxy path is
@@ -809,7 +804,6 @@ impl LifecycleController {
             prefer_ipv6: std::sync::atomic::AtomicBool::new(false),
             ip_mode: std::sync::atomic::AtomicU8::new(0),
             eviction_lock: tokio::sync::Mutex::new(()),
-            shared_dns_cache: Arc::new(DnsLruCache::new(2048)),
             vpn_mode: std::sync::atomic::AtomicBool::new(false),
             socket_protector: RwLock::new(None),
             tun_endpoint: RwLock::new(None),
@@ -870,6 +864,17 @@ impl LifecycleController {
             2 => crate::config::toml_config::DnsStrategy::Host,
             _ => crate::config::toml_config::DnsStrategy::TunnelOnly,
         }
+    }
+
+    /// DNS config for a tunnel boot: each boot gets a fresh private
+    /// cache, so a resolution learned through one tunnel can never be
+    /// served to — and timed by — a client of another tunnel (audit
+    /// run-3 #4, shared-cache timing oracle). Sharing is kept inside
+    /// one tunnel: every connection through the same stack's resolver
+    /// uses that stack's cache. The cost is one upstream query per
+    /// tunnel for the same domain instead of one daemon-wide.
+    fn stack_dns_config(&self) -> StackDnsConfig {
+        StackDnsConfig::new(*self.dns_fallback.lock(), self.dns_strategy())
     }
 
     /// Configure the handshake / endpoint resolution timeout for tunnel activation.
@@ -1266,11 +1271,7 @@ impl LifecycleController {
             }
             TunnelState::Dormant | TunnelState::Activating => {
                 let activating_guard = ActivatingGuard::new(&entry);
-                let dns = StackDnsConfig::with_shared_cache(
-                    *self.dns_fallback.lock(),
-                    self.dns_strategy(),
-                    Arc::clone(&self.shared_dns_cache),
-                );
+                let dns = self.stack_dns_config();
                 match self
                     .boot_tunnel(
                         &entry,
@@ -1376,11 +1377,7 @@ impl LifecycleController {
             }
             TunnelState::Dormant | TunnelState::Activating => {
                 let activating_guard = ActivatingGuard::new(&entry);
-                let dns = StackDnsConfig::with_shared_cache(
-                    *self.dns_fallback.lock(),
-                    self.dns_strategy(),
-                    Arc::clone(&self.shared_dns_cache),
-                );
+                let dns = self.stack_dns_config();
                 match self
                     .boot_tunnel(
                         &entry,
@@ -1982,6 +1979,26 @@ mod tests {
             cache.get(endpoint),
             None,
             "stale entry must expire once the capped window passes"
+        );
+    }
+
+    #[test]
+    fn test_stack_dns_config_is_per_tunnel_private() {
+        // Audit run-3 #4: every tunnel boot must get its own DNS
+        // cache, so a resolution learned through one tunnel can never
+        // be served to — and timed by — another tunnel's clients.
+        // Two configs built from the same controller must not share a
+        // cache instance.
+        let controller = LifecycleController::new(
+            Arc::new(TunnelRegistry::new()),
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        );
+        let first = controller.stack_dns_config();
+        let second = controller.stack_dns_config();
+        assert!(
+            !Arc::ptr_eq(&first.shared_cache, &second.shared_cache),
+            "each tunnel boot must get a fresh private DNS cache"
         );
     }
 }
