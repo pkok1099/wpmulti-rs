@@ -1,6 +1,7 @@
 //! HTTP routing and request dispatch for the Admin REST API.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -78,6 +79,20 @@ impl HttpResponse {
         Self {
             status: 401,
             reason: "Unauthorized",
+            content_type: "application/json",
+            body,
+        }
+    }
+
+    /// Construct a 429 Too Many Requests response (audit run-3 #1:
+    /// source IP rate-limited after repeated failed credentials).
+    pub fn too_many_requests() -> Self {
+        let body =
+            serde_json::to_vec(&json!({ "error": "too many failed authentication attempts" }))
+                .unwrap_or_default();
+        Self {
+            status: 429,
+            reason: "Too Many Requests",
             content_type: "application/json",
             body,
         }
@@ -279,6 +294,49 @@ fn is_authorized(req: &HttpRequest, auth_token: Option<&str>) -> bool {
         return false;
     }
     crate::proxy::router::constant_time_eq_str(token, expected_token)
+}
+
+/// Admin credential gate with per-source-IP failed-attempt accounting
+/// (audit run-3 #1).
+///
+/// Returns `Ok(())` when the request is authorized, `Err(response)`
+/// with the rejection otherwise: `429` when the source IP is
+/// rate-limited, `401` for a wrong token. Only requests that actually
+/// present an `Authorization` header are counted — a missing header
+/// presents nothing to guess — and only while a token is configured:
+/// with no token there is no credential to guess. A presented valid
+/// token clears the source's failure record.
+fn admin_auth_gate(
+    req: &HttpRequest,
+    auth_token: Option<&str>,
+    peer_ip: Option<IpAddr>,
+) -> Result<(), HttpResponse> {
+    use crate::proxy::router::SHARED_FAILED_AUTH_LIMITER;
+
+    let presented = req.headers.contains_key("authorization");
+    if let Some(ip) = peer_ip
+        && auth_token.is_some()
+        && presented
+        && SHARED_FAILED_AUTH_LIMITER.is_blocked(ip)
+    {
+        return Err(HttpResponse::too_many_requests());
+    }
+    if !is_authorized(req, auth_token) {
+        if let Some(ip) = peer_ip
+            && auth_token.is_some()
+            && presented
+        {
+            SHARED_FAILED_AUTH_LIMITER.note_failure(ip);
+        }
+        return Err(HttpResponse::unauthorized());
+    }
+    if let Some(ip) = peer_ip
+        && auth_token.is_some()
+        && presented
+    {
+        SHARED_FAILED_AUTH_LIMITER.note_success(ip);
+    }
+    Ok(())
 }
 
 fn handle_status_request(manager: &Arc<TunnelManager>, uptime_secs: u64) -> HttpResponse {
@@ -529,7 +587,7 @@ fn is_allowed_unauthenticated_host(host_header: &str) -> bool {
         || trimmed.split_once(':').map_or(trimmed, |(h, _)| h),
         |rest| rest.split_once(']').map_or(trimmed, |(h, _)| h),
     );
-    host_only.eq_ignore_ascii_case("localhost") || host_only.parse::<std::net::IpAddr>().is_ok()
+    host_only.eq_ignore_ascii_case("localhost") || host_only.parse::<IpAddr>().is_ok()
 }
 
 fn has_json_content_type(req: &HttpRequest) -> bool {
@@ -547,6 +605,18 @@ pub async fn handle_admin_request(
     auth_token: Option<&str>,
     uptime_secs: u64,
 ) -> HttpResponse {
+    handle_admin_request_with_peer(req, manager, auth_token, uptime_secs, None).await
+}
+
+/// Core routing function for incoming Admin REST API requests with
+/// the peer IP for failed-attempt accounting; `None` skips limiting.
+pub async fn handle_admin_request_with_peer(
+    req: &HttpRequest,
+    manager: &Arc<TunnelManager>,
+    auth_token: Option<&str>,
+    uptime_secs: u64,
+    peer_ip: Option<IpAddr>,
+) -> HttpResponse {
     if auth_token.is_none()
         && let Some(host) = req.headers.get("host")
         && !is_allowed_unauthenticated_host(host)
@@ -554,8 +624,8 @@ pub async fn handle_admin_request(
         return HttpResponse::forbidden("Invalid Host header for unauthenticated Admin API");
     }
 
-    if !is_authorized(req, auth_token) {
-        return HttpResponse::unauthorized();
+    if let Err(response) = admin_auth_gate(req, auth_token, peer_ip) {
+        return response;
     }
 
     let method = req.method.as_str();

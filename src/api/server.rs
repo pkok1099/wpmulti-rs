@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::api::routes::{HttpResponse, handle_admin_request, parse_http_request};
+use crate::api::routes::{HttpResponse, handle_admin_request_with_peer, parse_http_request};
 use crate::core::TunnelManager;
 
 /// Embedded HTTP Admin REST API server.
@@ -499,7 +499,7 @@ async fn read_admin_request_body<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
 async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
-    _peer_addr: SocketAddr,
+    peer_addr: SocketAddr,
     manager: Arc<TunnelManager>,
     auth_token: Option<&str>,
     start_time: Instant,
@@ -537,7 +537,14 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             // send the token from `WPMULTI_ADMIN_TOKEN` /
             // `--auth-token` when one is configured.
             let effective_auth_token = dynamic_token.as_deref().or(auth_token);
-            handle_admin_request(&req, &manager, effective_auth_token, uptime_secs).await
+            handle_admin_request_with_peer(
+                &req,
+                &manager,
+                effective_auth_token,
+                uptime_secs,
+                Some(peer_addr.ip()),
+            )
+            .await
         }
         Err(e) => HttpResponse::bad_request(&e),
     };

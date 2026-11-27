@@ -13,10 +13,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proxy::replay::{BlackholeEjectionReason, replay_metrics};
 use crate::proxy::router::{
-    DynStream, ProxyTunnelTarget, ProxyUdpSocket, RouterConnectError, TargetAddr, TunnelRouter,
-    TunnelSelector, bound_candidate_addrs, connect_via_router, is_forbidden_destination_ip,
-    is_valid_target_domain, parse_domain_ip_literal, resolve_and_validate_domain,
-    send_udp_to_validated_addrs,
+    DynStream, ProxyTunnelTarget, ProxyUdpSocket, RouterConnectError, SHARED_FAILED_AUTH_LIMITER,
+    TargetAddr, TunnelRouter, TunnelSelector, bound_candidate_addrs, connect_via_router,
+    is_forbidden_destination_ip, is_valid_target_domain, parse_domain_ip_literal,
+    resolve_and_validate_domain, send_udp_to_validated_addrs,
 };
 
 // SOCKS Protocol Versions
@@ -282,6 +282,7 @@ async fn read_rfc1929_credentials<S: AsyncRead + AsyncWrite + Unpin>(
 async fn negotiate_socks5_auth<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     router: &Arc<dyn TunnelRouter>,
+    peer_ip: Option<IpAddr>,
 ) -> io::Result<(TunnelSelector, Option<(String, String)>)> {
     let mut header = [0u8; 2];
     stream.read_exact(&mut header).await?;
@@ -335,8 +336,24 @@ async fn negotiate_socks5_auth<S: AsyncRead + AsyncWrite + Unpin>(
 
     let (username, password) = read_rfc1929_credentials(stream).await?;
 
+    // A rate-limited source gets the same 0x01 rejection as a wrong
+    // password, without its credential being verified at all (audit
+    // run-3 #1): the reply must not reveal whether the IP is blocked
+    // or the guess was merely wrong.
+    if peer_ip.is_some_and(|ip| SHARED_FAILED_AUTH_LIMITER.is_blocked(ip)) {
+        stream.write_all(&[RFC1929_VERSION, 0x01]).await?;
+        stream.flush().await?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authentication rate limited",
+        ));
+    }
+
     match router.authenticate(Some((&username, &password))) {
         Ok(sel) => {
+            if let Some(ip) = peer_ip {
+                SHARED_FAILED_AUTH_LIMITER.note_success(ip);
+            }
             stream.write_all(&[RFC1929_VERSION, 0x00]).await?;
             stream.flush().await?;
             // The credentials travel with the selector: the router
@@ -345,6 +362,9 @@ async fn negotiate_socks5_auth<S: AsyncRead + AsyncWrite + Unpin>(
             Ok((sel, Some((username, password))))
         }
         Err(err) => {
+            if let Some(ip) = peer_ip {
+                SHARED_FAILED_AUTH_LIMITER.note_failure(ip);
+            }
             tracing::debug!("SOCKS5 RFC 1929 authentication rejected: {:?}", err);
             stream.write_all(&[RFC1929_VERSION, 0x01]).await?;
             stream.flush().await?;
@@ -442,7 +462,7 @@ where
     let handshake_timeout = std::time::Duration::from_secs(30);
     let (selector, credentials) = tokio::time::timeout(
         handshake_timeout,
-        negotiate_socks5_auth(&mut stream, &router),
+        negotiate_socks5_auth(&mut stream, &router, peer_ip),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 auth timed out"))??;

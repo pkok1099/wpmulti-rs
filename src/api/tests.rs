@@ -1,6 +1,7 @@
 //! Unit tests for Milestone 5: HTTP Admin REST API & Prometheus metrics.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,10 +9,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::api::routes::{HttpRequest, handle_admin_request};
+use crate::api::routes::{HttpRequest, handle_admin_request, handle_admin_request_with_peer};
 use crate::api::server::AdminServer;
 use crate::config::{MainConfig, TunnelConfig, WgInterfaceConfig, WgPeerConfig};
 use crate::core::TunnelManager;
+use crate::proxy::router::MAX_FAILED_AUTH_ATTEMPTS;
 
 fn make_test_tunnel_config(id: &str, endpoint: &str) -> TunnelConfig {
     let iface = WgInterfaceConfig {
@@ -1622,4 +1624,72 @@ async fn test_admin_global_slots_exhausted_by_8_distinct_slow_ips() {
         task.abort();
     }
     server.stop().await;
+}
+
+#[tokio::test]
+async fn test_admin_auth_rate_limited_after_repeated_failures() {
+    // Audit run-3 #1: 1000 wrong Admin tokens were answered
+    // immediately at 603.5/s. After the threshold the source gets
+    // 429 even with the correct token, another source still gets
+    // 200, and a request without a token from the blocked source is
+    // still 401 (a missing header presents nothing to guess, so it
+    // is neither counted nor gated by the limiter).
+    let manager = create_test_manager();
+    let token = "dummy-admin-token";
+    let ip: IpAddr = "127.0.0.6".parse().unwrap();
+    let other_ip: IpAddr = "127.0.0.7".parse().unwrap();
+    let req_with_token = |bearer: &str| {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), format!("Bearer {bearer}"));
+        HttpRequest {
+            method: "GET".to_string(),
+            path: "/health".to_string(),
+            query: None,
+            headers,
+            body: Vec::new(),
+        }
+    };
+    for _ in 0..MAX_FAILED_AUTH_ATTEMPTS {
+        let resp = handle_admin_request_with_peer(
+            &req_with_token("wrong-token"),
+            &manager,
+            Some(token),
+            10,
+            Some(ip),
+        )
+        .await;
+        assert_eq!(resp.status, 401, "wrong token must be rejected with 401");
+    }
+    let resp =
+        handle_admin_request_with_peer(&req_with_token(token), &manager, Some(token), 10, Some(ip))
+            .await;
+    assert_eq!(
+        resp.status, 429,
+        "correct token from a blocked source must be rate-limited"
+    );
+    let resp = handle_admin_request_with_peer(
+        &req_with_token(token),
+        &manager,
+        Some(token),
+        10,
+        Some(other_ip),
+    )
+    .await;
+    assert_eq!(
+        resp.status, 200,
+        "correct token from another source must succeed"
+    );
+    let req_no_token = HttpRequest {
+        method: "GET".to_string(),
+        path: "/health".to_string(),
+        query: None,
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let resp =
+        handle_admin_request_with_peer(&req_no_token, &manager, Some(token), 10, Some(ip)).await;
+    assert_eq!(
+        resp.status, 401,
+        "missing token from a blocked source stays 401, not 429"
+    );
 }

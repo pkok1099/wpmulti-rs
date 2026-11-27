@@ -10,9 +10,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -1448,6 +1448,177 @@ pub fn credentials_match(presented: (&str, &str), expected: (&str, &str)) -> boo
     let pass_matches = constant_time_eq_str(presented.1, expected.1);
     user_matches & pass_matches
 }
+
+/// Failed credential attempts tolerated from one source IP inside
+/// [`FAILED_AUTH_WINDOW`] before that IP is blocked.
+///
+/// Audit run-3 #1: 1000 wrong credentials per surface answered
+/// immediately, 284–604 guesses/s, no delay or lockout.
+pub const MAX_FAILED_AUTH_ATTEMPTS: u32 = 5;
+
+/// Window in which [`MAX_FAILED_AUTH_ATTEMPTS`] failures accumulate
+/// for one source IP.
+pub const FAILED_AUTH_WINDOW: Duration = Duration::from_secs(300);
+
+/// How long a source IP stays blocked once it reaches
+/// [`MAX_FAILED_AUTH_ATTEMPTS`] failures.
+///
+/// The block is temporary by design: it expires on its own, and one
+/// correct credential clears the record outright, so a legitimate
+/// operator who mistypes is never locked out permanently.
+pub const FAILED_AUTH_BLOCK_DURATION: Duration = Duration::from_secs(60);
+
+/// Upper bound on tracked source IPs: once exceeded, entries whose
+/// window or block already expired are dropped, so a spray of fresh
+/// IPs cannot grow the map without bound.
+const MAX_TRACKED_AUTH_IPS: usize = 1024;
+
+/// Per-source-IP failed-credential accounting shared by the SOCKS5,
+/// HTTP proxy, and Admin surfaces (audit run-3 #1).
+///
+/// Only attempts that actually present a credential are counted: an
+/// anonymous request (or a missing `Authorization` header) presents
+/// nothing to guess, so it neither counts nor is blocked. Callers
+/// check [`FailedAuthLimiter::is_blocked`] before verifying a
+/// presented credential, then record the outcome with
+/// [`FailedAuthLimiter::note_success`] /
+/// [`FailedAuthLimiter::note_failure`]. The lock is never held across
+/// an `.await`: every method is synchronous and short.
+#[derive(Debug)]
+pub struct FailedAuthLimiter {
+    max_failures: u32,
+    window: Duration,
+    block_duration: Duration,
+    state: Mutex<HashMap<IpAddr, FailedAuthState>>,
+}
+
+/// Failure record for one source IP.
+#[derive(Debug, Clone, Copy)]
+struct FailedAuthState {
+    failures: u32,
+    window_start: Instant,
+    blocked_until: Option<Instant>,
+}
+
+impl Default for FailedAuthLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FailedAuthLimiter {
+    /// Limiter with the production limits.
+    pub fn new() -> Self {
+        Self {
+            max_failures: MAX_FAILED_AUTH_ATTEMPTS,
+            window: FAILED_AUTH_WINDOW,
+            block_duration: FAILED_AUTH_BLOCK_DURATION,
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Limiter with explicit limits (tests: short windows/blocks keep
+    /// expiry tests fast instead of waiting out production durations).
+    pub fn with_limits(max_failures: u32, window: Duration, block_duration: Duration) -> Self {
+        Self {
+            max_failures,
+            window,
+            block_duration,
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether `ip` is currently blocked. An expired block or window
+    /// clears the record, so the next failure starts a fresh window.
+    pub fn is_blocked(&self, ip: IpAddr) -> bool {
+        let mut state = self.state.lock();
+        let Some(entry) = state.get_mut(&ip) else {
+            return false;
+        };
+        match entry.blocked_until {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                state.remove(&ip);
+                false
+            }
+            None => {
+                if entry.window_start.elapsed() >= self.window {
+                    state.remove(&ip);
+                }
+                false
+            }
+        }
+    }
+
+    /// A presented credential was accepted: the record for `ip` is
+    /// cleared, so one correct login recovers a mistyping operator
+    /// immediately instead of waiting out the window.
+    pub fn note_success(&self, ip: IpAddr) {
+        self.state.lock().remove(&ip);
+    }
+
+    /// A presented credential was rejected: count it, blocking `ip`
+    /// once the threshold is reached inside the window. An already
+    /// blocked IP keeps its original block — hammering during the
+    /// block does not extend it.
+    pub fn note_failure(&self, ip: IpAddr) {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        if state.len() > MAX_TRACKED_AUTH_IPS {
+            state.retain(|_, entry| {
+                entry
+                    .blocked_until
+                    .map_or(entry.window_start + self.window > now, |until| until > now)
+            });
+        }
+        let Some(entry) = state.get_mut(&ip) else {
+            state.insert(
+                ip,
+                FailedAuthState {
+                    failures: 1,
+                    window_start: now,
+                    blocked_until: None,
+                },
+            );
+            return;
+        };
+        if let Some(until) = entry.blocked_until {
+            if now < until {
+                return;
+            }
+            // Block expired: clean slate, the next failure starts over.
+            entry.failures = 0;
+            entry.window_start = now;
+            entry.blocked_until = None;
+        }
+        if entry.window_start.elapsed() >= self.window {
+            entry.failures = 0;
+            entry.window_start = now;
+        }
+        entry.failures = entry.failures.saturating_add(1);
+        let newly_blocked = entry.failures >= self.max_failures;
+        if newly_blocked {
+            entry.blocked_until = Some(now + self.block_duration);
+        }
+        let failures = entry.failures;
+        // Release the lock before logging: the record is final, and
+        // holding the guard through the log call would serialize
+        // every other source's attempt behind it.
+        drop(state);
+        if newly_blocked {
+            tracing::warn!(
+                "auth rate limit: {ip} blocked for {}s after {failures} failed attempts",
+                self.block_duration.as_secs(),
+            );
+        }
+    }
+}
+
+/// Process-wide failed-credential accounting shared by the SOCKS5,
+/// HTTP proxy, and Admin surfaces, so guesses spread across surfaces
+/// accumulate in one per-IP bucket (audit run-3 #1).
+pub static SHARED_FAILED_AUTH_LIMITER: std::sync::LazyLock<FailedAuthLimiter> =
+    std::sync::LazyLock::new(FailedAuthLimiter::new);
 
 /// Shared credential check for routers that resolve a [`TunnelSelector`]
 /// from optional SOCKS5/HTTP credentials.

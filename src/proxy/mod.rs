@@ -25,8 +25,8 @@ use replay::{
 };
 
 pub use http::{
-    extract_basic_auth, handle_http, parse_authority, read_http_request_headers,
-    read_http_request_headers_buffered,
+    extract_basic_auth, handle_http, handle_http_with_peer, parse_authority,
+    read_http_request_headers, read_http_request_headers_buffered,
 };
 pub use router::{
     AsyncReadWrite, DirectTunnelTarget, DynStream, PoolKeyword, PoolRouter, ProxyAuthError,
@@ -1429,9 +1429,10 @@ pub async fn run_http_listener(
             break;
         };
         let router_clone = Arc::clone(&router);
+        let peer_ip = Some(peer_addr.ip());
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle_http(stream, router_clone).await {
+            if let Err(e) = handle_http_with_peer(stream, router_clone, peer_ip).await {
                 tracing::debug!("HTTP proxy client {} disconnected: {:?}", peer_addr, e);
             }
         });

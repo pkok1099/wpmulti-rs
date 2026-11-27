@@ -68,8 +68,9 @@ pub use proxy::{
     REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE, REP_NETWORK_UNREACHABLE, REP_SUCCESS,
     REP_TTL_EXPIRED, RFC1929_VERSION, SOCKS5_VERSION, SingleTunnelRouter, TargetAddr, TunnelRouter,
     TunnelSelector, build_socks5_udp_packet, encode_target_addr, encode_target_addr_slice,
-    extract_basic_auth, handle_http, handle_socks5, handle_socks5_with_addrs, parse_authority,
-    parse_socks5_udp_packet, read_http_request_headers, read_http_request_headers_buffered,
-    run_http_listener, run_socks5_listener, send_socks5_reply, write_socks5_udp_header,
+    extract_basic_auth, handle_http, handle_http_with_peer, handle_socks5,
+    handle_socks5_with_addrs, parse_authority, parse_socks5_udp_packet, read_http_request_headers,
+    read_http_request_headers_buffered, run_http_listener, run_socks5_listener, send_socks5_reply,
+    write_socks5_udp_header,
 };
 pub use tui::{TuiApp, TuiDataSource, format_bytes, render_dashboard, run_terminal_tui};

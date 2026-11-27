@@ -15,20 +15,21 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::config::{AuthMode, PoolStrategy};
 use crate::proxy::http::{
-    ResponseBodyFraming, copy_limited_idle, extract_basic_auth, handle_http, parse_authority,
-    parse_response_head, read_http_request_headers_buffered,
+    ResponseBodyFraming, copy_limited_idle, extract_basic_auth, handle_http, handle_http_with_peer,
+    parse_authority, parse_response_head, read_http_request_headers_buffered,
 };
 use crate::proxy::router::{
-    DirectTunnelTarget, DynStream, PoolKeyword, PoolRouter, ProxyAuthError, ProxyTunnelTarget,
-    ProxyUdpSocket, SelectTunnelFut, SingleTunnelRouter, TargetAddr, TunnelRouter, TunnelSelector,
+    DirectTunnelTarget, DynStream, FailedAuthLimiter, MAX_FAILED_AUTH_ATTEMPTS, PoolKeyword,
+    PoolRouter, ProxyAuthError, ProxyTunnelTarget, ProxyUdpSocket, SelectTunnelFut,
+    SingleTunnelRouter, TargetAddr, TunnelRouter, TunnelSelector,
 };
 use crate::proxy::socks5::ExpectedUdpReplies;
 use crate::proxy::socks5::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, CMD_CONNECT, CMD_UDP_ASSOCIATE, METHOD_NO_ACCEPTABLE,
     METHOD_NO_AUTH, METHOD_USER_PASS, REP_CONN_NOT_ALLOWED, REP_GENERAL_FAILURE,
     REP_HOST_UNREACHABLE, REP_NETWORK_UNREACHABLE, REP_SUCCESS, RFC1929_VERSION, SOCKS5_VERSION,
-    UdpPayloadPool, build_socks5_udp_packet, handle_socks5, parse_socks5_udp_packet,
-    send_socks5_reply,
+    UdpPayloadPool, build_socks5_udp_packet, handle_socks5, handle_socks5_with_addrs,
+    parse_socks5_udp_packet, send_socks5_reply,
 };
 
 /// TEST-NET-1 address named as the proxy-visible destination in tests
@@ -6311,5 +6312,200 @@ async fn test_replay_budget_exhaustion_emits_no_warn() {
     assert!(
         rendered.is_empty(),
         "budget exhaustion must emit no WARN, got: {rendered:?}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Failed-auth rate limiting (audit run-3 #1)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_failed_auth_limiter_blocks_after_threshold() {
+    let limiter =
+        FailedAuthLimiter::with_limits(3, Duration::from_secs(60), Duration::from_secs(60));
+    let ip: IpAddr = "127.0.0.2".parse().unwrap();
+    assert!(!limiter.is_blocked(ip));
+    limiter.note_failure(ip);
+    assert!(!limiter.is_blocked(ip));
+    limiter.note_failure(ip);
+    assert!(!limiter.is_blocked(ip));
+    limiter.note_failure(ip);
+    assert!(limiter.is_blocked(ip));
+}
+
+#[test]
+fn test_failed_auth_limiter_success_resets_failures() {
+    let limiter =
+        FailedAuthLimiter::with_limits(3, Duration::from_secs(60), Duration::from_secs(60));
+    let ip: IpAddr = "127.0.0.2".parse().unwrap();
+    limiter.note_failure(ip);
+    limiter.note_failure(ip);
+    limiter.note_success(ip);
+    limiter.note_failure(ip);
+    limiter.note_failure(ip);
+    assert!(!limiter.is_blocked(ip));
+}
+
+#[test]
+fn test_failed_auth_limiter_block_expires_and_resets() {
+    let limiter =
+        FailedAuthLimiter::with_limits(2, Duration::from_secs(60), Duration::from_millis(100));
+    let ip: IpAddr = "127.0.0.2".parse().unwrap();
+    limiter.note_failure(ip);
+    limiter.note_failure(ip);
+    assert!(limiter.is_blocked(ip));
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!limiter.is_blocked(ip));
+    // Clean slate after the block: one more failure does not re-block.
+    limiter.note_failure(ip);
+    assert!(!limiter.is_blocked(ip));
+}
+
+#[test]
+fn test_failed_auth_limiter_window_expiry_resets_failures() {
+    let limiter =
+        FailedAuthLimiter::with_limits(3, Duration::from_millis(100), Duration::from_secs(60));
+    let ip: IpAddr = "127.0.0.2".parse().unwrap();
+    limiter.note_failure(ip);
+    limiter.note_failure(ip);
+    std::thread::sleep(Duration::from_millis(150));
+    limiter.note_failure(ip);
+    assert!(!limiter.is_blocked(ip));
+    limiter.note_failure(ip);
+    limiter.note_failure(ip);
+    assert!(limiter.is_blocked(ip));
+}
+
+#[test]
+fn test_failed_auth_limiter_is_per_ip() {
+    let limiter =
+        FailedAuthLimiter::with_limits(2, Duration::from_secs(60), Duration::from_secs(60));
+    let blocked: IpAddr = "127.0.0.2".parse().unwrap();
+    let other: IpAddr = "127.0.0.3".parse().unwrap();
+    limiter.note_failure(blocked);
+    limiter.note_failure(blocked);
+    assert!(limiter.is_blocked(blocked));
+    assert!(!limiter.is_blocked(other));
+}
+
+/// One SOCKS5 RFC 1929 auth attempt from `peer_ip` over a duplex
+/// stream; returns the RFC 1929 status byte (`0x00` success).
+async fn socks5_auth_attempt(
+    router: &Arc<dyn TunnelRouter>,
+    peer_ip: IpAddr,
+    user: &str,
+    pass: &str,
+) -> u8 {
+    let (mut client, server) = tokio::io::duplex(1024);
+    let r = Arc::clone(router);
+    tokio::spawn(async move {
+        let _ = handle_socks5_with_addrs(server, r, None, Some(peer_ip)).await;
+    });
+    client
+        .write_all(&[SOCKS5_VERSION, 1, METHOD_USER_PASS])
+        .await
+        .unwrap();
+    let mut g_resp = [0u8; 2];
+    client.read_exact(&mut g_resp).await.unwrap();
+    assert_eq!(g_resp, [SOCKS5_VERSION, METHOD_USER_PASS]);
+    let mut auth_req = vec![RFC1929_VERSION, user.len() as u8];
+    auth_req.extend_from_slice(user.as_bytes());
+    auth_req.push(pass.len() as u8);
+    auth_req.extend_from_slice(pass.as_bytes());
+    client.write_all(&auth_req).await.unwrap();
+    let mut a_resp = [0u8; 2];
+    client.read_exact(&mut a_resp).await.unwrap();
+    assert_eq!(a_resp[0], RFC1929_VERSION);
+    a_resp[1]
+}
+
+#[tokio::test]
+async fn test_socks5_auth_rate_limited_after_repeated_failures() {
+    // Audit run-3 #1: 1000 wrong SOCKS5 credentials were answered
+    // immediately at 283.6/s. After the threshold, even the correct
+    // credential must be rejected while the source is blocked, and
+    // another source must be unaffected.
+    let ip: IpAddr = "127.0.0.2".parse().unwrap();
+    let other_ip: IpAddr = "127.0.0.3".parse().unwrap();
+    let target = Arc::new(DirectTunnelTarget);
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "auth-tunnel",
+        target,
+        Some(("alice".to_string(), "pass123".to_string())),
+    ));
+    for _ in 0..MAX_FAILED_AUTH_ATTEMPTS {
+        assert_eq!(
+            socks5_auth_attempt(&router, ip, "alice", "wrong").await,
+            0x01,
+            "wrong password must be rejected"
+        );
+    }
+    assert_eq!(
+        socks5_auth_attempt(&router, ip, "alice", "pass123").await,
+        0x01,
+        "correct password from a blocked source must still be rejected"
+    );
+    assert_eq!(
+        socks5_auth_attempt(&router, other_ip, "alice", "pass123").await,
+        0x00,
+        "correct password from another source must succeed"
+    );
+}
+
+/// One HTTP proxy CONNECT attempt from `peer_ip` over a duplex
+/// stream; returns the HTTP status code of the first response.
+async fn http_auth_attempt(
+    router: &Arc<dyn TunnelRouter>,
+    peer_ip: IpAddr,
+    target_addr: SocketAddr,
+    user: &str,
+    pass: &str,
+) -> u16 {
+    let (mut client, server) = tokio::io::duplex(2048);
+    let r = Arc::clone(router);
+    tokio::spawn(async move {
+        let _ = handle_http_with_peer(server, r, Some(peer_ip)).await;
+    });
+    let auth_hdr = format_basic_auth(user, pass);
+    let req = format!(
+        "CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\nProxy-Authorization: {auth_hdr}\r\n\r\n",
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+    let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
+    status
+}
+
+#[tokio::test]
+async fn test_http_auth_rate_limited_after_repeated_failures() {
+    // Audit run-3 #1: 1000 wrong HTTP proxy credentials were answered
+    // immediately at 345.8/s. After the threshold the source gets
+    // 429, and another source still authenticates (200 via the echo
+    // server behind the mock tunnel target).
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target_addr = test_echo_target(echo_addr);
+    let target = Arc::new(MockTunnelTarget::new("http-tunnel").with_dial_redirect(echo_addr));
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "http-tunnel",
+        target,
+        Some(("proxyuser".to_string(), "proxypass123".to_string())),
+    ));
+    let ip: IpAddr = "127.0.0.4".parse().unwrap();
+    let other_ip: IpAddr = "127.0.0.5".parse().unwrap();
+    for _ in 0..MAX_FAILED_AUTH_ATTEMPTS {
+        assert_eq!(
+            http_auth_attempt(&router, ip, target_addr, "proxyuser", "wrongpassword").await,
+            407,
+            "wrong password must be rejected with 407"
+        );
+    }
+    assert_eq!(
+        http_auth_attempt(&router, ip, target_addr, "proxyuser", "proxypass123").await,
+        429,
+        "correct password from a blocked source must be rate-limited"
+    );
+    assert_eq!(
+        http_auth_attempt(&router, other_ip, target_addr, "proxyuser", "proxypass123").await,
+        200,
+        "correct password from another source must succeed"
     );
 }

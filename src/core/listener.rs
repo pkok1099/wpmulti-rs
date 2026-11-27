@@ -21,7 +21,7 @@ use crate::core::CoreError;
 use crate::core::lifecycle::LifecycleController;
 use crate::core::registry::TunnelRegistry;
 use crate::core::router::{DedicatedTunnelRouter, MultiTenantRouter};
-use crate::proxy::{TunnelRouter, handle_http, handle_socks5_with_addrs};
+use crate::proxy::{TunnelRouter, handle_http_with_peer, handle_socks5_with_addrs};
 
 /// Diagnostic metadata for an active TCP listener.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1047,7 +1047,9 @@ async fn run_listener_loop(
                                 ListenerType::Socks5 => {
                                     handle_socks5_with_addrs(stream, r, local_ip, peer_ip).await
                                 }
-                                ListenerType::Http => handle_http(stream, r).await,
+                                ListenerType::Http => {
+                                    handle_http_with_peer(stream, r, peer_ip).await
+                                }
                             };
                             if let Err(e) = result {
                                 // A handshake timeout means the client

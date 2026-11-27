@@ -14,8 +14,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 
 use crate::proxy::replay::{BlackholeEjectionReason, replay_metrics};
 use crate::proxy::router::{
-    DynStream, RouterConnectError, TargetAddr, TunnelRouter, TunnelSelector, connect_via_router,
-    is_forbidden_destination_ip, is_valid_target_domain, parse_domain_ip_literal,
+    DynStream, RouterConnectError, SHARED_FAILED_AUTH_LIMITER, TargetAddr, TunnelRouter,
+    TunnelSelector, connect_via_router, is_forbidden_destination_ip, is_valid_target_domain,
+    parse_domain_ip_literal,
 };
 
 const MAX_HEADER_SIZE: usize = 16384;
@@ -348,7 +349,69 @@ pub async fn read_http_request_headers<R: AsyncRead + Unpin>(
 ///
 /// Handles `CONNECT` tunneling (RFC 9110 Section 9.3.6), Basic Authentication challenges (RFC 7617),
 /// and forward proxy requests for absolute URIs.
-pub async fn handle_http<S>(mut stream: S, router: Arc<dyn TunnelRouter>) -> io::Result<()>
+pub async fn handle_http<S>(stream: S, router: Arc<dyn TunnelRouter>) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_http_with_peer(stream, router, None).await
+}
+
+/// Verify presented HTTP proxy credentials, with per-source-IP
+/// failed-attempt accounting (audit run-3 #1).
+///
+/// Returns `Ok(None)` after writing the rejection when the attempt
+/// must not proceed: `407` for a wrong or missing credential, `429`
+/// when the source IP is rate-limited. Only credential-bearing
+/// attempts are counted; an anonymous request presents nothing to
+/// guess, so it neither counts nor is blocked.
+async fn authenticate_http_client<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    router: &Arc<dyn TunnelRouter>,
+    cred_refs: Option<(&str, &str)>,
+    peer_ip: Option<IpAddr>,
+) -> io::Result<Option<TunnelSelector>> {
+    let presented = cred_refs.is_some();
+    if let Some(ip) = peer_ip
+        && presented
+        && SHARED_FAILED_AUTH_LIMITER.is_blocked(ip)
+    {
+        let resp = "HTTP/1.1 429 Too Many Requests\r\n\
+                    Content-Length: 0\r\n\
+                    Connection: close\r\n\r\n";
+        stream.write_all(resp.as_bytes()).await?;
+        stream.flush().await?;
+        return Ok(None);
+    }
+    let Ok(selector) = router.authenticate(cred_refs) else {
+        if let Some(ip) = peer_ip
+            && presented
+        {
+            SHARED_FAILED_AUTH_LIMITER.note_failure(ip);
+        }
+        let resp = "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                    Proxy-Authenticate: Basic realm=\"wpmulti\"\r\n\
+                    Content-Length: 0\r\n\
+                    Connection: close\r\n\r\n";
+        stream.write_all(resp.as_bytes()).await?;
+        stream.flush().await?;
+        return Ok(None);
+    };
+    if let Some(ip) = peer_ip
+        && presented
+    {
+        SHARED_FAILED_AUTH_LIMITER.note_success(ip);
+    }
+    Ok(Some(selector))
+}
+
+/// Core HTTP proxy connection handler with the peer IP for
+/// failed-attempt accounting; `None` skips limiting (in-process
+/// streams without a TCP peer, as in tests).
+pub async fn handle_http_with_peer<S>(
+    mut stream: S,
+    router: Arc<dyn TunnelRouter>,
+    peer_ip: Option<IpAddr>,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -381,13 +444,8 @@ where
     let credentials = extract_basic_auth_vec(&headers);
     let cred_refs = credentials.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
 
-    let Ok(selector) = router.authenticate(cred_refs) else {
-        let resp = "HTTP/1.1 407 Proxy Authentication Required\r\n\
-                    Proxy-Authenticate: Basic realm=\"wpmulti\"\r\n\
-                    Content-Length: 0\r\n\
-                    Connection: close\r\n\r\n";
-        stream.write_all(resp.as_bytes()).await?;
-        stream.flush().await?;
+    let Some(selector) = authenticate_http_client(&mut stream, &router, cred_refs, peer_ip).await?
+    else {
         return Ok(());
     };
 
