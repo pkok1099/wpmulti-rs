@@ -50,26 +50,42 @@ pub(crate) const MIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 /// Default overall timeout budget for validated multi-address UDP datagram sends.
 pub(crate) const DEFAULT_UDP_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Returns `true` if `v4` is a forbidden IPv4 destination (unspecified, loopback, private
-/// (RFC1918), link-local, multicast, or broadcast).
+/// Returns `true` if `v4` is a forbidden IPv4 destination: unspecified
+/// (`0.0.0.0/8` — the whole /8, not just `0.0.0.0` itself), loopback,
+/// private (RFC1918), link-local, multicast, broadcast, shared/CGNAT
+/// (`100.64.0.0/10`), benchmarking (`198.18.0.0/15`), and reserved
+/// (`240.0.0.0/4`) (audit run-3 #6).
+///
+/// The CGNAT/benchmarking/reserved ranges use manual octet checks: the
+/// `std` helpers (`is_shared`, `is_benchmarking`, `is_reserved`) are
+/// still unstable on this toolchain, and each range is a couple of
+/// integer comparisons.
 pub(crate) const fn is_forbidden_ipv4(v4: Ipv4Addr) -> bool {
-    v4.is_unspecified()
+    let o = v4.octets();
+    o[0] == 0
         || v4.is_loopback()
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_multicast()
         || v4.is_broadcast()
+        || (o[0] == 100 && o[1] >= 64 && o[1] <= 127)
+        || (o[0] == 198 && o[1] >= 18 && o[1] <= 19)
+        || o[0] >= 240
 }
 
 /// Returns `true` if `ip` is an unsafe/forbidden proxy destination:
 /// - IPv4: unspecified (`0.0.0.0/8`), loopback (`127.0.0.0/8`), private/RFC1918 (`10/8`,
 ///   `172.16/12`, `192.168/16`), link-local (`169.254.0.0/16`), multicast (`224.0.0.0/4`),
-///   broadcast (`255.255.255.255`). Loopback and RFC1918 destinations would reach services
+///   broadcast (`255.255.255.255`), shared/CGNAT (`100.64.0.0/10`), benchmarking
+///   (`198.18.0.0/15`), reserved (`240.0.0.0/4`). Loopback and RFC1918 destinations would reach services
 ///   on the tunnel peer's loopback/LAN, not the public internet, so a proxy client must
 ///   not be able to name them (audit run-1,
-///   `proxy.destination.ipv4-loopback-rfc1918-not-forbidden`).
+///   `proxy.destination.ipv4-loopback-rfc1918-not-forbidden`); the CGNAT/benchmarking/
+///   reserved ranges are likewise peer-side infrastructure, not public destinations
+///   (audit run-3 #6).
 /// - IPv6: loopback (`::1`), unspecified (`::`), link-local (`fe80::/10`), Unique Local (`fc00::/7`),
-///   multicast (`ff00::/8`), IPv4-mapped IPv6 (`::ffff:0:0/96`), and NAT64 well-known prefix (`64:ff9b::/96`)
+///   multicast (`ff00::/8`), deprecated site-local (`fec0::/10`), IPv4-mapped IPv6 (`::ffff:0:0/96`),
+///   NAT64 well-known prefix (`64:ff9b::/96`), 6to4 (`2002::/16`), and Teredo (`2001::/32`)
 ///   when embedding a forbidden IPv4 address.
 pub(crate) const fn is_forbidden_destination_ip(ip: IpAddr) -> bool {
     match ip {
@@ -91,11 +107,35 @@ pub(crate) const fn is_forbidden_destination_ip(ip: IpAddr) -> bool {
                 let embedded_v4 = Ipv4Addr::new(o[12], o[13], o[14], o[15]);
                 return is_forbidden_ipv4(embedded_v4);
             }
+            // 6to4 2002::/16: the embedded IPv4 address is segments 1-2.
+            if segs[0] == 0x2002 {
+                let embedded_v4 = Ipv4Addr::new(
+                    (segs[1] >> 8) as u8,
+                    segs[1] as u8,
+                    (segs[2] >> 8) as u8,
+                    segs[2] as u8,
+                );
+                return is_forbidden_ipv4(embedded_v4);
+            }
+            // Teredo 2001::/32: the embedded client IPv4 address is the
+            // last 32 bits, XORed with 0xffffffff (RFC 4380).
+            if segs[0] == 0x2001 && segs[1] == 0 {
+                let xored = ((segs[6] as u32) << 16) | (segs[7] as u32);
+                let client = !xored;
+                let embedded_v4 = Ipv4Addr::new(
+                    (client >> 24) as u8,
+                    (client >> 16) as u8,
+                    (client >> 8) as u8,
+                    client as u8,
+                );
+                return is_forbidden_ipv4(embedded_v4);
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (segs[0] & 0xffc0) == 0xfe80
                 || (segs[0] & 0xfe00) == 0xfc00
+                || (segs[0] & 0xffc0) == 0xfec0
         }
     }
 }

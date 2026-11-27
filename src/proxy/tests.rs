@@ -525,6 +525,7 @@ struct RecordingStubTarget {
     dns_table: RwLock<HashMap<String, IpAddr>>,
     queries: Mutex<Vec<String>>,
     dials: Mutex<Vec<SocketAddr>>,
+    fail_tcp: bool,
     dial_redirect: Option<SocketAddr>,
 }
 
@@ -536,12 +537,21 @@ impl RecordingStubTarget {
             dns_table: RwLock::new(HashMap::new()),
             queries: Mutex::new(Vec::new()),
             dials: Mutex::new(Vec::new()),
+            fail_tcp: false,
             dial_redirect: None,
         }
     }
 
     fn with_live(self) -> Self {
         Self { live: true, ..self }
+    }
+
+    /// Fail TCP dials fast (after recording them) instead of dialing.
+    fn with_failing_tcp(self) -> Self {
+        Self {
+            fail_tcp: true,
+            ..self
+        }
     }
 
     fn with_dns(self, domain: &str, ip: IpAddr) -> Self {
@@ -573,6 +583,14 @@ impl ProxyTunnelTarget for RecordingStubTarget {
         dst: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
         self.dials.lock().unwrap().push(dst);
+        if self.fail_tcp {
+            return Box::pin(async move {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "stub tcp connect refused",
+                ))
+            });
+        }
         let redirect = self.dial_redirect;
         Box::pin(async move {
             let stream = TcpStream::connect(redirect.unwrap_or(dst)).await?;
@@ -2328,6 +2346,24 @@ fn test_is_forbidden_destination_ip_parity_and_ipv6_ranges() {
         "64:ff9b::10.0.0.1",
         "64:ff9b::169.254.169.254",
         "64:ff9b::0.0.0.0",
+        // Run-3 #6: CGNAT, benchmarking, reserved, 0.0.0.0/8 remainder,
+        // deprecated site-local, and embedded-IPv4 forms.
+        "100.64.0.1",
+        "100.127.255.255",
+        "198.18.0.1",
+        "198.19.255.255",
+        "240.0.0.1",
+        "248.1.2.3",
+        "0.1.2.3",
+        "0.255.255.255",
+        "fec0::1",
+        "feff::1",
+        "2002:6440:1::1",
+        "2002:7f00:1::1",
+        "2001:0000:0102:0304:0000:0000:9bbf:fffe",
+        "2001:0000:0102:0304:0000:0000:f5ff:fffe",
+        "::ffff:100.64.0.1",
+        "64:ff9b::100.64.0.1",
     ];
     for s in forbidden {
         let ip: IpAddr = s.parse().unwrap();
@@ -2339,6 +2375,12 @@ fn test_is_forbidden_destination_ip_parity_and_ipv6_ranges() {
         "2606:4700:4700::1111",
         "64:ff9b::1.1.1.1",
         "::ffff:1.1.1.1",
+        // Just outside the run-3 #6 ranges: still public destinations.
+        "100.63.255.255",
+        "100.128.0.1",
+        "198.20.0.1",
+        "8.8.8.8",
+        "2002:808:808::1",
     ];
     for s in allowed {
         let ip: IpAddr = s.parse().unwrap();
@@ -3158,6 +3200,54 @@ async fn test_preresolve_uses_selected_tunnel_only() {
         target_b.dials().is_empty(),
         "the unselected tunnel B must see no dial, got {:?}",
         target_b.dials()
+    );
+}
+
+/// Regression (audit run-3 #6,
+/// `proxy.destination.cgnat-reserved-ranges-not-forbidden`): SOCKS5 and
+/// HTTP CONNECT to CGNAT, benchmarking, reserved, and 0.0.0.0/8-remainder
+/// destinations must be rejected with the forbidden-destination reply
+/// and never dialled through the tunnel.
+#[tokio::test]
+async fn test_socks5_and_http_reject_cgnat_and_reserved_ranges() {
+    let stub = Arc::new(RecordingStubTarget::new("cgnat-stub").with_failing_tcp());
+    let router: Arc<dyn TunnelRouter> = Arc::new(SingleTunnelRouter::new(
+        "cgnat-stub",
+        Arc::<RecordingStubTarget>::clone(&stub),
+        None,
+    ));
+
+    for ip_str in ["100.64.0.1", "198.18.0.1", "240.0.0.1", "0.1.2.3"] {
+        let ip: Ipv4Addr = ip_str.parse().unwrap();
+        run_socks5_connect_expect_rep(
+            Arc::clone(&router),
+            ATYP_IPV4,
+            &ip.octets(),
+            80,
+            Some(crate::proxy::socks5::REP_CONN_NOT_ALLOWED),
+        )
+        .await;
+    }
+
+    for ip_str in ["100.64.0.1", "198.18.0.1", "240.0.0.1"] {
+        let (mut client, server) = tokio::io::duplex(2048);
+        let r_connect = Arc::clone(&router);
+        tokio::spawn(async move {
+            let _ = handle_http(server, r_connect).await;
+        });
+        let req = format!("CONNECT {ip_str}:80 HTTP/1.1\r\nHost: {ip_str}:80\r\n\r\n");
+        client.write_all(req.as_bytes()).await.unwrap();
+        let (status, _, _, _) = read_http_headers_helper(&mut client).await.unwrap();
+        assert_eq!(
+            status, 403,
+            "HTTP CONNECT to {ip_str} must be rejected with 403"
+        );
+    }
+
+    assert!(
+        stub.dials().is_empty(),
+        "no dial may be attempted to a forbidden range, got {:?}",
+        stub.dials()
     );
 }
 

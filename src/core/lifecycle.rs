@@ -1600,12 +1600,34 @@ impl LifecycleController {
         handshake_timeout: Duration,
         tunnel_id: &str,
     ) -> Result<SocketAddr, CoreError> {
+        Self::resolve_endpoint_with_lookup(
+            cache,
+            endpoint,
+            handshake_timeout,
+            tunnel_id,
+            async move { tokio::net::lookup_host(endpoint).await.map(Vec::from_iter) },
+        )
+        .await
+    }
+
+    /// Same as [`Self::resolve_endpoint_cached`] but with the DNS
+    /// lookup injected, so tests can force the timeout arm with a
+    /// never-completing future: real DNS timing cannot be forced
+    /// deterministically — this sandbox's resolver synthesizes an
+    /// answer for any syntactically valid name, faster than any
+    /// usable timeout.
+    async fn resolve_endpoint_with_lookup(
+        cache: &EndpointDnsCache,
+        endpoint: &str,
+        handshake_timeout: Duration,
+        tunnel_id: &str,
+        lookup: impl Future<Output = io::Result<Vec<SocketAddr>>> + Send,
+    ) -> Result<SocketAddr, CoreError> {
         if let Some(addr) = cache.get(endpoint) {
             return Ok(addr);
         }
-        match tokio::time::timeout(handshake_timeout, tokio::net::lookup_host(endpoint)).await {
+        match tokio::time::timeout(handshake_timeout, lookup).await {
             Ok(Ok(addrs)) => {
-                let addrs: Vec<SocketAddr> = addrs.collect();
                 if addrs.is_empty() {
                     return Err(CoreError::ActivationFailed(
                         tunnel_id.to_string(),
@@ -1929,18 +1951,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_endpoint_dns_cache_timeout_serves_stale_entry() {
-        // A lookup that times out (1us is far below any real DNS round
-        // trip) serves the last-known-good address instead of failing
-        // the activation.
+        // A lookup that never completes must serve the last-known-good
+        // address instead of failing the activation. The lookup is
+        // injected as a never-completing future: the old version of
+        // this test used a 1us timeout against a real lookup, but that
+        // is racy by construction — this sandbox's resolver synthesizes
+        // an answer for any syntactically valid name in well under a
+        // millisecond (and, since run-3 #6 forbids its 198.18.0.0/15
+        // answers, a real lookup here fails with "resolved only to
+        // forbidden addresses" instead of timing out). Injecting the
+        // lookup keeps the timeout arm covered deterministically.
         let cache = EndpointDnsCache::new();
         let endpoint = "endpoint-cache-timeout-serves-stale.invalid:51820";
         let stale: SocketAddr = "192.0.2.3:51820".parse().unwrap();
         cache.insert_expired(endpoint, stale);
-        let resolved = LifecycleController::resolve_endpoint_cached(
+        let resolved = LifecycleController::resolve_endpoint_with_lookup(
             &cache,
             endpoint,
-            Duration::from_micros(1),
+            Duration::from_millis(1),
             "tunnel-test",
+            std::future::pending::<std::io::Result<Vec<SocketAddr>>>(),
         )
         .await
         .expect("timed-out lookup must serve the stale entry");
