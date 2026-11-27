@@ -328,10 +328,10 @@ async fn test_shared_port_router_auth_and_strategies() {
 }
 
 // =============================================================================
-// 4b. Live-resolve target for the DNS pre-resolve (fix8)
+// 4b. Pre-resolve selection gate (run-3 #7)
 // =============================================================================
 
-fn make_live_resolve_router() -> (Arc<TunnelRegistry>, Arc<MultiTenantRouter>) {
+fn make_test_router() -> (Arc<TunnelRegistry>, Arc<MultiTenantRouter>) {
     let registry = Arc::new(TunnelRegistry::new());
     let lifecycle = LifecycleController::new(
         Arc::clone(&registry),
@@ -342,88 +342,97 @@ fn make_live_resolve_router() -> (Arc<TunnelRegistry>, Arc<MultiTenantRouter>) {
         Arc::clone(&lifecycle),
         Arc::clone(&registry),
         PoolStrategy::RoundRobin,
-        true, // anonymous access allowed: the pre-resolve needs no auth
+        true, // anonymous access allowed
     );
     (registry, router)
 }
 
+/// Regression (audit run-3 #7,
+/// `proxy.dns-pre-resolve-cross-tunnel-no-selector-binding`): the DNS
+/// pre-resolve used to ask the router for any live tunnel with no
+/// selector binding, so a domain query egressed via an unselected
+/// tunnel — even for a client whose credentials the selected tunnel
+/// rejects. `live_resolve_target` is deleted; the pre-resolve now runs
+/// through `select_tunnel` first, so a rejected selection means no
+/// DNS query anywhere. This test pins the gate the pre-resolve depends
+/// on at the real router (two tunnels, only B live and warm, client
+/// asking for A with wrong A credentials); the stub-level test in
+/// `proxy::tests` proves the zero-query consequence.
 #[tokio::test]
-async fn test_live_resolve_target_returns_none_when_warm_list_empty() {
-    let (_registry, router) = make_live_resolve_router();
-    let target = router
-        .live_resolve_target(&TunnelSelector::DefaultPool, None)
-        .await;
-    assert!(
-        target.is_none(),
-        "an empty warm list must offer no pre-resolve target"
-    );
-}
+async fn test_preresolve_gate_rejects_wrong_credentials_before_dns() {
+    use crate::proxy::router::{RouterConnectError, TargetAddr, connect_via_router};
 
-#[tokio::test]
-async fn test_live_resolve_target_returns_none_when_warm_tunnel_not_live() {
-    let (registry, router) = make_live_resolve_router();
-    let id = "wgcf-warm-dormant-01".to_string();
-    registry
-        .register(TunnelEntry::new(
-            id.clone(),
-            make_test_tunnel_config(&id),
-            LifecycleMode::Lazy,
-        ))
-        .unwrap();
-    // Seeded in the warm list, but still Dormant with no handshake:
-    // not Live, so it must not serve the pre-resolve.
-    router.note_warm_success(&id);
-    let target = router
-        .live_resolve_target(&TunnelSelector::DefaultPool, None)
-        .await;
-    assert!(
-        target.is_none(),
-        "a dormant warm-list tunnel is not live and must not serve the pre-resolve"
+    let registry = Arc::new(TunnelRegistry::new());
+    for id in ["wgcf-a", "wgcf-b"] {
+        registry
+            .register(TunnelEntry::new(
+                id,
+                make_test_tunnel_config(id),
+                LifecycleMode::Lazy,
+            ))
+            .unwrap();
+    }
+    let lifecycle = LifecycleController::new(
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
     );
-}
+    let mut passwords = std::collections::HashMap::new();
+    passwords.insert("wgcf-a".to_string(), "pw-a".to_string());
+    passwords.insert("wgcf-b".to_string(), "pw-b".to_string());
+    let router = MultiTenantRouter::new(
+        Arc::clone(&lifecycle),
+        Arc::clone(&registry),
+        PoolStrategy::RoundRobin,
+        false,
+    )
+    .with_auth(AuthMode::PerTunnel, None)
+    .with_per_tunnel_passwords(passwords);
 
-#[tokio::test]
-async fn test_live_resolve_target_returns_live_warm_tunnel() {
-    let (registry, router) = make_live_resolve_router();
-    let id = "wgcf-warm-live-01".to_string();
-    registry
-        .register(TunnelEntry::new(
-            id.clone(),
-            make_test_tunnel_config(&id),
-            LifecycleMode::Lazy,
-        ))
-        .unwrap();
-    // Activate the tunnel (boots a device + stack with the test config,
-    // as the existing router tests do).
-    let _target = router
-        .select_tunnel(&TunnelSelector::ById(id.clone()), None)
+    // Only B is live and warm — the tunnel the old unbound pre-resolve
+    // would have picked for any selector. Activate B and mark it Live.
+    let _b_target = router
+        .select_tunnel(
+            &TunnelSelector::ById("wgcf-b".to_string()),
+            Some(("wgcf-b", "pw-b")),
+        )
         .await
-        .expect("activation must succeed");
-    assert!(registry.get(&id).unwrap().is_active());
-    // Make it Live: a fresh handshake plus a healthy verdict.
+        .expect("activating B must succeed");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let entry = registry.get(&id).unwrap();
-    entry.stats.record_handshake(now);
-    entry.health.record_success();
-    router.note_warm_success(&id);
+    let b_entry = registry.get("wgcf-b").unwrap();
+    b_entry.stats.record_handshake(now);
+    b_entry.health.record_success();
+    router.note_warm_success("wgcf-b");
 
-    let live = router
-        .live_resolve_target(&TunnelSelector::DefaultPool, None)
-        .await
-        .expect("a live warm-list tunnel must serve the pre-resolve");
-    assert_eq!(
-        live.tunnel_id().map(str::to_string).as_deref(),
-        Some(id.as_str()),
-        "pre-resolve target must be the live warm-list tunnel"
+    // Client asks for A with wrong A credentials: selection must fail
+    // before any DNS is attempted, and A must never activate.
+    let router_dyn: Arc<dyn TunnelRouter> = router;
+    let err = connect_via_router(
+        &router_dyn,
+        &TunnelSelector::ById("wgcf-a".to_string()),
+        &TargetAddr::Domain("victim.example.test".to_string(), 443),
+        Some(("wgcf-a", "WRONG")),
+        None,
+    )
+    .await
+    .err()
+    .expect("wrong credentials must fail the connect");
+    let RouterConnectError::SelectTunnel(e) = err else {
+        panic!("wrong credentials must fail at selection, got {err:?}");
+    };
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        !registry.get("wgcf-a").unwrap().is_active(),
+        "rejected selection must not activate tunnel A"
     );
 }
 
 #[tokio::test]
 async fn test_record_tunnel_blackhole_penalizes_tunnel() {
-    let (registry, router) = make_live_resolve_router();
+    let (registry, router) = make_test_router();
     let id = "wgcf-blackhole-01".to_string();
     registry
         .register(TunnelEntry::new(

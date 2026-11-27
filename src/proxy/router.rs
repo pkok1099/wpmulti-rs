@@ -168,10 +168,6 @@ pub type UdpBindFut<'a> =
 pub type SelectTunnelFut<'a> =
     Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>>;
 
-/// Future returned by [`TunnelRouter::live_resolve_target`].
-pub type LiveResolveTargetFut<'a> =
-    Pin<Box<dyn Future<Output = Option<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>>;
-
 /// Future returned by [`ProxyTunnelTarget::resolve_all_in_tunnel`].
 pub type ResolveAllFut<'a> = Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send + 'a>>;
 
@@ -453,27 +449,47 @@ pub(crate) async fn connect_via_router(
     credentials: Option<(&str, &str)>,
     exclude_tunnel: Option<&str>,
 ) -> Result<(DynStream, Option<String>), RouterConnectError> {
-    // Pre-resolve a domain target on a provably live tunnel before the
-    // race dials: the singleflight query must never go through a cold
-    // tunnel. The measured failure was one cold-tunnel query timing
-    // out (1 s DNS deadline vs a handshake that takes longer) and
-    // fanning out to 31 waiters in 38 ms — every one of them logging
-    // a WARN on attempt 1/3. A pre-resolve on a live tunnel populates
+    // Select the tunnel — and verify the caller's credentials against
+    // it — BEFORE any DNS leaves the daemon. The old pre-resolve asked
+    // the router for a live target with no selector binding, so the
+    // query egressed via whatever warm-list tunnel happened to be
+    // live, even for a client whose credentials the selected tunnel
+    // rejects (audit run-3 #7). A selection failure is terminal here,
+    // so a rejected client causes zero DNS queries anywhere.
+    //
+    // The pre-resolve still only runs on a live tunnel: the
+    // singleflight query must never go through a cold tunnel. The
+    // measured failure was one cold-tunnel query timing out (1 s DNS
+    // deadline vs a handshake that takes longer) and fanning out to
+    // 31 waiters in 38 ms — every one of them logging a WARN on
+    // attempt 1/3. A pre-resolve on the selected live tunnel populates
     // the shared cache, so the race legs hit the LRU fast-path instead
     // of creating a cell on a cold tunnel; when the domain is already
     // cached this is just the LRU lookup. A pre-resolve failure is
     // best-effort and falls through to the per-leg resolve below, so
-    // a router without a live tunnel behaves exactly as before. The
-    // failover deadline is created after this, so the pre-resolve
+    // a selected tunnel that is not live behaves exactly as before.
+    // The failover deadline is created after this, so the pre-resolve
     // never eats the race budget.
-    if let TargetAddr::Domain(domain, _) = target
-        && let Some(live) = router.live_resolve_target(selector, credentials).await
-        && let Err(e) = resolve_and_validate_domain(live.as_ref(), domain).await
-    {
-        tracing::debug!(
-            "live pre-resolve of '{domain}' failed ({}); falling back to per-leg resolve",
-            e
-        );
+    //
+    // The pre-selected target is dropped at the end of this block —
+    // its trial slot, if one was claimed, is released by the guard's
+    // `Drop` — and the failover loop below selects the dial tunnel
+    // itself.
+    if let TargetAddr::Domain(domain, _) = target {
+        let selected = match router.select_tunnel(selector, credentials).await {
+            Ok(target) => target,
+            Err(e) => return Err(RouterConnectError::SelectTunnel(e)),
+        };
+        let excluded = selected.tunnel_id() == exclude_tunnel;
+        if selected.is_live()
+            && !excluded
+            && let Err(e) = resolve_and_validate_domain(selected.as_ref(), domain).await
+        {
+            tracing::debug!(
+                "live pre-resolve of '{domain}' failed ({}); falling back to per-leg resolve",
+                e
+            );
+        }
     }
 
     let max_attempts = if matches!(selector, TunnelSelector::ById(_)) {
@@ -1263,28 +1279,6 @@ pub trait TunnelRouter: Send + Sync {
         credentials: Option<(&'a str, &'a str)>,
     ) -> SelectTunnelFut<'a>;
 
-    /// A tunnel that is provably live right now (fresh handshake),
-    /// for resolving a target domain *before* the race dials — if the
-    /// router can name one. `connect_via_router` uses it to pre-resolve
-    /// the domain on a live tunnel so the singleflight query never
-    /// goes through a cold tunnel (the measured failure: one
-    /// cold-tunnel query timing out and fanning out to 31 waiters).
-    ///
-    /// The target is chosen for liveness only, not for routing: the
-    /// DNS answer is shared daemon-wide, and the actual dial still
-    /// goes through the normal [`Self::select_tunnel`] path with the
-    /// caller's selector and credentials. `None` means the router has
-    /// no live tunnel to offer (or does not track liveness), and the
-    /// caller falls back to resolving through the race legs, exactly
-    /// as before. The default is `None`.
-    fn live_resolve_target<'a>(
-        &'a self,
-        _selector: &'a TunnelSelector,
-        _credentials: Option<(&'a str, &'a str)>,
-    ) -> LiveResolveTargetFut<'a> {
-        Box::pin(async move { None })
-    }
-
     /// Record a blackhole session on `tunnel_id`: the client sent
     /// its request through this tunnel and received zero response
     /// bytes while the tunnel stayed silent. The router charges
@@ -1326,14 +1320,6 @@ impl<T: TunnelRouter + ?Sized> TunnelRouter for Arc<T> {
         credentials: Option<(&'a str, &'a str)>,
     ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn ProxyTunnelTarget>>> + Send + 'a>> {
         (**self).select_tunnel(selector, credentials)
-    }
-
-    fn live_resolve_target<'a>(
-        &'a self,
-        selector: &'a TunnelSelector,
-        credentials: Option<(&'a str, &'a str)>,
-    ) -> LiveResolveTargetFut<'a> {
-        (**self).live_resolve_target(selector, credentials)
     }
 
     fn record_tunnel_blackhole(&self, tunnel_id: &str) {

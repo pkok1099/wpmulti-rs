@@ -513,6 +513,145 @@ impl TunnelRouter for RecordingRouter {
     }
 }
 
+/// Test-only tunnel target that records every DNS query and TCP dial
+/// (requested destination) instead of performing them, so tests can
+/// prove which tunnel a query or dial went through (run-3 #7
+/// pre-resolve, #6 forbidden destinations). DNS answers come from a
+/// fixed table; TCP dials go to a redirect address (a loopback echo
+/// server) while the proxy still sees the requested destination.
+struct RecordingStubTarget {
+    id: String,
+    live: bool,
+    dns_table: RwLock<HashMap<String, IpAddr>>,
+    queries: Mutex<Vec<String>>,
+    dials: Mutex<Vec<SocketAddr>>,
+    dial_redirect: Option<SocketAddr>,
+}
+
+impl RecordingStubTarget {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            live: false,
+            dns_table: RwLock::new(HashMap::new()),
+            queries: Mutex::new(Vec::new()),
+            dials: Mutex::new(Vec::new()),
+            dial_redirect: None,
+        }
+    }
+
+    fn with_live(self) -> Self {
+        Self { live: true, ..self }
+    }
+
+    fn with_dns(self, domain: &str, ip: IpAddr) -> Self {
+        self.dns_table.write().insert(domain.to_string(), ip);
+        self
+    }
+
+    /// Redirect actual TCP dials to `addr` while the proxy still sees
+    /// the requested (public) destination (see [`TEST_ECHO_IP`]).
+    fn with_dial_redirect(self, addr: SocketAddr) -> Self {
+        Self {
+            dial_redirect: Some(addr),
+            ..self
+        }
+    }
+
+    fn queries(&self) -> Vec<String> {
+        self.queries.lock().unwrap().clone()
+    }
+
+    fn dials(&self) -> Vec<SocketAddr> {
+        self.dials.lock().unwrap().clone()
+    }
+}
+
+impl ProxyTunnelTarget for RecordingStubTarget {
+    fn tcp_connect<'a>(
+        &'a self,
+        dst: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<DynStream>> + Send + 'a>> {
+        self.dials.lock().unwrap().push(dst);
+        let redirect = self.dial_redirect;
+        Box::pin(async move {
+            let stream = TcpStream::connect(redirect.unwrap_or(dst)).await?;
+            Ok(Box::new(stream) as DynStream)
+        })
+    }
+
+    fn udp_bind<'a>(
+        &'a self,
+        _local_port: u16,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn ProxyUdpSocket>>> + Send + 'a>> {
+        Box::pin(async move { Err(io::Error::other("stub udp unused")) })
+    }
+
+    fn resolve_in_tunnel<'a>(
+        &'a self,
+        domain: &'a str,
+    ) -> Pin<Box<dyn Future<Output = io::Result<IpAddr>> + Send + 'a>> {
+        self.queries.lock().unwrap().push(domain.to_string());
+        let found = self.dns_table.read().get(domain).copied();
+        match found {
+            Some(ip) => Box::pin(async move { Ok(ip) }),
+            None => Box::pin(async move {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("stub dns could not resolve '{domain}'"),
+                ))
+            }),
+        }
+    }
+
+    fn tunnel_id(&self) -> Option<&str> {
+        Some(&self.id)
+    }
+
+    fn is_live(&self) -> bool {
+        self.live
+    }
+}
+
+/// Stub `TunnelRouter` for the #7 pre-resolve tests: `select_tunnel`
+/// enforces tunnel-A credentials and only ever returns target A —
+/// the real router's password gate without a live WireGuard stack.
+/// Target B is held only by the test, as the tunnel the old unbound
+/// pre-resolve would have picked.
+struct AuthEnforcingStubRouter {
+    target_a: Arc<dyn ProxyTunnelTarget>,
+}
+
+impl TunnelRouter for AuthEnforcingStubRouter {
+    fn authenticate(
+        &self,
+        credentials: Option<(&str, &str)>,
+    ) -> Result<TunnelSelector, ProxyAuthError> {
+        match credentials {
+            Some(("wgcf-a", "pw-a")) => Ok(TunnelSelector::ById("wgcf-a".to_string())),
+            Some(_) => Err(ProxyAuthError::InvalidCredentials),
+            None => Err(ProxyAuthError::AuthRequired),
+        }
+    }
+
+    fn select_tunnel<'a>(
+        &'a self,
+        _selector: &'a TunnelSelector,
+        credentials: Option<(&'a str, &'a str)>,
+    ) -> SelectTunnelFut<'a> {
+        let target = Arc::clone(&self.target_a);
+        Box::pin(async move {
+            match credentials {
+                Some(("wgcf-a", "pw-a")) => Ok(target),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "invalid proxy credentials for the selected tunnel",
+                )),
+            }
+        })
+    }
+}
+
 async fn spawn_echo_tcp_server_ipv6() -> Option<SocketAddr> {
     let listener = TcpListener::bind("[::1]:0").await.ok()?;
     let addr = listener.local_addr().ok()?;
@@ -2921,6 +3060,104 @@ async fn test_connect_via_router_budget_abort_notes_attempt_aborted() {
     assert!(
         aborted.load(Ordering::SeqCst),
         "pool deadline abort must note the aborted attempt on the target"
+    );
+}
+
+/// Regression (audit run-3 #7,
+/// `proxy.dns-pre-resolve-cross-tunnel-no-selector-binding`): the
+/// pre-resolve used to ask the router for any live tunnel with no
+/// selector binding, so a domain query egressed via the unselected
+/// tunnel B — even for a client whose credentials tunnel A rejects.
+/// The pre-resolve now runs through `select_tunnel` first and only via
+/// the selected tunnel when it is live; a failed selection means no
+/// DNS query anywhere.
+#[tokio::test]
+async fn test_preresolve_uses_selected_tunnel_only() {
+    use crate::proxy::router::{RouterConnectError, connect_via_router};
+
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target_a = Arc::new(
+        RecordingStubTarget::new("wgcf-a")
+            .with_live()
+            .with_dns("victim.example.test", "192.0.2.99".parse().unwrap())
+            .with_dns("victim2.example.test", "192.0.2.99".parse().unwrap())
+            .with_dial_redirect(echo_addr),
+    );
+    let target_b = Arc::new(
+        RecordingStubTarget::new("wgcf-b")
+            .with_live()
+            .with_dns("victim.example.test", "192.0.2.99".parse().unwrap())
+            .with_dns("victim2.example.test", "192.0.2.99".parse().unwrap()),
+    );
+    let router: Arc<dyn TunnelRouter> = Arc::new(AuthEnforcingStubRouter {
+        target_a: Arc::<RecordingStubTarget>::clone(&target_a),
+    });
+
+    // Case 2 first (wrong credentials, fresh targets): selection must
+    // fail before any DNS is attempted, on either tunnel.
+    let err = connect_via_router(
+        &router,
+        &TunnelSelector::ById("wgcf-a".to_string()),
+        &TargetAddr::Domain("victim2.example.test".to_string(), 443),
+        Some(("wgcf-a", "WRONG")),
+        None,
+    )
+    .await
+    .err()
+    .expect("wrong credentials must fail the connect");
+    let RouterConnectError::SelectTunnel(e) = err else {
+        panic!("wrong credentials must fail at selection, got {err:?}");
+    };
+    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        target_a.queries().is_empty() && target_b.queries().is_empty(),
+        "a rejected client must cause zero DNS queries anywhere: A={:?} B={:?}",
+        target_a.queries(),
+        target_b.queries()
+    );
+    assert!(
+        target_a.dials().is_empty() && target_b.dials().is_empty(),
+        "a rejected client must cause zero dials anywhere: A={:?} B={:?}",
+        target_a.dials(),
+        target_b.dials()
+    );
+
+    // Case 1 — client authenticated only for tunnel A, ById(A): the
+    // query must go via A (pre-resolve + per-leg resolve), never via
+    // B, and the dial must go via A.
+    let (stream, winner) = connect_via_router(
+        &router,
+        &TunnelSelector::ById("wgcf-a".to_string()),
+        &TargetAddr::Domain("victim.example.test".to_string(), 443),
+        Some(("wgcf-a", "pw-a")),
+        None,
+    )
+    .await
+    .expect("authenticated connect must succeed");
+    drop(stream);
+    assert_eq!(winner.as_deref(), Some("wgcf-a"));
+    assert_eq!(
+        target_a.queries(),
+        vec![
+            "victim.example.test".to_string(),
+            "victim.example.test".to_string()
+        ],
+        "pre-resolve and per-leg resolve must both go via the selected tunnel A"
+    );
+    assert!(
+        target_b.queries().is_empty(),
+        "the unselected tunnel B must see no DNS query, got {:?}",
+        target_b.queries()
+    );
+    assert_eq!(
+        target_a.dials(),
+        vec!["192.0.2.99:443".parse::<SocketAddr>().unwrap()],
+        "the dial must go via the selected tunnel A"
+    );
+    assert!(
+        target_b.dials().is_empty(),
+        "the unselected tunnel B must see no dial, got {:?}",
+        target_b.dials()
     );
 }
 

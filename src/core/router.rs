@@ -18,9 +18,7 @@ use parking_lot::RwLock;
 
 use crate::config::{AuthMode, IpMode, PoolStrategy, SharedListenerSettings, TunnelPoolSelection};
 use crate::core::health::HealthStatus;
-use crate::core::lifecycle::{
-    GuardedTunnelTarget, LifecycleController, TunnelConnGuard, handshake_is_fresh,
-};
+use crate::core::lifecycle::{GuardedTunnelTarget, LifecycleController, handshake_is_fresh};
 use crate::core::registry::{TunnelEntry, TunnelRegistry};
 use crate::core::selection::{WarmList, dormant_jitter_ms, score_entry};
 use crate::proxy::router::{AuthChecker, constant_time_eq_str};
@@ -936,48 +934,6 @@ impl TunnelRouter for MultiTenantRouter {
                 Arc::new(IpFilteredTunnelTarget::new(Arc::new(guarded), ip_mode))
             };
             Ok(target)
-        })
-    }
-
-    fn live_resolve_target<'a>(
-        &'a self,
-        _selector: &'a TunnelSelector,
-        _credentials: Option<(&'a str, &'a str)>,
-    ) -> crate::proxy::router::LiveResolveTargetFut<'a> {
-        Box::pin(async move {
-            // The warm list holds the tunnels that most recently proved
-            // themselves by moving real traffic. Only one that is still
-            // in the Live tier (Active, Healthy, handshaked within the
-            // freshness window) may serve the pre-resolve: anything
-            // else would put the DNS query back on a cold tunnel — the
-            // failure the pre-resolve exists to prevent.
-            let id = self.warm_list.pick()?;
-            let entry = self.registry.get(&id)?;
-            if selection_tier(&entry, now_unix_secs()) != SelectionTier::Live {
-                return None;
-            }
-            // Build the target from the entry's live handle directly,
-            // without `get_or_activate`: the tunnel is already Active,
-            // so no boot or resume is needed, and no activation lock
-            // is taken. The connection guard is dropped with the
-            // target after the pre-resolve, so no slot is held.
-            let active = entry.active.read().clone()?;
-            let guard = TunnelConnGuard::new(&id, Arc::clone(&entry.stats));
-            let health = Arc::clone(&entry.health);
-            let (threshold, cooldown) = self.effective_health();
-            let mut guarded =
-                GuardedTunnelTarget::new_with_health(active, guard, health, threshold, cooldown);
-            guarded.set_warm_list(Arc::clone(&self.warm_list));
-            // Mirror `select_tunnel`: non-dual-stack listeners filter
-            // the target's address families. An ip-mode error fails
-            // open to the per-leg resolve instead of serving a target
-            // the listener would not have selected.
-            let target: Arc<dyn ProxyTunnelTarget> = match self.effective_ip_mode() {
-                Ok(IpMode::DualStack) => Arc::new(guarded),
-                Ok(mode) => Arc::new(IpFilteredTunnelTarget::new(Arc::new(guarded), mode)),
-                Err(_) => return None,
-            };
-            Some(target)
         })
     }
 
