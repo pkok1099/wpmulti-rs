@@ -76,8 +76,8 @@ impl AdminServer {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         let task = tokio::spawn(async move {
-            const MAX_ADMIN_CONNS: usize = 64;
-            let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_ADMIN_CONNS));
+            let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_ADMIN_CONNS_GENERAL));
+            let reserve_sem = Arc::new(tokio::sync::Semaphore::new(ADMIN_RESERVED_CONNS));
             // Live per-IP connection counts: one peer may hold at most
             // `MAX_ADMIN_CONNS_PER_IP` slots, so a single Slowloris peer
             // cannot take all 64 slots (audit run-1,
@@ -106,22 +106,14 @@ impl AdminServer {
                     res = listener.accept() => {
                         match res {
                             Ok((stream, peer_addr)) => {
-                                let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
-                                    tracing::warn!("Admin server connection limit ({}) reached; dropping connection", MAX_ADMIN_CONNS);
-                                    drop(stream);
-                                    continue;
-                                };
-                                // Per-peer fairness: cap slots per IP before
-                                // spawning, so one peer cannot starve the
-                                // rest even while slots remain.
-                                let Some(per_ip_guard) =
-                                    try_admit_admin_ip(&per_ip_counts, peer_addr.ip())
+                                let Some((permit, per_ip_guard)) =
+                                    try_admit_admin_connection(
+                                        &conn_sem,
+                                        &reserve_sem,
+                                        &per_ip_counts,
+                                        peer_addr.ip(),
+                                    )
                                 else {
-                                    tracing::warn!(
-                                        "Admin server per-IP connection limit ({}) reached for {}; dropping connection",
-                                        MAX_ADMIN_CONNS_PER_IP,
-                                        peer_addr.ip()
-                                    );
                                     drop(stream);
                                     continue;
                                 };
@@ -214,6 +206,17 @@ const ADMIN_READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
 /// room for the local operator and TUI polling from one address while
 /// still requiring at least 8 distinct IPs to exhaust the server.
 const MAX_ADMIN_CONNS_PER_IP: usize = 8;
+/// Global Admin slot budget (64): 56 general slots open to any peer,
+/// plus 8 reserved slots that only a peer IP's *first* live connection
+/// may take. The reserve keeps a legitimate request from a fresh IP
+/// servable while slow peers hold the general pool (audit run-3,
+/// `admin-slot-exhaustion`: 8 IPs x 8 trickling connections used to
+/// take all 64). A first connection tries the general pool first and
+/// falls back to the reserve only when it is full, so the reserve
+/// stays free until it is actually needed.
+const MAX_ADMIN_CONNS: usize = 64;
+const ADMIN_RESERVED_CONNS: usize = 8;
+const MAX_ADMIN_CONNS_GENERAL: usize = MAX_ADMIN_CONNS - ADMIN_RESERVED_CONNS;
 
 /// RAII decrement of a peer IP's live Admin-connection count; dropped
 /// when its client task ends (including on abort during shutdown).
@@ -236,25 +239,69 @@ impl Drop for PerIpConnGuard {
 
 /// Admit one Admin connection from `peer_ip` under the per-IP cap,
 /// returning the RAII guard that releases the slot when the client task
-/// ends. `None` when the peer already holds `MAX_ADMIN_CONNS_PER_IP`
-/// slots (audit run-1, `admin-http-parse:slowloris-connection-slot-exhaustion`).
+/// ends, plus whether this is the peer's first live connection (its
+/// count was 0 before this admission — the caller may let such a
+/// connection fall back to the reserved global pool). `None` when the
+/// peer already holds `MAX_ADMIN_CONNS_PER_IP` slots (audit run-1,
+/// `admin-http-parse:slowloris-connection-slot-exhaustion`).
 fn try_admit_admin_ip(
     counts: &Arc<Mutex<HashMap<IpAddr, usize>>>,
     peer_ip: IpAddr,
-) -> Option<PerIpConnGuard> {
+) -> Option<(PerIpConnGuard, bool)> {
     let mut locked = counts.lock();
     let slot = locked.entry(peer_ip).or_insert(0);
     if *slot >= MAX_ADMIN_CONNS_PER_IP {
         return None;
     }
+    let is_first_conn = *slot == 0;
     *slot += 1;
     // Release the lock before building the guard: the count is already
     // bumped, and the guard only carries the shared map for its Drop.
     drop(locked);
-    Some(PerIpConnGuard {
-        counts: Arc::clone(counts),
-        ip: peer_ip,
-    })
+    Some((
+        PerIpConnGuard {
+            counts: Arc::clone(counts),
+            ip: peer_ip,
+        },
+        is_first_conn,
+    ))
+}
+
+/// Admit one Admin connection from `peer_ip`: per-IP cap first, then a
+/// global slot — the general pool, or the reserved pool when this is
+/// the peer's first live connection and the general pool is full.
+/// Returns the global permit and the per-IP guard, both held by the
+/// spawned client task; `None` (after logging which limit hit) when
+/// either limit is hit and the connection must be dropped.
+fn try_admit_admin_connection(
+    conn_sem: &Arc<tokio::sync::Semaphore>,
+    reserve_sem: &Arc<tokio::sync::Semaphore>,
+    per_ip_counts: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+    peer_ip: IpAddr,
+) -> Option<(tokio::sync::OwnedSemaphorePermit, PerIpConnGuard)> {
+    let Some((per_ip_guard, is_first_conn)) = try_admit_admin_ip(per_ip_counts, peer_ip) else {
+        tracing::warn!(
+            "Admin server per-IP connection limit ({MAX_ADMIN_CONNS_PER_IP}) reached for {peer_ip}; dropping connection"
+        );
+        return None;
+    };
+    let permit = if is_first_conn {
+        Arc::clone(conn_sem)
+            .try_acquire_owned()
+            .ok()
+            .or_else(|| Arc::clone(reserve_sem).try_acquire_owned().ok())
+    } else {
+        Arc::clone(conn_sem).try_acquire_owned().ok()
+    };
+    permit.map_or_else(
+        || {
+            tracing::warn!(
+                "Admin server connection limit ({MAX_ADMIN_CONNS}) reached; dropping connection"
+            );
+            None
+        },
+        |permit| Some((permit, per_ip_guard)),
+    )
 }
 
 /// Wait up to `drain_dur` for in-flight Admin client tasks to finish,

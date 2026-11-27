@@ -1557,11 +1557,11 @@ async fn test_admin_server_per_ip_connection_cap() {
     server.stop().await;
 }
 
-/// Run-3 finding #11 (validation): the per-IP cap (8) is the only
-/// fairness control on the Admin API — 8 distinct source IPs holding
-/// 8 slow connections each exhaust all 64 global slots, and a
-/// legitimate request is dropped until the 10 s outer read timeout
-/// frees them.
+/// Run-3 finding #11 (validation, updated for the fix): the per-IP cap
+/// (8) is not the only fairness control on the Admin API — a small
+/// reserve of global slots is held for a peer IP's *first* connection,
+/// so 8 distinct source IPs holding 8 slow connections each cannot
+/// starve a legitimate request from a 9th IP.
 #[tokio::test]
 async fn test_admin_global_slots_exhausted_by_8_distinct_slow_ips() {
     use std::net::IpAddr;
@@ -1595,46 +1595,28 @@ async fn test_admin_global_slots_exhausted_by_8_distinct_slow_ips() {
             }));
         }
     }
-    // Let the accept loop admit all 64 before probing.
+    // Let the accept loop admit the trickling connections before probing.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Legitimate loopback request (no token needed on loopback) from a
-    // 9th address while all 64 slots are held: dropped, no response.
+    // Legitimate loopback request from a 9th address, holding no
+    // connection yet: its first connection may use a reserved slot,
+    // so it must be served (200 OK) even while the trickling
+    // connections hold the general pool.
     let mut legit = TcpStream::connect(bound).await.unwrap();
     legit
         .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
         .await
         .unwrap();
     let mut resp = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(3), legit.read_to_end(&mut resp)).await;
-    assert!(read.is_ok(), "legit request must be dropped, not held");
+    tokio::time::timeout(Duration::from_secs(3), legit.read_to_end(&mut resp))
+        .await
+        .expect("legit request must be served, not dropped")
+        .unwrap();
     assert!(
-        resp.is_empty(),
-        "dropped legit request must get no response, got: {resp:?}"
+        String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200 OK"),
+        "legit request from a new IP must get 200 OK while slots are held, got: {}",
+        String::from_utf8_lossy(&resp)
     );
-
-    // After the 10 s outer timeout frees the slots, the same request
-    // succeeds.
-    let ok = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let mut retry = TcpStream::connect(bound).await.unwrap();
-            retry
-                .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-                .await
-                .unwrap();
-            let mut buf = Vec::new();
-            if tokio::time::timeout(Duration::from_secs(2), retry.read_to_end(&mut buf))
-                .await
-                .is_ok()
-                && String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 200 OK")
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    })
-    .await;
-    assert!(ok.is_ok(), "legit request must succeed once slots free");
 
     for task in trickle_tasks {
         task.abort();
