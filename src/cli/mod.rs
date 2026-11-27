@@ -5,7 +5,7 @@ pub mod commands;
 pub mod tests;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use commands::{
     ProbeResult, cmd_probe, cmd_run, cmd_status, cmd_toggle_tunnels, cmd_top, cmd_validate,
@@ -61,12 +61,14 @@ pub enum Commands {
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
 
-        /// Deprecated: bearer authentication token for protected Admin API.
-        /// The value stays visible in the process argument list
-        /// (`/proc/<pid>/cmdline`, `ps`) for the whole session;
-        /// prefer the `WPMULTI_ADMIN_TOKEN` environment variable.
+        /// Path to a file holding the bearer authentication token for
+        /// a protected Admin API (first line, trimmed). The token is
+        /// never passed on the command line: `--auth-token` was removed
+        /// (audit run-3 #13) because argv stays visible in
+        /// `/proc/<pid>/cmdline` to other local users. When omitted,
+        /// the `WPMULTI_ADMIN_TOKEN` environment variable is used.
         #[clap(long)]
-        auth_token: Option<String>,
+        auth_token_file: Option<PathBuf>,
     },
     /// Validate configuration and tunnel files without starting listeners
     #[clap(after_help = "EXAMPLES:\n  \
@@ -88,12 +90,14 @@ pub enum Commands {
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
 
-        /// Deprecated: bearer authentication token for protected Admin API.
-        /// The value stays visible in the process argument list
-        /// (`/proc/<pid>/cmdline`, `ps`) for the whole session;
-        /// prefer the `WPMULTI_ADMIN_TOKEN` environment variable.
+        /// Path to a file holding the bearer authentication token for
+        /// a protected Admin API (first line, trimmed). The token is
+        /// never passed on the command line: `--auth-token` was removed
+        /// (audit run-3 #13) because argv stays visible in
+        /// `/proc/<pid>/cmdline` to other local users. When omitted,
+        /// the `WPMULTI_ADMIN_TOKEN` environment variable is used.
         #[clap(long)]
-        auth_token: Option<String>,
+        auth_token_file: Option<PathBuf>,
     },
     /// Probe WireGuard tunnel configs for connectivity, RTT latency, and exit IP
     #[clap(after_help = "EXAMPLES:\n  \
@@ -131,12 +135,14 @@ pub enum Commands {
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
 
-        /// Deprecated: bearer authentication token for protected Admin API.
-        /// The value stays visible in the process argument list
-        /// (`/proc/<pid>/cmdline`, `ps`) for the whole session;
-        /// prefer the `WPMULTI_ADMIN_TOKEN` environment variable.
+        /// Path to a file holding the bearer authentication token for
+        /// a protected Admin API (first line, trimmed). The token is
+        /// never passed on the command line: `--auth-token` was removed
+        /// (audit run-3 #13) because argv stays visible in
+        /// `/proc/<pid>/cmdline` to other local users. When omitted,
+        /// the `WPMULTI_ADMIN_TOKEN` environment variable is used.
         #[clap(long)]
-        auth_token: Option<String>,
+        auth_token_file: Option<PathBuf>,
     },
     /// Enable one or more disabled tunnels (`A`, `1`, `1-200`, `all`) via Admin API
     #[clap(after_help = "EXAMPLES:\n  \
@@ -152,12 +158,14 @@ pub enum Commands {
         #[clap(long, default_value = "http://127.0.0.1:9090")]
         admin_url: String,
 
-        /// Deprecated: bearer authentication token for protected Admin API.
-        /// The value stays visible in the process argument list
-        /// (`/proc/<pid>/cmdline`, `ps`) for the whole session;
-        /// prefer the `WPMULTI_ADMIN_TOKEN` environment variable.
+        /// Path to a file holding the bearer authentication token for
+        /// a protected Admin API (first line, trimmed). The token is
+        /// never passed on the command line: `--auth-token` was removed
+        /// (audit run-3 #13) because argv stays visible in
+        /// `/proc/<pid>/cmdline` to other local users. When omitted,
+        /// the `WPMULTI_ADMIN_TOKEN` environment variable is used.
         #[clap(long)]
-        auth_token: Option<String>,
+        auth_token_file: Option<PathBuf>,
     },
 }
 
@@ -186,17 +194,31 @@ where
         .finish()
 }
 
-/// Warn that `--auth-token` is deprecated: the flag value stays visible
-/// in the process argument list (`/proc/<pid>/cmdline`, `ps`) to other
-/// local users for the whole session, while the token grants full Admin
-/// API control. Prefer the `WPMULTI_ADMIN_TOKEN` environment variable
-/// (audit run-1, `tui-cli/admin-token-cli-flag-argv`).
-fn warn_auth_token_flag_deprecated() {
-    use std::io::Write;
-    let _ = writeln!(
-        std::io::stderr(),
-        "warning: --auth-token is deprecated: the token is visible in the process argument list; use the WPMULTI_ADMIN_TOKEN environment variable instead"
-    );
+/// Read an Admin token from a file: the first line, trimmed. An empty
+/// or whitespace-only file means "no token", like an unset
+/// `WPMULTI_ADMIN_TOKEN`. The token value is never logged.
+pub(crate) fn read_auth_token_file(path: &Path) -> Result<Option<String>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read admin token file '{}': {e}", path.display()))?;
+    Ok(content
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string))
+}
+
+/// Resolve the Admin token for `top`/`status`/`disable`/`enable`:
+/// `--auth-token-file` wins over the `WPMULTI_ADMIN_TOKEN`
+/// environment variable; with neither, there is no token.
+pub(crate) fn resolve_admin_token(
+    auth_token_file: Option<PathBuf>,
+    env_token: Option<String>,
+) -> Result<Option<String>, String> {
+    auth_token_file.map_or_else(
+        || Ok(env_token.filter(|token| !token.is_empty())),
+        |path| read_auth_token_file(&path),
+    )
 }
 
 /// Parse arguments and execute the selected subcommand.
@@ -225,25 +247,17 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Run { .. } => unreachable!(),
         Commands::Top {
             admin_url,
-            auth_token,
-        } => {
-            if auth_token.is_some() {
-                warn_auth_token_flag_deprecated();
-            }
-            cmd_top(admin_url, auth_token.or(env_token)).await
-        }
+            auth_token_file,
+        } => cmd_top(admin_url, resolve_admin_token(auth_token_file, env_token)?).await,
         Commands::Validate { config, dir } => {
             cmd_validate(config, dir)?;
             Ok(())
         }
         Commands::Status {
             admin_url,
-            auth_token,
+            auth_token_file,
         } => {
-            if auth_token.is_some() {
-                warn_auth_token_flag_deprecated();
-            }
-            cmd_status(admin_url, auth_token.or(env_token)).await?;
+            cmd_status(admin_url, resolve_admin_token(auth_token_file, env_token)?).await?;
             Ok(())
         }
         Commands::Probe {
@@ -263,22 +277,28 @@ pub async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Disable {
             target,
             admin_url,
-            auth_token,
+            auth_token_file,
         } => {
-            if auth_token.is_some() {
-                warn_auth_token_flag_deprecated();
-            }
-            cmd_toggle_tunnels(target, true, admin_url, auth_token.or(env_token)).await
+            cmd_toggle_tunnels(
+                target,
+                true,
+                admin_url,
+                resolve_admin_token(auth_token_file, env_token)?,
+            )
+            .await
         }
         Commands::Enable {
             target,
             admin_url,
-            auth_token,
+            auth_token_file,
         } => {
-            if auth_token.is_some() {
-                warn_auth_token_flag_deprecated();
-            }
-            cmd_toggle_tunnels(target, false, admin_url, auth_token.or(env_token)).await
+            cmd_toggle_tunnels(
+                target,
+                false,
+                admin_url,
+                resolve_admin_token(auth_token_file, env_token)?,
+            )
+            .await
         }
     }
 }

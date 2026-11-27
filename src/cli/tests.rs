@@ -68,7 +68,7 @@ fn test_cli_parse_top() {
         cli_default.command,
         Commands::Top {
             admin_url: "http://127.0.0.1:9090".to_string(),
-            auth_token: None,
+            auth_token_file: None,
         }
     );
 
@@ -79,7 +79,7 @@ fn test_cli_parse_top() {
         cli_custom.command,
         Commands::Top {
             admin_url: "http://10.0.0.1:8080".to_string(),
-            auth_token: None,
+            auth_token_file: None,
         }
     );
 }
@@ -112,8 +112,111 @@ fn test_cli_parse_status() {
         cli.command,
         Commands::Status {
             admin_url: "http://127.0.0.1:9090".to_string(),
-            auth_token: None,
+            auth_token_file: None,
         }
+    );
+}
+
+#[test]
+fn test_cli_parse_rejects_auth_token_flag() {
+    // Audit run-3 #13: `--auth-token` exposed the Admin token in
+    // world-readable `/proc/<pid>/cmdline` for the whole process
+    // lifetime, so the flag was removed outright. clap must reject it
+    // as an unknown argument on every subcommand that used to take it.
+    for args in [
+        vec!["wpmulti", "top", "--auth-token", "dummy-token"],
+        vec!["wpmulti", "status", "--auth-token", "dummy-token"],
+        vec!["wpmulti", "disable", "all", "--auth-token", "dummy-token"],
+        vec![
+            "wpmulti",
+            "enable",
+            "wgcf-001",
+            "--auth-token",
+            "dummy-token",
+        ],
+    ] {
+        assert!(
+            Cli::try_parse_from(args.clone()).is_err(),
+            "--auth-token must be rejected: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn test_cli_parse_auth_token_file() {
+    // The non-interactive replacement for `--auth-token`: the token is
+    // read from a file (first line, trimmed) instead of argv, so it
+    // never appears in `/proc/<pid>/cmdline`.
+    let dir = tempdir().expect("tempdir");
+    let token_file = dir.path().join("admin-token.txt");
+    fs::write(&token_file, "dummy-token-from-file\n").expect("write token file");
+    let cli = Cli::try_parse_from([
+        "wpmulti",
+        "status",
+        "--auth-token-file",
+        token_file.to_str().expect("utf8 path"),
+    ])
+    .expect("parse status with --auth-token-file");
+    assert_eq!(
+        cli.command,
+        Commands::Status {
+            admin_url: "http://127.0.0.1:9090".to_string(),
+            auth_token_file: Some(token_file),
+        }
+    );
+}
+
+#[test]
+fn test_read_auth_token_file_trims_first_line_only() {
+    use super::{read_auth_token_file, resolve_admin_token};
+
+    // Only the first line is the token; surrounding whitespace is
+    // trimmed and later lines are ignored.
+    let dir = tempdir().expect("tempdir");
+    let token_file = dir.path().join("admin-token.txt");
+    fs::write(&token_file, "  dummy-token-13  \nsecond-line-ignored\n").expect("write token file");
+    assert_eq!(
+        read_auth_token_file(&token_file).expect("read token file"),
+        Some("dummy-token-13".to_string())
+    );
+
+    // An empty / whitespace-only file means "no token".
+    let empty_file = dir.path().join("empty-token.txt");
+    fs::write(&empty_file, "  \n\n").expect("write empty token file");
+    assert_eq!(
+        read_auth_token_file(&empty_file).expect("read empty file"),
+        None
+    );
+
+    // A missing file is an error, not a silent fallback to no token:
+    // silently running without auth against a protected Admin API
+    // would only fail later with a confusing 401.
+    let missing = dir.path().join("does-not-exist.txt");
+    let err = read_auth_token_file(&missing).expect_err("missing token file must error");
+    assert!(err.contains("does-not-exist.txt"), "error was: {err}");
+    assert!(
+        !err.contains("dummy-token-13"),
+        "error must never echo the token: {err}"
+    );
+
+    // Precedence: the file wins over the environment variable; without
+    // a file the env var is used; with neither there is no token.
+    assert_eq!(
+        resolve_admin_token(Some(token_file), Some("env-token".to_string()))
+            .expect("resolve with file"),
+        Some("dummy-token-13".to_string())
+    );
+    assert_eq!(
+        resolve_admin_token(None, Some("env-token".to_string())).expect("resolve with env"),
+        Some("env-token".to_string())
+    );
+    assert_eq!(
+        resolve_admin_token(None, Some(String::new())).expect("resolve with empty env"),
+        None
+    );
+    assert_eq!(
+        resolve_admin_token(None, None).expect("resolve with neither"),
+        None
     );
 }
 
