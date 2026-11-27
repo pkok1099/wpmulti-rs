@@ -3238,3 +3238,107 @@ async fn test_tun_drops_local_destinations() {
 
     endpoint.shutdown().await;
 }
+
+/// Run-3 validation #15: unusable longest-prefix TUN route shadows
+/// usable covering route (fingerprint
+/// tun-resolve-route-unusable-longest-prefix-shadow).
+///
+/// tunnel-a holds the specific route 10.1.0.0/16, tunnel-b the
+/// covering 0.0.0.0/0. With tunnel-a usable the packet to 10.1.2.3
+/// goes via tunnel-a (control). Once tunnel-a is unusable, a new
+/// flow to the same specific prefix must fall through to the usable
+/// covering route (tunnel-b) instead of being dropped: the longest
+/// prefix must be computed over usable routes only.
+#[tokio::test]
+async fn test_tun_unusable_specific_route_does_not_shadow_usable_covering() {
+    use gotatun::packet::PacketBufPool;
+    use gotatun::tun::IpRecv;
+    use std::io::Write;
+    use std::sync::Arc;
+    use zerocopy::IntoBytes;
+
+    let (endpoint, mut peer) = tun_test_endpoint();
+    endpoint.start_dispatcher().expect("dispatcher starts");
+    endpoint.set_strategy(crate::netstack::VpnRouteStrategy::Fallback);
+    let checker = Arc::new(TestUsableChecker::new(&[]));
+    endpoint.set_usable_checker(Some(
+        Arc::clone(&checker) as Arc<dyn crate::netstack::TunnelUsable>
+    ));
+    let (_send_a, mut recv_a) =
+        endpoint.attach_tunnel("tunnel-a", vec!["10.1.0.0/16".parse().unwrap()], vec![]);
+    let (_send_b, mut recv_b) =
+        endpoint.attach_tunnel("tunnel-b", vec!["0.0.0.0/0".parse().unwrap()], vec![]);
+    let mut pool = PacketBufPool::new(8);
+
+    // Control: both usable, the longest-prefix route (tunnel-a) wins.
+    let first = tun_test_ipv4_packet([10, 0, 0, 2], [10, 1, 2, 3], 6, 40000, 443);
+    peer.write_all(&first).expect("write first flow");
+    let got = tun_recv_one(&mut recv_a, &mut pool).await;
+    assert_eq!(
+        crate::netstack::parse_flow_key((*got).as_bytes())
+            .expect("packet parses")
+            .src_port,
+        40000,
+        "control: specific-prefix flow goes to tunnel-a while it is usable"
+    );
+
+    // tunnel-a becomes unusable; a NEW flow to the same specific
+    // prefix must fall through to the usable covering route.
+    checker.mark_unusable("tunnel-a");
+    let second = tun_test_ipv4_packet([10, 0, 0, 2], [10, 1, 2, 3], 6, 40001, 443);
+    peer.write_all(&second).expect("write second flow");
+    // Record (do not panic yet) whether the flow reaches tunnel-b,
+    // so the drop counter below can characterise the outcome.
+    let arrived_b = tokio::time::timeout(Duration::from_secs(2), recv_b.recv(&mut pool)).await;
+    let arrived_b = match arrived_b {
+        Ok(Ok(received)) => {
+            let mut packets: Vec<_> = received.collect();
+            assert_eq!(packets.len(), 1, "exactly one packet per write");
+            let got = packets.pop().expect("one packet");
+            assert_eq!(
+                crate::netstack::parse_flow_key((*got).as_bytes())
+                    .expect("packet parses")
+                    .src_port,
+                40001,
+                "unusable specific route must not shadow the usable covering route"
+            );
+            true
+        }
+        Ok(Err(_)) => false,
+        Err(_) => false,
+    };
+    // It must not have been misrouted back to the unusable tunnel-a.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), recv_a.recv(&mut pool))
+            .await
+            .is_err(),
+        "second flow must not reach the unusable tunnel-a"
+    );
+
+    // Wait until the dispatcher counted the second packet, then read
+    // the drop counter: a shadowed packet is dropped as no-route.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let stats = loop {
+        let stats = endpoint.stats_snapshot();
+        if stats.packets_read >= 2 {
+            break stats;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dispatcher must count both packets, got {}",
+            stats.packets_read
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        arrived_b,
+        "second flow must reach tunnel-b (usable covering route); packets_no_route={}",
+        stats.packets_no_route
+    );
+    assert_eq!(
+        stats.packets_no_route, 0,
+        "no packet may be dropped for lack of a route while a usable covering route exists"
+    );
+
+    endpoint.shutdown().await;
+}

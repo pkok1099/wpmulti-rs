@@ -1344,6 +1344,10 @@ impl TunEndpoint {
             let best_prefix = tables
                 .routes
                 .iter()
+                // Longest prefix is computed over usable routes only:
+                // a specific route on an unusable tunnel must not
+                // shadow a usable covering route (audit run-3 #15).
+                .filter(|route| self.is_usable(&route.id))
                 .flat_map(|route| route.allowed_ips.iter())
                 .filter(|network| network.contains(key.dst))
                 .map(IpNetwork::prefix)
