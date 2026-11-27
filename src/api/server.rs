@@ -452,7 +452,7 @@ async fn read_admin_request_body<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
 async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
-    peer_addr: SocketAddr,
+    _peer_addr: SocketAddr,
     manager: Arc<TunnelManager>,
     auth_token: Option<&str>,
     start_time: Instant,
@@ -481,22 +481,15 @@ async fn handle_client_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
     let response = match parse_http_request(&buf) {
         Ok(req) => {
-            // A loopback connection that sends no bearer token is the
-            // daemon's own operator (`wpmulti top` on the same machine):
-            // it needs no token even when one is configured, so `top`
-            // reads a running daemon without a password. A token still
-            // gates every non-loopback peer, and a loopback client that
-            // *does* send a token is validated normally. The Host-header
-            // check in `handle_admin_request` still applies to the
-            // unauthenticated path (DNS-rebinding guard). This is
-            // deliberately not logged: `top` polls the Admin API every
-            // refresh, so a per-connection line would flood the log.
-            let effective_auth_token =
-                if peer_addr.ip().is_loopback() && !req.headers.contains_key("authorization") {
-                    None
-                } else {
-                    dynamic_token.as_deref().or(auth_token)
-                };
+            // A configured admin token gates every peer, loopback
+            // included: loopback is not an identity, any local UID can
+            // connect to it (audit run-3, `loopback-no-token-any-local-
+            // user-admin`). When no token is configured at all the
+            // request stays unauthenticated, as before. First-party
+            // clients (`wpmulti top`, `status`, `disable`/`enable`)
+            // send the token from `WPMULTI_ADMIN_TOKEN` /
+            // `--auth-token` when one is configured.
+            let effective_auth_token = dynamic_token.as_deref().or(auth_token);
             handle_admin_request(&req, &manager, effective_auth_token, uptime_secs).await
         }
         Err(e) => HttpResponse::bad_request(&e),

@@ -519,11 +519,12 @@ async fn test_admin_server_e2e_tcp() {
 }
 
 #[tokio::test]
-async fn test_admin_server_loopback_needs_no_token() {
-    // `wpmulti top` on the same machine must read a running daemon
-    // without a password, even when the daemon has a token configured
-    // (the token gates remote peers). A loopback client that *does*
-    // send a token is still validated normally.
+async fn test_admin_server_loopback_requires_token() {
+    // Run-3 finding #12: with an admin token configured, a loopback
+    // client with no `Authorization` header must be rejected, exactly
+    // like a wrong token — loopback is not an identity, any local UID
+    // can connect to it. `wpmulti top` sends the token from
+    // `WPMULTI_ADMIN_TOKEN` / `--auth-token` when one is configured.
     let manager = create_test_manager();
     let server = AdminServer::new(
         "127.0.0.1:0".parse().unwrap(),
@@ -532,38 +533,54 @@ async fn test_admin_server_loopback_needs_no_token() {
     );
     let bound_addr = server.start().await.expect("server started");
 
-    async fn get_health(addr: std::net::SocketAddr, auth: Option<&str>) -> String {
-        let mut client = TcpStream::connect(addr).await.expect("connect");
-        let auth_header =
-            auth.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
-        let req = format!(
-            "GET /health HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Connection: close\r\n\r\n"
-        );
-        client.write_all(req.as_bytes()).await.unwrap();
-        let mut resp_buf = Vec::new();
-        client.read_to_end(&mut resp_buf).await.unwrap();
-        String::from_utf8_lossy(&resp_buf).into_owned()
-    }
-
-    // Loopback, no token at all: allowed.
-    let resp_no_token = get_health(bound_addr, None).await;
-    assert!(
-        resp_no_token.starts_with("HTTP/1.1 200 OK"),
-        "loopback without a token must be allowed, got: {resp_no_token}"
+    // Loopback, no token at all: rejected.
+    let resp_no_token = tcp_http_exchange(bound_addr, "GET", "/health", None, None).await;
+    assert_eq!(
+        resp_no_token.0, 401,
+        "loopback without a token must be rejected, got: {}",
+        resp_no_token.1
     );
 
-    // Loopback, wrong token: rejected (a sent token is validated).
-    let resp_wrong = get_health(bound_addr, Some("wrong-token")).await;
-    assert!(
-        resp_wrong.starts_with("HTTP/1.1 401"),
-        "loopback with a wrong token must be rejected, got: {resp_wrong}"
+    // Loopback, wrong token: rejected.
+    let resp_wrong =
+        tcp_http_exchange(bound_addr, "GET", "/health", Some("wrong-token"), None).await;
+    assert_eq!(
+        resp_wrong.0, 401,
+        "loopback with a wrong token must be rejected, got: {}",
+        resp_wrong.1
     );
 
     // Loopback, correct token: allowed.
-    let resp_good = get_health(bound_addr, Some("test_token")).await;
-    assert!(
-        resp_good.starts_with("HTTP/1.1 200 OK"),
-        "loopback with the right token must be allowed, got: {resp_good}"
+    let resp_good = tcp_http_exchange(bound_addr, "GET", "/health", Some("test_token"), None).await;
+    assert_eq!(
+        resp_good.0, 200,
+        "loopback with the right token must be allowed, got: {}",
+        resp_good.1
+    );
+
+    // State-changing route, no token: rejected before the handler runs.
+    let resp_reload_no_token =
+        tcp_http_exchange(bound_addr, "POST", "/reload", None, Some(b"{}")).await;
+    assert_eq!(
+        resp_reload_no_token.0, 401,
+        "POST /reload without a token must be rejected, got: {}",
+        resp_reload_no_token.1
+    );
+
+    // State-changing route, correct token: reaches the handler (the
+    // test fixture has no config dir to reload from, so the handler
+    // itself may answer 500 — the point is it is not a 401).
+    let resp_reload_good = tcp_http_exchange(
+        bound_addr,
+        "POST",
+        "/reload",
+        Some("test_token"),
+        Some(b"{}"),
+    )
+    .await;
+    assert_ne!(
+        resp_reload_good.0, 401,
+        "POST /reload with the right token must reach the handler, got 401"
     );
 
     server.stop().await;
@@ -1537,5 +1554,90 @@ async fn test_admin_server_per_ip_connection_cap() {
     );
 
     drop(holders);
+    server.stop().await;
+}
+
+/// Run-3 finding #11 (validation): the per-IP cap (8) is the only
+/// fairness control on the Admin API — 8 distinct source IPs holding
+/// 8 slow connections each exhaust all 64 global slots, and a
+/// legitimate request is dropped until the 10 s outer read timeout
+/// frees them.
+#[tokio::test]
+async fn test_admin_global_slots_exhausted_by_8_distinct_slow_ips() {
+    use std::net::IpAddr;
+    use tokio::net::TcpSocket;
+
+    let manager = create_test_manager();
+    let server = AdminServer::new("127.0.0.1:0".parse().unwrap(), manager, None);
+    let bound = server.start().await.unwrap();
+
+    // 8 source addresses in 127/8 (all loopback on Linux) x 8
+    // trickling connections each = 64 = MAX_ADMIN_CONNS. Each sends
+    // one byte per ~0.9 s, inside the 2 s chunk deadline, so its slot
+    // is held until the 10 s outer read timeout.
+    let mut trickle_tasks = Vec::new();
+    for octet in 2..=9u8 {
+        for _ in 0..8 {
+            let src = std::net::SocketAddr::new(IpAddr::from([127, 0, 0, octet]), 0);
+            let sock = TcpSocket::new_v4().unwrap();
+            sock.bind(src).unwrap();
+            let stream = sock.connect(bound).await.unwrap();
+            let (_read_half, mut write_half) = stream.into_split();
+            trickle_tasks.push(tokio::spawn(async move {
+                let mut byte = b'G';
+                loop {
+                    if write_half.write_all(&[byte]).await.is_err() {
+                        break;
+                    }
+                    byte = byte.wrapping_add(1);
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                }
+            }));
+        }
+    }
+    // Let the accept loop admit all 64 before probing.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Legitimate loopback request (no token needed on loopback) from a
+    // 9th address while all 64 slots are held: dropped, no response.
+    let mut legit = TcpStream::connect(bound).await.unwrap();
+    legit
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(3), legit.read_to_end(&mut resp)).await;
+    assert!(read.is_ok(), "legit request must be dropped, not held");
+    assert!(
+        resp.is_empty(),
+        "dropped legit request must get no response, got: {resp:?}"
+    );
+
+    // After the 10 s outer timeout frees the slots, the same request
+    // succeeds.
+    let ok = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let mut retry = TcpStream::connect(bound).await.unwrap();
+            retry
+                .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            if tokio::time::timeout(Duration::from_secs(2), retry.read_to_end(&mut buf))
+                .await
+                .is_ok()
+                && String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 200 OK")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await;
+    assert!(ok.is_ok(), "legit request must succeed once slots free");
+
+    for task in trickle_tasks {
+        task.abort();
+    }
     server.stop().await;
 }

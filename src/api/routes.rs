@@ -586,7 +586,7 @@ pub async fn handle_admin_request(
             // a simple content type or fires a CORS preflight this
             // server does not answer. Requiring JSON here is what keeps
             // a website visited by the operator from firing a reload
-            // through the loopback no-token bypass, exactly like
+            // when no admin token is configured, exactly like
             // `POST /config` and the batch toggle already do. The
             // first-party client sends this header on every POST
             // (see `admin_http_request_with_body`).
