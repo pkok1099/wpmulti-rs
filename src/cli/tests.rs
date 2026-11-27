@@ -282,19 +282,109 @@ fn test_discover_local_config_finds_wpmulti_toml_in_dir() {
     // directory instead of the compiled-in defaults — but only when one
     // is actually there.
     let dir = tempdir().expect("tempdir");
-    assert_eq!(discover_local_config_in(dir.path()), None);
+    assert!(discover_local_config_in(dir.path()).is_none());
 
     let toml_path = dir.path().join("wpmulti.toml");
     fs::write(&toml_path, "[global]\n").expect("write toml");
     assert_eq!(
-        discover_local_config_in(dir.path()),
+        discover_local_config_in(dir.path()).map(|found| found.path),
         Some(toml_path.clone())
     );
 
     // A differently-named file does not count.
     let other = tempdir().expect("tempdir");
     fs::write(other.path().join("wpmulti.toml.example"), "[global]\n").expect("write example");
-    assert_eq!(discover_local_config_in(other.path()), None);
+    assert!(discover_local_config_in(other.path()).is_none());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_discover_local_config_binds_content_to_opened_fd() {
+    // Audit run-3 #2: the owner check and the read are bound to the
+    // same opened inode. Discovery returns the content read from that
+    // fd, so a symlink swapped afterwards cannot change what the caller
+    // parses.
+    let dir = tempdir().expect("tempdir");
+    let op_file = dir.path().join("op.toml");
+    let att_file = dir.path().join("att.toml");
+    fs::write(&op_file, "[global]\nconfig_dir = \"/tmp/toctou-op-dir\"\n").expect("write op");
+    fs::write(
+        &att_file,
+        "[global]\nconfig_dir = \"/tmp/toctou-att-dir\"\n",
+    )
+    .expect("write att");
+    let link = dir.path().join("wpmulti.toml");
+    std::os::unix::fs::symlink(&op_file, &link).expect("symlink op");
+
+    // (b) A symlink to an operator-owned file loads, with its content.
+    let found = discover_local_config_in(dir.path()).expect("discover op config");
+    assert_eq!(found.path, link);
+    assert_eq!(
+        found.content.as_deref(),
+        Some("[global]\nconfig_dir = \"/tmp/toctou-op-dir\"\n")
+    );
+
+    // (c) Swap the symlink after discovery: the already-returned
+    // content is unchanged (bound to the opened fd), while a fresh
+    // discovery sees the new target.
+    fs::remove_file(&link).expect("unlink");
+    std::os::unix::fs::symlink(&att_file, &link).expect("symlink att");
+    assert_eq!(
+        found.content.as_deref(),
+        Some("[global]\nconfig_dir = \"/tmp/toctou-op-dir\"\n"),
+        "discovered content must not follow a later symlink swap"
+    );
+    let found_after_swap = discover_local_config_in(dir.path()).expect("discover after swap");
+    assert_eq!(
+        found_after_swap.content.as_deref(),
+        Some("[global]\nconfig_dir = \"/tmp/toctou-att-dir\"\n"),
+        "a fresh discovery must see the swapped target"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_discover_local_config_ignores_symlink_to_non_owner_file() {
+    // Audit run-3 #2 (a): a symlink to a file owned by another uid is
+    // ignored, exactly like a directly-owned foreign file. Building
+    // the fixture needs privilege to chown (the sandbox runs as root);
+    // without it the test bails out instead of failing spuriously.
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempdir().expect("tempdir");
+    let att_file = dir.path().join("att.toml");
+    fs::write(
+        &att_file,
+        "[global]\nconfig_dir = \"/tmp/toctou-att-dir\"\n",
+    )
+    .expect("write att");
+    let process_uid = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|uid| uid.parse::<u32>().ok())
+        });
+    let Some(process_uid) = process_uid else {
+        return;
+    };
+    // A uid that is neither root nor the process uid.
+    let foreign_uid = if process_uid == 1000 { 1001 } else { 1000 };
+    let chowned = std::process::Command::new("chown")
+        .arg(format!("{foreign_uid}:{foreign_uid}"))
+        .arg(&att_file)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !chowned {
+        return;
+    }
+    assert_eq!(att_file.metadata().expect("stat att").uid(), foreign_uid);
+    let link = dir.path().join("wpmulti.toml");
+    std::os::unix::fs::symlink(&att_file, &link).expect("symlink att");
+    assert!(discover_local_config_in(dir.path()).is_none());
 }
 
 #[test]
@@ -315,7 +405,8 @@ fn test_discover_default_config_prefers_local_over_user_config() {
     fs::write(&user, "[global]\n").expect("write user toml");
 
     assert_eq!(
-        discover_default_config_in(cwd.path(), None, Some(home.path().as_os_str())),
+        discover_default_config_in(cwd.path(), None, Some(home.path().as_os_str()))
+            .map(|found| found.path),
         Some(local)
     );
 }
@@ -335,7 +426,8 @@ fn test_discover_default_config_falls_back_to_user_config() {
     fs::write(&user, "[global]\n").expect("write user toml");
 
     assert_eq!(
-        discover_default_config_in(cwd.path(), None, Some(home.path().as_os_str())),
+        discover_default_config_in(cwd.path(), None, Some(home.path().as_os_str()))
+            .map(|found| found.path),
         Some(user)
     );
 }
@@ -355,7 +447,8 @@ fn test_discover_default_config_prefers_xdg_over_home() {
             cwd.path(),
             Some(xdg.path().as_os_str()),
             Some(home.path().as_os_str())
-        ),
+        )
+        .map(|found| found.path),
         Some(user)
     );
 }
@@ -379,7 +472,8 @@ fn test_discover_default_config_ignores_relative_xdg() {
             cwd.path(),
             Some(std::ffi::OsStr::new("relative/config")),
             Some(home.path().as_os_str())
-        ),
+        )
+        .map(|found| found.path),
         Some(user)
     );
 }
@@ -391,10 +485,11 @@ fn test_discover_default_config_none_when_nothing_exists() {
     let cwd = tempdir().expect("tempdir");
     let home = tempdir().expect("tempdir");
     assert_eq!(
-        discover_default_config_in(cwd.path(), None, Some(home.path().as_os_str())),
+        discover_default_config_in(cwd.path(), None, Some(home.path().as_os_str()))
+            .map(|found| found.path),
         None
     );
-    assert_eq!(discover_default_config_in(cwd.path(), None, None), None);
+    assert!(discover_default_config_in(cwd.path(), None, None).is_none());
 }
 
 #[test]

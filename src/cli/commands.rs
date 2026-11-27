@@ -159,6 +159,100 @@ fn process_uid() -> Option<u32> {
     None
 }
 
+/// A config file found by discovery. `path` is the pathname (used for
+/// error messages and for resolving relative `config_dir` entries);
+/// `content` carries the file's content when it was read from the same
+/// opened file descriptor the owner check ran on (CWD discovery, audit
+/// run-3 #2): check and read are bound to one inode, so a symlink
+/// swapped after the open cannot redirect the read. `content` is `None`
+/// for paths found outside CWD discovery (explicit `-c`, XDG user
+/// config), which the caller reads by pathname as before — an explicit
+/// operator choice needs no TOCTOU binding.
+pub(crate) struct DiscoveredConfig {
+    pub path: PathBuf,
+    pub content: Option<String>,
+}
+
+impl DiscoveredConfig {
+    /// An explicitly passed (`-c`) config path: no fd-bound content,
+    /// the caller reads it by pathname.
+    const fn from_explicit(path: PathBuf) -> Self {
+        Self {
+            path,
+            content: None,
+        }
+    }
+}
+
+/// Open `path`, fstat the fd for the owner check, and read the config
+/// from that fd (audit run-3 #2). The open follows symlinks on purpose:
+/// a symlink to an operator-owned file is a legitimate config, and the
+/// owner check applies to the file actually opened, whichever it is.
+/// What the fd binding rules out is the check-then-read swap: the check
+/// (`fstat` on the fd) and the read both operate on the opened inode,
+/// never on the pathname again, so a symlink swapped after this open
+/// cannot redirect either step. `O_NOFOLLOW` was deliberately not used:
+/// it would reject symlinks to operator-owned files outright, which is
+/// a behaviour change beyond the finding, while the fd binding already
+/// provides the security property — the owner decision is always made
+/// about the exact inode that is read.
+#[cfg(unix)]
+fn read_local_config_bound(path: &Path) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!(
+                "Ignoring wpmulti.toml in working directory '{}': cannot open it: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    // `File::metadata` is `fstat` on the opened fd: bound to the inode
+    // above, not to the pathname.
+    let file_uid = match file.metadata() {
+        Ok(meta) => meta.uid(),
+        Err(e) => {
+            tracing::warn!(
+                "Ignoring wpmulti.toml in working directory '{}': cannot stat it: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    match process_uid() {
+        Some(uid) if config_file_owner_trusted(file_uid, uid) => {}
+        Some(uid) => {
+            tracing::warn!(
+                "Ignoring wpmulti.toml in working directory '{}': owned by uid {} (process uid {}); pass -c <file> to use it explicitly",
+                path.display(),
+                file_uid,
+                uid
+            );
+            return None;
+        }
+        None => {
+            tracing::warn!(
+                "Ignoring wpmulti.toml in working directory '{}': cannot determine process uid; pass -c <file> to use it explicitly",
+                path.display()
+            );
+            return None;
+        }
+    }
+    let mut content = String::new();
+    if let Err(e) = file.read_to_string(&mut content) {
+        tracing::warn!(
+            "Ignoring wpmulti.toml in working directory '{}': cannot read it: {e}",
+            path.display()
+        );
+        return None;
+    }
+    Some(content)
+}
+
 /// Find a `wpmulti.toml` in `dir` for `run` when it was started without
 /// `-c` or `-d`. `run` without arguments used to ignore a `wpmulti.toml`
 /// sitting in the working directory and start with the compiled-in
@@ -172,45 +266,16 @@ fn process_uid() -> Option<u32> {
 /// by another local user must not silently override the per-user
 /// config. An untrusted file is ignored with a warning; pass `-c
 /// <file>` to use such a file explicitly.
-pub(crate) fn discover_local_config_in(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn discover_local_config_in(dir: &Path) -> Option<DiscoveredConfig> {
     let path = dir.join("wpmulti.toml");
     if !path.exists() {
         return None;
     }
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let file_uid = match fs::metadata(&path) {
-            Ok(meta) => meta.uid(),
-            Err(e) => {
-                tracing::warn!(
-                    "Ignoring wpmulti.toml in working directory '{}': cannot stat it: {e}",
-                    path.display()
-                );
-                return None;
-            }
-        };
-        match process_uid() {
-            Some(uid) if config_file_owner_trusted(file_uid, uid) => {}
-            Some(uid) => {
-                tracing::warn!(
-                    "Ignoring wpmulti.toml in working directory '{}': owned by uid {} (process uid {}); pass -c <file> to use it explicitly",
-                    path.display(),
-                    file_uid,
-                    uid
-                );
-                return None;
-            }
-            None => {
-                tracing::warn!(
-                    "Ignoring wpmulti.toml in working directory '{}': cannot determine process uid; pass -c <file> to use it explicitly",
-                    path.display()
-                );
-                return None;
-            }
-        }
-    }
-    Some(path)
+    let content = Some(read_local_config_bound(&path)?);
+    #[cfg(not(unix))]
+    let content: Option<String> = None;
+    Some(DiscoveredConfig { path, content })
 }
 
 /// Resolve the config file to use when no explicit `-c` was given, in
@@ -227,7 +292,7 @@ pub(crate) fn discover_local_config_in(dir: &Path) -> Option<PathBuf> {
 ///
 /// Returns `None` when neither exists and the caller falls back to the
 /// compiled-in defaults.
-pub(crate) fn discover_default_config() -> Option<PathBuf> {
+pub(crate) fn discover_default_config() -> Option<DiscoveredConfig> {
     discover_default_config_in(
         Path::new("."),
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
@@ -242,11 +307,16 @@ pub(crate) fn discover_default_config_in(
     cwd: &Path,
     xdg_config_home: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
-) -> Option<PathBuf> {
+) -> Option<DiscoveredConfig> {
     if let Some(local) = discover_local_config_in(cwd) {
         return Some(local);
     }
-    user_config_file(xdg_config_home, home).filter(|path| path.exists())
+    user_config_file(xdg_config_home, home)
+        .filter(|path| path.exists())
+        .map(|path| DiscoveredConfig {
+            path,
+            content: None,
+        })
 }
 
 /// Absolute path of the per-user config file:
@@ -324,15 +394,33 @@ pub async fn cmd_run(
     // defaults. This applies with `-d` too: `-d` only overrides where the
     // tunnel `.conf` files live, it must not silently discard the user's
     // config.
-    let config_path = config_path.or_else(discover_default_config);
-    let saved_config_path = config_path.clone();
-    let mut config = if let Some(path) = config_path {
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
-        let mut cfg = MainConfig::from_toml_str(&content)
-            .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?;
-        cfg.resolve_config_dir_against(&path);
+    let config_path = config_path
+        .map(DiscoveredConfig::from_explicit)
+        .or_else(discover_default_config);
+    let saved_config_path = config_path.as_ref().map(|found| found.path.clone());
+    let mut config = if let Some(found) = config_path {
+        // A CWD-discovered config carries content read from the opened
+        // fd (audit run-3 #2): use it, never re-resolve the pathname.
+        // Anything else (explicit `-c`, XDG user config) is read by
+        // pathname as before.
+        let content = match found.content {
+            Some(content) => content,
+            None => tokio::fs::read_to_string(&found.path).await.map_err(|e| {
+                format!(
+                    "Failed to read config file '{}': {}",
+                    found.path.display(),
+                    e
+                )
+            })?,
+        };
+        let mut cfg = MainConfig::from_toml_str(&content).map_err(|e| {
+            format!(
+                "Failed to parse config file '{}': {}",
+                found.path.display(),
+                e
+            )
+        })?;
+        cfg.resolve_config_dir_against(&found.path);
         cfg
     } else {
         MainConfig::default()
@@ -480,13 +568,32 @@ pub fn cmd_validate(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     // Same discovery as `run`: an explicit `-c` wins, then
     // `./wpmulti.toml`, then `~/.config/wpmulti/wpmulti.toml`.
-    let config_path = config_path.or_else(discover_default_config);
-    let mut config = if let Some(path) = config_path {
-        let content = fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
-        let mut cfg = MainConfig::from_toml_str(&content)
-            .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?;
-        cfg.resolve_config_dir_against(&path);
+    let config_path = config_path
+        .map(DiscoveredConfig::from_explicit)
+        .or_else(discover_default_config);
+    let mut config = if let Some(found) = config_path {
+        // A CWD-discovered config carries content read from the opened
+        // fd (audit run-3 #2): use it, never re-resolve the pathname.
+        // Anything else (explicit `-c`, XDG user config) is read by
+        // pathname as before.
+        let content = match found.content {
+            Some(content) => content,
+            None => fs::read_to_string(&found.path).map_err(|e| {
+                format!(
+                    "Failed to read config file '{}': {}",
+                    found.path.display(),
+                    e
+                )
+            })?,
+        };
+        let mut cfg = MainConfig::from_toml_str(&content).map_err(|e| {
+            format!(
+                "Failed to parse config file '{}': {}",
+                found.path.display(),
+                e
+            )
+        })?;
+        cfg.resolve_config_dir_against(&found.path);
         cfg
     } else {
         MainConfig::default()
