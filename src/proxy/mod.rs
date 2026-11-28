@@ -873,6 +873,13 @@ impl RetryCopy {
                 // the client giving up on a blackhole tunnel: end
                 // now instead of lingering until the idle timeout.
                 if self.client_aborted_after_silence() {
+                    // fix15: flag it, so a dial aborted by the epoch
+                    // end is not mistaken for one cut short by the
+                    // primary closing.
+                    self.silence
+                        .shared
+                        .client_gone
+                        .store(true, Ordering::Relaxed);
                     return Some(EpochOutcome::Done((
                         CopyEndKind::ClientAborted,
                         Ok(self.counts()),
@@ -915,6 +922,19 @@ impl RetryCopy {
         tunnel_id: Option<&str>,
     ) -> EpochOutcome {
         self.check_replay_resolution(tunnel_id);
+        // fix15: the primary ended while a secondary dial was still
+        // in flight — stamp it, so the dial-outcome record can state
+        // the fast-close window (primary close minus dial start).
+        // Gated on `Dialing`: once the race resolved, the dial
+        // already has its terminal outcome.
+        if self.silence.phase == SilencePhase::Dialing
+            && matches!(
+                &res,
+                RaceReaderDone::PrimaryClosed | RaceReaderDone::PrimaryReset(_)
+            )
+        {
+            self.silence.shared.timings.lock().primary_closed_at = Some(Instant::now());
+        }
         match res {
             RaceReaderDone::PrimaryClosed => self.on_tunnel_closed(
                 self.client_bytes.load(Ordering::Relaxed),
@@ -1153,13 +1173,16 @@ impl RetryCopy {
             return None;
         }
         // The re-dial is a single direct dial, not the racing
-        // router: a replay must not start its own fix6 race.
+        // router: a replay must not start its own fix6 race. Its
+        // dial stages are not reported (fix15 records them only for
+        // silence-replay dials).
         let (mut stream, new_id) = match router::connect_direct(
             ctx.router,
             ctx.selector,
             ctx.target,
             ctx.credentials,
             tunnel_id.as_deref(),
+            &mut router::DialStages::default(),
         )
         .await
         {
@@ -1227,6 +1250,29 @@ impl RetryCopy {
     }
 }
 
+/// Build the owned dial context for a post-send replay from the
+/// handler's borrowed retry context, stamped with the session's
+/// correlation id and start: the silence replay dials from a spawned
+/// task, where the handler's borrows do not live, and the fix15
+/// dial-outcome record needs both.
+fn owned_replay_dial_ctx(
+    retry: &ZeroResponseRetry<'_>,
+    request_id: u64,
+    session_started_at: Instant,
+) -> Arc<ReplayDialCtx> {
+    Arc::new(ReplayDialCtx {
+        router: Arc::clone(retry.router),
+        selector: retry.selector.clone(),
+        target: retry.target.clone(),
+        credentials: retry
+            .credentials
+            .map(|(user, pass)| (user.to_string(), pass.to_string())),
+        protocol: retry.protocol,
+        request_id,
+        session_started_at,
+    })
+}
+
 /// Relay bytes in both directions between `a` and `b` until either side
 /// closes, and end the session when no byte flows in either direction
 /// for `idle_timeout` (audit run-1,
@@ -1287,20 +1333,13 @@ where
     // The silence replay draws from the global bucket: one primary
     // request per refill token.
     replay_budget_note_primary_request();
-    // Owned dial context for a post-send replay, cloned from the
-    // handler's borrowed context: the silence replay dials from a
-    // spawned task, where those borrows do not live.
-    let dial_ctx = retry.as_ref().map(|ctx| {
-        Arc::new(ReplayDialCtx {
-            router: Arc::clone(ctx.router),
-            selector: ctx.selector.clone(),
-            target: ctx.target.clone(),
-            credentials: ctx
-                .credentials
-                .map(|(user, pass)| (user.to_string(), pass.to_string())),
-            protocol: ctx.protocol,
-        })
-    });
+    // Owned dial context for a post-send replay (see
+    // `owned_replay_dial_ctx`): the silence replay dials from a
+    // spawned task, where the handler's borrows do not live.
+    let (request_id, started_at) = (next_replay_request_id(), Instant::now());
+    let dial_ctx = retry
+        .as_ref()
+        .map(|ctx| owned_replay_dial_ctx(ctx, request_id, started_at));
     let mut state = RetryCopy {
         activity_tx,
         activity_rx,
@@ -1309,13 +1348,13 @@ where
         prefix: Arc::new(RetryPrefix::new(seed)),
         retried: retry.is_none(),
         idle_timeout,
-        started_at: Instant::now(),
+        started_at,
         retry_reason: "zero-response EOF",
         replay_token: PostSendReplayToken::new(),
         dial_ctx,
         seed_len,
         silence: SilenceReplay::new(),
-        request_id: next_replay_request_id(),
+        request_id,
     };
     let mut retry = retry;
     loop {

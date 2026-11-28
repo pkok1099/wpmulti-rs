@@ -602,7 +602,7 @@ pub(crate) async fn connect_via_router(
             };
             race.race(target_tunnel, &mut tried_ids).await
         } else {
-            connect_target(&target_tunnel, target, attempt, max_attempts, true)
+            connect_target_single(&target_tunnel, target, attempt, max_attempts)
                 .await
                 .map(|stream| (stream, tried_ids.last().cloned()))
         };
@@ -678,7 +678,7 @@ impl LegRace<'_> {
         set.spawn(async move {
             let result = tokio::time::timeout(
                 timeout,
-                connect_target(&tunnel, &target, attempt, max_attempts, true),
+                connect_target_single(&tunnel, &target, attempt, max_attempts),
             )
             .await
             .unwrap_or_else(|_| {
@@ -871,24 +871,68 @@ fn within_failover_budget(attempt: usize, deadline: tokio::time::Instant) -> boo
     deadline.saturating_duration_since(tokio::time::Instant::now()) >= MIN_ATTEMPT_TIMEOUT
 }
 
+/// One dial attempt through [`connect_target`] that does not report
+/// fix15 stages: the fix6 paths (the single-attempt failover arm and
+/// the race legs) have no dial-outcome record to fill in, so the
+/// stages go to a throwaway sink. DNS failures warn, as before.
+async fn connect_target_single(
+    target_tunnel: &Arc<dyn ProxyTunnelTarget>,
+    target: &TargetAddr,
+    attempt: usize,
+    max_attempts: usize,
+) -> Result<DynStream, RouterConnectError> {
+    connect_target(
+        target_tunnel,
+        target,
+        attempt,
+        max_attempts,
+        true,
+        &mut DialStages::default(),
+    )
+    .await
+}
+
 /// Attempt one connection through `target_tunnel` for `target`.
+/// `stages` records where one direct dial got to (fix15): the DNS
+/// and TCP phases are stamped here, where the dial genuinely passes
+/// through them — a stage the dial never reaches stays `None` (an
+/// IP target never resolves DNS, a failed dial never connects).
+/// Callers with no dial-outcome record (the fix5 re-dial) pass a
+/// throwaway default; the fix6 paths use [`connect_target_single`].
 async fn connect_target(
     target_tunnel: &Arc<dyn ProxyTunnelTarget>,
     target: &TargetAddr,
     attempt: usize,
     max_attempts: usize,
     warn_dns: bool,
+    stages: &mut DialStages,
 ) -> Result<DynStream, RouterConnectError> {
     match target {
-        TargetAddr::Ip(dst_addr) => target_tunnel
-            .tcp_connect(*dst_addr)
-            .await
-            .map_err(RouterConnectError::TcpConnect),
+        TargetAddr::Ip(dst_addr) => {
+            stages.tcp_connect_started = Some(Instant::now());
+            let connected = target_tunnel
+                .tcp_connect(*dst_addr)
+                .await
+                .map_err(RouterConnectError::TcpConnect);
+            if connected.is_ok() {
+                stages.tcp_connected = Some(Instant::now());
+            }
+            connected
+        }
         TargetAddr::Domain(domain, port) => {
+            stages.dns_started = Some(Instant::now());
             match resolve_and_validate_domain(target_tunnel.as_ref(), domain).await {
-                Ok(ips) => connect_validated_addrs(target_tunnel.as_ref(), &ips, *port)
-                    .await
-                    .map_err(RouterConnectError::TcpConnect),
+                Ok(ips) => {
+                    stages.dns_completed = Some(Instant::now());
+                    stages.tcp_connect_started = Some(Instant::now());
+                    let connected = connect_validated_addrs(target_tunnel.as_ref(), &ips, *port)
+                        .await
+                        .map_err(RouterConnectError::TcpConnect);
+                    if connected.is_ok() {
+                        stages.tcp_connected = Some(Instant::now());
+                    }
+                    connected
+                }
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                     Err(RouterConnectError::ForbiddenDestination(e))
                 }
@@ -912,6 +956,21 @@ async fn connect_target(
     }
 }
 
+/// Per-stage timestamps of one direct dial (fix15): when a tunnel
+/// was selected, when DNS started and completed, and when the TCP
+/// connect started and connected. A stage the dial never reached
+/// stays `None`. The dial task copies these into the shared replay
+/// timings, so the dial-outcome record carries them as millisecond
+/// offsets from the session start.
+#[derive(Default)]
+pub(crate) struct DialStages {
+    pub(crate) dns_started: Option<Instant>,
+    pub(crate) dns_completed: Option<Instant>,
+    pub(crate) tunnel_ready: Option<Instant>,
+    pub(crate) tcp_connect_started: Option<Instant>,
+    pub(crate) tcp_connected: Option<Instant>,
+}
+
 /// Dial `target` through exactly one tunnel selected by `selector`,
 /// excluding `exclude_tunnel`, without the fix6 dial race and without
 /// the pool failover loop: a post-send replay (fix5 retry or the
@@ -923,13 +982,14 @@ async fn connect_target(
 /// keeps serving. Returns `NotConnected` when no tunnel other than
 /// the excluded one exists (a `ById` selector, or a one-tunnel pool),
 /// so the caller can tell "no different tunnel" apart from a dial
-/// failure.
+/// failure. `stages` records where the dial got to (fix15).
 pub(crate) async fn connect_direct(
     router: &Arc<dyn TunnelRouter>,
     selector: &TunnelSelector,
     target: &TargetAddr,
     credentials: Option<(&str, &str)>,
     exclude_tunnel: Option<&str>,
+    stages: &mut DialStages,
 ) -> Result<(DynStream, Option<String>), RouterConnectError> {
     for attempt in 1..=MAX_RACE_SELECT_TRIES {
         let target_tunnel = router
@@ -940,12 +1000,14 @@ pub(crate) async fn connect_direct(
         if id.as_deref() == exclude_tunnel {
             continue;
         }
+        stages.tunnel_ready = Some(Instant::now());
         let dial = connect_target(
             &target_tunnel,
             target,
             attempt,
             MAX_RACE_SELECT_TRIES,
             false,
+            stages,
         );
         return match tokio::time::timeout(FIRST_ATTEMPT_TIMEOUT, dial).await {
             Ok(Ok(stream)) => Ok((stream, id)),

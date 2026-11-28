@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -401,6 +401,43 @@ async fn spawn_delayed_echo_tcp_server(delay: Duration) -> SocketAddr {
                 }
                 tokio::time::sleep(delay).await;
                 let _ = stream.write_all(&buf[..read]).await;
+            });
+        }
+    });
+    addr
+}
+
+/// Like `spawn_delayed_echo_tcp_server`, but the connection stays
+/// open after the delayed echo instead of closing: a primary that
+/// answers late without ending the epoch, so a secondary dial in
+/// flight reaches its pre-send check (and is suppressed as
+/// primary-won) instead of being aborted by the epoch end.
+async fn spawn_delayed_echo_keep_open_tcp_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let mut read = 0usize;
+                while read < buf.len() {
+                    match stream.read(&mut buf[read..]).await {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            read += n;
+                            if read >= 4 && buf[..read].ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                tokio::time::sleep(delay).await;
+                let _ = stream.write_all(&buf[..read]).await;
+                // Stay open: the epoch must outlive the dial for the
+                // pre-send check to run. (The session ends on the
+                // test's idle timeout instead.)
+                tokio::time::sleep(Duration::from_secs(30)).await;
             });
         }
     });
@@ -6343,6 +6380,357 @@ async fn test_replay_dial_not_sent_records_no_tunnel_reason() {
         request_id_in_line(suppressed_line).expect("suppression record must carry an id");
     assert_eq!(decision_id, suppressed_id);
     assert_eq!(result.request_id, decision_id);
+}
+
+/// Assert the fix15 terminal-outcome counters, in
+/// `request_sent, dial_failed, primary_won, client_closed, other`
+/// order. Each started dial ends in exactly one outcome, so callers
+/// assert the total against `dial_started` separately.
+fn assert_dial_outcome_counts(
+    sent: u64,
+    failed: u64,
+    primary_won: u64,
+    client_closed: u64,
+    other: u64,
+) {
+    use crate::proxy::replay::replay_metrics;
+    let metrics = replay_metrics();
+    assert_eq!(
+        metrics.dial_outcome_request_sent.load(Ordering::Relaxed),
+        sent
+    );
+    assert_eq!(
+        metrics.dial_outcome_dial_failed.load(Ordering::Relaxed),
+        failed
+    );
+    assert_eq!(
+        metrics
+            .dial_outcome_cancelled_primary_won
+            .load(Ordering::Relaxed),
+        primary_won
+    );
+    assert_eq!(
+        metrics
+            .dial_outcome_cancelled_client_closed
+            .load(Ordering::Relaxed),
+        client_closed
+    );
+    assert_eq!(
+        metrics.dial_outcome_cancelled_other.load(Ordering::Relaxed),
+        other
+    );
+}
+
+/// Fields every fix15 dial-outcome record must carry: the session
+/// id, the terminal outcome, and the per-stage dial timestamps as
+/// millisecond offsets from the session start.
+const DIAL_OUTCOME_FIELDS: &[&str] = &[
+    "request_id=",
+    "outcome=",
+    "secondary_dial_started_ms=",
+    "dns_started_ms=",
+    "dns_completed_ms=",
+    "tunnel_ready_ms=",
+    "tcp_connect_started_ms=",
+    "tcp_connected_ms=",
+    "primary_closed_ms=",
+];
+
+#[tokio::test]
+async fn test_replay_dial_primary_wins_before_send_records_terminal_outcome() {
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
+    use crate::proxy::router::connect_via_router;
+    use crate::proxy::{
+        CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
+    };
+
+    // fix15: a secondary dial that ends because the primary answered
+    // first — the primary echoes at ~2.8 s, the secondary dial takes
+    // ~1 s from the 2.5 s trigger, so the pre-send check finds
+    // response bytes — records exactly one terminal outcome
+    // (`cancelled_primary_won_before_send`), and the outcome record
+    // carries the same request id as the trigger decision.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let msg = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let slow_addr = spawn_delayed_echo_keep_open_tcp_server(Duration::from_millis(2800)).await;
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "slow-1",
+        Arc::new(MockTunnelTarget::new("slow-1").with_dial_redirect(slow_addr)),
+    );
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(
+            MockTunnelTarget::new("alive-1")
+                .with_dial_redirect(echo_addr)
+                .with_tcp_delay(Duration::from_millis(1000)),
+        ),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+    let selector = TunnelSelector::DefaultPool;
+
+    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+        .await
+        .expect("first dial must succeed");
+    assert_eq!(first_id.as_deref(), Some("slow-1"));
+
+    let (mut client, mut server) = tokio::io::duplex(2048);
+    let retry = ZeroResponseRetry::new(&router, &selector, &target, None, "SOCKS5", Vec::new());
+    let (relay_out, echo_buf) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            async move {
+                let mut tunnel_id = first_id;
+                let result = copy_bidirectional_with_zero_response_retry(
+                    &mut server,
+                    first_stream,
+                    Duration::from_secs(3),
+                    Some(retry),
+                    &mut tunnel_id,
+                )
+                .await;
+                (result, tunnel_id)
+            },
+            async {
+                client.write_all(msg).await.unwrap();
+                let mut echo_buf = vec![0u8; msg.len()];
+                client.read_exact(&mut echo_buf).await.unwrap();
+                echo_buf
+            },
+        )
+    })
+    .await
+    .expect("test must finish within 10s");
+    assert_eq!(&echo_buf, msg);
+
+    let (result, tunnel_id) = relay_out;
+    assert_eq!(result.kind, CopyEndKind::IdleTimeout);
+    assert_eq!(tunnel_id.as_deref(), Some("slow-1"));
+
+    // Exactly one terminal outcome, and the outcome family sums to
+    // the started dials: no started dial ends without an outcome.
+    let metrics = replay_metrics();
+    assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.dial_started.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.request_sent.load(Ordering::Relaxed), 0);
+    assert_dial_outcome_counts(0, 0, 1, 0, 0);
+
+    let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    let outcome_line = rendered
+        .lines()
+        .find(|line| line.contains("safe HTTP silence replay dial outcome"))
+        .unwrap_or_else(|| panic!("expected one dial-outcome record, got: {rendered:?}"));
+    assert_line_has_fields(outcome_line, DIAL_OUTCOME_FIELDS);
+    assert!(
+        outcome_line.contains("cancelled_primary_won_before_send"),
+        "outcome must name the primary winning first, got: {outcome_line:?}"
+    );
+    let outcome_id =
+        request_id_in_line(outcome_line).expect("outcome record must carry a numeric id");
+    assert_eq!(result.request_id, outcome_id);
+    let decision_line = rendered
+        .lines()
+        .find(|line| line.contains("safe HTTP silence replay decision"))
+        .unwrap_or_else(|| panic!("expected the decision record, got: {rendered:?}"));
+    assert_eq!(
+        request_id_in_line(decision_line).expect("decision record must carry an id"),
+        outcome_id
+    );
+}
+
+#[tokio::test]
+async fn test_replay_dial_records_stage_timestamps() {
+    use crate::proxy::replay::{
+        REPLAY_TEST_LOCK, ReplayDialCtx, ReplayDialOutcome, SilenceReplay, dial_secondary_leg,
+        next_replay_request_id, reset_replay_state_for_tests,
+    };
+
+    // fix15: a secondary dial through a domain target records every
+    // stage it passes through — tunnel selection, DNS, TCP connect
+    // — on the shared timings, and ends with the `request_sent`
+    // terminal outcome.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let echo_addr = spawn_echo_tcp_server().await;
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "stage-1",
+        Arc::new(
+            MockTunnelTarget::new("stage-1")
+                .with_dns("example.test", TEST_ECHO_IP)
+                .with_dial_redirect(echo_addr),
+        ),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let header: Arc<[u8]> = Arc::from(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".as_slice());
+    let replay = SilenceReplay::new();
+    let shared = Arc::clone(&replay.shared);
+    let ctx = Arc::new(ReplayDialCtx {
+        router: Arc::clone(&router),
+        selector: TunnelSelector::DefaultPool,
+        target: TargetAddr::Domain("example.test".to_string(), echo_addr.port()),
+        credentials: None,
+        protocol: "SOCKS5",
+        request_id: next_replay_request_id(),
+        session_started_at: std::time::Instant::now(),
+    });
+    let outcome = dial_secondary_leg(
+        ctx,
+        None,
+        header,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::clone(&shared),
+    )
+    .await;
+    assert!(
+        matches!(outcome, ReplayDialOutcome::Ready(_)),
+        "domain dial through the mock must send the GET, got a terminal failure instead"
+    );
+
+    let timings = shared.timings.lock();
+    assert!(
+        timings.dial_started_at.is_some(),
+        "dial start must be stamped"
+    );
+    assert!(
+        timings.dns_started_at.is_some(),
+        "DNS start must be stamped"
+    );
+    assert!(
+        timings.dns_completed_at.is_some(),
+        "DNS completion must be stamped"
+    );
+    assert!(
+        timings.tunnel_ready_at.is_some(),
+        "tunnel selection must be stamped"
+    );
+    assert!(
+        timings.tcp_connect_started_at.is_some(),
+        "TCP connect start must be stamped"
+    );
+    assert!(
+        timings.dial_connected_at.is_some(),
+        "TCP connect must be stamped"
+    );
+    assert!(
+        timings.primary_closed_at.is_none(),
+        "no primary closed during this dial"
+    );
+    drop(timings);
+
+    assert_dial_outcome_counts(1, 0, 0, 0, 0);
+
+    let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    let outcome_line = rendered
+        .lines()
+        .find(|line| line.contains("safe HTTP silence replay dial outcome"))
+        .unwrap_or_else(|| panic!("expected one dial-outcome record, got: {rendered:?}"));
+    assert_line_has_fields(outcome_line, DIAL_OUTCOME_FIELDS);
+    assert!(
+        outcome_line.contains("request_sent"),
+        "outcome must be request_sent, got: {outcome_line:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_replay_dial_aborted_records_cancelled_other() {
+    use crate::proxy::replay::{
+        REPLAY_TEST_LOCK, ReplayDialCtx, SilenceReplay, dial_secondary_leg, next_replay_request_id,
+        reset_replay_state_for_tests,
+    };
+
+    // fix15: a dial task aborted mid-flight (its epoch ended before
+    // the dial returned) still ends with exactly one terminal
+    // outcome — the guard's drop records `cancelled_other` when the
+    // primary never answered and the client never went away.
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let echo_addr = spawn_echo_tcp_server().await;
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "hang-1",
+        Arc::new(MockTunnelTarget::new("hang-1").with_hanging_tcp()),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let header: Arc<[u8]> = Arc::from(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".as_slice());
+    let replay = SilenceReplay::new();
+    let shared = Arc::clone(&replay.shared);
+    let ctx = Arc::new(ReplayDialCtx {
+        router: Arc::clone(&router),
+        selector: TunnelSelector::DefaultPool,
+        target: TargetAddr::Ip(test_echo_target(echo_addr)),
+        credentials: None,
+        protocol: "SOCKS5",
+        request_id: next_replay_request_id(),
+        session_started_at: std::time::Instant::now(),
+    });
+    let handle = tokio::spawn(dial_secondary_leg(
+        ctx,
+        None,
+        header,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::clone(&shared),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.abort();
+    let joined = handle.await;
+    assert!(
+        joined.is_err(),
+        "the aborted dial task must not return normally"
+    );
+
+    assert_dial_outcome_counts(0, 0, 0, 0, 1);
+
+    let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    let outcome_lines: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.contains("safe HTTP silence replay dial outcome"))
+        .collect();
+    assert_eq!(
+        outcome_lines.len(),
+        1,
+        "an aborted dial must record exactly one outcome, got: {rendered:?}"
+    );
+    assert_line_has_fields(outcome_lines[0], DIAL_OUTCOME_FIELDS);
+    assert!(
+        outcome_lines[0].contains("cancelled_other"),
+        "outcome must be cancelled_other, got: {:?}",
+        outcome_lines[0]
+    );
 }
 
 // -----------------------------------------------------------------------------

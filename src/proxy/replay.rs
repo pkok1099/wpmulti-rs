@@ -23,7 +23,7 @@
 use std::fmt::Write as _;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -31,7 +31,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
 use super::router::{
-    DynStream, RouterConnectError, TargetAddr, TunnelRouter, TunnelSelector, connect_direct,
+    DialStages, DynStream, RouterConnectError, TargetAddr, TunnelRouter, TunnelSelector,
+    connect_direct,
 };
 
 /// Silence after the complete GET header was written to the primary
@@ -397,6 +398,17 @@ pub(crate) struct ReplayMetrics {
     pub(crate) dial_started: AtomicU64,
     pub(crate) dial_failed: AtomicU64,
     pub(crate) request_sent: AtomicU64,
+    /// Terminal outcome of every started secondary dial (fix15):
+    /// each started dial ends in exactly one of these, so the five
+    /// counters sum to `dial_started`. Kept separate from
+    /// `dial_failed`/`request_sent` (which predate the outcome
+    /// taxonomy and count the same events from the epoch loop's
+    /// side): the outcome family is the auditable one.
+    pub(crate) dial_outcome_request_sent: AtomicU64,
+    pub(crate) dial_outcome_dial_failed: AtomicU64,
+    pub(crate) dial_outcome_cancelled_primary_won: AtomicU64,
+    pub(crate) dial_outcome_cancelled_client_closed: AtomicU64,
+    pub(crate) dial_outcome_cancelled_other: AtomicU64,
     pub(crate) winner_primary: AtomicU64,
     pub(crate) winner_secondary: AtomicU64,
     /// Secondary legs that produced the first response byte: a win,
@@ -444,6 +456,11 @@ impl ReplayMetrics {
             dial_started: AtomicU64::new(0),
             dial_failed: AtomicU64::new(0),
             request_sent: AtomicU64::new(0),
+            dial_outcome_request_sent: AtomicU64::new(0),
+            dial_outcome_dial_failed: AtomicU64::new(0),
+            dial_outcome_cancelled_primary_won: AtomicU64::new(0),
+            dial_outcome_cancelled_client_closed: AtomicU64::new(0),
+            dial_outcome_cancelled_other: AtomicU64::new(0),
             winner_primary: AtomicU64::new(0),
             winner_secondary: AtomicU64::new(0),
             secondary_wins: AtomicU64::new(0),
@@ -495,6 +512,19 @@ impl ReplayMetrics {
 
     pub(crate) fn inc_request_sent(&self) {
         self.request_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one started dial's terminal outcome (fix15): called
+    /// exactly once per started dial, by the dial-outcome guard.
+    pub(crate) fn inc_dial_outcome(&self, outcome: DialOutcome) {
+        let counter = match outcome {
+            DialOutcome::RequestSent => &self.dial_outcome_request_sent,
+            DialOutcome::DialFailed => &self.dial_outcome_dial_failed,
+            DialOutcome::CancelledPrimaryWonBeforeSend => &self.dial_outcome_cancelled_primary_won,
+            DialOutcome::CancelledClientClosed => &self.dial_outcome_cancelled_client_closed,
+            DialOutcome::CancelledOther => &self.dial_outcome_cancelled_other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn inc_winner_primary(&self) {
@@ -673,6 +703,50 @@ impl ReplayMetrics {
             "safe_http_replay_request_sent_total",
             "GET headers sent on a secondary leg",
             self.request_sent.load(Ordering::Relaxed),
+        );
+        // Terminal outcome of every started dial (fix15): the five
+        // counters sum to `safe_http_replay_dial_started_total`.
+        write_counter_labeled(
+            out,
+            "safe_http_replay_dial_outcome_total",
+            "Started secondary dials by terminal outcome",
+            "outcome",
+            DialOutcome::RequestSent.label(),
+            self.dial_outcome_request_sent.load(Ordering::Relaxed),
+        );
+        write_counter_labeled(
+            out,
+            "safe_http_replay_dial_outcome_total",
+            "Started secondary dials by terminal outcome",
+            "outcome",
+            DialOutcome::DialFailed.label(),
+            self.dial_outcome_dial_failed.load(Ordering::Relaxed),
+        );
+        write_counter_labeled(
+            out,
+            "safe_http_replay_dial_outcome_total",
+            "Started secondary dials by terminal outcome",
+            "outcome",
+            DialOutcome::CancelledPrimaryWonBeforeSend.label(),
+            self.dial_outcome_cancelled_primary_won
+                .load(Ordering::Relaxed),
+        );
+        write_counter_labeled(
+            out,
+            "safe_http_replay_dial_outcome_total",
+            "Started secondary dials by terminal outcome",
+            "outcome",
+            DialOutcome::CancelledClientClosed.label(),
+            self.dial_outcome_cancelled_client_closed
+                .load(Ordering::Relaxed),
+        );
+        write_counter_labeled(
+            out,
+            "safe_http_replay_dial_outcome_total",
+            "Started secondary dials by terminal outcome",
+            "outcome",
+            DialOutcome::CancelledOther.label(),
+            self.dial_outcome_cancelled_other.load(Ordering::Relaxed),
         );
         write_counter_labeled(
             out,
@@ -878,6 +952,21 @@ pub(crate) fn reset_replay_state_for_tests() {
     REPLAY_METRICS.dial_started.store(0, Ordering::Relaxed);
     REPLAY_METRICS.dial_failed.store(0, Ordering::Relaxed);
     REPLAY_METRICS.request_sent.store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .dial_outcome_request_sent
+        .store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .dial_outcome_dial_failed
+        .store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .dial_outcome_cancelled_primary_won
+        .store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .dial_outcome_cancelled_client_closed
+        .store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .dial_outcome_cancelled_other
+        .store(0, Ordering::Relaxed);
     REPLAY_METRICS.winner_primary.store(0, Ordering::Relaxed);
     REPLAY_METRICS.winner_secondary.store(0, Ordering::Relaxed);
     REPLAY_METRICS.secondary_wins.store(0, Ordering::Relaxed);
@@ -1073,6 +1162,11 @@ pub(crate) struct ReplayDialCtx {
     pub(crate) target: TargetAddr,
     pub(crate) credentials: Option<(String, String)>,
     pub(crate) protocol: &'static str,
+    /// The session's correlation id, for the dial-outcome record.
+    pub(crate) request_id: u64,
+    /// When the session started: the anchor for the dial-stage
+    /// millisecond offsets on the outcome record.
+    pub(crate) session_started_at: Instant,
 }
 
 /// The replay phase, for the epoch loop's timer guard: the timer
@@ -1151,10 +1245,20 @@ pub(crate) const RACE_SECONDARY_FAILED: u8 = 3;
 /// Replay timings, for the resolution log lines: when the secondary
 /// dial started and connected, when each leg produced its first
 /// response byte, and which tunnel the secondary is on. (The primary
-/// header-written time lives on the session state, not here.)
+/// header-written time lives on the session state, not here.) The
+/// fix15 dial stages (`dns_*`, `tunnel_ready_at`,
+/// `tcp_connect_started_at`, `primary_closed_at`) are the per-stage
+/// timestamps of one secondary dial, so the fast-close window
+/// (`primary_closed_at` minus `dial_started_at`) can be read off the
+/// dial-outcome record; a stage the dial never reached stays `None`
+/// (an IP target never resolves DNS, a failed dial never connects).
 #[derive(Default)]
 pub(crate) struct ReplayTimings {
     pub(crate) dial_started_at: Option<Instant>,
+    pub(crate) dns_started_at: Option<Instant>,
+    pub(crate) dns_completed_at: Option<Instant>,
+    pub(crate) tunnel_ready_at: Option<Instant>,
+    pub(crate) tcp_connect_started_at: Option<Instant>,
     pub(crate) dial_connected_at: Option<Instant>,
     /// When the GET header was written to the secondary leg: the
     /// second of the four hedge timestamps (the other three are the
@@ -1163,6 +1267,11 @@ pub(crate) struct ReplayTimings {
     pub(crate) secondary_request_sent_at: Option<Instant>,
     pub(crate) primary_first_byte_at: Option<Instant>,
     pub(crate) secondary_first_byte_at: Option<Instant>,
+    /// When the primary stream closed or reset while a secondary
+    /// dial was in flight (stamped by the epoch loop, only while
+    /// the replay phase is `Dialing`): the end of the fast-close
+    /// window. `None` when the primary never closed mid-dial.
+    pub(crate) primary_closed_at: Option<Instant>,
     pub(crate) secondary_tunnel_id: Option<String>,
 }
 
@@ -1175,6 +1284,12 @@ pub(crate) struct RaceShared {
     pub(crate) header_len: AtomicUsize,
     pub(crate) winner: AtomicU8,
     pub(crate) timings: Mutex<ReplayTimings>,
+    /// Set by the epoch loop when it ends because the client gave
+    /// up on a silent tunnel (`ClientAborted`): the dial-outcome
+    /// guard reads it when a dial task is aborted, so a dial cut
+    /// short by the client going away is not mistaken for one cut
+    /// short by the primary closing.
+    pub(crate) client_gone: AtomicBool,
 }
 
 impl RaceShared {
@@ -1184,13 +1299,31 @@ impl RaceShared {
             winner: AtomicU8::new(RACE_UNDECIDED),
             timings: Mutex::new(ReplayTimings {
                 dial_started_at: None,
+                dns_started_at: None,
+                dns_completed_at: None,
+                tunnel_ready_at: None,
+                tcp_connect_started_at: None,
                 dial_connected_at: None,
                 secondary_request_sent_at: None,
                 primary_first_byte_at: None,
                 secondary_first_byte_at: None,
+                primary_closed_at: None,
                 secondary_tunnel_id: None,
             }),
+            client_gone: AtomicBool::new(false),
         }
+    }
+
+    /// Copy one dial's stage timestamps into the shared timings:
+    /// a failed dial still says where it got to, and the
+    /// dial-outcome record reads the stages from here.
+    pub(crate) fn record_dial_stages(&self, stages: &DialStages) {
+        let mut timings = self.timings.lock();
+        timings.dns_started_at = stages.dns_started;
+        timings.dns_completed_at = stages.dns_completed;
+        timings.tunnel_ready_at = stages.tunnel_ready;
+        timings.tcp_connect_started_at = stages.tcp_connect_started;
+        timings.dial_connected_at = stages.tcp_connected;
     }
 }
 
@@ -1217,6 +1350,128 @@ pub(crate) enum ReplayDialOutcome {
     Failed(RouterConnectError),
 }
 
+/// Terminal outcome of one started secondary dial (fix15): every
+/// dial that starts ends in exactly one of these, counted in
+/// `safe_http_replay_dial_outcome_total{outcome=...}` and logged on
+/// the dial-outcome record under the session's request id. The five
+/// counters sum to `safe_http_replay_dial_started_total` — a started
+/// dial with no outcome is the gap this exists to close (29 such
+/// dials in the last measured log: aborted when the primary answered
+/// first, with no terminal record).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DialOutcome {
+    /// The dial connected and the GET header went out on it.
+    RequestSent,
+    /// The dial (or the GET send) failed, or no different tunnel
+    /// existed to dial through.
+    DialFailed,
+    /// The primary answered while the dial was in flight, so the
+    /// replay was moot before the send.
+    CancelledPrimaryWonBeforeSend,
+    /// The epoch ended because the client gave up, while the dial
+    /// was still in flight.
+    CancelledClientClosed,
+    /// The dial ended without a verdict: aborted when the epoch
+    /// ended for another reason (the primary closed first — the
+    /// fast-close case — an idle timeout, or a retry epoch), or
+    /// moot for a reason the other outcomes do not name (the client
+    /// sent past the GET header).
+    CancelledOther,
+}
+
+impl DialOutcome {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::RequestSent => "request_sent",
+            Self::DialFailed => "dial_failed",
+            Self::CancelledPrimaryWonBeforeSend => "cancelled_primary_won_before_send",
+            Self::CancelledClientClosed => "cancelled_client_closed",
+            Self::CancelledOther => "cancelled_other",
+        }
+    }
+}
+
+/// Guarantees one terminal outcome per started secondary dial: the
+/// dial task creates this guard first, records its outcome
+/// explicitly on every return path, and the `Drop` records the
+/// abort outcome when the task is dropped mid-flight (the epoch
+/// ends and its dial set is dropped with it) or unwinds. The
+/// record carries the per-stage dial timestamps as millisecond
+/// offsets from the session start, so the fast-close window
+/// (`primary_closed_ms` minus `secondary_dial_started_ms`) reads
+/// off the same line as the outcome. INFO, never WARN: a cancelled
+/// dial is expected behaviour.
+pub(crate) struct DialOutcomeGuard {
+    outcome: Option<DialOutcome>,
+    request_id: u64,
+    session_started_at: Instant,
+    shared: Arc<RaceShared>,
+    tunnel_bytes: Arc<AtomicU64>,
+}
+
+impl DialOutcomeGuard {
+    pub(crate) const fn new(
+        request_id: u64,
+        session_started_at: Instant,
+        shared: Arc<RaceShared>,
+        tunnel_bytes: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            outcome: None,
+            request_id,
+            session_started_at,
+            shared,
+            tunnel_bytes,
+        }
+    }
+
+    /// Record `outcome` once: the counter and the one log line.
+    /// A second call is a no-op, so an explicit record followed by
+    /// the drop can never double-count.
+    pub(crate) fn record(&mut self, outcome: DialOutcome) {
+        if self.outcome.is_some() {
+            return;
+        }
+        self.outcome = Some(outcome);
+        replay_metrics().inc_dial_outcome(outcome);
+        let timings = self.shared.timings.lock();
+        let started_at = Some(self.session_started_at);
+        tracing::info!(
+            request_id = self.request_id,
+            outcome = outcome.label(),
+            secondary_dial_started_ms = super::latency_ms(started_at, timings.dial_started_at),
+            dns_started_ms = super::latency_ms(started_at, timings.dns_started_at),
+            dns_completed_ms = super::latency_ms(started_at, timings.dns_completed_at),
+            tunnel_ready_ms = super::latency_ms(started_at, timings.tunnel_ready_at),
+            tcp_connect_started_ms = super::latency_ms(started_at, timings.tcp_connect_started_at),
+            tcp_connected_ms = super::latency_ms(started_at, timings.dial_connected_at),
+            primary_closed_ms = super::latency_ms(started_at, timings.primary_closed_at),
+            "safe HTTP silence replay dial outcome"
+        );
+    }
+}
+
+impl Drop for DialOutcomeGuard {
+    fn drop(&mut self) {
+        if self.outcome.is_some() {
+            return;
+        }
+        // No explicit outcome: the task was aborted (or panicked)
+        // before it could return one. Classify from the shared
+        // state: response bytes mean the primary answered first,
+        // the client-gone flag means the client gave up, anything
+        // else is the epoch ending for another reason.
+        let outcome = if self.tunnel_bytes.load(Ordering::Relaxed) > 0 {
+            DialOutcome::CancelledPrimaryWonBeforeSend
+        } else if self.shared.client_gone.load(Ordering::Relaxed) {
+            DialOutcome::CancelledClientClosed
+        } else {
+            DialOutcome::CancelledOther
+        };
+        self.record(outcome);
+    }
+}
+
 /// Dial one different tunnel and send the buffered GET header on it:
 /// the secondary leg of a silence replay. Runs as a spawned task so
 /// the epoch loop keeps reading the primary while the dial is in
@@ -1232,29 +1487,53 @@ pub(crate) async fn dial_secondary_leg(
     shared: Arc<RaceShared>,
 ) -> ReplayDialOutcome {
     let started = Instant::now();
+    // fix15: the guard owns this dial's terminal outcome — it is
+    // created before the dial starts, so even an abort mid-dial
+    // records exactly one outcome.
+    let mut outcome_guard = DialOutcomeGuard::new(
+        ctx.request_id,
+        ctx.session_started_at,
+        Arc::clone(&shared),
+        Arc::clone(&tunnel_bytes),
+    );
+    shared.timings.lock().dial_started_at = Some(started);
     let credentials = ctx
         .credentials
         .as_ref()
         .map(|(user, pass)| (user.as_str(), pass.as_str()));
+    let mut stages = DialStages::default();
     let dialed = connect_direct(
         &ctx.router,
         &ctx.selector,
         &ctx.target,
         credentials,
         exclude_tunnel.as_deref(),
+        &mut stages,
     )
     .await;
+    // Copy the dial stages into the shared timings on every path:
+    // a failed dial still says where it got to, and the outcome
+    // record reads them from here.
+    shared.record_dial_stages(&stages);
     let (mut stream, tunnel_id) = match dialed {
         Ok(pair) => pair,
         Err(RouterConnectError::SelectTunnel(e)) if e.kind() == io::ErrorKind::NotConnected => {
+            // No different tunnel exists: the dial could not be
+            // placed, so it ends as a failed dial (the outcome
+            // family must still sum to the started dials).
+            outcome_guard.record(DialOutcome::DialFailed);
             return ReplayDialOutcome::NoTunnel;
         }
-        Err(e) => return ReplayDialOutcome::Failed(e),
+        Err(e) => {
+            outcome_guard.record(DialOutcome::DialFailed);
+            return ReplayDialOutcome::Failed(e);
+        }
     };
     let connected = Instant::now();
     // The primary answered while the dial was in flight: the replay
     // is moot — do not send the request to a second origin.
     if tunnel_bytes.load(Ordering::Relaxed) > 0 {
+        outcome_guard.record(DialOutcome::CancelledPrimaryWonBeforeSend);
         return ReplayDialOutcome::Suppressed(SuppressReason::ResponseStarted);
     }
     // The client sent more than the GET header while the dial was in
@@ -1262,6 +1541,7 @@ pub(crate) async fn dial_secondary_leg(
     // secondary win would lose them — do not send.
     let header_len = shared.header_len.load(Ordering::Relaxed);
     if client_bytes.load(Ordering::Relaxed) > header_len as u64 {
+        outcome_guard.record(DialOutcome::CancelledOther);
         return ReplayDialOutcome::Suppressed(SuppressReason::ClientSentMore);
     }
     let send = async {
@@ -1273,6 +1553,7 @@ pub(crate) async fn dial_secondary_leg(
             // The GET is on the secondary: record when, for the
             // hedge timestamps (the observer logs all four).
             shared.timings.lock().secondary_request_sent_at = Some(Instant::now());
+            outcome_guard.record(DialOutcome::RequestSent);
             ReplayDialOutcome::Ready(SecondaryLeg {
                 stream,
                 tunnel_id,
@@ -1280,7 +1561,10 @@ pub(crate) async fn dial_secondary_leg(
                 dial_connected_at: connected,
             })
         }
-        Err(e) => ReplayDialOutcome::Failed(RouterConnectError::TcpConnect(e)),
+        Err(e) => {
+            outcome_guard.record(DialOutcome::DialFailed);
+            ReplayDialOutcome::Failed(RouterConnectError::TcpConnect(e))
+        }
     }
 }
 
