@@ -3,7 +3,7 @@ members = ["crates/wpmulti-uniffi"]
 
 [package]
 name = "wpmulti"
-version = "0.2.16-beta"
+version = "0.2.17-beta"
 edition = "2024"
 rust-version = "1.100"
 license = "MPL-2.0"
