@@ -9,7 +9,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
@@ -46,6 +46,14 @@ pub(crate) const RACE_STAGGER: Duration = Duration::from_millis(250);
 
 /// Minimum timeout budget allocated to each candidate dial/send attempt while budget remains.
 pub(crate) const MIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Daemon-generated ids for the race trace (GPT round 12): one
+/// `connect_id` per CONNECT, one `race_id` per pool race (each
+/// failover attempt runs its own race). Monotonic counters — the id
+/// is the join key the client↔daemon join never had, so the parser
+/// can group legs and attempts without timestamps.
+static NEXT_CONNECT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_RACE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Default overall timeout budget for validated multi-address UDP datagram sends.
 pub(crate) const DEFAULT_UDP_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -323,6 +331,19 @@ pub trait ProxyTunnelTarget: Send + Sync {
     fn is_live(&self) -> bool {
         false
     }
+
+    /// Live count of smoltcp SYN retransmits observed on this
+    /// target's stack (the bridge's `syn_retransmits` counter), or
+    /// `None` when the target has no userspace stack to sample (a
+    /// direct target, or a test double). The race trace samples this
+    /// at leg start and leg end; the delta is the leg's
+    /// `tcp_syn_retransmitted_count`. The counter is per-stack, not
+    /// per-leg, so concurrent dials on the same tunnel inflate a
+    /// leg's delta — the count is a window observation, not an exact
+    /// per-leg attribution.
+    fn bridge_syn_retransmits(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Filter out forbidden destination IPs and cap candidates at [`MAX_CANDIDATE_IPS`],
@@ -492,7 +513,11 @@ pub(crate) async fn connect_via_router(
     exclude_tunnel: Option<&str>,
 ) -> Result<(DynStream, Option<String>, ConnectTrace), RouterConnectError> {
     let started = Instant::now();
-    let mut trace = ConnectTrace::default();
+    let mut trace = ConnectTrace {
+        connect_id: NEXT_CONNECT_ID.fetch_add(1, Ordering::Relaxed),
+        started: Some(started),
+        ..Default::default()
+    };
     let result = connect_via_router_inner(
         router,
         selector,
@@ -526,6 +551,7 @@ fn log_connect_trace(target: &TargetAddr, trace: &ConnectTrace) {
         leg2_dns_ms = trace.second_leg.as_ref().and_then(|leg| leg.dns_ms),
         leg2_tcp_ms = trace.second_leg.as_ref().and_then(|leg| leg.tcp_ms),
         leg2_outcome = ?trace.second_leg.as_ref().map(|leg| leg.outcome),
+        connect_id = trace.connect_id,
         "connect trace"
     );
 }
@@ -722,6 +748,9 @@ async fn connect_via_router_inner(
                 deadline: failover_deadline,
                 attempt,
                 max_attempts,
+                race_id: NEXT_RACE_ID.fetch_add(1, Ordering::Relaxed),
+                connect_id: trace.connect_id,
+                connect_started: trace.started.unwrap_or_else(Instant::now),
             };
             race.race_traced(target_tunnel, &mut tried_ids, trace).await
         } else {
@@ -781,6 +810,264 @@ pub(crate) enum LegOutcomeKind {
     Forbidden,
 }
 
+impl LegOutcomeKind {
+    /// Snake-case name for the race trace line (`leg_terminal_reason`).
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRun => "not_run",
+            Self::Won => "won",
+            Self::TcpFailed => "tcp_failed",
+            Self::DnsFailed => "dns_failed",
+            Self::TimedOut => "timed_out",
+            Self::Aborted => "aborted",
+            Self::Forbidden => "forbidden",
+        }
+    }
+}
+
+/// Why one race leg launched (race trace `leg_launch_reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LegLaunchReason {
+    /// First leg: starts with the race.
+    #[default]
+    Immediate,
+    /// Hedge leg: the stagger elapsed with the first leg unfinished.
+    HedgeStagger,
+    /// Hedge leg: the first leg failed fast.
+    HedgeFastFailure,
+}
+
+impl LegLaunchReason {
+    /// Snake-case name for the race trace line.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::HedgeStagger => "hedge_stagger",
+            Self::HedgeFastFailure => "hedge_fast_failure",
+        }
+    }
+}
+
+/// Why the hedge leg never launched (race trace
+/// `leg2_skipped_reason`). Determined at race completion by
+/// [`determine_leg2_skip_reason`]: the hedge-deadline arm is
+/// disabled while the first leg is live, so the reason is only
+/// knowable once the race has ended and leg1's TCP state at the
+/// stagger is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Leg2SkippedReason {
+    /// Leg1's TCP connected at or before the stagger elapsed.
+    FirstTcpConnected,
+    /// Leg1's tunnel was live, so the hedge was suppressed, and its
+    /// TCP was still pending when the stagger elapsed.
+    FirstTunnelHealthyButTcpPending,
+    /// Leg1 terminated (failed or timed out) before the stagger
+    /// elapsed while the live-gate suppressed the hedge.
+    FirstLegFailedFast,
+    /// The hedge selection found no distinct tunnel.
+    NoAlternateTunnel,
+    /// The race ended before the stagger elapsed with the first leg
+    /// neither live nor finished: no limiter explains the
+    /// suppression. No global race limiter exists today, so this is
+    /// the catch-all for a future limiter — a hedge suppressed for
+    /// an unclassified reason surfaces here instead of being
+    /// mislabelled as one of the known reasons.
+    GlobalRaceLimit,
+    /// Leg1 timed out before the stagger could fire: the remaining
+    /// failover budget was already shorter than the stagger.
+    AttemptBudgetExhausted,
+}
+
+impl Leg2SkippedReason {
+    /// Snake-case name for the race trace line.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstTcpConnected => "first_tcp_connected",
+            Self::FirstTunnelHealthyButTcpPending => "first_tunnel_healthy_but_tcp_pending",
+            Self::FirstLegFailedFast => "first_leg_failed_fast",
+            Self::NoAlternateTunnel => "no_alternate_tunnel",
+            Self::GlobalRaceLimit => "global_race_limit",
+            Self::AttemptBudgetExhausted => "attempt_budget_exhausted",
+        }
+    }
+}
+
+/// Inputs to [`determine_leg2_skip_reason`], bundled so the pure
+/// function stays under the argument limit. All timestamps are
+/// milliseconds since the CONNECT started.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SkipReasonInputs {
+    pub(crate) hedge_select_failed: bool,
+    pub(crate) first_is_live: bool,
+    pub(crate) tcp_connected_at_ms: Option<u64>,
+    pub(crate) stagger_elapsed_at_ms: u64,
+    pub(crate) first_terminal_at_ms: Option<u64>,
+    pub(crate) first_outcome: Option<LegOutcomeKind>,
+    pub(crate) first_leg_timeout_ms: u64,
+}
+
+/// Decide why leg2 never launched, from the race's end state. Only
+/// called when no hedge leg spawned. A leg1 TCP completion at or
+/// before the stagger means the hedge was never needed; a leg1 that
+/// ended before the stagger means the race was already over; a live
+/// first leg still pending at the stagger is the GPT round-12
+/// predicate case — the tunnel was healthy but the TCP handshake
+/// had not completed.
+pub(crate) fn determine_leg2_skip_reason(inputs: &SkipReasonInputs) -> Leg2SkippedReason {
+    if inputs.hedge_select_failed {
+        return Leg2SkippedReason::NoAlternateTunnel;
+    }
+    if inputs
+        .tcp_connected_at_ms
+        .is_some_and(|connected| connected <= inputs.stagger_elapsed_at_ms)
+    {
+        return Leg2SkippedReason::FirstTcpConnected;
+    }
+    if inputs
+        .first_terminal_at_ms
+        .is_some_and(|terminal| terminal < inputs.stagger_elapsed_at_ms)
+    {
+        match inputs.first_outcome {
+            Some(LegOutcomeKind::Won) => return Leg2SkippedReason::FirstTcpConnected,
+            Some(LegOutcomeKind::TimedOut)
+                if !inputs.first_is_live
+                    && inputs.first_leg_timeout_ms
+                        < u64::try_from(RACE_STAGGER.as_millis()).unwrap_or(u64::MAX) =>
+            {
+                return Leg2SkippedReason::AttemptBudgetExhausted;
+            }
+            _ => return Leg2SkippedReason::FirstLegFailedFast,
+        }
+    }
+    if inputs.first_is_live {
+        Leg2SkippedReason::FirstTunnelHealthyButTcpPending
+    } else {
+        Leg2SkippedReason::GlobalRaceLimit
+    }
+}
+
+/// Retransmits observed on a leg's tunnel between its start and end
+/// bridge-counter samples. `None` when the target exposes no
+/// counter (a direct target or test double); saturating so a counter
+/// reset can never underflow.
+pub(crate) const fn syn_retransmit_delta(start: Option<u64>, end: Option<u64>) -> Option<u64> {
+    match (start, end) {
+        (Some(start), Some(end)) => Some(end.saturating_sub(start)),
+        _ => None,
+    }
+}
+
+/// One race leg's history (GPT round 12): every leg of every
+/// attempt is retained, independently of the per-CONNECT trace
+/// (which still keeps only the final attempt's legs). All `*_at`
+/// values are milliseconds since the CONNECT started, so the
+/// parser can compare legs without a clock.
+///
+/// Three GPT fields are deliberately ABSENT — they cannot be
+/// observed at leg level with the current stack, and are never
+/// fabricated. `tcp_syn_emitted_at` is unmeasured because smoltcp
+/// emits the SYN inside the interface poll, not in the dial future,
+/// and no per-socket emission hook exists (the bridge sees SYNs
+/// without leg attribution). `tcp_synack_received_at` is unmeasured
+/// because the SYN-ACK is processed inside the stack reactor; the
+/// dial future only observes `Established` (`tcp_connected_at`
+/// bounds it from above). `tcp_syn_retransmitted_at` is unmeasured
+/// because no per-retransmit timestamps exist; the bridge counter
+/// only yields a count, so the leg carries
+/// `tcp_syn_retransmitted_count` instead (a window sample off the
+/// shared per-stack counter).
+/// Aborted legs carry no DNS/TCP stage times: their stages die
+/// with the aborted task, so those fields stay absent.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RaceLegTrace {
+    pub(crate) race_id: u64,
+    pub(crate) connect_id: u64,
+    pub(crate) attempt_index: usize,
+    pub(crate) leg_index: usize,
+    pub(crate) tunnel_id: Option<String>,
+    pub(crate) candidate_selection_source: &'static str,
+    pub(crate) leg_launch_reason: LegLaunchReason,
+    pub(crate) race_started_at_ms: u64,
+    pub(crate) leg_scheduled_at_ms: u64,
+    pub(crate) leg_started_at_ms: Option<u64>,
+    pub(crate) dns_started_at_ms: Option<u64>,
+    pub(crate) dns_completed_at_ms: Option<u64>,
+    pub(crate) tunnel_ready_at_ms: Option<u64>,
+    pub(crate) tcp_connect_started_at_ms: Option<u64>,
+    pub(crate) tcp_syn_retransmitted_count: Option<u64>,
+    pub(crate) tcp_connected_at_ms: Option<u64>,
+    pub(crate) leg_terminal_at_ms: u64,
+    pub(crate) leg_terminal_reason: LegOutcomeKind,
+}
+
+/// One race's outcome (GPT round 12): which leg won and when, when
+/// the loser was cancelled, and why leg2 never launched. Logged
+/// once per race as `race trace`, alongside one `race leg trace`
+/// line per leg.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RaceSummary {
+    pub(crate) race_id: u64,
+    pub(crate) connect_id: u64,
+    pub(crate) attempt_index: usize,
+    pub(crate) race_started_at_ms: u64,
+    pub(crate) first_is_live: bool,
+    pub(crate) race_winner_leg: Option<RaceLeg>,
+    pub(crate) race_winner_at_ms: Option<u64>,
+    pub(crate) loser_cancelled_at_ms: Option<u64>,
+    pub(crate) leg2_skipped_reason: Option<Leg2SkippedReason>,
+}
+
+/// One debug line per race leg, in the structured format the probe
+/// scripts parse (`race leg trace`, `tracing` key=value fields).
+/// Absent `Option` fields are omitted by the formatter, which the
+/// parser reads as unmeasured.
+fn log_race_leg_trace(leg: &RaceLegTrace) {
+    tracing::debug!(
+        race_id = leg.race_id,
+        connect_id = leg.connect_id,
+        attempt_index = leg.attempt_index,
+        leg_index = leg.leg_index,
+        tunnel_id = leg.tunnel_id.as_deref(),
+        candidate_selection_source = leg.candidate_selection_source,
+        leg_launch_reason = leg.leg_launch_reason.as_str(),
+        race_started_at = leg.race_started_at_ms,
+        leg_scheduled_at = leg.leg_scheduled_at_ms,
+        leg_started_at = leg.leg_started_at_ms,
+        dns_started_at = leg.dns_started_at_ms,
+        dns_completed_at = leg.dns_completed_at_ms,
+        tunnel_ready_at = leg.tunnel_ready_at_ms,
+        tcp_connect_started_at = leg.tcp_connect_started_at_ms,
+        tcp_syn_retransmitted_count = leg.tcp_syn_retransmitted_count,
+        tcp_connected_at = leg.tcp_connected_at_ms,
+        leg_terminal_at = leg.leg_terminal_at_ms,
+        leg_terminal_reason = leg.leg_terminal_reason.as_str(),
+        "race leg trace"
+    );
+}
+
+/// One debug line per race: the winner and the leg2 skip reason.
+/// `race_winner_leg` is `first` / `second` / `none`;
+/// `leg2_skipped_reason` is omitted when leg2 launched.
+fn log_race_summary_trace(summary: &RaceSummary) {
+    let winner = match summary.race_winner_leg {
+        Some(RaceLeg::First) => "first",
+        Some(RaceLeg::Second) => "second",
+        None => "none",
+    };
+    tracing::debug!(
+        race_id = summary.race_id,
+        connect_id = summary.connect_id,
+        attempt_index = summary.attempt_index,
+        race_started_at = summary.race_started_at_ms,
+        first_is_live = summary.first_is_live,
+        race_winner_leg = winner,
+        race_winner_at = summary.race_winner_at_ms,
+        loser_cancelled_at = summary.loser_cancelled_at_ms,
+        leg2_skipped_reason = summary.leg2_skipped_reason.map(Leg2SkippedReason::as_str),
+        "race trace"
+    );
+}
+
 /// Per-leg timing of one pool race leg (probe instrumentation): the
 /// fix15 [`DialStages`] reduced to durations, plus the outcome. The
 /// durations decide M1 vs M2 per request — a ~1 s TCP stage with fast
@@ -812,6 +1099,14 @@ struct RaceTrace {
 /// already covered by the terminal-failure WARN.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ConnectTrace {
+    /// Daemon-generated id of this CONNECT (see [`NEXT_CONNECT_ID`]).
+    pub(crate) connect_id: u64,
+    /// CONNECT start instant, set by [`connect_via_router`]; the
+    /// race `*_at` timestamps are offsets from it. Not logged.
+    /// `None` only when the trace was built without
+    /// `connect_via_router` (tests); the race then falls back to its
+    /// own start instant.
+    pub(crate) started: Option<Instant>,
     /// Whole `connect_via_router` call (excludes the loopback
     /// accept/greeting prefix, measured 12–14 ms and exonerated in the
     /// P=64 investigation).
@@ -910,7 +1205,9 @@ impl RaceTrace {
 /// One finished race leg: its dial result, the fix15 stages it passed
 /// through, and whether the per-leg timeout cut it off (the timeout arm
 /// in `spawn_leg` knows; the error alone cannot tell a leg-cap timeout
-/// from an inner TCP timeout).
+/// from an inner TCP timeout). `started_at` is stamped when the dial
+/// task first polls, so the leg's start is measured inside the task
+/// rather than at spawn time.
 struct LegCompletion {
     leg: RaceLeg,
     result: Result<DynStream, RouterConnectError>,
@@ -932,6 +1229,48 @@ struct LegRace<'a> {
     deadline: tokio::time::Instant,
     attempt: usize,
     max_attempts: usize,
+    /// Daemon-generated id of this race (see [`NEXT_RACE_ID`]).
+    race_id: u64,
+    /// Id of the CONNECT this race belongs to.
+    connect_id: u64,
+    /// CONNECT start instant; race `*_at` timestamps are offsets
+    /// from it.
+    connect_started: Instant,
+}
+
+/// Caller-side record of one race leg: when it was scheduled, why it
+/// launched, where its tunnel came from, and what its dial had
+/// reached when the race observed it. The dial task's stages (DNS /
+/// TCP times) arrive with its completion; an aborted leg has no
+/// completion, so only these caller-side facts survive for it.
+struct LegRunState {
+    scheduled_at: Instant,
+    launch_reason: LegLaunchReason,
+    selection_source: &'static str,
+    /// Bridge SYN-retransmit counter sampled when the leg spawned.
+    syn_start: Option<u64>,
+    tcp_connected_at: Option<Instant>,
+    terminal_at: Option<Instant>,
+    outcome: Option<LegOutcomeKind>,
+}
+
+impl LegRunState {
+    const fn new(
+        scheduled_at: Instant,
+        launch_reason: LegLaunchReason,
+        selection_source: &'static str,
+        syn_start: Option<u64>,
+    ) -> Self {
+        Self {
+            scheduled_at,
+            launch_reason,
+            selection_source,
+            syn_start,
+            tcp_connected_at: None,
+            terminal_at: None,
+            outcome: None,
+        }
+    }
 }
 
 /// Mutable state of one running pool race, bundled so the race loop
@@ -946,6 +1285,17 @@ struct RaceRun<'a> {
     last_err: Option<RouterConnectError>,
     tried_ids: &'a mut SmallVec<[String; MAX_POOL_FAILOVER_ATTEMPTS]>,
     trace: &'a mut RaceTrace,
+    race_started: Instant,
+    /// Per-leg cap applied to the first leg, for the skip-reason
+    /// budget check.
+    first_leg_timeout: Duration,
+    first_state: LegRunState,
+    second_state: Option<LegRunState>,
+    /// When the winning leg completed.
+    winner_at: Option<Instant>,
+    /// When the still-running loser was cancelled (same instant as
+    /// the win, when there was a loser to cancel).
+    loser_cancelled_at: Option<Instant>,
 }
 
 impl LegRace<'_> {
@@ -962,18 +1312,28 @@ impl LegRace<'_> {
     /// HalfOpen trial cannot linger undecided (the same guarantee the
     /// old whole-budget timeout gave, now per leg). The leg's fix15
     /// stages ride back with its result, so the race can trace it.
+    /// `timeout` is computed by the caller at spawn time (the
+    /// remaining failover budget, capped at
+    /// [`FIRST_ATTEMPT_TIMEOUT`]).
     fn spawn_leg(
         &self,
         set: &mut tokio::task::JoinSet<LegCompletion>,
         tunnel: Arc<dyn ProxyTunnelTarget>,
         leg: RaceLeg,
+        timeout: Duration,
     ) {
         let target = self.target.clone();
         let attempt = self.attempt;
         let max_attempts = self.max_attempts;
-        let timeout = self.first_leg_timeout();
         set.spawn(async move {
-            let mut stages = DialStages::default();
+            let started_at = Instant::now();
+            let mut stages = DialStages {
+                started_at: Some(started_at),
+                // The tunnel was selected before the leg spawned, so
+                // it is ready when the dial task starts.
+                tunnel_ready: Some(started_at),
+                ..Default::default()
+            };
             let dial = tokio::time::timeout(
                 timeout,
                 connect_target_single(&tunnel, &target, attempt, max_attempts, &mut stages),
@@ -1024,19 +1384,35 @@ impl LegRace<'_> {
         None
     }
 
+    /// Where one leg's tunnel came from, for the race trace.
+    fn selection_source(&self, target: &Arc<dyn ProxyTunnelTarget>) -> &'static str {
+        target.tunnel_id().map_or("unknown", |id| {
+            self.router.selection_source(self.selector, id)
+        })
+    }
+
     /// Start the hedge leg on a distinct tunnel, if one is available,
     /// recording it so the race can cancel and resolve it on a win.
-    async fn spawn_hedge(
-        &self,
-        set: &mut tokio::task::JoinSet<LegCompletion>,
-        tried_ids: &[String],
-        second: &mut Option<Arc<dyn ProxyTunnelTarget>>,
-    ) {
-        let Some(distinct) = self.select_distinct(tried_ids).await else {
+    /// Returns `false` when no distinct tunnel exists: the caller
+    /// records the failed selection for the leg2 skip reason. The
+    /// caller still marks the hedge attempted, exactly as before —
+    /// a failed selection must not re-arm the stagger.
+    async fn spawn_hedge(&self, run: &mut RaceRun<'_>, reason: LegLaunchReason) {
+        let scheduled_at = Instant::now();
+        let Some(distinct) = self.select_distinct(run.tried_ids).await else {
             return;
         };
-        self.spawn_leg(set, Arc::clone(&distinct), RaceLeg::Second);
-        *second = Some(distinct);
+        let source = self.selection_source(&distinct);
+        let syn_start = distinct.bridge_syn_retransmits();
+        let timeout = self.first_leg_timeout();
+        self.spawn_leg(
+            &mut run.set,
+            Arc::clone(&distinct),
+            RaceLeg::Second,
+            timeout,
+        );
+        run.second = Some(distinct);
+        run.second_state = Some(LegRunState::new(scheduled_at, reason, source, syn_start));
     }
 
     /// Race the first leg against a hedged second leg and return the
@@ -1076,6 +1452,14 @@ impl LegRace<'_> {
         tried_ids: &mut SmallVec<[String; MAX_POOL_FAILOVER_ATTEMPTS]>,
         trace: &mut RaceTrace,
     ) -> Result<(DynStream, Option<String>), RouterConnectError> {
+        let race_started = Instant::now();
+        let first_is_live = first.is_live();
+        let first_leg_timeout = self.first_leg_timeout();
+        let first_syn_start = first.bridge_syn_retransmits();
+        // Warm-list membership is read here, with no await between
+        // selection and this race, so it still describes the
+        // selection (see `TunnelRouter::selection_source`).
+        let first_source = self.selection_source(&first);
         let mut run = RaceRun {
             first,
             set: tokio::task::JoinSet::new(),
@@ -1086,10 +1470,75 @@ impl LegRace<'_> {
             last_err: None,
             tried_ids,
             trace,
+            race_started,
+            first_leg_timeout,
+            first_state: LegRunState::new(
+                race_started,
+                LegLaunchReason::Immediate,
+                first_source,
+                first_syn_start,
+            ),
+            second_state: None,
+            winner_at: None,
+            loser_cancelled_at: None,
         };
-        let first_is_live = run.first.is_live();
-        self.spawn_leg(&mut run.set, Arc::clone(&run.first), RaceLeg::First);
-        self.run_race_loop(&mut run, first_is_live).await
+        self.spawn_leg(
+            &mut run.set,
+            Arc::clone(&run.first),
+            RaceLeg::First,
+            first_leg_timeout,
+        );
+        let result = self.run_race_loop(&mut run, first_is_live).await;
+        self.finish_race(&run, first_is_live);
+        result
+    }
+
+    /// Close out one race for the trace: decide why leg2 never
+    /// launched (when it did not) and emit the one `race trace`
+    /// summary line. Called after the race loop returns, on the
+    /// winning path and on the all-legs-failed path alike. Behaviour
+    /// is unchanged: this only records and logs.
+    fn finish_race(&self, run: &RaceRun<'_>, first_is_live: bool) {
+        let race_started_at_ms = duration_ms(self.connect_started, run.race_started);
+        let stagger_elapsed_at_ms = race_started_at_ms
+            .saturating_add(u64::try_from(RACE_STAGGER.as_millis()).unwrap_or(u64::MAX));
+        let leg2_skipped_reason = if run.second_state.is_some() {
+            None
+        } else {
+            // A hedge was attempted but no distinct tunnel was found.
+            let hedge_select_failed = run.hedge_spawned && run.second_state.is_none();
+            Some(determine_leg2_skip_reason(&SkipReasonInputs {
+                hedge_select_failed,
+                first_is_live,
+                tcp_connected_at_ms: run
+                    .first_state
+                    .tcp_connected_at
+                    .map(|at| duration_ms(self.connect_started, at)),
+                stagger_elapsed_at_ms,
+                first_terminal_at_ms: run
+                    .first_state
+                    .terminal_at
+                    .map(|at| duration_ms(self.connect_started, at)),
+                first_outcome: run.first_state.outcome,
+                first_leg_timeout_ms: u64::try_from(run.first_leg_timeout.as_millis())
+                    .unwrap_or(u64::MAX),
+            }))
+        };
+        log_race_summary_trace(&RaceSummary {
+            race_id: self.race_id,
+            connect_id: self.connect_id,
+            attempt_index: self.attempt,
+            race_started_at_ms,
+            first_is_live,
+            race_winner_leg: run.trace.winner,
+            race_winner_at_ms: run
+                .winner_at
+                .map(|at| duration_ms(self.connect_started, at)),
+            loser_cancelled_at_ms: run
+                .loser_cancelled_at
+                .map(|at| duration_ms(self.connect_started, at)),
+            leg2_skipped_reason,
+        });
     }
 
     /// Run the race loop: join legs as they finish, spawn the hedge on
@@ -1124,8 +1573,7 @@ impl LegRace<'_> {
                 }
                 () = &mut hedge_deadline, if !run.hedge_spawned && !first_is_live => {
                     run.hedge_spawned = true;
-                    self.spawn_hedge(&mut run.set, run.tried_ids, &mut run.second)
-                        .await;
+                    self.spawn_hedge(run, LegLaunchReason::HedgeStagger).await;
                 }
             }
         }
@@ -1137,6 +1585,46 @@ impl LegRace<'_> {
         }))
     }
 
+    /// Tunnel id of a leg, from the targets the race holds.
+    fn leg_tunnel_id(run: &RaceRun<'_>, leg: RaceLeg) -> Option<String> {
+        let target = match leg {
+            RaceLeg::First => Some(&run.first),
+            RaceLeg::Second => run.second.as_ref(),
+        };
+        target.and_then(|t| t.tunnel_id().map(str::to_string))
+    }
+
+    /// The loser trace for a win: the still-running loser traces as
+    /// aborted; a never-spawned hedge and an already-finished loser
+    /// leave no loser trace.
+    fn win_loser_trace(
+        run: &RaceRun<'_>,
+        leg: RaceLeg,
+        first_id: Option<String>,
+    ) -> Option<LegTrace> {
+        if leg == RaceLeg::First {
+            (run.hedge_spawned && !run.second_done)
+                .then(|| aborted_leg_trace(Self::leg_tunnel_id(run, RaceLeg::Second)))
+        } else {
+            (!run.first_done).then(|| aborted_leg_trace(first_id))
+        }
+    }
+
+    /// A fast first-leg failure hedges immediately instead of waiting
+    /// out the stagger (a live first leg is never hedged).
+    async fn maybe_hedge_after_fast_failure(
+        &self,
+        run: &mut RaceRun<'_>,
+        leg: RaceLeg,
+        first_is_live: bool,
+    ) {
+        if leg == RaceLeg::First && !run.hedge_spawned && !first_is_live {
+            run.hedge_spawned = true;
+            self.spawn_hedge(run, LegLaunchReason::HedgeFastFailure)
+                .await;
+        }
+    }
+
     /// Resolve one finished leg. Returns `Some` when the race is
     /// decided (a winner, or a forbidden destination); `None` when
     /// racing continues (a failed leg, possibly with the hedge started).
@@ -1146,42 +1634,25 @@ impl LegRace<'_> {
         completion: LegCompletion,
         first_is_live: bool,
     ) -> Option<Result<(DynStream, Option<String>), RouterConnectError>> {
+        let terminal_at = Instant::now();
         let LegCompletion {
             leg,
             result: outcome,
             stages,
             timed_out,
         } = completion;
-        let first_id = run.first.tunnel_id().map(str::to_string);
-        let leg_id = match leg {
-            RaceLeg::First => first_id.clone(),
-            RaceLeg::Second => run
-                .second
-                .as_ref()
-                .and_then(|t| t.tunnel_id().map(str::to_string)),
-        };
+        let first_id = Self::leg_tunnel_id(run, RaceLeg::First);
+        let leg_id = Self::leg_tunnel_id(run, leg);
         match leg {
             RaceLeg::First => run.first_done = true,
             RaceLeg::Second => run.second_done = true,
         }
         match outcome {
             Ok(stream) => {
-                // The loser, if it was spawned but never finished,
-                // traces as aborted; a never-spawned hedge (fast
-                // first leg) and an already-finished loser leave no
-                // loser trace — the second leg stays `None`, and a
-                // finished loser's own trace stands.
-                let loser_trace = if leg == RaceLeg::First {
-                    (run.hedge_spawned && !run.second_done).then(|| {
-                        aborted_leg_trace(
-                            run.second
-                                .as_ref()
-                                .and_then(|t| t.tunnel_id().map(str::to_string)),
-                        )
-                    })
-                } else {
-                    (!run.first_done).then(|| aborted_leg_trace(first_id.clone()))
-                };
+                run.winner_at = Some(terminal_at);
+                self.record_leg_completion(run, leg, &stages, LegOutcomeKind::Won, terminal_at);
+                let loser_trace = Self::win_loser_trace(run, leg, first_id.clone());
+                self.record_aborted_loser(run, leg, terminal_at);
                 run.trace
                     .record_win(leg, leg_id.clone(), &stages, loser_trace);
                 abort_loser(
@@ -1203,6 +1674,14 @@ impl LegRace<'_> {
                 })
             }
             Err(err @ RouterConnectError::ForbiddenDestination(_)) => {
+                self.record_leg_completion(
+                    run,
+                    leg,
+                    &stages,
+                    LegOutcomeKind::Forbidden,
+                    terminal_at,
+                );
+                self.record_aborted_loser(run, leg, terminal_at);
                 store_leg_trace(
                     &mut *run.trace,
                     leg,
@@ -1224,16 +1703,115 @@ impl LegRace<'_> {
                 } else {
                     leg_outcome_from_error(&err)
                 };
+                self.record_leg_completion(run, leg, &stages, outcome, terminal_at);
                 store_leg_trace(&mut *run.trace, leg, leg_trace(leg_id, &stages, outcome));
                 run.last_err = Some(err);
-                if leg == RaceLeg::First && !run.hedge_spawned && !first_is_live {
-                    run.hedge_spawned = true;
-                    self.spawn_hedge(&mut run.set, run.tried_ids, &mut run.second)
-                        .await;
-                }
+                self.maybe_hedge_after_fast_failure(run, leg, first_is_live)
+                    .await;
                 None
             }
         }
+    }
+
+    /// Record one finished leg's race history: update its caller-side
+    /// state, sample the end bridge counter, and emit its one
+    /// `race leg trace` line (also retained on the race trace).
+    /// `terminal_at` is when the race loop observed the completion;
+    /// the dial task's first poll comes from `stages.started_at`.
+    fn record_leg_completion(
+        &self,
+        run: &mut RaceRun<'_>,
+        leg: RaceLeg,
+        stages: &DialStages,
+        outcome: LegOutcomeKind,
+        terminal_at: Instant,
+    ) {
+        let tunnel_id = Self::leg_tunnel_id(run, leg);
+        let state = match leg {
+            RaceLeg::First => &mut run.first_state,
+            RaceLeg::Second => match run.second_state.as_mut() {
+                Some(state) => state,
+                None => return,
+            },
+        };
+        state.terminal_at = Some(terminal_at);
+        state.outcome = Some(outcome);
+        state.tcp_connected_at = stages.tcp_connected;
+        let end_syn = match leg {
+            RaceLeg::First => run.first.bridge_syn_retransmits(),
+            RaceLeg::Second => run
+                .second
+                .as_ref()
+                .and_then(ProxyTunnelTarget::bridge_syn_retransmits),
+        };
+        let leg_trace = RaceLegTrace {
+            race_id: self.race_id,
+            connect_id: self.connect_id,
+            attempt_index: self.attempt,
+            leg_index: match leg {
+                RaceLeg::First => 0,
+                RaceLeg::Second => 1,
+            },
+            tunnel_id,
+            candidate_selection_source: state.selection_source,
+            leg_launch_reason: state.launch_reason,
+            race_started_at_ms: duration_ms(self.connect_started, run.race_started),
+            leg_scheduled_at_ms: duration_ms(self.connect_started, state.scheduled_at),
+            leg_started_at_ms: stages
+                .started_at
+                .map(|at| duration_ms(self.connect_started, at)),
+            dns_started_at_ms: stages
+                .dns_started
+                .map(|at| duration_ms(self.connect_started, at)),
+            dns_completed_at_ms: stages
+                .dns_completed
+                .map(|at| duration_ms(self.connect_started, at)),
+            tunnel_ready_at_ms: stages
+                .tunnel_ready
+                .map(|at| duration_ms(self.connect_started, at)),
+            tcp_connect_started_at_ms: stages
+                .tcp_connect_started
+                .map(|at| duration_ms(self.connect_started, at)),
+            tcp_syn_retransmitted_count: syn_retransmit_delta(state.syn_start, end_syn),
+            tcp_connected_at_ms: stages
+                .tcp_connected
+                .map(|at| duration_ms(self.connect_started, at)),
+            leg_terminal_at_ms: duration_ms(self.connect_started, terminal_at),
+            leg_terminal_reason: outcome,
+        };
+        log_race_leg_trace(&leg_trace);
+    }
+
+    /// Record the still-running loser's race history when the race
+    /// is decided: its stages died with its task, so the line
+    /// carries only caller-side facts — the dial task's start
+    /// instant and its DNS/TCP stages are absent, since only the
+    /// task knew them — and the abort as its terminal reason. A
+    /// never-spawned or already-finished loser leaves no line.
+    fn record_aborted_loser(&self, run: &mut RaceRun<'_>, winner: RaceLeg, terminal_at: Instant) {
+        let loser = match winner {
+            RaceLeg::First => RaceLeg::Second,
+            RaceLeg::Second => RaceLeg::First,
+        };
+        let spawned = match loser {
+            RaceLeg::First => true,
+            RaceLeg::Second => run.second_state.is_some(),
+        };
+        let done = match loser {
+            RaceLeg::First => run.first_done,
+            RaceLeg::Second => run.second_done,
+        };
+        if !spawned || done {
+            return;
+        }
+        run.loser_cancelled_at = Some(terminal_at);
+        self.record_leg_completion(
+            run,
+            loser,
+            &DialStages::default(),
+            LegOutcomeKind::Aborted,
+            terminal_at,
+        );
     }
 }
 
@@ -1360,6 +1938,10 @@ async fn connect_target(
 /// offsets from the session start.
 #[derive(Default)]
 pub(crate) struct DialStages {
+    /// When the dial task first polled; the tunnel was selected
+    /// before the task spawned, so `tunnel_ready` is stamped here
+    /// too.
+    pub(crate) started_at: Option<Instant>,
     pub(crate) dns_started: Option<Instant>,
     pub(crate) dns_completed: Option<Instant>,
     pub(crate) tunnel_ready: Option<Instant>,
@@ -1577,6 +2159,14 @@ impl ProxyTunnelTarget for VirtualNetworkStack {
     fn connect_timeout(&self) -> Duration {
         self.connect_timeout()
     }
+
+    fn bridge_syn_retransmits(&self) -> Option<u64> {
+        Some(
+            self.bridge_counters()
+                .syn_retransmits
+                .load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl<T: ProxyTunnelTarget + ?Sized> ProxyTunnelTarget for Arc<T> {
@@ -1619,6 +2209,10 @@ impl<T: ProxyTunnelTarget + ?Sized> ProxyTunnelTarget for Arc<T> {
 
     fn is_live(&self) -> bool {
         (**self).is_live()
+    }
+
+    fn bridge_syn_retransmits(&self) -> Option<u64> {
+        (**self).bridge_syn_retransmits()
     }
 }
 
@@ -1802,6 +2396,22 @@ pub trait TunnelRouter: Send + Sync {
     /// connection is not evidence the tunnel is silently
     /// blackholing. The default is a no-op.
     fn record_tunnel_transport_failure(&self, _tunnel_id: &str) {}
+
+    /// Where the tunnel named by `tunnel_id` came from when
+    /// `selector` last resolved it, for the race trace's
+    /// `candidate_selection_source` field: `"by_id"` for an explicit
+    /// tunnel, `"warm_list"` / `"random_pool"` for the Stratified P2C
+    /// draws, `"fallback_scan"` for the degraded-pool scan,
+    /// `"dedicated"` for a single-tunnel router. The default is
+    /// `"unknown"`: routers that do not track the draw (test
+    /// doubles) report it. The warm/random split is a membership
+    /// check at selection time, not the draw itself — a random-draw
+    /// winner that happens to be warm is labelled `"warm_list"`,
+    /// which mislabels roughly the warm share of random wins
+    /// (~6% at 12 warm of 199 tunnels).
+    fn selection_source(&self, _selector: &TunnelSelector, _tunnel_id: &str) -> &'static str {
+        "unknown"
+    }
 }
 
 impl<T: TunnelRouter + ?Sized> TunnelRouter for Arc<T> {
@@ -1830,6 +2440,10 @@ impl<T: TunnelRouter + ?Sized> TunnelRouter for Arc<T> {
 
     fn record_tunnel_transport_failure(&self, tunnel_id: &str) {
         (**self).record_tunnel_transport_failure(tunnel_id);
+    }
+
+    fn selection_source(&self, selector: &TunnelSelector, tunnel_id: &str) -> &'static str {
+        (**self).selection_source(selector, tunnel_id)
     }
 }
 
@@ -2203,6 +2817,10 @@ impl TunnelRouter for SingleTunnelRouter {
         let target = Arc::clone(&self.target);
         Box::pin(async move { Ok(target) })
     }
+
+    fn selection_source(&self, _selector: &TunnelSelector, _tunnel_id: &str) -> &'static str {
+        "dedicated"
+    }
 }
 
 struct PoolInner {
@@ -2412,5 +3030,19 @@ impl TunnelRouter for PoolRouter {
                 TunnelSelector::DefaultPool => self.pick_pool_tunnel(),
             }
         })
+    }
+
+    fn selection_source(&self, selector: &TunnelSelector, _tunnel_id: &str) -> &'static str {
+        match selector {
+            TunnelSelector::ById(_) => "by_id",
+            TunnelSelector::ByTag(_) => "by_tag",
+            TunnelSelector::ByKeyword(PoolKeyword::Random) => "random",
+            TunnelSelector::ByKeyword(_) => "round_robin",
+            TunnelSelector::DefaultPool => match self.strategy {
+                PoolStrategy::Random => "random",
+                PoolStrategy::Fallback => "fallback_scan",
+                PoolStrategy::RoundRobin | PoolStrategy::LeastConn => "round_robin",
+            },
+        }
     }
 }

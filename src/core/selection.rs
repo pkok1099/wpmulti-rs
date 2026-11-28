@@ -183,6 +183,12 @@ impl WarmList {
         inner.get(idx).cloned()
     }
 
+    /// Whether `id` is currently a member, for the race trace's
+    /// candidate-selection source (the router's `selection_source`).
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.inner.read().iter().any(|existing| existing == id)
+    }
+
     /// Current membership, most-recent-first.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<String> {

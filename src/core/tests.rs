@@ -349,6 +349,66 @@ fn make_test_router() -> (Arc<TunnelRegistry>, Arc<MultiTenantRouter>) {
     (registry, router)
 }
 
+/// Race trace (GPT round 12): the candidate-selection source names
+/// the draw — explicit id, warm-list member vs random pool for P2C,
+/// and the keyword strategies.
+#[test]
+fn test_selection_source_names_the_draw() {
+    let (_registry, router) = make_test_router();
+
+    assert_eq!(
+        router.selection_source(&TunnelSelector::ById("wgcf-a".to_string()), "wgcf-a"),
+        "by_id"
+    );
+    assert_eq!(
+        router.selection_source(&TunnelSelector::ByTag("wgcf".to_string()), "wgcf-a"),
+        "by_tag"
+    );
+    assert_eq!(
+        router.selection_source(&TunnelSelector::ByKeyword(PoolKeyword::Random), "wgcf-a"),
+        "random"
+    );
+    assert_eq!(
+        router.selection_source(
+            &TunnelSelector::ByKeyword(PoolKeyword::RoundRobin),
+            "wgcf-a"
+        ),
+        "round_robin"
+    );
+    assert_eq!(
+        router.selection_source(&TunnelSelector::ByKeyword(PoolKeyword::LeastConn), "wgcf-a"),
+        "least_conn"
+    );
+    // The default pool is P2C here (the RoundRobin strategy routes
+    // through it): a warm-list member reads warm_list, anything else
+    // random_pool.
+    assert_eq!(
+        router.selection_source(&TunnelSelector::DefaultPool, "wgcf-a"),
+        "random_pool"
+    );
+    router.note_warm_success("wgcf-a");
+    assert_eq!(
+        router.selection_source(&TunnelSelector::DefaultPool, "wgcf-a"),
+        "warm_list"
+    );
+    assert_eq!(
+        router.selection_source(&TunnelSelector::ByKeyword(PoolKeyword::Auto), "wgcf-a"),
+        "warm_list"
+    );
+}
+
+/// Race trace (GPT round 12): warm-list membership tracks success
+/// and blackhole removal.
+#[test]
+fn test_warm_list_contains() {
+    let warm = WarmList::new();
+    assert!(!warm.contains("wgcf-a"));
+    warm.note_success("wgcf-a");
+    assert!(warm.contains("wgcf-a"));
+    warm.note_failure("wgcf-a");
+    assert!(!warm.contains("wgcf-a"));
+}
+
 /// Regression (audit run-3 #7,
 /// `proxy.dns-pre-resolve-cross-tunnel-no-selector-binding`): the DNS
 /// pre-resolve used to ask the router for any live tunnel with no

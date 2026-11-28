@@ -448,6 +448,12 @@ impl ProxyTunnelTarget for ActiveTunnel {
                 netstack.connect_timeout()
             })
     }
+
+    fn bridge_syn_retransmits(&self) -> Option<u64> {
+        self.netstack
+            .as_ref()
+            .and_then(ProxyTunnelTarget::bridge_syn_retransmits)
+    }
 }
 
 /// A wrapper around a [`DynStream`] that updates tunnel RX and TX statistics.

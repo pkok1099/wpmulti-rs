@@ -513,6 +513,20 @@ impl MultiTenantRouter {
         }
     }
 
+    /// P2C draw source for `tunnel_id` by warm-list membership (see
+    /// `TunnelRouter::selection_source`): the warm candidate wins
+    /// unless the random candidate scores lower, and the draw itself
+    /// is not recorded — membership is the observable proxy, so a
+    /// random-draw winner that happens to be warm is labelled
+    /// `"warm_list"`.
+    fn p2c_source(&self, tunnel_id: &str) -> &'static str {
+        if self.warm_list.contains(tunnel_id) {
+            "warm_list"
+        } else {
+            "random_pool"
+        }
+    }
+
     /// Degraded-pool fallback for [`Self::select_p2c`]: tiered scan
     /// over the allowed candidates, claiming the first routable one.
     fn fallback_scan_select(&self, allowed: Option<&[String]>) -> io::Result<String> {
@@ -1005,6 +1019,26 @@ impl TunnelRouter for MultiTenantRouter {
         entry.health.record_failure(threshold, cooldown);
         entry.stats.record_rtt_failure();
     }
+
+    fn selection_source(&self, selector: &TunnelSelector, tunnel_id: &str) -> &'static str {
+        match selector {
+            TunnelSelector::ById(_) => "by_id",
+            TunnelSelector::ByTag(_) => "by_tag",
+            TunnelSelector::ByKeyword(keyword) => match keyword {
+                PoolKeyword::Auto => self.p2c_source(tunnel_id),
+                PoolKeyword::Random => "random",
+                PoolKeyword::RoundRobin => "round_robin",
+                PoolKeyword::LeastConn => "least_conn",
+            },
+            TunnelSelector::DefaultPool => {
+                if self.default_strategy == PoolStrategy::Fallback {
+                    "fallback_scan"
+                } else {
+                    self.p2c_source(tunnel_id)
+                }
+            }
+        }
+    }
 }
 
 /// Dedicated router for per-tunnel ports forwarding all connections directly to a single tunnel.
@@ -1087,6 +1121,10 @@ impl TunnelRouter for DedicatedTunnelRouter {
             Ok(target)
         })
     }
+
+    fn selection_source(&self, _selector: &TunnelSelector, _tunnel_id: &str) -> &'static str {
+        "dedicated"
+    }
 }
 
 /// Tunnel target wrapper enforcing a listener- or global-level [`IpMode`] on TCP, UDP, and DNS.
@@ -1159,6 +1197,10 @@ impl ProxyTunnelTarget for IpFilteredTunnelTarget {
 
     fn is_live(&self) -> bool {
         self.inner.is_live()
+    }
+
+    fn bridge_syn_retransmits(&self) -> Option<u64> {
+        self.inner.bridge_syn_retransmits()
     }
 }
 

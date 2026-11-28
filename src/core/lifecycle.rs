@@ -484,6 +484,10 @@ impl ProxyTunnelTarget for GuardedTunnelTarget {
             .as_ref()
             .is_none_or(|h| h.current_status() == HealthStatus::Healthy)
     }
+
+    fn bridge_syn_retransmits(&self) -> Option<u64> {
+        self.tunnel.bridge_syn_retransmits()
+    }
 }
 
 /// A wrapper around a [`ProxyUdpSocket`] that keeps a [`TunnelConnGuard`] alive until dropped.

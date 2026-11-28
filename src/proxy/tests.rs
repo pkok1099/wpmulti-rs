@@ -65,6 +65,11 @@ struct MockTunnelTarget {
     /// Whether this mock reports a live session (`is_live`), standing
     /// in for a tunnel that just moved real traffic.
     live: bool,
+    /// When set, the mock reports this bridge SYN-retransmit count,
+    /// standing in for a real stack's counter (constant, so the
+    /// leg's window delta is 0 — the sampling plumbing, not the
+    /// counter, is what the race trace tests exercise).
+    syn_retransmits: Option<u64>,
 }
 
 impl MockTunnelTarget {
@@ -80,6 +85,7 @@ impl MockTunnelTarget {
             dial_redirect: None,
             udp_redirect: None,
             live: false,
+            syn_retransmits: None,
         }
     }
 
@@ -133,6 +139,14 @@ impl MockTunnelTarget {
     fn with_tcp_delay(self, delay: Duration) -> Self {
         Self {
             tcp_delay: delay,
+            ..self
+        }
+    }
+
+    /// Report `count` as the bridge SYN-retransmit counter.
+    fn with_syn_retransmits(self, count: u64) -> Self {
+        Self {
+            syn_retransmits: Some(count),
             ..self
         }
     }
@@ -267,6 +281,10 @@ impl ProxyTunnelTarget for MockTunnelTarget {
 
     fn is_live(&self) -> bool {
         self.live
+    }
+
+    fn bridge_syn_retransmits(&self) -> Option<u64> {
+        self.syn_retransmits
     }
 }
 
@@ -3180,6 +3198,576 @@ async fn test_connect_trace_records_winning_leg_and_stages() {
     assert_eq!(trace.first_leg.dns_ms, None, "IP target has no DNS stage");
     assert!(trace.second_leg.is_none(), "fast first leg is never hedged");
     assert!(trace.total_ms < 5000, "trace total took {}", trace.total_ms);
+}
+
+/// Extract one `key=value` field from a rendered `tracing` line
+/// (race trace helper): the value without surrounding quotes.
+fn race_trace_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    let prefix = format!("{field}=");
+    line.split_whitespace().find_map(|token| {
+        token
+            .strip_prefix(prefix.as_str())
+            .map(|value| value.trim_matches('"'))
+    })
+}
+
+/// Find the first rendered line containing `marker`, or panic
+/// showing the whole captured log.
+fn race_trace_line<'a>(rendered: &'a str, marker: &str) -> &'a str {
+    rendered
+        .lines()
+        .find(|line| line.contains(marker))
+        .unwrap_or_else(|| panic!("expected a line containing {marker:?}, got: {rendered:?}"))
+}
+
+/// Capture `tracing` output at DEBUG into a shared buffer for the
+/// race-trace tests below.
+fn capture_race_trace_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(VecMakeWriter(Arc::clone(&captured)))
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (captured, guard)
+}
+
+fn rendered_logs(captured: &Arc<Mutex<Vec<u8>>>) -> String {
+    String::from_utf8(captured.lock().unwrap().clone()).unwrap()
+}
+
+/// Race trace (GPT round 12): the leg2 skip reason covers every
+/// suppression of the hedge — fast win, live-but-pending TCP, fast
+/// leg1 failure, no alternate tunnel, exhausted budget, and the
+/// no-limiter catch-all.
+#[test]
+fn test_leg2_skip_reason_covers_all_suppressions() {
+    use crate::proxy::router::{
+        Leg2SkippedReason, LegOutcomeKind, SkipReasonInputs, determine_leg2_skip_reason,
+    };
+
+    let base = SkipReasonInputs {
+        hedge_select_failed: false,
+        first_is_live: false,
+        tcp_connected_at_ms: None,
+        stagger_elapsed_at_ms: 250,
+        first_terminal_at_ms: None,
+        first_outcome: None,
+        first_leg_timeout_ms: 1250,
+    };
+    // Leg1's TCP connected at 100 ms, before the 250 ms stagger:
+    // the hedge was never needed.
+    assert_eq!(
+        determine_leg2_skip_reason(&SkipReasonInputs {
+            tcp_connected_at_ms: Some(100),
+            first_terminal_at_ms: Some(100),
+            first_outcome: Some(LegOutcomeKind::Won),
+            ..base
+        }),
+        Leg2SkippedReason::FirstTcpConnected
+    );
+    // Connected exactly at the stagger: still "never needed".
+    assert_eq!(
+        determine_leg2_skip_reason(&SkipReasonInputs {
+            tcp_connected_at_ms: Some(250),
+            first_terminal_at_ms: Some(250),
+            first_outcome: Some(LegOutcomeKind::Won),
+            ..base
+        }),
+        Leg2SkippedReason::FirstTcpConnected
+    );
+    // Live first leg, TCP still pending at the stagger, won later:
+    // the GPT predicate case — healthy tunnel, uncompleted TCP.
+    assert_eq!(
+        determine_leg2_skip_reason(&SkipReasonInputs {
+            first_is_live: true,
+            first_terminal_at_ms: Some(600),
+            first_outcome: Some(LegOutcomeKind::Won),
+            ..base
+        }),
+        Leg2SkippedReason::FirstTunnelHealthyButTcpPending
+    );
+    // Live first leg, still running when the race ended without a
+    // leg1 completion stamp: pending at the stagger as well.
+    assert_eq!(
+        determine_leg2_skip_reason(&SkipReasonInputs {
+            first_is_live: true,
+            ..base
+        }),
+        Leg2SkippedReason::FirstTunnelHealthyButTcpPending
+    );
+    // Live first leg failed fast (refused) before the stagger: the
+    // race was already over, and the live-gate had suppressed the
+    // hedge — neither "connected" nor "pending".
+    assert_eq!(
+        determine_leg2_skip_reason(&SkipReasonInputs {
+            first_is_live: true,
+            first_terminal_at_ms: Some(50),
+            first_outcome: Some(LegOutcomeKind::TcpFailed),
+            ..base
+        }),
+        Leg2SkippedReason::FirstLegFailedFast
+    );
+    // The hedge selection found no distinct tunnel.
+    assert_eq!(
+        determine_leg2_skip_reason(&SkipReasonInputs {
+            hedge_select_failed: true,
+            ..base
+        }),
+        Leg2SkippedReason::NoAlternateTunnel
+    );
+    // Leg1 timed out before the stagger could fire: the remaining
+    // failover budget (100 ms) was already shorter than the stagger.
+    assert_eq!(
+        determine_leg2_skip_reason(&SkipReasonInputs {
+            first_terminal_at_ms: Some(100),
+            first_outcome: Some(LegOutcomeKind::TimedOut),
+            first_leg_timeout_ms: 100,
+            ..base
+        }),
+        Leg2SkippedReason::AttemptBudgetExhausted
+    );
+    // Budget exactly the stagger: the timeout did not cut the leg
+    // short before the stagger, so it is a fast failure, not an
+    // exhausted budget.
+    assert_eq!(
+        determine_leg2_skip_reason(&SkipReasonInputs {
+            first_terminal_at_ms: Some(100),
+            first_outcome: Some(LegOutcomeKind::TimedOut),
+            first_leg_timeout_ms: 250,
+            ..base
+        }),
+        Leg2SkippedReason::FirstLegFailedFast
+    );
+    // Not live, no completion, race over after the stagger: no
+    // limiter explains the suppression — the catch-all.
+    assert_eq!(
+        determine_leg2_skip_reason(&base),
+        Leg2SkippedReason::GlobalRaceLimit
+    );
+}
+
+/// Race trace (GPT round 12): the reason strings the parser depends
+/// on are exactly the specified snake-case values.
+#[test]
+fn test_race_trace_reason_strings() {
+    use crate::proxy::router::{Leg2SkippedReason, LegLaunchReason, LegOutcomeKind};
+
+    assert_eq!(LegOutcomeKind::Won.as_str(), "won");
+    assert_eq!(LegOutcomeKind::TcpFailed.as_str(), "tcp_failed");
+    assert_eq!(LegOutcomeKind::DnsFailed.as_str(), "dns_failed");
+    assert_eq!(LegOutcomeKind::TimedOut.as_str(), "timed_out");
+    assert_eq!(LegOutcomeKind::Aborted.as_str(), "aborted");
+    assert_eq!(LegOutcomeKind::Forbidden.as_str(), "forbidden");
+    assert_eq!(LegOutcomeKind::NotRun.as_str(), "not_run");
+    assert_eq!(LegLaunchReason::Immediate.as_str(), "immediate");
+    assert_eq!(LegLaunchReason::HedgeStagger.as_str(), "hedge_stagger");
+    assert_eq!(
+        LegLaunchReason::HedgeFastFailure.as_str(),
+        "hedge_fast_failure"
+    );
+    assert_eq!(
+        Leg2SkippedReason::FirstTcpConnected.as_str(),
+        "first_tcp_connected"
+    );
+    assert_eq!(
+        Leg2SkippedReason::FirstTunnelHealthyButTcpPending.as_str(),
+        "first_tunnel_healthy_but_tcp_pending"
+    );
+    assert_eq!(
+        Leg2SkippedReason::FirstLegFailedFast.as_str(),
+        "first_leg_failed_fast"
+    );
+    assert_eq!(
+        Leg2SkippedReason::NoAlternateTunnel.as_str(),
+        "no_alternate_tunnel"
+    );
+    assert_eq!(
+        Leg2SkippedReason::GlobalRaceLimit.as_str(),
+        "global_race_limit"
+    );
+    assert_eq!(
+        Leg2SkippedReason::AttemptBudgetExhausted.as_str(),
+        "attempt_budget_exhausted"
+    );
+}
+
+/// Race trace (GPT round 12): the bridge-counter window delta is
+/// the retransmit count, `None` without a counter, and saturating
+/// so a counter reset can never underflow.
+#[test]
+fn test_syn_retransmit_delta() {
+    use crate::proxy::router::syn_retransmit_delta;
+
+    assert_eq!(syn_retransmit_delta(Some(3), Some(5)), Some(2));
+    assert_eq!(syn_retransmit_delta(Some(5), Some(5)), Some(0));
+    assert_eq!(syn_retransmit_delta(Some(5), Some(3)), Some(0));
+    assert_eq!(syn_retransmit_delta(None, Some(5)), None);
+    assert_eq!(syn_retransmit_delta(Some(5), None), None);
+    assert_eq!(syn_retransmit_delta(None, None), None);
+}
+
+/// Race trace (GPT round 12): a fast first leg wins alone — one leg
+/// line, one race line, the skip reason `first_tcp_connected`, and
+/// the same `race_id` / `connect_id` joining the leg line, the race
+/// line, and the per-CONNECT trace line.
+#[tokio::test]
+async fn test_race_trace_fast_first_leg_records_skip_reason() {
+    use crate::proxy::router::connect_via_router;
+
+    let (captured, _guard) = capture_race_trace_logs();
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    pool.add_tunnel(
+        "alive-2",
+        Arc::new(MockTunnelTarget::new("alive-2").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (_stream, winner_id, _) =
+        connect_via_router(&router, &TunnelSelector::DefaultPool, &target, None, None)
+            .await
+            .expect("dial must succeed");
+    assert_eq!(winner_id.as_deref(), Some("alive-1"));
+
+    let rendered = rendered_logs(&captured);
+    let leg_lines: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.contains("race leg trace"))
+        .collect();
+    assert_eq!(
+        leg_lines.len(),
+        1,
+        "a fast win runs one leg only, got: {rendered:?}"
+    );
+    let leg = leg_lines[0];
+    assert_eq!(race_trace_field(leg, "attempt_index"), Some("0"));
+    assert_eq!(race_trace_field(leg, "leg_index"), Some("0"));
+    assert_eq!(
+        race_trace_field(leg, "leg_launch_reason"),
+        Some("immediate")
+    );
+    assert_eq!(
+        race_trace_field(leg, "candidate_selection_source"),
+        Some("round_robin"),
+        "the test pool router's round-robin draw is named"
+    );
+    assert_eq!(race_trace_field(leg, "leg_terminal_reason"), Some("won"));
+    let connected: u64 = race_trace_field(leg, "tcp_connected_at")
+        .expect("winning leg must carry tcp_connected_at")
+        .parse()
+        .unwrap();
+    assert!(
+        connected < 250,
+        "a fast win connects before the 250 ms stagger, got {connected}"
+    );
+    assert!(
+        race_trace_field(leg, "tcp_syn_retransmitted_count").is_none(),
+        "a target without a bridge counter reports no count, got: {leg:?}"
+    );
+
+    let race = race_trace_line(&rendered, " race trace ");
+    assert_eq!(race_trace_field(race, "race_winner_leg"), Some("first"));
+    assert_eq!(race_trace_field(race, "first_is_live"), Some("false"));
+    assert_eq!(
+        race_trace_field(race, "leg2_skipped_reason"),
+        Some("first_tcp_connected")
+    );
+    assert_eq!(
+        race_trace_field(race, "race_id"),
+        race_trace_field(leg, "race_id"),
+        "the leg and race lines share one race_id"
+    );
+    let connect = race_trace_line(&rendered, "connect trace");
+    assert_eq!(
+        race_trace_field(race, "connect_id"),
+        race_trace_field(connect, "connect_id"),
+        "the race line joins the connect trace on connect_id"
+    );
+    assert!(
+        race_trace_field(connect, "connect_id").is_some_and(|id| id != "0"),
+        "the CONNECT carries a daemon-generated id, got: {connect:?}"
+    );
+}
+
+/// Race trace (GPT round 12): a live but slow first leg is never
+/// hedged — the race line records
+/// `first_tunnel_healthy_but_tcp_pending`, and the leg line proves
+/// the TCP dial was already started before the stagger and still
+/// unconnected after it (the SYN-SENT-at-250 ms fact the next probe
+/// aggregates).
+#[tokio::test]
+async fn test_race_trace_live_slow_leg_records_tcp_pending_skip() {
+    use crate::proxy::router::connect_via_router;
+
+    let (captured, _guard) = capture_race_trace_logs();
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+    let live_slow = Arc::new(
+        MockTunnelTarget::new("wgcf-001")
+            .with_live()
+            .with_dial_redirect(echo_addr)
+            .with_tcp_delay(Duration::from_millis(600)),
+    );
+    let fast = Arc::new(MockTunnelTarget::new("wgcf-002").with_dial_redirect(echo_addr));
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "wgcf-001",
+        Arc::clone(&live_slow) as Arc<dyn ProxyTunnelTarget>,
+    );
+    pool.add_tunnel("wgcf-002", Arc::clone(&fast) as Arc<dyn ProxyTunnelTarget>);
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (stream, id, _) =
+        connect_via_router(&router, &TunnelSelector::DefaultPool, &target, None, None)
+            .await
+            .expect("live slow dial must succeed");
+    drop(stream);
+    assert_eq!(id.as_deref(), Some("wgcf-001"));
+    assert_eq!(
+        fast.tcp_conns.load(Ordering::SeqCst),
+        0,
+        "second tunnel must never be dialed when the first leg is live"
+    );
+
+    let rendered = rendered_logs(&captured);
+    let leg_lines: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.contains("race leg trace"))
+        .collect();
+    assert_eq!(leg_lines.len(), 1, "no hedge runs, got: {rendered:?}");
+    let leg = leg_lines[0];
+    let tcp_started: u64 = race_trace_field(leg, "tcp_connect_started_at")
+        .expect("leg must carry tcp_connect_started_at")
+        .parse()
+        .unwrap();
+    let connected: u64 = race_trace_field(leg, "tcp_connected_at")
+        .expect("winning leg must carry tcp_connected_at")
+        .parse()
+        .unwrap();
+    assert!(
+        tcp_started < 250 && connected > 250,
+        "leg1 was mid-TCP at the 250 ms stagger (started {tcp_started}, connected {connected})"
+    );
+    assert!(
+        (250..1250).contains(&connected),
+        "live slow leg connects inside its per-leg deadline, got {connected}"
+    );
+    let race = race_trace_line(&rendered, " race trace ");
+    assert_eq!(race_trace_field(race, "race_winner_leg"), Some("first"));
+    assert_eq!(race_trace_field(race, "first_is_live"), Some("true"));
+    assert_eq!(
+        race_trace_field(race, "leg2_skipped_reason"),
+        Some("first_tunnel_healthy_but_tcp_pending")
+    );
+}
+
+/// Race trace (GPT round 12): a dormant slow first leg is hedged —
+/// both leg lines are retained, the loser traces as aborted with no
+/// stage times (its stages died with its task), the winner is the
+/// second leg, and no skip reason is recorded.
+#[tokio::test]
+async fn test_race_trace_hedged_legs_record_both_legs() {
+    use crate::proxy::router::connect_via_router;
+
+    let (captured, _guard) = capture_race_trace_logs();
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+    let slow = Arc::new(
+        MockTunnelTarget::new("wgcf-001")
+            .with_dial_redirect(echo_addr)
+            .with_tcp_delay(Duration::from_millis(2000)),
+    );
+    let slow_aborted = Arc::clone(&slow.aborted);
+    let fast = Arc::new(
+        MockTunnelTarget::new("wgcf-002")
+            .with_dial_redirect(echo_addr)
+            .with_syn_retransmits(7),
+    );
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel("wgcf-001", Arc::clone(&slow) as Arc<dyn ProxyTunnelTarget>);
+    pool.add_tunnel("wgcf-002", Arc::clone(&fast) as Arc<dyn ProxyTunnelTarget>);
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (stream, id, _) =
+        connect_via_router(&router, &TunnelSelector::DefaultPool, &target, None, None)
+            .await
+            .expect("hedged dial must succeed");
+    drop(stream);
+    assert_eq!(id.as_deref(), Some("wgcf-002"));
+    assert!(
+        slow_aborted.load(Ordering::SeqCst),
+        "losing leg must be noted aborted"
+    );
+
+    let rendered = rendered_logs(&captured);
+    assert_hedged_race_lines(&rendered);
+}
+
+/// The two leg lines and the race line of a hedged race: leg 0 was
+/// aborted mid-dial (no stages), leg 1 won at the stagger.
+fn assert_hedged_race_lines(rendered: &str) {
+    let leg_lines: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.contains("race leg trace"))
+        .collect();
+    assert_eq!(
+        leg_lines.len(),
+        2,
+        "both legs are retained, got: {rendered:?}"
+    );
+    let first = leg_lines
+        .iter()
+        .find(|line| race_trace_field(line, "leg_index") == Some("0"))
+        .expect("leg 0 line must exist");
+    let second = leg_lines
+        .iter()
+        .find(|line| race_trace_field(line, "leg_index") == Some("1"))
+        .expect("leg 1 line must exist");
+    assert_eq!(
+        race_trace_field(first, "candidate_selection_source"),
+        Some("round_robin"),
+        "the pool router's round-robin draw is named, got: {first:?}"
+    );
+    assert_eq!(
+        race_trace_field(first, "leg_launch_reason"),
+        Some("immediate")
+    );
+    assert_eq!(
+        race_trace_field(first, "leg_terminal_reason"),
+        Some("aborted")
+    );
+    assert!(
+        race_trace_field(first, "leg_started_at").is_none(),
+        "an aborted leg's task start is unmeasured, got: {first:?}"
+    );
+    assert!(
+        race_trace_field(first, "tcp_connect_started_at").is_none(),
+        "an aborted leg's stages died with its task, got: {first:?}"
+    );
+    assert!(
+        race_trace_field(first, "tcp_syn_retransmitted_count").is_none(),
+        "a target without a bridge counter reports no count"
+    );
+    assert_eq!(
+        race_trace_field(second, "leg_launch_reason"),
+        Some("hedge_stagger")
+    );
+    assert_eq!(race_trace_field(second, "leg_terminal_reason"), Some("won"));
+    let scheduled: u64 = race_trace_field(second, "leg_scheduled_at")
+        .expect("hedge leg must carry leg_scheduled_at")
+        .parse()
+        .unwrap();
+    assert!(
+        (200..1500).contains(&scheduled),
+        "the hedge is scheduled at the 250 ms stagger, got {scheduled}"
+    );
+    assert_eq!(
+        race_trace_field(second, "tcp_syn_retransmitted_count"),
+        Some("0"),
+        "a constant bridge counter samples to a zero window delta"
+    );
+    assert_eq!(
+        race_trace_field(first, "race_id"),
+        race_trace_field(second, "race_id"),
+        "both legs share one race_id"
+    );
+
+    let race = race_trace_line(rendered, " race trace ");
+    assert_eq!(race_trace_field(race, "race_winner_leg"), Some("second"));
+    assert!(
+        race_trace_field(race, "loser_cancelled_at").is_some(),
+        "the loser's cancel instant is recorded, got: {race:?}"
+    );
+    assert!(
+        race_trace_field(race, "leg2_skipped_reason").is_none(),
+        "leg2 launched, so no skip reason is recorded, got: {race:?}"
+    );
+}
+
+/// Race trace (GPT round 12): a domain leg records its DNS stages
+/// and the full field set, and the log never emits the three
+/// unmeasurable SYN fields — not even as zeros.
+#[tokio::test]
+async fn test_race_trace_domain_leg_records_dns_stages_and_full_format() {
+    use crate::proxy::router::connect_via_router;
+
+    let (captured, _guard) = capture_race_trace_logs();
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Domain("example.test".to_string(), echo_addr.port());
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(
+            MockTunnelTarget::new("alive-1")
+                .with_dial_redirect(echo_addr)
+                .with_dns("example.test", TEST_ECHO_IP)
+                .with_syn_retransmits(7),
+        ),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (_stream, winner_id, _) =
+        connect_via_router(&router, &TunnelSelector::DefaultPool, &target, None, None)
+            .await
+            .expect("dial must succeed");
+    assert_eq!(winner_id.as_deref(), Some("alive-1"));
+
+    let rendered = rendered_logs(&captured);
+    let leg = race_trace_line(&rendered, "race leg trace");
+    for field in [
+        "race_id",
+        "connect_id",
+        "attempt_index",
+        "leg_index",
+        "tunnel_id",
+        "candidate_selection_source",
+        "leg_launch_reason",
+        "race_started_at",
+        "leg_scheduled_at",
+        "leg_started_at",
+        "dns_started_at",
+        "dns_completed_at",
+        "tunnel_ready_at",
+        "tcp_connect_started_at",
+        "tcp_syn_retransmitted_count",
+        "tcp_connected_at",
+        "leg_terminal_at",
+        "leg_terminal_reason",
+    ] {
+        assert!(
+            race_trace_field(leg, field).is_some(),
+            "leg line must carry {field}, got: {leg:?}"
+        );
+    }
+    assert_eq!(
+        race_trace_field(leg, "tcp_syn_retransmitted_count"),
+        Some("0")
+    );
+    assert!(
+        !rendered.contains("tcp_syn_emitted_at"),
+        "SYN emission is unmeasured and must never be logged"
+    );
+    assert!(
+        !rendered.contains("tcp_synack_received_at"),
+        "SYN-ACK receipt is unmeasured and must never be logged"
+    );
+    assert!(
+        !rendered.contains("tcp_syn_retransmitted_at="),
+        "retransmit timestamps are unmeasured and must never be logged"
+    );
+    let race = race_trace_line(&rendered, " race trace ");
+    assert_eq!(race_trace_field(race, "race_winner_leg"), Some("first"));
+    assert_eq!(
+        race_trace_field(race, "leg2_skipped_reason"),
+        Some("first_tcp_connected")
+    );
 }
 
 /// Regression (audit run-3 #7,
