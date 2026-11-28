@@ -356,6 +356,138 @@ fn test_bridge_tx_backpressure() {
     assert!(bridge.transmit(now).is_none());
 }
 
+/// Minimal IPv6 TCP SYN packet (40-byte IPv6 header + 20-byte TCP header).
+fn syn_v6(src_port: u16, seq: u32) -> Vec<u8> {
+    let mut pkt = vec![0u8; 60];
+    pkt[0] = 0x60; // version 6
+    pkt[5] = 20; // payload length: TCP header only
+    pkt[6] = 6; // next header: TCP
+    pkt[7] = 64; // hop limit
+    pkt[40..42].copy_from_slice(&src_port.to_be_bytes());
+    pkt[42..44].copy_from_slice(&80u16.to_be_bytes());
+    pkt[44..48].copy_from_slice(&seq.to_be_bytes());
+    pkt[52] = 0x50; // data offset 5
+    pkt[53] = 0x02; // SYN
+    pkt
+}
+
+/// Minimal IPv4 TCP SYN packet (20-byte IPv4 header + 20-byte TCP header).
+fn syn_v4(src_port: u16, seq: u32) -> Vec<u8> {
+    let mut pkt = vec![0u8; 40];
+    pkt[0] = 0x45; // version 4, IHL 5
+    pkt[2..4].copy_from_slice(&40u16.to_be_bytes()); // total length
+    pkt[8] = 64; // TTL
+    pkt[9] = 6; // protocol: TCP
+    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&80u16.to_be_bytes());
+    pkt[24..28].copy_from_slice(&seq.to_be_bytes());
+    pkt[32] = 0x50; // data offset 5
+    pkt[33] = 0x02; // SYN
+    pkt
+}
+
+#[test]
+fn test_bridge_syn_retransmit_counter() {
+    let (bridge, _ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 128);
+    let counters = bridge.counters();
+
+    // First SYN: a new dial, no retransmit.
+    counters.note_outgoing_packet(&syn_v6(49152, 1000));
+    assert_eq!(counters.snapshot().syn_retransmits, 0);
+    // Same (port, seq) again: an RTO retransmit.
+    counters.note_outgoing_packet(&syn_v6(49152, 1000));
+    assert_eq!(counters.snapshot().syn_retransmits, 1);
+    // Different seq: a new dial on the same port.
+    counters.note_outgoing_packet(&syn_v6(49152, 1001));
+    assert_eq!(counters.snapshot().syn_retransmits, 1);
+    // IPv4 SYN + retransmit.
+    counters.note_outgoing_packet(&syn_v4(49153, 2000));
+    counters.note_outgoing_packet(&syn_v4(49153, 2000));
+    assert_eq!(counters.snapshot().syn_retransmits, 2);
+    // SYN+ACK (flags 0x12) is not an outgoing SYN: ignored.
+    let mut synack = syn_v6(49154, 3000);
+    synack[53] = 0x12;
+    counters.note_outgoing_packet(&synack);
+    counters.note_outgoing_packet(&synack);
+    assert_eq!(counters.snapshot().syn_retransmits, 2);
+    // Short garbage: ignored, no panic.
+    counters.note_outgoing_packet(&[0x60, 0, 0]);
+    assert_eq!(counters.snapshot().syn_retransmits, 2);
+}
+
+#[tokio::test]
+async fn test_bridge_tx_full_stall_episode_counts_once_per_episode() {
+    use gotatun::tun::IpRecv;
+    use smoltcp::phy::{Device, TxToken};
+    let (mut bridge, _ip_send, mut ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 2);
+    let counters = bridge.counters();
+    let now = smoltcp::time::Instant::now();
+
+    // Fill the 2-slot TX channel; receive must stall and count one episode.
+    let tx1 = bridge.transmit(now).expect("slot 1 available");
+    tx1.consume(20, |_| {});
+    let tx2 = bridge.transmit(now).expect("slot 2 available");
+    tx2.consume(20, |_| {});
+    assert!(bridge.receive(now).is_none());
+    assert_eq!(counters.snapshot().tx_full_rx_stall_episodes, 1);
+    // Still full: another poll is the same episode, not a new one.
+    assert!(bridge.receive(now).is_none());
+    assert_eq!(counters.snapshot().tx_full_rx_stall_episodes, 1);
+
+    // Drain both packets: the gate opens and the episode resets. RX is
+    // empty, so receive returns None for lack of packets — but the gate
+    // is open, so no new episode is counted.
+    let mut pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+    let mut packets = ip_recv.recv(&mut pool).await.unwrap();
+    assert_eq!(packets.by_ref().count(), 2);
+    assert!(bridge.receive(now).is_none());
+    assert_eq!(counters.snapshot().tx_full_rx_stall_episodes, 1);
+
+    // Fill again: a second episode.
+    let tx3 = bridge.transmit(now).expect("slot 1 available");
+    tx3.consume(20, |_| {});
+    let tx4 = bridge.transmit(now).expect("slot 2 available");
+    tx4.consume(20, |_| {});
+    assert!(bridge.receive(now).is_none());
+    assert_eq!(counters.snapshot().tx_full_rx_stall_episodes, 2);
+}
+
+#[tokio::test]
+async fn test_bridge_ipsend_wait_counts_backpressure() {
+    use smoltcp::phy::Device;
+    let (mut bridge, mut ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 1);
+    let counters = bridge.counters();
+    let pool = gotatun::packet::PacketBufPool::<4096>::new(16);
+
+    // Fill the 1-slot RX channel.
+    let builder = PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).udp(1234, 5678);
+    let mut raw = Vec::new();
+    builder.write(&mut raw, b"PAYLOAD").unwrap();
+    let mut pkt = pool.get();
+    pkt.truncate(raw.len());
+    pkt.copy_from_slice(&raw);
+    ip_send.send(pkt.try_into_ip().unwrap()).await.unwrap();
+
+    // A second send must wait for RX capacity; drain after 50 ms.
+    let mut ip_send2 = ip_send.clone();
+    let mut pkt2 = pool.get();
+    pkt2.truncate(raw.len());
+    pkt2.copy_from_slice(&raw);
+    let send_task = tokio::spawn(async move { ip_send2.send(pkt2.try_into_ip().unwrap()).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let now = smoltcp::time::Instant::now();
+    assert!(bridge.receive(now).is_some());
+    send_task.await.unwrap().unwrap();
+    let snap = counters.snapshot();
+    assert!(
+        snap.ipsend_wait_ms_total >= 40,
+        "waited {} ms",
+        snap.ipsend_wait_ms_total
+    );
+    assert_eq!(snap.ipsend_waits_over_10ms, 1);
+    assert_eq!(snap.rx_depth_max, 1);
+}
+
 #[tokio::test]
 async fn test_bridge_notify_liveness() {
     let (_bridge, mut ip_send, _ip_recv) = VirtualTunBridge::new(DEFAULT_MTU, 16);

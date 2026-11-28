@@ -469,7 +469,9 @@ fn log_terminal_connect_failure(
 /// Returns the stream plus the id of the tunnel that served the
 /// connection (the last id in the attempt list), so protocol handlers
 /// can name the tunnel in post-grant session logging — a stream alone
-/// carries no tunnel identity.
+/// carries no tunnel identity — plus the per-CONNECT probe trace
+/// (pre-resolve timing, race legs, stage durations), which is also
+/// logged at debug on every return.
 ///
 /// `exclude_tunnel` names a tunnel that must never be selected on
 /// this call: a zero-response retry re-dials after that tunnel closed
@@ -488,49 +490,169 @@ pub(crate) async fn connect_via_router(
     target: &TargetAddr,
     credentials: Option<(&str, &str)>,
     exclude_tunnel: Option<&str>,
-) -> Result<(DynStream, Option<String>), RouterConnectError> {
-    // Select the tunnel — and verify the caller's credentials against
-    // it — BEFORE any DNS leaves the daemon. The old pre-resolve asked
-    // the router for a live target with no selector binding, so the
-    // query egressed via whatever warm-list tunnel happened to be
-    // live, even for a client whose credentials the selected tunnel
-    // rejects (audit run-3 #7). A selection failure is terminal here,
-    // so a rejected client causes zero DNS queries anywhere.
-    //
-    // The pre-resolve still only runs on a live tunnel: the
-    // singleflight query must never go through a cold tunnel. The
-    // measured failure was one cold-tunnel query timing out (1 s DNS
-    // deadline vs a handshake that takes longer) and fanning out to
-    // 31 waiters in 38 ms — every one of them logging a WARN on
-    // attempt 1/3. A pre-resolve on the selected live tunnel populates
-    // the shared cache, so the race legs hit the LRU fast-path instead
-    // of creating a cell on a cold tunnel; when the domain is already
-    // cached this is just the LRU lookup. A pre-resolve failure is
-    // best-effort and falls through to the per-leg resolve below, so
-    // a selected tunnel that is not live behaves exactly as before.
-    // The failover deadline is created after this, so the pre-resolve
-    // never eats the race budget.
-    //
-    // The pre-selected target is dropped at the end of this block —
-    // its trial slot, if one was claimed, is released by the guard's
-    // `Drop` — and the failover loop below selects the dial tunnel
-    // itself.
-    if let TargetAddr::Domain(domain, _) = target {
-        let selected = match router.select_tunnel(selector, credentials).await {
-            Ok(target) => target,
-            Err(e) => return Err(RouterConnectError::SelectTunnel(e)),
-        };
-        let excluded = selected.tunnel_id() == exclude_tunnel;
-        if selected.is_live()
-            && !excluded
-            && let Err(e) = resolve_and_validate_domain(selected.as_ref(), domain).await
-        {
+) -> Result<(DynStream, Option<String>, ConnectTrace), RouterConnectError> {
+    let started = Instant::now();
+    let mut trace = ConnectTrace::default();
+    let result = connect_via_router_inner(
+        router,
+        selector,
+        target,
+        credentials,
+        exclude_tunnel,
+        &mut trace,
+    )
+    .await;
+    trace.total_ms = duration_ms(started, Instant::now());
+    log_connect_trace(target, &trace);
+    result.map(|(stream, tunnel_id)| (stream, tunnel_id, trace))
+}
+
+/// One debug line per CONNECT with the probe trace: pre-resolve timing
+/// and the race legs' stage durations and outcomes. The analysis counts
+/// these lines by leg outcome and stage duration.
+fn log_connect_trace(target: &TargetAddr, trace: &ConnectTrace) {
+    tracing::debug!(
+        target = %target,
+        total_ms = trace.total_ms,
+        preresolve_ms = trace.preresolve_ms,
+        preresolve_failed = trace.preresolve_failed,
+        attempts = trace.attempts,
+        winner_leg = ?trace.winner_leg,
+        leg1_tunnel = trace.first_leg.tunnel_id.as_deref(),
+        leg1_dns_ms = trace.first_leg.dns_ms,
+        leg1_tcp_ms = trace.first_leg.tcp_ms,
+        leg1_outcome = ?trace.first_leg.outcome,
+        leg2_tunnel = trace.second_leg.as_ref().and_then(|leg| leg.tunnel_id.as_deref()),
+        leg2_dns_ms = trace.second_leg.as_ref().and_then(|leg| leg.dns_ms),
+        leg2_tcp_ms = trace.second_leg.as_ref().and_then(|leg| leg.tcp_ms),
+        leg2_outcome = ?trace.second_leg.as_ref().map(|leg| leg.outcome),
+        "connect trace"
+    );
+}
+
+/// Pre-resolve a domain target on the selected live tunnel, and time
+/// it for the probe trace.
+///
+/// The selection runs first so the query egresses only via the tunnel
+/// the caller will actually use (audit run-3 #7: the old pre-resolve
+/// asked the router for a live target with no selector binding, so the
+/// query egressed via whatever warm-list tunnel happened to be live,
+/// even for a client whose credentials the selected tunnel rejects).
+/// The pre-resolve still only runs on a live tunnel: the singleflight
+/// query must never go through a cold tunnel. The measured failure was
+/// one cold-tunnel query timing out (1 s DNS deadline vs a handshake
+/// that takes longer) and fanning out to 31 waiters in 38 ms — every
+/// one of them logging a WARN on attempt 1/3. A pre-resolve on the
+/// selected live tunnel populates the shared cache, so the race legs
+/// hit the LRU fast-path instead of creating a cell on a cold tunnel;
+/// when the domain is already cached this is just the LRU lookup. A
+/// pre-resolve failure is best-effort and falls through to the per-leg
+/// resolve, so a selected tunnel that is not live behaves exactly as
+/// before. The failover deadline is created after this, so the
+/// pre-resolve never eats the race budget.
+///
+/// The pre-selected target is dropped at the end of this call — its
+/// trial slot, if one was claimed, is released by the guard's `Drop`.
+async fn preresolve_on_selected_live_tunnel(
+    router: &Arc<dyn TunnelRouter>,
+    selector: &TunnelSelector,
+    target: &TargetAddr,
+    credentials: Option<(&str, &str)>,
+    exclude_tunnel: Option<&str>,
+    trace: &mut ConnectTrace,
+) -> Result<(), RouterConnectError> {
+    let TargetAddr::Domain(domain, _) = target else {
+        return Ok(());
+    };
+    let selected = router
+        .select_tunnel(selector, credentials)
+        .await
+        .map_err(RouterConnectError::SelectTunnel)?;
+    let excluded = selected.tunnel_id() == exclude_tunnel;
+    if selected.is_live() && !excluded {
+        let started = Instant::now();
+        let preresolved = resolve_and_validate_domain(selected.as_ref(), domain).await;
+        trace.preresolve_ms = Some(duration_ms(started, Instant::now()));
+        if let Err(e) = preresolved {
+            trace.preresolve_failed = true;
             tracing::debug!(
                 "live pre-resolve of '{domain}' failed ({}); falling back to per-leg resolve",
                 e
             );
         }
     }
+    Ok(())
+}
+
+/// Run one dial without the fix6 race (single-attempt path): fill the
+/// trace's first leg from the dial stages and return the stream.
+/// `tried_ids` supplies the winner id, as in the race path.
+async fn dial_single_attempt(
+    target_tunnel: &Arc<dyn ProxyTunnelTarget>,
+    target: &TargetAddr,
+    attempt: usize,
+    max_attempts: usize,
+    tried_ids: &[String],
+    trace: &mut ConnectTrace,
+) -> Result<(DynStream, Option<String>), RouterConnectError> {
+    let mut stages = DialStages::default();
+    let result =
+        connect_target_single(target_tunnel, target, attempt, max_attempts, &mut stages).await;
+    let outcome = match &result {
+        Ok(_) => LegOutcomeKind::Won,
+        Err(err) => leg_outcome_from_error(err),
+    };
+    trace.first_leg = leg_trace(
+        target_tunnel.tunnel_id().map(str::to_string),
+        &stages,
+        outcome,
+    );
+    trace.winner_leg = None;
+    result.map(|stream| (stream, tried_ids.last().cloned()))
+}
+
+/// Terminal failure after the failover loop: the last error, or a
+/// pool-empty error when no attempt ran. Logs the WARN the next
+/// measurement run classifies on.
+fn failover_terminal_error(
+    selector: &TunnelSelector,
+    target: &TargetAddr,
+    tried_ids: &[String],
+    attempts_run: usize,
+    last_err: Option<RouterConnectError>,
+) -> RouterConnectError {
+    let err = last_err.unwrap_or_else(|| {
+        RouterConnectError::SelectTunnel(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no healthy tunnels available in pool",
+        ))
+    });
+    log_terminal_connect_failure(selector, target, tried_ids, attempts_run, &err);
+    err
+}
+
+/// Inner connect loop for [`connect_via_router`]; fills `trace` as it
+/// goes (pre-resolve timing, final attempt's race legs).
+async fn connect_via_router_inner(
+    router: &Arc<dyn TunnelRouter>,
+    selector: &TunnelSelector,
+    target: &TargetAddr,
+    credentials: Option<(&str, &str)>,
+    exclude_tunnel: Option<&str>,
+    trace: &mut ConnectTrace,
+) -> Result<(DynStream, Option<String>), RouterConnectError> {
+    // Select the tunnel — and verify the caller's credentials against
+    // it — BEFORE any DNS leaves the daemon; see
+    // `preresolve_on_selected_live_tunnel` for why.
+    preresolve_on_selected_live_tunnel(
+        router,
+        selector,
+        target,
+        credentials,
+        exclude_tunnel,
+        trace,
+    )
+    .await?;
 
     let max_attempts = if matches!(selector, TunnelSelector::ById(_)) {
         1
@@ -548,6 +670,7 @@ pub(crate) async fn connect_via_router(
             break;
         }
         attempts_run += 1;
+        trace.attempts = attempts_run;
         let target_tunnel = match router.select_tunnel(selector, credentials).await {
             Ok(t) => t,
             Err(e) => {
@@ -600,11 +723,17 @@ pub(crate) async fn connect_via_router(
                 attempt,
                 max_attempts,
             };
-            race.race(target_tunnel, &mut tried_ids).await
+            race.race_traced(target_tunnel, &mut tried_ids, trace).await
         } else {
-            connect_target_single(&target_tunnel, target, attempt, max_attempts)
-                .await
-                .map(|stream| (stream, tried_ids.last().cloned()))
+            dial_single_attempt(
+                &target_tunnel,
+                target,
+                attempt,
+                max_attempts,
+                &tried_ids,
+                trace,
+            )
+            .await
         };
 
         match attempt_res {
@@ -616,25 +745,178 @@ pub(crate) async fn connect_via_router(
         }
     }
 
-    let err = last_err.unwrap_or_else(|| {
-        RouterConnectError::SelectTunnel(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "no healthy tunnels available in pool",
-        ))
-    });
-    log_terminal_connect_failure(selector, target, &tried_ids, attempts_run, &err);
-    Err(err)
+    Err(failover_terminal_error(
+        selector,
+        target,
+        &tried_ids,
+        attempts_run,
+        last_err,
+    ))
 }
 
 /// Which leg of a pool race an outcome belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RaceLeg {
+pub(crate) enum RaceLeg {
     First,
     Second,
 }
 
-/// Outcome of one race leg: which leg it was, and its dial result.
-type LegOutcome = (RaceLeg, Result<DynStream, RouterConnectError>);
+/// Outcome of one race leg, for the per-CONNECT probe trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LegOutcomeKind {
+    /// The leg never ran (selection failed before any dial).
+    #[default]
+    NotRun,
+    /// The leg's dial completed first and served the connection.
+    Won,
+    /// The TCP dial failed (refused, reset, unreachable).
+    TcpFailed,
+    /// The domain resolve failed (timeout or error).
+    DnsFailed,
+    /// The leg hit the per-leg timeout (1.25 s).
+    TimedOut,
+    /// The leg was still running when the other leg won; cancelled.
+    Aborted,
+    /// The destination was rejected by policy.
+    Forbidden,
+}
+
+/// Per-leg timing of one pool race leg (probe instrumentation): the
+/// fix15 [`DialStages`] reduced to durations, plus the outcome. The
+/// durations decide M1 vs M2 per request — a ~1 s TCP stage with fast
+/// DNS is an RTO firing (M1); a ~1 s DNS stage is a DNS timeout (M2).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LegTrace {
+    pub(crate) tunnel_id: Option<String>,
+    /// DNS phase (resolve start → complete), if the leg resolved a domain.
+    pub(crate) dns_ms: Option<u64>,
+    /// TCP phase (connect start → connected), if the leg reached the TCP dial.
+    pub(crate) tcp_ms: Option<u64>,
+    pub(crate) outcome: LegOutcomeKind,
+}
+
+/// The legs of one pool race, filled by [`LegRace::race`] as legs
+/// complete. The caller owns it, so the trace survives the race
+/// failing (all legs failed) as well as winning.
+#[derive(Debug, Default)]
+struct RaceTrace {
+    winner: Option<RaceLeg>,
+    first: Option<LegTrace>,
+    second: Option<LegTrace>,
+}
+
+/// One CONNECT's probe trace: pre-resolve timing plus the race legs.
+/// Logged at debug by [`connect_via_router`] on every return; the
+/// analysis counts traces by leg outcome and stage duration. Only the
+/// final failover attempt's legs are carried — earlier attempts are
+/// already covered by the terminal-failure WARN.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConnectTrace {
+    /// Whole `connect_via_router` call (excludes the loopback
+    /// accept/greeting prefix, measured 12–14 ms and exonerated in the
+    /// P=64 investigation).
+    pub(crate) total_ms: u64,
+    /// Pre-resolve duration, if a live tunnel was pre-resolved.
+    pub(crate) preresolve_ms: Option<u64>,
+    /// Whether the pre-resolve failed (falls back to per-leg resolve).
+    pub(crate) preresolve_failed: bool,
+    /// Failover attempts run.
+    pub(crate) attempts: usize,
+    /// Which race leg won; `None` on the single-attempt path.
+    pub(crate) winner_leg: Option<RaceLeg>,
+    pub(crate) first_leg: LegTrace,
+    pub(crate) second_leg: Option<LegTrace>,
+}
+
+/// Milliseconds between two `Instant`s, saturating at `u64::MAX`.
+fn duration_ms(from: Instant, to: Instant) -> u64 {
+    u64::try_from(to.saturating_duration_since(from).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Build a leg trace from the fix15 dial stages and the leg's outcome.
+fn leg_trace(tunnel_id: Option<String>, stages: &DialStages, outcome: LegOutcomeKind) -> LegTrace {
+    let dns_ms = match (stages.dns_started, stages.dns_completed) {
+        (Some(started), Some(completed)) => Some(duration_ms(started, completed)),
+        _ => None,
+    };
+    let tcp_ms = match (stages.tcp_connect_started, stages.tcp_connected) {
+        (Some(started), Some(connected)) => Some(duration_ms(started, connected)),
+        _ => None,
+    };
+    LegTrace {
+        tunnel_id,
+        dns_ms,
+        tcp_ms,
+        outcome,
+    }
+}
+
+/// Classify a leg's dial error for the trace. A timeout inside a leg
+/// is the leg cap (see `LegCompletion::timed_out`); this maps the
+/// remaining errors only.
+const fn leg_outcome_from_error(err: &RouterConnectError) -> LegOutcomeKind {
+    match err {
+        RouterConnectError::DnsResolution(_) => LegOutcomeKind::DnsFailed,
+        RouterConnectError::ForbiddenDestination(_) => LegOutcomeKind::Forbidden,
+        RouterConnectError::TcpConnect(_) | RouterConnectError::SelectTunnel(_) => {
+            LegOutcomeKind::TcpFailed
+        }
+    }
+}
+
+/// Store one finished leg's trace in the race trace.
+fn store_leg_trace(trace: &mut RaceTrace, leg: RaceLeg, leg_trace: LegTrace) {
+    match leg {
+        RaceLeg::First => trace.first = Some(leg_trace),
+        RaceLeg::Second => trace.second = Some(leg_trace),
+    }
+}
+
+/// Trace a leg that never finished as aborted (its stages died with
+/// its task when the other leg won).
+fn aborted_leg_trace(tunnel_id: Option<String>) -> LegTrace {
+    LegTrace {
+        tunnel_id,
+        outcome: LegOutcomeKind::Aborted,
+        ..Default::default()
+    }
+}
+
+impl RaceTrace {
+    /// Record a race win: the winner's leg plus, when the loser was
+    /// spawned but never finished, its trace as aborted. `loser_trace`
+    /// is `None` when there is no loser to trace — the hedge never
+    /// started (a fast first leg wins alone, so the second leg stays
+    /// `None`) or it already finished (its own trace stands).
+    fn record_win(
+        &mut self,
+        leg: RaceLeg,
+        winner_id: Option<String>,
+        stages: &DialStages,
+        loser_trace: Option<LegTrace>,
+    ) {
+        self.winner = Some(leg);
+        store_leg_trace(self, leg, leg_trace(winner_id, stages, LegOutcomeKind::Won));
+        if let Some(loser_trace) = loser_trace {
+            let loser = match leg {
+                RaceLeg::First => RaceLeg::Second,
+                RaceLeg::Second => RaceLeg::First,
+            };
+            store_leg_trace(self, loser, loser_trace);
+        }
+    }
+}
+
+/// One finished race leg: its dial result, the fix15 stages it passed
+/// through, and whether the per-leg timeout cut it off (the timeout arm
+/// in `spawn_leg` knows; the error alone cannot tell a leg-cap timeout
+/// from an inner TCP timeout).
+struct LegCompletion {
+    leg: RaceLeg,
+    result: Result<DynStream, RouterConnectError>,
+    stages: DialStages,
+    timed_out: bool,
+}
 
 /// Tries to select a second tunnel distinct from the first leg.
 const MAX_RACE_SELECT_TRIES: usize = 3;
@@ -652,6 +934,20 @@ struct LegRace<'a> {
     max_attempts: usize,
 }
 
+/// Mutable state of one running pool race, bundled so the race loop
+/// and its completion handler stay under the function-size limit.
+struct RaceRun<'a> {
+    first: Arc<dyn ProxyTunnelTarget>,
+    set: tokio::task::JoinSet<LegCompletion>,
+    second: Option<Arc<dyn ProxyTunnelTarget>>,
+    first_done: bool,
+    second_done: bool,
+    hedge_spawned: bool,
+    last_err: Option<RouterConnectError>,
+    tried_ids: &'a mut SmallVec<[String; MAX_POOL_FAILOVER_ATTEMPTS]>,
+    trace: &'a mut RaceTrace,
+}
+
 impl LegRace<'_> {
     /// Deadline for one race leg: the remaining failover budget,
     /// capped at [`FIRST_ATTEMPT_TIMEOUT`].
@@ -664,10 +960,11 @@ impl LegRace<'_> {
     /// Spawn one race leg: the dial bounded by the per-attempt
     /// deadline. A deadline cut resolves the attempt as aborted, so a
     /// HalfOpen trial cannot linger undecided (the same guarantee the
-    /// old whole-budget timeout gave, now per leg).
+    /// old whole-budget timeout gave, now per leg). The leg's fix15
+    /// stages ride back with its result, so the race can trace it.
     fn spawn_leg(
         &self,
-        set: &mut tokio::task::JoinSet<LegOutcome>,
+        set: &mut tokio::task::JoinSet<LegCompletion>,
         tunnel: Arc<dyn ProxyTunnelTarget>,
         leg: RaceLeg,
     ) {
@@ -676,19 +973,31 @@ impl LegRace<'_> {
         let max_attempts = self.max_attempts;
         let timeout = self.first_leg_timeout();
         set.spawn(async move {
-            let result = tokio::time::timeout(
+            let mut stages = DialStages::default();
+            let dial = tokio::time::timeout(
                 timeout,
-                connect_target_single(&tunnel, &target, attempt, max_attempts),
+                connect_target_single(&tunnel, &target, attempt, max_attempts, &mut stages),
             )
-            .await
-            .unwrap_or_else(|_| {
+            .await;
+            if let Ok(result) = dial {
+                LegCompletion {
+                    leg,
+                    result,
+                    stages,
+                    timed_out: false,
+                }
+            } else {
                 tunnel.note_attempt_aborted();
-                Err(RouterConnectError::TcpConnect(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("connect attempt timed out after {timeout:?}"),
-                )))
-            });
-            (leg, result)
+                LegCompletion {
+                    leg,
+                    result: Err(RouterConnectError::TcpConnect(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("connect attempt timed out after {timeout:?}"),
+                    ))),
+                    stages,
+                    timed_out: true,
+                }
+            }
         });
     }
 
@@ -719,7 +1028,7 @@ impl LegRace<'_> {
     /// recording it so the race can cancel and resolve it on a win.
     async fn spawn_hedge(
         &self,
-        set: &mut tokio::task::JoinSet<LegOutcome>,
+        set: &mut tokio::task::JoinSet<LegCompletion>,
         tried_ids: &[String],
         second: &mut Option<Arc<dyn ProxyTunnelTarget>>,
     ) {
@@ -742,95 +1051,189 @@ impl LegRace<'_> {
     /// hedged — hedging it would only double-spend a healthy tunnel
     /// for a slow target. A leg that fails fast hedges immediately
     /// instead of waiting out the stagger.
+    ///
+    /// `trace` is filled as legs complete — winner, loser outcome, and
+    /// per-leg stage durations — on the winning path and on the
+    /// all-legs-failed path alike.
+    /// Run the race and fold its trace into the CONNECT trace.
+    async fn race_traced(
+        &self,
+        first: Arc<dyn ProxyTunnelTarget>,
+        tried_ids: &mut SmallVec<[String; MAX_POOL_FAILOVER_ATTEMPTS]>,
+        trace: &mut ConnectTrace,
+    ) -> Result<(DynStream, Option<String>), RouterConnectError> {
+        let mut race_trace = RaceTrace::default();
+        let result = self.race(first, tried_ids, &mut race_trace).await;
+        trace.winner_leg = race_trace.winner;
+        trace.first_leg = race_trace.first.take().unwrap_or_default();
+        trace.second_leg = race_trace.second.take();
+        result
+    }
+
     async fn race(
         &self,
         first: Arc<dyn ProxyTunnelTarget>,
         tried_ids: &mut SmallVec<[String; MAX_POOL_FAILOVER_ATTEMPTS]>,
+        trace: &mut RaceTrace,
     ) -> Result<(DynStream, Option<String>), RouterConnectError> {
-        let first_is_live = first.is_live();
-        let first_id = first.tunnel_id().map(str::to_string);
-        let mut set: tokio::task::JoinSet<LegOutcome> = tokio::task::JoinSet::new();
-        self.spawn_leg(&mut set, Arc::clone(&first), RaceLeg::First);
-        let mut second: Option<Arc<dyn ProxyTunnelTarget>> = None;
-        let mut first_done = false;
-        let mut second_done = false;
-        let mut hedge_spawned = false;
-        let mut last_err: Option<RouterConnectError> = None;
+        let mut run = RaceRun {
+            first,
+            set: tokio::task::JoinSet::new(),
+            second: None,
+            first_done: false,
+            second_done: false,
+            hedge_spawned: false,
+            last_err: None,
+            tried_ids,
+            trace,
+        };
+        let first_is_live = run.first.is_live();
+        self.spawn_leg(&mut run.set, Arc::clone(&run.first), RaceLeg::First);
+        self.run_race_loop(&mut run, first_is_live).await
+    }
+
+    /// Run the race loop: join legs as they finish, spawn the hedge on
+    /// a slow or failed first leg, and return the winner — or the last
+    /// error once every leg is done.
+    async fn run_race_loop(
+        &self,
+        run: &mut RaceRun<'_>,
+        first_is_live: bool,
+    ) -> Result<(DynStream, Option<String>), RouterConnectError> {
         let hedge_deadline = tokio::time::sleep(RACE_STAGGER);
         tokio::pin!(hedge_deadline);
         loop {
-            if set.is_empty() {
+            if run.set.is_empty() {
                 break;
             }
             tokio::select! {
                 biased;
-                res = set.join_next() => {
+                res = run.set.join_next() => {
                     let Some(joined) = res else { break };
-                    let Ok((leg, outcome)) = joined else {
-                        last_err = Some(RouterConnectError::TcpConnect(io::Error::other(
+                    let Ok(completion) = joined else {
+                        run.last_err = Some(RouterConnectError::TcpConnect(io::Error::other(
                             "race leg task ended unexpectedly",
                         )));
                         continue;
                     };
-                    match leg {
-                        RaceLeg::First => first_done = true,
-                        RaceLeg::Second => second_done = true,
-                    }
-                    match outcome {
-                        Ok(stream) => {
-                            abort_loser(
-                                &mut set,
-                                leg,
-                                &first,
-                                second.as_ref(),
-                                first_done,
-                                second_done,
-                            );
-                            match leg {
-                                RaceLeg::First => return Ok((stream, first_id)),
-                                RaceLeg::Second => {
-                                    let winner_id = second
-                                        .as_ref()
-                                        .and_then(|t| t.tunnel_id().map(str::to_string));
-                                    if let Some(id) = &winner_id {
-                                        tried_ids.push(id.clone());
-                                    }
-                                    return Ok((stream, winner_id));
-                                }
-                            }
-                        }
-                        Err(err @ RouterConnectError::ForbiddenDestination(_)) => {
-                            abort_loser(
-                                &mut set,
-                                leg,
-                                &first,
-                                second.as_ref(),
-                                first_done,
-                                second_done,
-                            );
-                            return Err(err);
-                        }
-                        Err(err) => {
-                            last_err = Some(err);
-                            if leg == RaceLeg::First && !hedge_spawned && !first_is_live {
-                                hedge_spawned = true;
-                                self.spawn_hedge(&mut set, tried_ids, &mut second).await;
-                            }
-                        }
+                    if let Some(decided) =
+                        self.resolve_leg(run, completion, first_is_live).await
+                    {
+                        return decided;
                     }
                 }
-                () = &mut hedge_deadline, if !hedge_spawned && !first_is_live => {
-                    hedge_spawned = true;
-                    self.spawn_hedge(&mut set, tried_ids, &mut second).await;
+                () = &mut hedge_deadline, if !run.hedge_spawned && !first_is_live => {
+                    run.hedge_spawned = true;
+                    self.spawn_hedge(&mut run.set, run.tried_ids, &mut run.second)
+                        .await;
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
+        Err(run.last_err.take().unwrap_or_else(|| {
             RouterConnectError::SelectTunnel(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "no healthy tunnels available in pool",
             ))
         }))
+    }
+
+    /// Resolve one finished leg. Returns `Some` when the race is
+    /// decided (a winner, or a forbidden destination); `None` when
+    /// racing continues (a failed leg, possibly with the hedge started).
+    async fn resolve_leg(
+        &self,
+        run: &mut RaceRun<'_>,
+        completion: LegCompletion,
+        first_is_live: bool,
+    ) -> Option<Result<(DynStream, Option<String>), RouterConnectError>> {
+        let LegCompletion {
+            leg,
+            result: outcome,
+            stages,
+            timed_out,
+        } = completion;
+        let first_id = run.first.tunnel_id().map(str::to_string);
+        let leg_id = match leg {
+            RaceLeg::First => first_id.clone(),
+            RaceLeg::Second => run
+                .second
+                .as_ref()
+                .and_then(|t| t.tunnel_id().map(str::to_string)),
+        };
+        match leg {
+            RaceLeg::First => run.first_done = true,
+            RaceLeg::Second => run.second_done = true,
+        }
+        match outcome {
+            Ok(stream) => {
+                // The loser, if it was spawned but never finished,
+                // traces as aborted; a never-spawned hedge (fast
+                // first leg) and an already-finished loser leave no
+                // loser trace — the second leg stays `None`, and a
+                // finished loser's own trace stands.
+                let loser_trace = if leg == RaceLeg::First {
+                    (run.hedge_spawned && !run.second_done).then(|| {
+                        aborted_leg_trace(
+                            run.second
+                                .as_ref()
+                                .and_then(|t| t.tunnel_id().map(str::to_string)),
+                        )
+                    })
+                } else {
+                    (!run.first_done).then(|| aborted_leg_trace(first_id.clone()))
+                };
+                run.trace
+                    .record_win(leg, leg_id.clone(), &stages, loser_trace);
+                abort_loser(
+                    &mut run.set,
+                    leg,
+                    &run.first,
+                    run.second.as_ref(),
+                    run.first_done,
+                    run.second_done,
+                );
+                Some(match leg {
+                    RaceLeg::First => Ok((stream, first_id)),
+                    RaceLeg::Second => {
+                        if let Some(id) = &leg_id {
+                            run.tried_ids.push(id.clone());
+                        }
+                        Ok((stream, leg_id))
+                    }
+                })
+            }
+            Err(err @ RouterConnectError::ForbiddenDestination(_)) => {
+                store_leg_trace(
+                    &mut *run.trace,
+                    leg,
+                    leg_trace(leg_id, &stages, LegOutcomeKind::Forbidden),
+                );
+                abort_loser(
+                    &mut run.set,
+                    leg,
+                    &run.first,
+                    run.second.as_ref(),
+                    run.first_done,
+                    run.second_done,
+                );
+                Some(Err(err))
+            }
+            Err(err) => {
+                let outcome = if timed_out {
+                    LegOutcomeKind::TimedOut
+                } else {
+                    leg_outcome_from_error(&err)
+                };
+                store_leg_trace(&mut *run.trace, leg, leg_trace(leg_id, &stages, outcome));
+                run.last_err = Some(err);
+                if leg == RaceLeg::First && !run.hedge_spawned && !first_is_live {
+                    run.hedge_spawned = true;
+                    self.spawn_hedge(&mut run.set, run.tried_ids, &mut run.second)
+                        .await;
+                }
+                None
+            }
+        }
     }
 }
 
@@ -841,7 +1244,7 @@ impl LegRace<'_> {
 /// future is dropped, and the netstack socket guard removes its
 /// socket, so no socket or session leaks.
 fn abort_loser(
-    set: &mut tokio::task::JoinSet<LegOutcome>,
+    set: &mut tokio::task::JoinSet<LegCompletion>,
     winner: RaceLeg,
     first: &Arc<dyn ProxyTunnelTarget>,
     second: Option<&Arc<dyn ProxyTunnelTarget>>,
@@ -871,25 +1274,18 @@ fn within_failover_budget(attempt: usize, deadline: tokio::time::Instant) -> boo
     deadline.saturating_duration_since(tokio::time::Instant::now()) >= MIN_ATTEMPT_TIMEOUT
 }
 
-/// One dial attempt through [`connect_target`] that does not report
-/// fix15 stages: the fix6 paths (the single-attempt failover arm and
-/// the race legs) have no dial-outcome record to fill in, so the
-/// stages go to a throwaway sink. DNS failures warn, as before.
+/// One dial attempt through [`connect_target`] that reports its fix15
+/// stages to the caller: the fix6 paths (the single-attempt failover
+/// arm and the race legs) fill the per-CONNECT probe trace from them.
+/// DNS failures warn, as before.
 async fn connect_target_single(
     target_tunnel: &Arc<dyn ProxyTunnelTarget>,
     target: &TargetAddr,
     attempt: usize,
     max_attempts: usize,
+    stages: &mut DialStages,
 ) -> Result<DynStream, RouterConnectError> {
-    connect_target(
-        target_tunnel,
-        target,
-        attempt,
-        max_attempts,
-        true,
-        &mut DialStages::default(),
-    )
-    .await
+    connect_target(target_tunnel, target, attempt, max_attempts, true, stages).await
 }
 
 /// Attempt one connection through `target_tunnel` for `target`.

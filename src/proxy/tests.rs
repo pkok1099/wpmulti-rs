@@ -3143,6 +3143,45 @@ async fn test_connect_via_router_budget_abort_notes_attempt_aborted() {
     );
 }
 
+/// Probe trace (P=64): a successful pool dial returns its trace — the
+/// winning leg, its stage durations, and the attempt count — so the
+/// analysis can classify each CONNECT as M1 (slow TCP stage, fast DNS)
+/// or M2 (slow DNS stage) without joining client records.
+#[tokio::test]
+async fn test_connect_trace_records_winning_leg_and_stages() {
+    use crate::proxy::router::{LegOutcomeKind, RaceLeg, connect_via_router};
+
+    let echo_addr = spawn_echo_tcp_server().await;
+    let target = TargetAddr::Ip(test_echo_target(echo_addr));
+    let pool = Arc::new(PoolRouter::new(PoolStrategy::RoundRobin, true));
+    pool.add_tunnel(
+        "alive-1",
+        Arc::new(MockTunnelTarget::new("alive-1").with_dial_redirect(echo_addr)),
+    );
+    pool.add_tunnel(
+        "alive-2",
+        Arc::new(MockTunnelTarget::new("alive-2").with_dial_redirect(echo_addr)),
+    );
+    let router: Arc<dyn TunnelRouter> = pool;
+
+    let (_stream, winner_id, trace) =
+        connect_via_router(&router, &TunnelSelector::DefaultPool, &target, None, None)
+            .await
+            .expect("dial must succeed");
+    assert_eq!(winner_id.as_deref(), Some("alive-1"));
+    assert_eq!(trace.winner_leg, Some(RaceLeg::First));
+    assert_eq!(trace.attempts, 1);
+    assert_eq!(trace.first_leg.tunnel_id.as_deref(), Some("alive-1"));
+    assert_eq!(trace.first_leg.outcome, LegOutcomeKind::Won);
+    assert!(
+        trace.first_leg.tcp_ms.is_some(),
+        "winning leg must carry its TCP stage duration"
+    );
+    assert_eq!(trace.first_leg.dns_ms, None, "IP target has no DNS stage");
+    assert!(trace.second_leg.is_none(), "fast first leg is never hedged");
+    assert!(trace.total_ms < 5000, "trace total took {}", trace.total_ms);
+}
+
 /// Regression (audit run-3 #7,
 /// `proxy.dns-pre-resolve-cross-tunnel-no-selector-binding`): the
 /// pre-resolve used to ask the router for any live tunnel with no
@@ -3205,7 +3244,7 @@ async fn test_preresolve_uses_selected_tunnel_only() {
     // Case 1 — client authenticated only for tunnel A, ById(A): the
     // query must go via A (pre-resolve + per-leg resolve), never via
     // B, and the dial must go via A.
-    let (stream, winner) = connect_via_router(
+    let (stream, winner, _) = connect_via_router(
         &router,
         &TunnelSelector::ById("wgcf-a".to_string()),
         &TargetAddr::Domain("victim.example.test".to_string(), 443),
@@ -3371,7 +3410,7 @@ async fn test_race_hedges_dormant_slow_leg_with_second_tunnel() {
     let router: Arc<dyn TunnelRouter> = pool;
 
     let start = tokio::time::Instant::now();
-    let (stream, id) =
+    let (stream, id, _) =
         connect_via_router(&router, &TunnelSelector::DefaultPool, &target, None, None)
             .await
             .expect("hedged dial must succeed");
@@ -3423,7 +3462,7 @@ async fn test_race_does_not_hedge_live_first_leg() {
     let router: Arc<dyn TunnelRouter> = pool;
 
     let start = tokio::time::Instant::now();
-    let (stream, id) =
+    let (stream, id, _) =
         connect_via_router(&router, &TunnelSelector::DefaultPool, &target, None, None)
             .await
             .expect("live slow dial must succeed");
@@ -4644,7 +4683,7 @@ async fn test_zero_response_retry_retries_through_different_tunnel() {
     let selector = TunnelSelector::DefaultPool;
 
     // First dial lands on the blackhole (RoundRobin starts at index 0).
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dead-1"));
@@ -4721,7 +4760,7 @@ async fn test_zero_response_retry_skips_when_prefix_overflows_cap() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dead-1"));
@@ -4792,7 +4831,7 @@ async fn test_zero_response_retry_no_retry_when_response_received() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("one-byte-1"));
@@ -4866,7 +4905,7 @@ async fn test_zero_response_retry_retries_after_reset() {
     let selector = TunnelSelector::DefaultPool;
 
     // First dial lands on the reset server (RoundRobin starts at index 0).
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("reset-1"));
@@ -4957,7 +4996,7 @@ async fn test_zero_response_retry_retries_after_reset_large_prefix() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dead-1"));
@@ -5034,7 +5073,7 @@ async fn test_zero_response_retry_no_retry_after_reset_with_response() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("reset-1"));
@@ -5088,7 +5127,7 @@ async fn test_connect_via_router_excludes_tunnel() {
     let selector = TunnelSelector::DefaultPool;
 
     // Excluding an unrelated tunnel changes nothing.
-    let (_, id) = connect_via_router(&router, &selector, &target, None, Some("other"))
+    let (_, id, _) = connect_via_router(&router, &selector, &target, None, Some("other"))
         .await
         .expect("dial must succeed when the exclusion does not match");
     assert_eq!(id.as_deref(), Some("only-1"));
@@ -5214,7 +5253,7 @@ async fn test_safe_http_silence_replay_rescues_blackhole() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dead-1"));
@@ -5325,7 +5364,7 @@ async fn test_safe_http_silence_replay_ignores_opaque_tls() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dead-1"));
@@ -5410,7 +5449,7 @@ async fn test_zero_response_retry_blocks_opaque_after_bytes_written() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dead-1"));
@@ -5637,7 +5676,7 @@ async fn test_hedge_loser_late_response_no_penalty() {
     let router: Arc<dyn TunnelRouter> = router_inner;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("slow-1"));
@@ -5742,7 +5781,7 @@ async fn test_hedge_loser_transport_failure_no_blackhole() {
     let router: Arc<dyn TunnelRouter> = router_inner;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dying-1"));
@@ -5993,7 +6032,7 @@ async fn test_replay_decision_record_at_trigger_has_required_fields() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dead-1"));
@@ -6119,7 +6158,7 @@ async fn test_replay_suppression_budget_records_reason() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dead-1"));
@@ -6321,7 +6360,7 @@ async fn test_replay_dial_not_sent_records_no_tunnel_reason() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dead-1"));
@@ -6482,7 +6521,7 @@ async fn test_replay_dial_primary_wins_before_send_records_terminal_outcome() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("slow-1"));
@@ -6867,7 +6906,7 @@ async fn test_replay_budget_exhaustion_emits_no_warn() {
     let router: Arc<dyn TunnelRouter> = pool;
     let selector = TunnelSelector::DefaultPool;
 
-    let (first_stream, first_id) = connect_via_router(&router, &selector, &target, None, None)
+    let (first_stream, first_id, _) = connect_via_router(&router, &selector, &target, None, None)
         .await
         .expect("first dial must succeed");
     assert_eq!(first_id.as_deref(), Some("dead-1"));

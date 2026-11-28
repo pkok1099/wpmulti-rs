@@ -999,7 +999,7 @@ async fn resolve_and_connect_http_target<S: AsyncWrite + Unpin>(
     );
 
     match connect_via_router(router, selector, &target, credentials, None).await {
-        Ok((s, tunnel_id)) => Ok((s, tunnel_id, target)),
+        Ok((s, tunnel_id, _connect_trace)) => Ok((s, tunnel_id, target)),
         Err(RouterConnectError::SelectTunnel(e)) => {
             // Log exactly like the SOCKS5 path: docs §4 promises this
             // line for the pool-empty case, and without it an HTTP user

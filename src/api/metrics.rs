@@ -7,6 +7,18 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::core::{HealthStatus, TunnelEntry, TunnelManager};
+use crate::netstack::bridge::BridgeCounters;
+
+/// Read one bridge counter for a tunnel entry: 0 when the tunnel has
+/// no running netstack (dormant, or VPN mode).
+fn tunnel_bridge_counter(entry: &TunnelEntry, load: impl Fn(&BridgeCounters) -> u64) -> u64 {
+    entry
+        .active
+        .read()
+        .as_ref()
+        .and_then(|active| active.netstack.as_ref())
+        .map_or(0, |stack| load(stack.bridge_counters()))
+}
 
 /// Count registered tunnels by health status: (healthy, untested, unhealthy, dead).
 /// Half-open tunnels count in none of the four buckets.
@@ -191,9 +203,62 @@ pub fn generate_prometheus_metrics(manager: &TunnelManager) -> String {
         &entries,
         |e| e.health.cooldown_remaining_secs(),
     );
+    write_bridge_metrics(&mut out, &entries);
     // Safe HTTP silence replay (fix11): global counters rendered
     // from the proxy's replay state, next to the tunnel gauges.
     crate::proxy::replay::write_replay_metrics(&mut out);
 
     out
+}
+
+/// P=64 probe: per-stack bridge counters (see [`BridgeCounters`]).
+fn write_bridge_metrics(out: &mut String, entries: &[Arc<TunnelEntry>]) {
+    write_tunnel_metric(
+        out,
+        "wpmulti_tunnel_tcp_syn_retransmits",
+        "counter",
+        "Outgoing TCP SYNs repeating a recent (source port, sequence number): smoltcp RTO retransmits",
+        entries,
+        |e| tunnel_bridge_counter(e, |c| c.syn_retransmits.load(Ordering::Relaxed)),
+    );
+    write_tunnel_metric(
+        out,
+        "wpmulti_tunnel_tx_full_rx_stall_episodes",
+        "counter",
+        "Episodes where Device::receive returned None because the TX channel was full (TX-full RX stall)",
+        entries,
+        |e| tunnel_bridge_counter(e, |c| c.tx_full_rx_stall_episodes.load(Ordering::Relaxed)),
+    );
+    write_tunnel_metric(
+        out,
+        "wpmulti_tunnel_tx_full_drops",
+        "counter",
+        "Outbound packets dropped because the TX channel was full or closed",
+        entries,
+        |e| tunnel_bridge_counter(e, |c| c.tx_full_drops.load(Ordering::Relaxed)),
+    );
+    write_tunnel_metric(
+        out,
+        "wpmulti_tunnel_ipsend_wait_ms_total",
+        "counter",
+        "Total milliseconds BridgeIpSend::send spent awaiting RX channel capacity",
+        entries,
+        |e| tunnel_bridge_counter(e, |c| c.ipsend_wait_ms_total.load(Ordering::Relaxed)),
+    );
+    write_tunnel_metric(
+        out,
+        "wpmulti_tunnel_ipsend_waits_over_10ms",
+        "counter",
+        "Sends that waited over 10 ms for RX channel capacity",
+        entries,
+        |e| tunnel_bridge_counter(e, |c| c.ipsend_waits_over_10ms.load(Ordering::Relaxed)),
+    );
+    write_tunnel_metric(
+        out,
+        "wpmulti_tunnel_rx_depth_max",
+        "gauge",
+        "Deepest RX channel occupancy observed (packets waiting for smoltcp)",
+        entries,
+        |e| tunnel_bridge_counter(e, |c| c.rx_depth_max.load(Ordering::Relaxed) as u64),
+    );
 }

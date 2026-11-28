@@ -23,7 +23,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::WgInterfaceConfig;
-use crate::netstack::bridge::VirtualTunBridge;
+use crate::netstack::bridge::{BridgeCounters, VirtualTunBridge};
 use crate::netstack::dns::{DnsLruCache, InTunnelDnsResolver};
 use crate::netstack::stream::{VirtualTcpStream, VirtualUdpSocket, to_smoltcp_endpoint};
 
@@ -141,6 +141,8 @@ pub struct VirtualNetworkStack {
     next_ephemeral_port: AtomicU16,
     dns_resolver: InTunnelDnsResolver,
     connect_timeout_ms: AtomicU64,
+    /// Probe counters shared with the bridge the reactor owns.
+    bridge_counters: Arc<BridgeCounters>,
 }
 
 const fn compute_effective_ip_mode(
@@ -324,6 +326,9 @@ impl VirtualNetworkStack {
         connect_timeout: StdDuration,
     ) -> Result<Self, io::Error> {
         let notify = bridge.notify_handle();
+        // Take the counters before the bridge moves into the reactor:
+        // the stack is the handle the metrics endpoint reads them from.
+        let bridge_counters = bridge.counters();
 
         // 1. Configure smoltcp interface with Medium::Ip
         let mut iface_config = Config::new(HardwareAddress::Ip);
@@ -389,6 +394,7 @@ impl VirtualNetworkStack {
             next_ephemeral_port: AtomicU16::new(initial_port),
             dns_resolver: resolver,
             connect_timeout_ms: AtomicU64::new(timeout_ms),
+            bridge_counters,
         })
     }
 
@@ -439,6 +445,13 @@ impl VirtualNetworkStack {
     /// Return the configured TCP connection handshake timeout.
     pub fn connect_timeout(&self) -> StdDuration {
         StdDuration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    /// Per-stack probe counters (TCP SYN retransmits, bridge
+    /// backpressure). Shared with the bridge the reactor owns, so
+    /// reads here observe the live values.
+    pub const fn bridge_counters(&self) -> &Arc<BridgeCounters> {
+        &self.bridge_counters
     }
 
     /// Access the wakeup notification handle.

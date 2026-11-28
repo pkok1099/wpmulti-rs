@@ -4,8 +4,13 @@
 //! [`BridgeIpSend`] implementing [`gotatun::tun::IpSend`], and
 //! [`BridgeIpRecv`] implementing [`gotatun::tun::IpRecv`].
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant as StdInstant};
+
+use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
 
 use gotatun::packet::{Ip, Packet, PacketBufPool};
@@ -23,6 +28,146 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 /// Maximum batch size when draining outbound packets in `IpRecv::recv`.
 pub const MAX_DRAIN_BATCH_SIZE: usize = 16;
 
+/// How long an outbound SYN (source port, sequence number) is remembered
+/// for retransmit detection: well past the 1 s smoltcp RTO and its first
+/// backoff, short enough that a later connection reusing the port is not
+/// mistaken for a retransmit of the first.
+const SYN_RETRANSMIT_WINDOW: Duration = Duration::from_secs(65);
+
+/// Cap on remembered SYNs: one entry per outbound connection attempt;
+/// pruning runs only when the cap is hit, so the steady-state cost is a
+/// single hash lookup per SYN.
+const MAX_REMEMBERED_SYNS: usize = 4096;
+
+/// A `BridgeIpSend::send` that waits longer than this for RX channel
+/// capacity counts as a backpressure episode (M4 in the P=64 probe).
+const IPSEND_WAIT_THRESHOLD_MS: u64 = 10;
+
+/// Per-stack observation counters for the P=64 probe.
+///
+/// Instrumentation only — no behaviour change. Every field is an
+/// atomic: the bridge runs in the reactor task while the metrics
+/// endpoint reads from proxy tasks.
+///
+/// gotatun's handshake rate limiter deliberately has NO counter here:
+/// it is a private field of gotatun's `Device` with no accessor, and
+/// `verify_packet` passes data packets through untouched — it can only
+/// drop or cookie-reply handshake packets, so it cannot explain
+/// data-path loss (verified in gotatun 0.10.3 `noise/rate_limiter.rs`).
+#[derive(Debug, Default)]
+pub struct BridgeCounters {
+    /// Outgoing TCP SYNs repeating a (source port, sequence number)
+    /// seen within [`SYN_RETRANSMIT_WINDOW`]: smoltcp RTO retransmits
+    /// of a lost or delayed SYN (M1 in the P=64 probe).
+    pub syn_retransmits: AtomicU64,
+    /// Episodes where `Device::receive` returned `None` because the TX
+    /// channel was full — the TX-full → RX-stall coupling (M3).
+    /// Counted per episode (entering the full state), not per poll.
+    pub tx_full_rx_stall_episodes: AtomicU64,
+    /// Outbound packets dropped in `TxToken::consume` because the TX
+    /// channel was full or closed.
+    pub tx_full_drops: AtomicU64,
+    /// Total time `BridgeIpSend::send` spent awaiting RX channel
+    /// capacity, in milliseconds (M4 backpressure).
+    pub ipsend_wait_ms_total: AtomicU64,
+    /// Sends that waited longer than [`IPSEND_WAIT_THRESHOLD_MS`] for
+    /// RX channel capacity.
+    pub ipsend_waits_over_10ms: AtomicU64,
+    /// Deepest RX channel occupancy observed (packets waiting for smoltcp).
+    pub rx_depth_max: AtomicUsize,
+    /// Outbound SYNs seen recently, for retransmit detection.
+    syn_seen: Mutex<HashMap<(u16, u32), StdInstant>>,
+}
+
+/// Point-in-time copy of [`BridgeCounters`] for tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BridgeCountersSnapshot {
+    pub syn_retransmits: u64,
+    pub tx_full_rx_stall_episodes: u64,
+    pub tx_full_drops: u64,
+    pub ipsend_wait_ms_total: u64,
+    pub ipsend_waits_over_10ms: u64,
+    pub rx_depth_max: usize,
+}
+
+impl BridgeCounters {
+    /// Read all counters at once.
+    pub fn snapshot(&self) -> BridgeCountersSnapshot {
+        BridgeCountersSnapshot {
+            syn_retransmits: self.syn_retransmits.load(Ordering::Relaxed),
+            tx_full_rx_stall_episodes: self.tx_full_rx_stall_episodes.load(Ordering::Relaxed),
+            tx_full_drops: self.tx_full_drops.load(Ordering::Relaxed),
+            ipsend_wait_ms_total: self.ipsend_wait_ms_total.load(Ordering::Relaxed),
+            ipsend_waits_over_10ms: self.ipsend_waits_over_10ms.load(Ordering::Relaxed),
+            rx_depth_max: self.rx_depth_max.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Inspect one outgoing IP packet (smoltcp → WireGuard) for a
+    /// retransmitted TCP SYN. Only pure SYNs (flags exactly `0x02`)
+    /// are tracked: a retransmit repeats the source port and sequence
+    /// number, so a SYN matching a recent entry is an RTO firing, not
+    /// a new dial. IPv4 and IPv6 are both parsed; anything else is
+    /// ignored. The parse is a few bounds-checked reads — no work is
+    /// done for non-SYN packets beyond the flag check.
+    pub fn note_outgoing_packet(&self, bytes: &[u8]) {
+        let Some((src_port, seq)) = parse_tcp_syn(bytes) else {
+            return;
+        };
+        let now = StdInstant::now();
+        let mut seen = self.syn_seen.lock();
+        if let Some(first) = seen.get(&(src_port, seq))
+            && first.elapsed() < SYN_RETRANSMIT_WINDOW
+        {
+            self.syn_retransmits.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if seen.len() >= MAX_REMEMBERED_SYNS {
+            seen.retain(|_, first| first.elapsed() < SYN_RETRANSMIT_WINDOW);
+        }
+        seen.insert((src_port, seq), now);
+    }
+}
+
+fn be_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]))
+}
+
+fn be_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_be_bytes([
+        *bytes.get(at)?,
+        *bytes.get(at + 1)?,
+        *bytes.get(at + 2)?,
+        *bytes.get(at + 3)?,
+    ]))
+}
+
+/// Parse an outgoing IP packet, returning the (source port, sequence
+/// number) when it is a pure TCP SYN (flags exactly `0x02`).
+fn parse_tcp_syn(bytes: &[u8]) -> Option<(u16, u32)> {
+    let version = bytes.first().copied()? >> 4;
+    let tcp_start = match version {
+        6 => {
+            if bytes.len() < 60 || bytes.get(6).copied()? != 6 {
+                return None;
+            }
+            40
+        }
+        4 => {
+            let ihl = usize::from(bytes.first().copied()? & 0x0f) * 4;
+            if bytes.len() < ihl + 20 || bytes.get(9).copied()? != 6 {
+                return None;
+            }
+            ihl
+        }
+        _ => return None,
+    };
+    if bytes.get(tcp_start + 13).copied()? != 0x02 {
+        return None;
+    }
+    Some((be_u16(bytes, tcp_start)?, be_u32(bytes, tcp_start + 4)?))
+}
+
 /// Number of packet buffers retained by the bridge's own [`PacketBufPool`].
 ///
 /// The pool only bounds *retained* buffers; [`PacketBufPool::get`] allocates a
@@ -39,6 +184,10 @@ pub struct VirtualTunBridge {
     tx_sender: mpsc::Sender<Packet<[u8]>>,
     notify: Arc<Notify>,
     packet_pool: PacketBufPool,
+    counters: Arc<BridgeCounters>,
+    /// Whether the last `receive` hit the TX-full gate: the stall
+    /// episode is counted on entry, not on every poll while full.
+    tx_full_active: bool,
 }
 
 impl std::fmt::Debug for VirtualTunBridge {
@@ -54,6 +203,9 @@ impl std::fmt::Debug for VirtualTunBridge {
 pub struct BridgeIpSend {
     rx_sender: mpsc::Sender<Packet<Ip>>,
     notify: Arc<Notify>,
+    counters: Arc<BridgeCounters>,
+    /// Bound of the RX channel, for depth accounting in [`IpSend::send`].
+    rx_capacity: usize,
 }
 
 impl std::fmt::Debug for BridgeIpSend {
@@ -91,6 +243,7 @@ impl VirtualTunBridge {
         // `IpRecv::recv`, so the TX token cannot draw from it. Buffers drawn
         // here return to this pool on drop via `Packet`'s return-to-pool hook.
         let packet_pool = PacketBufPool::new(BRIDGE_PACKET_POOL_CAPACITY);
+        let counters = Arc::new(BridgeCounters::default());
 
         let bridge = Self {
             mtu,
@@ -98,11 +251,15 @@ impl VirtualTunBridge {
             tx_sender,
             notify: Arc::clone(&notify),
             packet_pool,
+            counters: Arc::clone(&counters),
+            tx_full_active: false,
         };
 
         let ip_send = BridgeIpSend {
             rx_sender,
             notify: Arc::clone(&notify),
+            counters,
+            rx_capacity: cap,
         };
 
         let ip_recv = BridgeIpRecv {
@@ -127,6 +284,11 @@ impl VirtualTunBridge {
     /// Get the configured MTU.
     pub const fn mtu(&self) -> u16 {
         self.mtu
+    }
+
+    /// Shared probe counters for this stack's bridge.
+    pub fn counters(&self) -> Arc<BridgeCounters> {
+        Arc::clone(&self.counters)
     }
 }
 
@@ -153,14 +315,26 @@ impl Device for VirtualTunBridge {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if self.tx_sender.capacity() == 0 {
+            // A full TX channel blocks RX processing entirely (smoltcp
+            // gets no RxToken while it cannot also get a TxToken), so
+            // SYN-ACKs and DNS replies stall with it. Counted per
+            // episode, not per poll.
+            if !self.tx_full_active {
+                self.tx_full_active = true;
+                self.counters
+                    .tx_full_rx_stall_episodes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return None;
         }
+        self.tx_full_active = false;
         match self.rx_receiver.try_recv() {
             Ok(packet) => {
                 let rx = VirtualTunRxToken { packet };
                 let tx = VirtualTunTxToken {
                     tx_sender: &self.tx_sender,
                     packet_pool: self.packet_pool.clone(),
+                    counters: Arc::clone(&self.counters),
                 };
                 Some((rx, tx))
             }
@@ -176,6 +350,7 @@ impl Device for VirtualTunBridge {
         (self.tx_sender.capacity() > 0).then(|| VirtualTunTxToken {
             tx_sender: &self.tx_sender,
             packet_pool: self.packet_pool.clone(),
+            counters: Arc::clone(&self.counters),
         })
     }
 }
@@ -210,6 +385,7 @@ impl RxToken for VirtualTunRxToken {
 pub struct VirtualTunTxToken<'a> {
     tx_sender: &'a mpsc::Sender<Packet<[u8]>>,
     packet_pool: PacketBufPool,
+    counters: Arc<BridgeCounters>,
 }
 
 impl std::fmt::Debug for VirtualTunTxToken<'_> {
@@ -232,7 +408,11 @@ impl TxToken for VirtualTunTxToken<'_> {
         let mut packet = self.packet_pool.get();
         packet.buf_mut().resize(len, 0);
         let result = f(packet.buf_mut());
+        // The filled buffer is the outgoing IP packet: check it for a
+        // retransmitted SYN before it leaves for WireGuard.
+        self.counters.note_outgoing_packet(packet.buf_mut());
         if self.tx_sender.try_send(packet).is_err() {
+            self.counters.tx_full_drops.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("VirtualTunBridge TX channel full or closed; dropping outbound packet");
         }
         result
@@ -252,12 +432,35 @@ impl BridgeIpSend {
 
 impl IpSend for BridgeIpSend {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
-        self.rx_sender.send(packet).await.map_err(|_| {
+        // Time the wait for RX channel capacity: when the channel is
+        // full this await stalls gotatun's reader, which stops reading
+        // its UDP socket and lets the kernel drop WireGuard packets
+        // silently (M4 backpressure in the P=64 probe).
+        let start = StdInstant::now();
+        let result = self.rx_sender.send(packet).await;
+        let waited_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if waited_ms > 0 {
+            self.counters
+                .ipsend_wait_ms_total
+                .fetch_add(waited_ms, Ordering::Relaxed);
+            if waited_ms > IPSEND_WAIT_THRESHOLD_MS {
+                self.counters
+                    .ipsend_waits_over_10ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result.map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "VirtualTunBridge netstack rx channel closed",
             )
         })?;
+        let depth = self.rx_capacity.saturating_sub(self.rx_sender.capacity());
+        if depth > self.counters.rx_depth_max.load(Ordering::Relaxed) {
+            self.counters
+                .rx_depth_max
+                .fetch_max(depth, Ordering::Relaxed);
+        }
         self.notify.notify_one();
         Ok(())
     }

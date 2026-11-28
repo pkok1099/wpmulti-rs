@@ -12,8 +12,8 @@ pub mod tests;
 pub mod tun;
 
 pub use bridge::{
-    BridgeIpRecv, BridgeIpSend, DEFAULT_CHANNEL_CAPACITY, DEFAULT_MTU, MAX_DRAIN_BATCH_SIZE,
-    VirtualTunBridge,
+    BridgeCounters, BridgeCountersSnapshot, BridgeIpRecv, BridgeIpSend, DEFAULT_CHANNEL_CAPACITY,
+    DEFAULT_MTU, MAX_DRAIN_BATCH_SIZE, VirtualTunBridge,
 };
 pub use dns::{
     DnsError, DnsLruCache, InTunnelDnsResolver, QueryType, build_query, build_response,
