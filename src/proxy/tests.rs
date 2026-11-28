@@ -5878,10 +5878,19 @@ const REPLAY_DECISION_FIELDS: &[&str] = &[
     "decision",
     "started",
     "dead-1",
+    "primary_tunnel_id=",
     "target=",
+    "decision_timestamp=",
     "request_forwarded_ms=",
     "silence_trigger_ms=",
     "primary_response_bytes=",
+    "active_replays=",
+    "max_concurrent_replays=",
+    "bucket_tokens=",
+    "bucket_capacity=",
+    "token_available=",
+    "slot_available=",
+    "admission_result=",
 ];
 
 /// Pull the `request_id=<digits>` value out of one rendered log
@@ -6017,12 +6026,22 @@ async fn test_replay_decision_record_at_trigger_has_required_fields() {
     assert_eq!(metrics.secondary_wins.load(Ordering::Relaxed), 1);
 }
 
+/// Drain all 10 bucket tokens through the admission API: each
+/// admitted guard is dropped at the end of the statement, so the
+/// bucket — not the concurrency cap — is what runs out.
+fn drain_replay_bucket_tokens() {
+    use crate::proxy::replay::{ReplayAdmission, replay_budget_try_start};
+    for _ in 0..10 {
+        assert!(matches!(
+            replay_budget_try_start(),
+            ReplayAdmission::Admitted { .. }
+        ));
+    }
+}
+
 #[tokio::test]
 async fn test_replay_suppression_budget_records_reason() {
-    use crate::proxy::replay::{
-        REPLAY_TEST_LOCK, replay_budget_finish, replay_budget_try_start, replay_metrics,
-        reset_replay_state_for_tests,
-    };
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
     use crate::proxy::router::connect_via_router;
     use crate::proxy::{
         CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
@@ -6030,17 +6049,13 @@ async fn test_replay_suppression_budget_records_reason() {
 
     // fix13: when the 2.5 s trigger fires but the global bucket is
     // empty, the suppression record names the reason
-    // (budget_exhausted) under the session's id — the exact record
-    // the fix12 measurement was missing.
+    // (`token_empty`: the bucket ran out while slots were free)
+    // under the session's id — the exact record the fix12
+    // measurement was missing. fix14 (GPT round 7): the record
+    // also carries the budget state the decision was based on.
     let _replay_guard = REPLAY_TEST_LOCK.lock().await;
     reset_replay_state_for_tests();
-    // Drain all 10 bucket tokens (releasing each concurrency slot
-    // right away, so the bucket — not the concurrency cap — is what
-    // runs out).
-    for _ in 0..10 {
-        assert!(replay_budget_try_start());
-        replay_budget_finish();
-    }
+    drain_replay_bucket_tokens();
 
     let captured = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
@@ -6108,7 +6123,12 @@ async fn test_replay_suppression_budget_records_reason() {
     let metrics = replay_metrics();
     assert_eq!(metrics.silence_trigger.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.dial_started.load(Ordering::Relaxed), 0);
-    assert_eq!(metrics.suppressed_budget.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.suppressed_token_empty.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        metrics.suppressed_concurrency_full.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(metrics.suppressed_both_exhausted.load(Ordering::Relaxed), 0);
 
     let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     let suppressed_line = rendered
@@ -6119,12 +6139,114 @@ async fn test_replay_suppression_budget_records_reason() {
         suppressed_line,
         &[
             "request_id=",
-            "budget_exhausted",
+            "token_empty",
             "dead-1",
+            "decision_timestamp=",
             "request_forwarded_ms=",
             "silence_trigger_ms=",
+            "active_replays=",
+            "bucket_tokens=",
+            "token_available=",
+            "slot_available=",
+            "admission_result=",
         ],
     );
+}
+
+#[tokio::test]
+async fn test_replay_budget_suppression_splits_token_and_slot() {
+    use crate::proxy::replay::{
+        REPLAY_TEST_LOCK, ReplayAdmission, ReplaySlotGuard, SuppressReason,
+        replay_budget_concurrent_for_tests, replay_budget_try_start, reset_replay_state_for_tests,
+    };
+
+    // GPT round 7: the old `budget_exhausted` hid which of the two
+    // constraints bound the replay — an empty token bucket or a
+    // full concurrency cap. The admission classifies both at the
+    // decision point and names the binding one (or both).
+    let _replay_guard = REPLAY_TEST_LOCK.lock().await;
+    reset_replay_state_for_tests();
+
+    // Admit one replay and keep its concurrency slot held; the
+    // token is spent at reservation. The caller drives the budget
+    // into a known state first, so an admission must succeed here.
+    let admit_holding_slot = || match replay_budget_try_start() {
+        ReplayAdmission::Admitted {
+            slot,
+            token: _token,
+            ..
+        } => slot,
+        ReplayAdmission::Suppressed { reason, .. } => {
+            panic!("expected admission, got suppression {reason:?}")
+        }
+    };
+
+    // Concurrency full, tokens available: hold all 4 slots (6 of
+    // the 10 tokens still left) and the next admission names the
+    // full cap, not the bucket.
+    let mut held: Vec<ReplaySlotGuard> = Vec::new();
+    for _ in 0..4 {
+        held.push(admit_holding_slot());
+    }
+    assert_eq!(replay_budget_concurrent_for_tests(), 4);
+    match replay_budget_try_start() {
+        ReplayAdmission::Suppressed { reason, snapshot } => {
+            assert_eq!(reason, SuppressReason::ConcurrencyFull);
+            assert_eq!(snapshot.tokens, 6);
+            assert_eq!(snapshot.concurrent, 4);
+            assert!(snapshot.token_available());
+            assert!(!snapshot.slot_available());
+        }
+        ReplayAdmission::Admitted { .. } => panic!("expected suppression, got admission"),
+    }
+    drop(held);
+    assert_eq!(replay_budget_concurrent_for_tests(), 0);
+
+    // Token empty, slots free: spend the remaining 6 tokens one at
+    // a time (releasing each slot right away) and the next
+    // admission names the empty bucket, not the cap.
+    for _ in 0..6 {
+        drop(admit_holding_slot());
+    }
+    assert_eq!(replay_budget_concurrent_for_tests(), 0);
+    match replay_budget_try_start() {
+        ReplayAdmission::Suppressed { reason, snapshot } => {
+            assert_eq!(reason, SuppressReason::TokenEmpty);
+            assert_eq!(snapshot.tokens, 0);
+            assert_eq!(snapshot.concurrent, 0);
+            assert!(!snapshot.token_available());
+            assert!(snapshot.slot_available());
+        }
+        ReplayAdmission::Admitted { .. } => panic!("expected suppression, got admission"),
+    }
+
+    // Both exhausted: spend the tokens while all 4 slots are held.
+    // Admit in waves — 4, then 2 at a time after releasing 2 — so
+    // the last admissions leave the bucket empty with the cap
+    // still full.
+    reset_replay_state_for_tests();
+    let mut held: Vec<ReplaySlotGuard> = Vec::new();
+    for _ in 0..4 {
+        held.push(admit_holding_slot());
+    }
+    for _ in 0..3 {
+        held.truncate(2);
+        for _ in 0..2 {
+            held.push(admit_holding_slot());
+        }
+    }
+    assert_eq!(replay_budget_concurrent_for_tests(), 4);
+    match replay_budget_try_start() {
+        ReplayAdmission::Suppressed { reason, snapshot } => {
+            assert_eq!(reason, SuppressReason::BothExhausted);
+            assert_eq!(snapshot.tokens, 0);
+            assert_eq!(snapshot.concurrent, 4);
+            assert!(!snapshot.token_available());
+            assert!(!snapshot.slot_available());
+        }
+        ReplayAdmission::Admitted { .. } => panic!("expected suppression, got admission"),
+    }
+    drop(held);
 }
 
 #[tokio::test]
@@ -6318,10 +6440,7 @@ async fn test_shared_proxy_conn_cap_across_listeners() {
 
 #[tokio::test]
 async fn test_replay_budget_exhaustion_emits_no_warn() {
-    use crate::proxy::replay::{
-        REPLAY_TEST_LOCK, replay_budget_finish, replay_budget_try_start, replay_metrics,
-        reset_replay_state_for_tests,
-    };
+    use crate::proxy::replay::{REPLAY_TEST_LOCK, replay_metrics, reset_replay_state_for_tests};
     use crate::proxy::router::connect_via_router;
     use crate::proxy::{
         CopyEndKind, ZeroResponseRetry, copy_bidirectional_with_zero_response_retry,
@@ -6333,10 +6452,7 @@ async fn test_replay_budget_exhaustion_emits_no_warn() {
     // session ends.
     let _replay_guard = REPLAY_TEST_LOCK.lock().await;
     reset_replay_state_for_tests();
-    for _ in 0..10 {
-        assert!(replay_budget_try_start());
-        replay_budget_finish();
-    }
+    drain_replay_bucket_tokens();
 
     let captured = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
@@ -6399,7 +6515,7 @@ async fn test_replay_budget_exhaustion_emits_no_warn() {
     assert_eq!(tunnel_id.as_deref(), Some("dead-1"));
 
     let metrics = replay_metrics();
-    assert_eq!(metrics.suppressed_budget.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.suppressed_token_empty.load(Ordering::Relaxed), 1);
 
     let rendered = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     assert!(

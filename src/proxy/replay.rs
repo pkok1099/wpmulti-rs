@@ -56,7 +56,7 @@ pub(crate) const SAFE_GET_MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Global replay token bucket capacity (shared across all tunnels,
 /// not per tunnel): at most this many silence replays may start
 /// before the bucket refills.
-const REPLAY_BUCKET_CAPACITY: u32 = 10;
+pub(crate) const REPLAY_BUCKET_CAPACITY: u32 = 10;
 
 /// Primary requests per bucket refill token: the bucket refills
 /// slowly enough that replays add at most ~1% extra upstream load.
@@ -64,7 +64,7 @@ const REPLAY_BUCKET_REFILL_REQUESTS: u32 = 100;
 
 /// Most post-send replays live at once: a second load control on top
 /// of the bucket, so a burst of blackholes cannot fan out.
-const MAX_CONCURRENT_REPLAYS: u32 = 4;
+pub(crate) const MAX_CONCURRENT_REPLAYS: u32 = 4;
 
 /// Which mechanism claimed the session's one post-send replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,8 +102,18 @@ pub(crate) enum SuppressReason {
     /// The shared post-send token was already claimed by the other
     /// mechanism.
     TokenClaimed,
-    /// The global replay bucket (or the concurrency limit) is empty.
-    BudgetExhausted,
+    /// The global replay bucket is empty (no token left) while a
+    /// concurrency slot is free: the bucket, not the cap, bound the
+    /// replay. Split from the old `BudgetExhausted`, which hid
+    /// which of the two constraints bound it.
+    TokenEmpty,
+    /// The concurrency cap is full (4 live replays) while the
+    /// bucket still holds a token: the cap, not the bucket, bound
+    /// the replay.
+    ConcurrencyFull,
+    /// Both constraints bound the replay at once: the bucket is
+    /// empty and the concurrency cap is full.
+    BothExhausted,
     /// The primary answered before the secondary was ready.
     ResponseStarted,
     /// No tunnel other than the primary exists to re-dial through.
@@ -120,7 +130,9 @@ impl SuppressReason {
         match self {
             Self::Ineligible => "ineligible",
             Self::TokenClaimed => "token_claimed",
-            Self::BudgetExhausted => "budget_exhausted",
+            Self::TokenEmpty => "token_empty",
+            Self::ConcurrencyFull => "concurrency_full",
+            Self::BothExhausted => "both_exhausted",
             Self::ResponseStarted => "response_started",
             Self::NoTunnel => "no_tunnel",
             Self::ClientGone => "client_gone",
@@ -226,25 +238,139 @@ pub(crate) fn replay_budget_note_primary_request() {
     }
 }
 
-/// Reserve a global replay slot (one bucket token + one concurrency
-/// slot). Returns false when the bucket or the concurrency limit is
-/// empty; the caller must not claim the per-request token then.
-pub(crate) fn replay_budget_try_start() -> bool {
-    let mut budget = REPLAY_BUDGET.lock();
-    if budget.tokens > 0 && budget.concurrent < MAX_CONCURRENT_REPLAYS {
-        budget.tokens -= 1;
-        budget.concurrent += 1;
-        true
-    } else {
-        false
+/// The global replay budget as observed at one decision point:
+/// the tokens left in the bucket and the replays live right now.
+/// Taken under the same lock acquisition as the admission it is
+/// returned with, so it is the state the decision was based on —
+/// not a re-read that another session may have moved since.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReplayBudgetSnapshot {
+    pub(crate) tokens: u32,
+    pub(crate) concurrent: u32,
+}
+
+impl ReplayBudgetSnapshot {
+    /// Whether a bucket token is available for a new replay.
+    pub(crate) const fn token_available(self) -> bool {
+        self.tokens > 0
+    }
+
+    /// Whether a concurrency slot is free for a new replay.
+    pub(crate) const fn slot_available(self) -> bool {
+        self.concurrent < MAX_CONCURRENT_REPLAYS
     }
 }
 
-/// Release a concurrency slot reserved by
-/// [`replay_budget_try_start`]. The bucket token is spent, not
-/// refunded. Idempotent only when paired with one reservation per
-/// session — callers guard it with their own `budget_held` flag.
-pub(crate) fn replay_budget_finish() {
+/// A held replay concurrency slot: dropping it releases the slot.
+/// The only way to hold a slot is through
+/// [`replay_budget_try_start`], and the only way to release it is
+/// to drop the guard — the session's epoch-end backstop, the race
+/// resolution, and the hedge-loser observer all move this guard
+/// instead of counting releases by hand, so a slot is released
+/// exactly once and can never leak on an early return.
+pub(crate) struct ReplaySlotGuard;
+
+impl Drop for ReplaySlotGuard {
+    fn drop(&mut self) {
+        replay_budget_finish();
+    }
+}
+
+/// Proof that a bucket token was reserved for a replay. The token
+/// is spent at reservation and never refunded — dropping this
+/// guard releases nothing, by design: the token is gone whether
+/// the replay later dials, fails, or is cancelled.
+pub(crate) struct ReplayTokenGuard;
+
+/// The outcome of one silence-replay admission attempt. Both
+/// constraints are classified at the decision point — never just
+/// whichever check fails first — so a suppression names the
+/// constraint that actually bound it.
+pub(crate) enum ReplayAdmission {
+    /// Both resources were reserved: the slot guard owns the
+    /// concurrency slot until it is dropped, the token guard
+    /// proves the (spent) bucket token, and the snapshot is the
+    /// budget state the decision was based on.
+    Admitted {
+        slot: ReplaySlotGuard,
+        token: ReplayTokenGuard,
+        snapshot: ReplayBudgetSnapshot,
+    },
+    /// No resource was reserved: the reason names every binding
+    /// constraint, and the snapshot is the budget state the
+    /// decision was based on.
+    Suppressed {
+        reason: SuppressReason,
+        snapshot: ReplayBudgetSnapshot,
+    },
+}
+
+impl ReplayAdmission {
+    /// The budget state this admission was decided on.
+    pub(crate) const fn snapshot(&self) -> ReplayBudgetSnapshot {
+        match self {
+            Self::Admitted { snapshot, .. } | Self::Suppressed { snapshot, .. } => *snapshot,
+        }
+    }
+}
+
+/// The global replay budget as observed right now. For suppression
+/// records that are not budget decisions (the primary answered,
+/// the client went away): the state at log time, not a decision
+/// snapshot — only [`replay_budget_try_start`] returns a
+/// decision-point snapshot.
+pub(crate) fn replay_budget_snapshot() -> ReplayBudgetSnapshot {
+    let budget = REPLAY_BUDGET.lock();
+    ReplayBudgetSnapshot {
+        tokens: budget.tokens,
+        concurrent: budget.concurrent,
+    }
+}
+
+/// Try to admit one silence replay: reserve a bucket token and a
+/// concurrency slot, transactionally. Both constraints are
+/// classified first, under one lock acquisition, and the
+/// reservation is applied only when both are available — a failed
+/// admission never leaves a partially acquired resource behind.
+/// The caller must not claim the per-request token then.
+pub(crate) fn replay_budget_try_start() -> ReplayAdmission {
+    let mut budget = REPLAY_BUDGET.lock();
+    let snapshot = ReplayBudgetSnapshot {
+        tokens: budget.tokens,
+        concurrent: budget.concurrent,
+    };
+    let admission = match (snapshot.token_available(), snapshot.slot_available()) {
+        (true, true) => {
+            budget.tokens -= 1;
+            budget.concurrent += 1;
+            ReplayAdmission::Admitted {
+                slot: ReplaySlotGuard,
+                token: ReplayTokenGuard,
+                snapshot,
+            }
+        }
+        (false, true) => ReplayAdmission::Suppressed {
+            reason: SuppressReason::TokenEmpty,
+            snapshot,
+        },
+        (true, false) => ReplayAdmission::Suppressed {
+            reason: SuppressReason::ConcurrencyFull,
+            snapshot,
+        },
+        (false, false) => ReplayAdmission::Suppressed {
+            reason: SuppressReason::BothExhausted,
+            snapshot,
+        },
+    };
+    drop(budget);
+    admission
+}
+
+/// Release a concurrency slot held by a [`ReplaySlotGuard`]. The
+/// bucket token is spent, not refunded. Only the guard's `Drop`
+/// calls this — callers move the guard instead of counting
+/// releases by hand.
+fn replay_budget_finish() {
     let mut budget = REPLAY_BUDGET.lock();
     budget.concurrent = budget.concurrent.saturating_sub(1);
 }
@@ -257,7 +383,12 @@ pub(crate) struct ReplayMetrics {
     pub(crate) eligible: AtomicU64,
     pub(crate) suppressed_ineligible: AtomicU64,
     pub(crate) suppressed_token_claimed: AtomicU64,
-    pub(crate) suppressed_budget: AtomicU64,
+    /// Suppressions that named the empty bucket (slots free).
+    pub(crate) suppressed_token_empty: AtomicU64,
+    /// Suppressions that named the full concurrency cap (tokens left).
+    pub(crate) suppressed_concurrency_full: AtomicU64,
+    /// Suppressions where both constraints bound at once.
+    pub(crate) suppressed_both_exhausted: AtomicU64,
     pub(crate) suppressed_response_started: AtomicU64,
     pub(crate) suppressed_no_tunnel: AtomicU64,
     pub(crate) suppressed_client_gone: AtomicU64,
@@ -302,7 +433,9 @@ impl ReplayMetrics {
             eligible: AtomicU64::new(0),
             suppressed_ineligible: AtomicU64::new(0),
             suppressed_token_claimed: AtomicU64::new(0),
-            suppressed_budget: AtomicU64::new(0),
+            suppressed_token_empty: AtomicU64::new(0),
+            suppressed_concurrency_full: AtomicU64::new(0),
+            suppressed_both_exhausted: AtomicU64::new(0),
             suppressed_response_started: AtomicU64::new(0),
             suppressed_no_tunnel: AtomicU64::new(0),
             suppressed_client_gone: AtomicU64::new(0),
@@ -337,7 +470,9 @@ impl ReplayMetrics {
         let counter = match reason {
             SuppressReason::Ineligible => &self.suppressed_ineligible,
             SuppressReason::TokenClaimed => &self.suppressed_token_claimed,
-            SuppressReason::BudgetExhausted => &self.suppressed_budget,
+            SuppressReason::TokenEmpty => &self.suppressed_token_empty,
+            SuppressReason::ConcurrencyFull => &self.suppressed_concurrency_full,
+            SuppressReason::BothExhausted => &self.suppressed_both_exhausted,
             SuppressReason::ResponseStarted => &self.suppressed_response_started,
             SuppressReason::NoTunnel => &self.suppressed_no_tunnel,
             SuppressReason::ClientGone => &self.suppressed_client_gone,
@@ -460,8 +595,24 @@ impl ReplayMetrics {
             "safe_http_replay_suppressed_total",
             "Replays suppressed, by reason",
             "reason",
-            SuppressReason::BudgetExhausted.label(),
-            self.suppressed_budget.load(Ordering::Relaxed),
+            SuppressReason::TokenEmpty.label(),
+            self.suppressed_token_empty.load(Ordering::Relaxed),
+        );
+        write_counter_labeled(
+            out,
+            "safe_http_replay_suppressed_total",
+            "Replays suppressed, by reason",
+            "reason",
+            SuppressReason::ConcurrencyFull.label(),
+            self.suppressed_concurrency_full.load(Ordering::Relaxed),
+        );
+        write_counter_labeled(
+            out,
+            "safe_http_replay_suppressed_total",
+            "Replays suppressed, by reason",
+            "reason",
+            SuppressReason::BothExhausted.label(),
+            self.suppressed_both_exhausted.load(Ordering::Relaxed),
         );
         write_counter_labeled(
             out,
@@ -702,7 +853,15 @@ pub(crate) fn reset_replay_state_for_tests() {
     REPLAY_METRICS
         .suppressed_token_claimed
         .store(0, Ordering::Relaxed);
-    REPLAY_METRICS.suppressed_budget.store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .suppressed_token_empty
+        .store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .suppressed_concurrency_full
+        .store(0, Ordering::Relaxed);
+    REPLAY_METRICS
+        .suppressed_both_exhausted
+        .store(0, Ordering::Relaxed);
     REPLAY_METRICS
         .suppressed_response_started
         .store(0, Ordering::Relaxed);
@@ -950,10 +1109,13 @@ pub(crate) struct SilenceReplay {
     pub(crate) trigger_fired_at: Option<Instant>,
     /// The replay phase.
     pub(crate) phase: SilencePhase,
-    /// Whether this session holds a slot in the global replay
-    /// budget (released exactly once, when the replay resolves or
-    /// the session ends).
-    pub(crate) budget_held: bool,
+    /// The replay concurrency slot this session holds, if any:
+    /// dropping the guard releases it exactly once — the epoch-end
+    /// backstop, the race resolution, and the hedge-loser observer
+    /// all move this guard instead of counting releases by hand.
+    /// The bucket token is not stored here: it is spent at
+    /// reservation and never refunded.
+    pub(crate) slot: Option<ReplaySlotGuard>,
     /// Shared race state, also visible to the tunnel-to-client
     /// reader (header-length guard, winner, timings).
     pub(crate) shared: Arc<RaceShared>,
@@ -967,7 +1129,7 @@ impl SilenceReplay {
             header_written_at: None,
             trigger_fired_at: None,
             phase: SilencePhase::Idle,
-            budget_held: false,
+            slot: None,
             shared: Arc::new(RaceShared::new()),
         }
     }
@@ -1525,28 +1687,33 @@ pub(crate) fn apply_hedge_loser_outcome(ctx: &HedgeLoserCtx, outcome: &HedgeLose
 }
 
 /// Run one hedge-loser observation to its verdict, then release the
-/// replay concurrency slot the win transferred to this task.
-/// Exactly once: the slot is released here and nowhere else once
-/// the session handed it over, and the observation always ends
-/// (answer, close, or deadline), so the slot cannot leak.
-async fn observe_hedge_loser(ctx: HedgeLoserCtx, primary: DynStream, deadline: Instant) {
+/// replay concurrency slot the win transferred to this task: the
+/// slot guard is dropped when this future ends, exactly once. The
+/// observation always ends (answer, close, or deadline), so the
+/// slot cannot leak.
+async fn observe_hedge_loser(
+    ctx: HedgeLoserCtx,
+    primary: DynStream,
+    deadline: Instant,
+    _slot: ReplaySlotGuard,
+) {
     let mut primary = primary;
     let outcome = classify_hedge_loser(&mut primary, deadline).await;
     // The verdict is in: close the loser now, whatever it did.
     drop(primary);
     apply_hedge_loser_outcome(&ctx, &outcome);
-    replay_budget_finish();
 }
 
 /// Spawn the hedge-loser observer for a primary that lost the race.
 /// The task owns the primary stream, the router, and the replay
-/// budget slot until the observation ends.
+/// concurrency slot (as its guard) until the observation ends.
 pub(crate) fn spawn_hedge_loser_observer(
     ctx: HedgeLoserCtx,
     primary: DynStream,
     deadline: Instant,
+    slot: ReplaySlotGuard,
 ) {
     tokio::spawn(async move {
-        observe_hedge_loser(ctx, primary, deadline).await;
+        observe_hedge_loser(ctx, primary, deadline, slot).await;
     });
 }

@@ -16,11 +16,12 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use replay::{
-    BlackholeEjectionReason, HEDGE_LOSER_OBSERVE_DEADLINE, HedgeLoserCtx, PostSendReplayToken,
-    RACE_PRIMARY, RACE_SECONDARY_FAILED, RaceReaderArgs, RaceReaderDone, ReplayDialCtx,
-    ReplayDialOutcome, ReplaySource, SafeGetParse, SecondaryLeg, SilencePhase, SilenceReplay,
-    SuppressReason, UpstreamRaceReader, dial_secondary_leg, next_replay_request_id,
-    parse_safe_http_get_header, replay_budget_finish, replay_budget_note_primary_request,
+    BlackholeEjectionReason, HEDGE_LOSER_OBSERVE_DEADLINE, HedgeLoserCtx, MAX_CONCURRENT_REPLAYS,
+    PostSendReplayToken, RACE_PRIMARY, RACE_SECONDARY_FAILED, REPLAY_BUCKET_CAPACITY,
+    RaceReaderArgs, RaceReaderDone, ReplayAdmission, ReplayBudgetSnapshot, ReplayDialCtx,
+    ReplayDialOutcome, ReplaySlotGuard, ReplaySource, SafeGetParse, SecondaryLeg, SilencePhase,
+    SilenceReplay, SuppressReason, UpstreamRaceReader, dial_secondary_leg, next_replay_request_id,
+    parse_safe_http_get_header, replay_budget_note_primary_request, replay_budget_snapshot,
     replay_budget_try_start, replay_metrics, spawn_hedge_loser_observer,
 };
 
@@ -402,26 +403,21 @@ impl RetryCopy {
     }
 
     /// Release the global replay budget slot this session holds, if
-    /// any. Idempotent: the slot is released exactly once.
+    /// any. Idempotent: taking the guard out and dropping it
+    /// releases the slot exactly once.
     fn finish_replay_budget(&mut self) {
-        if self.silence.budget_held {
-            self.silence.budget_held = false;
-            replay_budget_finish();
+        if let Some(slot) = self.silence.slot.take() {
+            drop(slot);
         }
     }
 
     /// Transfer the held replay budget slot to the hedge-loser
     /// observer: the session stops owning it (so the epoch-end
     /// backstop cannot release it twice) and the observer releases
-    /// it when its verdict lands. Returns false when no slot was
-    /// held.
-    const fn take_replay_budget(&mut self) -> bool {
-        if self.silence.budget_held {
-            self.silence.budget_held = false;
-            true
-        } else {
-            false
-        }
+    /// it when its verdict lands. Returns the guard to move into
+    /// the observer, or `None` when no slot was held.
+    const fn take_replay_budget(&mut self) -> Option<ReplaySlotGuard> {
+        self.silence.slot.take()
     }
 
     /// Start observing the losing primary after a secondary win:
@@ -445,9 +441,9 @@ impl RetryCopy {
         let Some(tunnel_id) = primary_tunnel_id else {
             return false;
         };
-        if !self.take_replay_budget() {
+        let Some(slot) = self.take_replay_budget() else {
             return false;
-        }
+        };
         let forwarded_at = header_written_at.unwrap_or(self.started_at);
         let deadline = forwarded_at
             .checked_add(HEDGE_LOSER_OBSERVE_DEADLINE)
@@ -463,6 +459,7 @@ impl RetryCopy {
             },
             primary_stream,
             deadline,
+            slot,
         );
         true
     }
@@ -542,25 +539,49 @@ impl RetryCopy {
         )
     }
 
+    /// Milliseconds from session start to the decision being
+    /// recorded: the `decision_timestamp` of the fix14 decision
+    /// records, on the same offset scale as
+    /// `replay_decision_offsets` (the log line itself carries the
+    /// wall-clock timestamp).
+    fn replay_decision_timestamp_ms(&self) -> u128 {
+        self.started_at.elapsed().as_millis()
+    }
+
     /// The replay is suppressed: record the reason, close the phase,
     /// and never re-arm the timer for this session. The record
-    /// carries the session's correlation id and the decision
-    /// offsets, so a suppressed replay can be joined to the same
-    /// request's trigger and session-end records. DEBUG, never
-    /// WARN: a normal budget exhaustion is not an operational
-    /// warning.
-    fn suppress_silence_replay(&mut self, reason: SuppressReason, primary_tunnel: Option<&str>) {
+    /// carries the session's correlation id, the decision
+    /// offsets, and the budget state the decision was based on
+    /// (from the admission for budget suppressions, the current
+    /// state otherwise), so a suppressed replay can be joined to
+    /// the same request's trigger and session-end records and the
+    /// binding constraint is visible. DEBUG, never WARN: a normal
+    /// budget exhaustion is not an operational warning.
+    fn suppress_silence_replay(
+        &mut self,
+        reason: SuppressReason,
+        primary_tunnel: Option<&str>,
+        snapshot: ReplayBudgetSnapshot,
+    ) {
         replay_metrics().inc_suppressed(reason);
         let (request_forwarded_ms, silence_trigger_ms, primary_response_bytes) =
             self.replay_decision_offsets();
         tracing::debug!(
             request_id = self.request_id,
             reason = reason.label(),
-            primary_tunnel = ?primary_tunnel,
+            primary_tunnel_id = ?primary_tunnel,
             target = ?self.dial_ctx.as_ref().map(|ctx| &ctx.target),
+            decision_timestamp = self.replay_decision_timestamp_ms(),
             request_forwarded_ms = request_forwarded_ms,
             silence_trigger_ms = silence_trigger_ms,
             primary_response_bytes = primary_response_bytes,
+            active_replays = snapshot.concurrent,
+            max_concurrent_replays = MAX_CONCURRENT_REPLAYS,
+            bucket_tokens = snapshot.tokens,
+            bucket_capacity = REPLAY_BUCKET_CAPACITY,
+            token_available = snapshot.token_available(),
+            slot_available = snapshot.slot_available(),
+            admission_result = "suppressed",
             "safe HTTP silence replay suppressed"
         );
         self.silence.phase = SilencePhase::Done;
@@ -630,25 +651,57 @@ impl RetryCopy {
         // decision point was reached.
         self.silence.trigger_fired_at = Some(Instant::now());
         if self.tunnel_bytes.load(Ordering::Relaxed) > 0 {
-            self.suppress_silence_replay(SuppressReason::ResponseStarted, primary_tunnel);
+            self.suppress_silence_replay(
+                SuppressReason::ResponseStarted,
+                primary_tunnel,
+                replay_budget_snapshot(),
+            );
             return false;
         }
         if client_done {
-            self.suppress_silence_replay(SuppressReason::ClientGone, primary_tunnel);
+            self.suppress_silence_replay(
+                SuppressReason::ClientGone,
+                primary_tunnel,
+                replay_budget_snapshot(),
+            );
             return false;
         }
         if self.client_bytes.load(Ordering::Relaxed) > header.len() as u64 {
-            self.suppress_silence_replay(SuppressReason::ClientSentMore, primary_tunnel);
+            self.suppress_silence_replay(
+                SuppressReason::ClientSentMore,
+                primary_tunnel,
+                replay_budget_snapshot(),
+            );
             return false;
         }
-        if !replay_budget_try_start() {
-            self.suppress_silence_replay(SuppressReason::BudgetExhausted, primary_tunnel);
-            return false;
+        // The admission classifies both budget constraints at the
+        // decision point and names the binding one; the snapshot
+        // it returns is the budget state the decision was based on.
+        let admission = replay_budget_try_start();
+        let snapshot = admission.snapshot();
+        match admission {
+            ReplayAdmission::Admitted {
+                slot,
+                token: _token,
+                ..
+            } => {
+                // The token guard is spent at reservation and
+                // releases nothing on drop; the slot guard is
+                // held until the replay resolves or is observed.
+                self.silence.slot = Some(slot);
+            }
+            ReplayAdmission::Suppressed { reason, .. } => {
+                self.suppress_silence_replay(reason, primary_tunnel, snapshot);
+                return false;
+            }
         }
-        self.silence.budget_held = true;
         if !self.claim_post_send_replay(ReplaySource::SilenceReplay) {
             self.finish_replay_budget();
-            self.suppress_silence_replay(SuppressReason::TokenClaimed, primary_tunnel);
+            self.suppress_silence_replay(
+                SuppressReason::TokenClaimed,
+                primary_tunnel,
+                replay_budget_snapshot(),
+            );
             return false;
         }
         self.silence.phase = SilencePhase::Dialing;
@@ -664,11 +717,19 @@ impl RetryCopy {
         tracing::info!(
             request_id = self.request_id,
             decision = "started",
-            primary_tunnel = ?primary_tunnel,
+            primary_tunnel_id = ?primary_tunnel,
             target = ?self.dial_ctx.as_ref().map(|ctx| &ctx.target),
+            decision_timestamp = self.replay_decision_timestamp_ms(),
             request_forwarded_ms = request_forwarded_ms,
             silence_trigger_ms = silence_trigger_ms,
             primary_response_bytes = primary_response_bytes,
+            active_replays = snapshot.concurrent,
+            max_concurrent_replays = MAX_CONCURRENT_REPLAYS,
+            bucket_tokens = snapshot.tokens,
+            bucket_capacity = REPLAY_BUCKET_CAPACITY,
+            token_available = snapshot.token_available(),
+            slot_available = snapshot.slot_available(),
+            admission_result = "admitted",
             "safe HTTP silence replay decision"
         );
         true
@@ -741,11 +802,15 @@ impl RetryCopy {
                 }
             }
             ReplayDialOutcome::Suppressed(reason) => {
-                self.suppress_silence_replay(reason, primary_tunnel);
+                self.suppress_silence_replay(reason, primary_tunnel, replay_budget_snapshot());
                 self.finish_replay_budget();
             }
             ReplayDialOutcome::NoTunnel => {
-                self.suppress_silence_replay(SuppressReason::NoTunnel, primary_tunnel);
+                self.suppress_silence_replay(
+                    SuppressReason::NoTunnel,
+                    primary_tunnel,
+                    replay_budget_snapshot(),
+                );
                 self.finish_replay_budget();
             }
             ReplayDialOutcome::Failed(e) => {
